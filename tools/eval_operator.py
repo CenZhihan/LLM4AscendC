@@ -348,6 +348,7 @@ def run_eval(op_dir: pathlib.Path, spec: OperatorSpec, *, module_name: str, art_
     env = build_subprocess_env(cfg)
     env["LLM4ASCENDC_OP_MODULE"] = module_name
     env["LLM4ASCENDC_OP_DIR"] = str(op_dir)
+    env["LLM4ASCENDC_ROOT"] = str(ROOT)
     env["PYTHONPATH"] = f"{ROOT}:{env.get('PYTHONPATH','')}"
 
     # Ensure Ascend env + conda in shell context when running python.
@@ -357,39 +358,16 @@ def run_eval(op_dir: pathlib.Path, spec: OperatorSpec, *, module_name: str, art_
     return 0
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--op", help="operator directory (e.g. operators/add)")
-    src.add_argument("--txt", help="txt bundle path (MKB-style blocks in one file)")
-    ap.add_argument("--mode", default="full", choices=["full", "build-only", "eval-only"])
-    ap.add_argument("--clean-policy", default="force", choices=["force", "smart"])
-    args = ap.parse_args()
+def _resolve_user_path(p: pathlib.Path) -> pathlib.Path:
+    if not p.is_absolute():
+        return (pathlib.Path.cwd() / p).resolve()
+    return p.resolve()
 
-    if args.op:
-        op_dir = pathlib.Path(args.op)
-        if not op_dir.is_absolute():
-            op_dir = (ROOT / op_dir).resolve()
-        if not op_dir.exists():
-            raise FileNotFoundError(op_dir)
-    else:
-        txt_path = pathlib.Path(args.txt)
-        if not txt_path.is_absolute():
-            txt_path = (pathlib.Path.cwd() / txt_path).resolve()
-        if not txt_path.exists():
-            raise FileNotFoundError(txt_path)
-        # Materialize into a staging operator directory under artifacts.
-        # It can still be evaluated using the same pipeline.
-        staging_root = (ROOT / "artifacts" / "_txt_staging")
-        if staging_root.exists():
-            shutil.rmtree(staging_root)
-        staging_root.mkdir(parents=True, exist_ok=True)
-        op_dir = materialize_operator_from_txt(
-            out_dir=staging_root / "operator",
-            txt_path=txt_path,
-            soc="ai_core-Ascend910B2",
-        )
 
+def _execute_pipeline(op_dir: pathlib.Path, *, mode: str, clean_policy: str) -> None:
+    """
+    Build/install/eval one operator directory. Raises on failure.
+    """
     spec = load_operator_spec(op_dir)
     cfg = EnvConfig()
     art_dir = ART_ROOT / spec.op_key
@@ -400,24 +378,22 @@ def main() -> int:
     fp_now = compute_fingerprint(op_dir)
     fp_now_hex = fp_now.hexdigest
 
-    # Default result bookkeeping
     logs: dict[str, str] = {}
     compiled_ok: bool | None = None
     correctness_ok: bool | None = None
     correctness_info: str | None = None
 
     try:
-        if args.mode in ("full", "build-only"):
+        if mode in ("full", "build-only"):
             _, module_name = build_and_install_operator(
-                op_dir, spec, clean_policy=args.clean_policy, mode=args.mode, cfg=cfg
+                op_dir, spec, clean_policy=clean_policy, mode=mode, cfg=cfg
             )
             compiled_ok = True
-            # Collect latest build logs if they exist (best-effort)
             for k in ["01-msopgen", "02-build", "03-install-run", "04-pybind-build", "05-pybind-install"]:
                 latest = sorted(logs_dir.glob(f"*-{k}.log"))
                 if latest:
                     logs[k] = str(latest[-1])
-            if args.mode == "build-only":
+            if mode == "build-only":
                 out_path = write_result_json(
                     art_dir=art_dir,
                     op_key=spec.op_key,
@@ -426,10 +402,11 @@ def main() -> int:
                     correctness_info=None,
                     logs=logs,
                     fingerprint=fp_now_hex,
-                    mode=args.mode,
+                    mode=mode,
                 )
                 print(f"[done] build-only OK. summary: {out_path}")
-                return 0
+                return
+
         else:
             state = state_dir / "installed.json"
             if not state.exists():
@@ -445,17 +422,16 @@ def main() -> int:
                 )
             compiled_ok = True
 
-        if args.mode in ("full", "eval-only"):
-            # Eval
+        if mode in ("full", "eval-only"):
             run_eval(op_dir, spec, module_name=module_name, art_dir=art_dir, cfg=cfg)
             latest_eval = sorted(logs_dir.glob("*-06-eval.log"))
             if latest_eval:
                 eval_log = latest_eval[-1]
                 logs["06-eval"] = str(eval_log)
                 tail = _read_tail(eval_log, max_lines=120)
-                if "[smoke] no eval_src provided" in tail:
+                if "[smoke] no model_src" in tail or "[smoke] no eval_src provided" in tail:
                     correctness_ok = None
-                    correctness_info = "No eval_src provided (smoke test only)"
+                    correctness_info = "No model_src/eval_src (smoke test only)"
                 else:
                     correctness_ok = True
             else:
@@ -469,23 +445,20 @@ def main() -> int:
             correctness_info=correctness_info,
             logs=logs,
             fingerprint=fp_now_hex,
-            mode=args.mode,
+            mode=mode,
         )
         print(f"[done] OK. summary: {out_path}")
-        return 0
 
     except Exception as e:
         compiled_ok = compiled_ok if compiled_ok is not None else False
         correctness_ok = correctness_ok if correctness_ok is not None else False
 
-        # best-effort: locate the newest log and extract core error
         newest_logs = sorted(logs_dir.glob("*.log"))
         newest = newest_logs[-1] if newest_logs else None
         tail = _read_tail(newest) if newest else ""
         core = _extract_core_error(tail)
         correctness_info = core or f"{type(e).__name__}: {e}"
 
-        # collect some recent logs for debugging
         for k in ["01-msopgen", "02-build", "03-install-run", "04-pybind-build", "05-pybind-install", "06-eval"]:
             latest = sorted(logs_dir.glob(f"*-{k}.log"))
             if latest:
@@ -495,14 +468,88 @@ def main() -> int:
             art_dir=art_dir,
             op_key=spec.op_key,
             compiled=compiled_ok,
-            correctness=correctness_ok if args.mode != "build-only" else None,
+            correctness=correctness_ok if mode != "build-only" else None,
             correctness_info=correctness_info,
             logs=logs,
             fingerprint=fp_now_hex,
-            mode=args.mode,
+            mode=mode,
         )
         print(f"[done] FAILED. summary: {out_path}")
         raise
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=(
+            "Unified AscendC operator build/eval. "
+            "MKB-style txt bundles: use output/<op_key>.txt where op_key matches "
+            "vendor/mkb/dataset.py (filename stem is the MKB op key)."
+        )
+    )
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--op", help="operator directory (e.g. operators/add)")
+    src.add_argument(
+        "--txt",
+        help="single txt bundle path (MKB-style blocks; basename stem must equal MKB op_key, e.g. output/layer_norm.txt)",
+    )
+    src.add_argument(
+        "--txt-dir",
+        dest="txt_dir",
+        metavar="DIR",
+        help="directory of *.txt bundles (each file stem = MKB op_key); runs all files sequentially",
+    )
+    ap.add_argument("--mode", default="full", choices=["full", "build-only", "eval-only"])
+    ap.add_argument("--clean-policy", default="force", choices=["force", "smart"])
+    args = ap.parse_args()
+
+    if args.txt_dir:
+        txt_dir = _resolve_user_path(pathlib.Path(args.txt_dir))
+        if not txt_dir.is_dir():
+            raise NotADirectoryError(txt_dir)
+        files = sorted(txt_dir.glob("*.txt"))
+        if not files:
+            raise RuntimeError(f"no .txt files in {txt_dir}")
+        rc = 0
+        for txt_path in files:
+            print(f"[batch] === {txt_path.name} ===")
+            staging_root = ROOT / "artifacts" / "_txt_staging" / txt_path.stem
+            if staging_root.exists():
+                shutil.rmtree(staging_root)
+            staging_root.mkdir(parents=True, exist_ok=True)
+            op_dir = materialize_operator_from_txt(
+                out_dir=staging_root / "operator",
+                txt_path=txt_path,
+                soc="ai_core-Ascend910B2",
+            )
+            try:
+                _execute_pipeline(op_dir, mode=args.mode, clean_policy=args.clean_policy)
+            except Exception as e:
+                print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
+                rc = 1
+        return rc
+
+    if args.op:
+        op_dir = pathlib.Path(args.op)
+        if not op_dir.is_absolute():
+            op_dir = (ROOT / op_dir).resolve()
+        if not op_dir.exists():
+            raise FileNotFoundError(op_dir)
+    else:
+        txt_path = _resolve_user_path(pathlib.Path(args.txt))
+        if not txt_path.exists():
+            raise FileNotFoundError(txt_path)
+        staging_root = ROOT / "artifacts" / "_txt_staging"
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
+        staging_root.mkdir(parents=True, exist_ok=True)
+        op_dir = materialize_operator_from_txt(
+            out_dir=staging_root / "operator",
+            txt_path=txt_path,
+            soc="ai_core-Ascend910B2",
+        )
+
+    _execute_pipeline(op_dir, mode=args.mode, clean_policy=args.clean_policy)
+    return 0
 
 
 if __name__ == "__main__":
