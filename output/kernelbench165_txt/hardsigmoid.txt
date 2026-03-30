@@ -1,0 +1,292 @@
+```python
+project_json_src='''
+
+[
+  {
+    "op": "HardSigmoidCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(HardSigmoidCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(HardSigmoidCustom, HardSigmoidCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "hard_sigmoid_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <algorithm>
+#include <cstdint>
+
+namespace optiling {
+
+static inline uint32_t CeilDivU32(uint32_t x, uint32_t y) { return (x + y - 1u) / y; }
+static inline uint32_t AlignDownU32(uint32_t x, uint32_t a) { return (x / a) * a; }
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    HardSigmoidCustomTilingData tiling;
+
+    const uint32_t totalLength =
+        static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+
+    // Elementwise op: keep block count moderate to avoid device/runtime pressure for tiny inputs.
+    uint32_t blockDim = 48;
+    if (totalLength < (1u << 20)) { // < ~1M elems
+        blockDim = 24;
+    }
+    const uint32_t minTileWork = 4096;
+    blockDim = std::max(1u, std::min(blockDim, CeilDivU32(totalLength == 0 ? 1u : totalLength, minTileWork)));
+    context->SetBlockDim(blockDim);
+
+    // UB double-buffered in/out: ~16 * tile bytes for fp32 (2 bufs * (in+out) * 4B).
+    uint32_t tile = 8192;
+    if (totalLength < 8192u) tile = 4096;
+    tile = AlignDownU32(tile, 256);
+    if (tile == 0) tile = 256;
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileLength(tile);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+}  // namespace optiling
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+
+}  // namespace ge
+
+namespace ops {
+
+class HardSigmoidCustom : public OpDef {
+public:
+    explicit HardSigmoidCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(HardSigmoidCustom);
+
+}  // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelHardSigmoidCustom {
+public:
+    __aicore__ inline KernelHardSigmoidCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileLength)
+    {
+        this->totalLength = totalLength;
+        this->tileLength = tileLength;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x, this->totalLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y, this->totalLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        if (this->totalLength == 0) return;
+
+        // Grid-stride over tiles for balanced work distribution and safe tail handling.
+        for (uint32_t tileIdx = blockIdx; ; tileIdx += blockNum) {
+            const uint32_t offset = tileIdx * this->tileLength;
+            if (offset >= this->totalLength) break;
+
+            uint32_t curLen = this->totalLength - offset;
+            if (curLen > this->tileLength) curLen = this->tileLength;
+
+            CopyIn(offset, curLen);
+            Compute(curLen);
+            CopyOut(offset, curLen);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t offset, uint32_t curLen)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[offset], curLen);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t curLen)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+
+        // HardSigmoid(x) = clamp(x + 3, 0, 6) / 6
+        const DTYPE_Y c3   = (DTYPE_Y)(3.0f);
+        const DTYPE_Y c0   = (DTYPE_Y)(0.0f);
+        const DTYPE_Y c6   = (DTYPE_Y)(6.0f);
+        const DTYPE_Y inv6 = (DTYPE_Y)(0.1666666716f);
+
+        AscendC::Adds(yLocal, xLocal, c3, curLen);
+        AscendC::Maxs(yLocal, yLocal, c0, curLen);
+        AscendC::Mins(yLocal, yLocal, c6, curLen);
+        AscendC::Muls(yLocal, yLocal, inv6, curLen);
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t offset, uint32_t curLen)
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[offset], yLocal, curLen);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t totalLength;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void hard_sigmoid_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    (void)workspace;
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelHardSigmoidCustom op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor& hard_sigmoid_custom_out_impl_npu(const at::Tensor& self, at::Tensor& out) {
+    TORCH_CHECK(self.device().type() == out.device().type(), "self/out device mismatch");
+    TORCH_CHECK(self.scalar_type() == out.scalar_type(), "self/out dtype mismatch");
+    TORCH_CHECK(self.numel() == out.numel(), "self/out numel mismatch");
+    EXEC_NPU_CMD(aclnnHardSigmoidCustom, self, out);
+    return out;
+}
+
+at::Tensor hard_sigmoid_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnHardSigmoidCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY(myops, m) {
+    m.def("hard_sigmoid_custom(Tensor x) -> Tensor");
+    m.def("hard_sigmoid_custom_out(Tensor x, Tensor(a!) out) -> Tensor(a!)");
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("hard_sigmoid_custom", &hard_sigmoid_custom_impl_npu);
+    m.impl("hard_sigmoid_custom_out", &hard_sigmoid_custom_out_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("hard_sigmoid_custom", &hard_sigmoid_custom_impl_npu,
+          "hard_sigmoid_custom(x) -> clamp(x + 3, 0, 6) / 6 (NPU)");
+    m.def("hard_sigmoid_custom_out", &hard_sigmoid_custom_out_impl_npu,
+          "hard_sigmoid_custom_out(x, out) -> out (NPU, avoids extra allocation)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'hard_sigmoid_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
+```

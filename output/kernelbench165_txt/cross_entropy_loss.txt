@@ -1,0 +1,327 @@
+```python
+project_json_src='''
+
+[
+    {
+        "op": "CrossEntropyLossCustom",
+        "input_desc": [
+            {
+                "name": "predict",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "target",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["int32"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CrossEntropyLossCustomTilingData)
+    TILING_DATA_FIELD_DEF(uint32_t, N);
+    TILING_DATA_FIELD_DEF(uint32_t, C);
+    TILING_DATA_FIELD_DEF(uint32_t, tileC);
+    TILING_DATA_FIELD_DEF(uint32_t, tilesPerRow);
+    TILING_DATA_FIELD_DEF(float, invN);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CrossEntropyLossCustom, CrossEntropyLossCustomTilingData)
+} // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "cross_entropy_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <stdint.h>
+
+namespace optiling {
+
+static inline uint32_t CeilDivU32(uint32_t a, uint32_t b) {
+    return (b == 0U) ? 0U : (a + b - 1U) / b;
+}
+
+static inline uint32_t AlignDownU32(uint32_t v, uint32_t a) {
+    return (a == 0U) ? v : (v / a) * a;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CrossEntropyLossCustomTilingData tiling;
+
+    uint64_t predElems64 = static_cast<uint64_t>(context->GetInputShape(0)->GetStorageShape().GetShapeSize());
+    uint64_t tgtElems64  = static_cast<uint64_t>(context->GetInputShape(1)->GetStorageShape().GetShapeSize());
+
+    uint32_t N = static_cast<uint32_t>(tgtElems64);
+    uint32_t C = 0U;
+    if (N > 0U) {
+        C = static_cast<uint32_t>(predElems64 / static_cast<uint64_t>(N));
+    }
+
+    // Keep single-core for robustness (no cross-core sync/reduction).
+    context->SetBlockDim(1);
+
+    // Increase tileC to reduce tilesPerRow and DataCopy/Reduce invocations.
+    // Keep multiple of 16 for better alignment.
+    uint32_t tileC = 2048U;
+    if (C > 0U && tileC > C) tileC = C;
+    tileC = AlignDownU32(tileC, 16U);
+    if (tileC == 0U) tileC = (C >= 16U) ? 16U : (C == 0U ? 1U : C);
+
+    uint32_t tilesPerRow = CeilDivU32(C, tileC);
+
+    tiling.set_N(N);
+    tiling.set_C(C);
+    tiling.set_tileC(tileC);
+    tiling.set_tilesPerRow(tilesPerRow);
+    tiling.set_invN((N > 0U) ? (1.0f / static_cast<float>(N)) : 0.0f);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ops {
+class CrossEntropyLossCustom : public OpDef {
+public:
+    explicit CrossEntropyLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("predict")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("target")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CrossEntropyLossCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr float NEG_INF_F = -3.402823466e+38f; // -FLT_MAX
+
+// Mean cross entropy loss:
+// loss_i = logsumexp(logits_i) - logits_i[target_i]
+// Uses a one-pass, numerically stable online logsumexp to avoid reading logits twice.
+class KernelCrossEntropyLoss {
+public:
+    __aicore__ inline KernelCrossEntropyLoss() {}
+
+    __aicore__ inline void Init(GM_ADDR predict, GM_ADDR target, GM_ADDR y,
+                               uint32_t N_, uint32_t C_, uint32_t tileC_,
+                               uint32_t tilesPerRow_, float invN_)
+    {
+        N = N_;
+        C = C_;
+        tileC = tileC_;
+        tilesPerRow = tilesPerRow_;
+        invN = invN_;
+
+        predGm.SetGlobalBuffer((__gm__ float*)predict, static_cast<uint64_t>(N) * static_cast<uint64_t>(C));
+        tgtGm.SetGlobalBuffer((__gm__ int32_t*)target, static_cast<uint64_t>(N));
+        outGm.SetGlobalBuffer((__gm__ float*)y, 1);
+
+        // Persistent UB buffers reused for all tiles.
+        pipe.InitBuffer(xBuf, tileC * sizeof(float));
+        pipe.InitBuffer(tmpBuf, tileC * sizeof(float));
+        pipe.InitBuffer(redBuf, tileC * sizeof(float));
+        pipe.InitBuffer(scalarBuf, 32U * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (static_cast<uint32_t>(AscendC::GetBlockIdx()) != 0U) return;
+
+        if (N == 0U || C == 0U) {
+            outGm.SetValue(0, 0.0f);
+            return;
+        }
+
+        float total = 0.0f;
+        for (uint32_t row = 0; row < N; ++row) {
+            total += RowLossOnePass(row);
+        }
+        outGm.SetValue(0, total * invN);
+    }
+
+private:
+    __aicore__ inline float ExpScalar(float v)
+    {
+        AscendC::LocalTensor<float> s = scalarBuf.Get<float>();
+        s.SetValue(0, v);
+        AscendC::Exp(s, s, 1U);
+        return s.GetValue(0);
+    }
+
+    __aicore__ inline float LogScalar(float v)
+    {
+        AscendC::LocalTensor<float> s = scalarBuf.Get<float>();
+        s.SetValue(0, v);
+        AscendC::Log(s, s, 1U);
+        return s.GetValue(0);
+    }
+
+    // One-pass stable logsumexp:
+    // maintain m = max seen so far, s = sum(exp(x - m)).
+    // when m increases to m', rescale s *= exp(m - m').
+    __aicore__ inline float RowLossOnePass(uint32_t row)
+    {
+        int32_t t = tgtGm.GetValue(static_cast<uint64_t>(row));
+        bool targetValid = (t >= 0) && (static_cast<uint32_t>(t) < C);
+        uint32_t tu = targetValid ? static_cast<uint32_t>(t) : 0U;
+
+        float m = NEG_INF_F;
+        float s = 0.0f;
+        float targetLogit = 0.0f;
+
+        AscendC::LocalTensor<float> x = xBuf.Get<float>();
+        AscendC::LocalTensor<float> tmp = tmpBuf.Get<float>();
+        AscendC::LocalTensor<float> red = redBuf.Get<float>();
+
+        for (uint32_t it = 0; it < tilesPerRow; ++it) {
+            uint32_t cStart = it * tileC;
+            uint32_t curC = C - cStart;
+            if (curC > tileC) curC = tileC;
+
+            uint64_t base = static_cast<uint64_t>(row) * static_cast<uint64_t>(C) + static_cast<uint64_t>(cStart);
+            AscendC::DataCopy(x, predGm[base], curC);
+
+            if (targetValid && tu >= cStart && tu < (cStart + curC)) {
+                targetLogit = x.GetValue(tu - cStart);
+            }
+
+            AscendC::ReduceMax<float>(red, x, tmp, static_cast<int32_t>(curC));
+            float tileMax = red.GetValue(0);
+
+            float oldm = m;
+            if (tileMax > m) m = tileMax;
+
+            if (m > oldm) {
+                // rescale existing sum when max increases
+                s *= ExpScalar(oldm - m);
+            }
+
+            AscendC::Adds(tmp, x, -m, static_cast<int32_t>(curC));
+            AscendC::Exp(tmp, tmp, static_cast<int32_t>(curC));
+            AscendC::ReduceSum<float>(red, tmp, x, static_cast<int32_t>(curC));
+            s += red.GetValue(0);
+        }
+
+        float logsumexp = LogScalar(s) + m;
+        return logsumexp - targetLogit;
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TBuf<> xBuf;
+    AscendC::TBuf<> tmpBuf;
+    AscendC::TBuf<> redBuf;
+    AscendC::TBuf<> scalarBuf;
+
+    AscendC::GlobalTensor<float> predGm;
+    AscendC::GlobalTensor<int32_t> tgtGm;
+    AscendC::GlobalTensor<float> outGm;
+
+    uint32_t N {0}, C {0}, tileC {0}, tilesPerRow {0};
+    float invN {0.0f};
+};
+
+extern "C" __global__ __aicore__ void cross_entropy_loss_custom(GM_ADDR predict,
+                                                                GM_ADDR target,
+                                                                GM_ADDR y,
+                                                                GM_ADDR workspace,
+                                                                GM_ADDR tiling)
+{
+    (void)workspace;
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCrossEntropyLoss op;
+    op.Init(predict, target, y,
+            tiling_data.N,
+            tiling_data.C,
+            tiling_data.tileC,
+            tiling_data.tilesPerRow,
+            tiling_data.invN);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor cross_entropy_loss_custom_impl_npu(const at::Tensor& predict, const at::Tensor& target) {
+    at::Tensor result = at::empty({}, predict.options().dtype(at::kFloat));
+    EXEC_NPU_CMD(aclnnCrossEntropyLossCustom, predict, target, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cross_entropy_loss_custom", &cross_entropy_loss_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cross_entropy_loss_custom", &cross_entropy_loss_custom_impl_npu, "cross entropy loss (custom, NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'cross_entropy_loss_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
+```

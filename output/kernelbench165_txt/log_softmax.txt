@@ -1,0 +1,463 @@
+```python
+project_json_src='''
+
+[
+  {
+    "op": "LogSoftmaxCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(LogSoftmaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, rowsPerCore);
+  TILING_DATA_FIELD_DEF(uint32_t, tileCols);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(LogSoftmaxCustom, LogSoftmaxCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "log_softmax_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <algorithm>
+#include <cstdint>
+
+namespace optiling {
+
+static constexpr uint32_t kMaxBlockDim = 24;
+
+// Favor larger tiles to reduce reduction/setup overhead for huge cols,
+// but keep strong alignment for MTE efficiency.
+static constexpr uint32_t kAlign   = 256;   // elements
+static constexpr uint32_t kMinTile = 2048;  // elements
+static constexpr uint32_t kMaxTile = 8192;  // elements
+
+static inline uint32_t AlignDown(uint32_t v, uint32_t a) {
+    return (a == 0) ? v : (v / a) * a;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    LogSoftmaxCustomTilingData tiling;
+
+    const auto* inShape = context->GetInputShape(0);
+    const gert::Shape& shape = inShape->GetOriginShape();
+    const int32_t dimNum = shape.GetDimNum();
+
+    uint64_t cols64 = 1;
+    uint64_t rows64 = 1;
+
+    if (dimNum <= 0) {
+        cols64 = 1;
+        rows64 = 0;
+    } else {
+        cols64 = static_cast<uint64_t>(shape.GetDim(dimNum - 1));
+        if (cols64 == 0) cols64 = 1;
+        rows64 = 1;
+        for (int32_t i = 0; i < dimNum - 1; ++i) {
+            rows64 *= static_cast<uint64_t>(shape.GetDim(i));
+        }
+    }
+
+    const uint32_t cols = static_cast<uint32_t>(cols64);
+    const uint32_t rows = static_cast<uint32_t>(rows64);
+
+    uint32_t blockDim = std::min<uint32_t>(kMaxBlockDim, std::max<uint32_t>(1u, rows == 0 ? 1u : rows));
+    context->SetBlockDim(blockDim);
+
+    const uint32_t rowsPerCore = (rows + blockDim - 1) / blockDim;
+
+    // Prefer biggest aligned tile <= kMaxTile to amortize reduction/loop overhead.
+    uint32_t tileCols = cols;
+    if (tileCols > kMaxTile) tileCols = kMaxTile;
+    if (tileCols < kMinTile) tileCols = kMinTile;
+    tileCols = AlignDown(tileCols, kAlign);
+
+    if (tileCols == 0) tileCols = 256;
+    if (cols > 0 && tileCols > cols) tileCols = cols;
+    if (cols == 0) tileCols = 1;
+
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+    tiling.set_rowsPerCore(rowsPerCore);
+    tiling.set_tileCols(tileCols);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+}  // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto dt = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dt);
+    return ge::GRAPH_SUCCESS;
+}
+}  // namespace ge
+
+namespace ops {
+class LogSoftmaxCustom : public OpDef {
+public:
+    explicit LogSoftmaxCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(LogSoftmaxCustom);
+}  // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+__aicore__ inline uint32_t CeilDivU32(uint32_t a, uint32_t b) {
+    return (a + b - 1u) / b;
+}
+
+class KernelLogSoftmax {
+public:
+    __aicore__ inline KernelLogSoftmax() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                               uint32_t rows, uint32_t cols, uint32_t rowsPerCore, uint32_t tileCols)
+    {
+        rows_ = rows;
+        cols_ = cols;
+        rowsPerCore_ = rowsPerCore;
+
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        startRow_ = blockIdx * rowsPerCore_;
+        uint32_t endRow = startRow_ + rowsPerCore_;
+        if (endRow > rows_) endRow = rows_;
+        rowCount_ = (startRow_ >= rows_) ? 0u : (endRow - startRow_);
+
+        const uint64_t total64 = static_cast<uint64_t>(rows_) * static_cast<uint64_t>(cols_);
+        const uint32_t totalCap = (total64 > 0x7FFFFFFFULL) ? 0x7FFFFFFF : static_cast<uint32_t>(total64);
+
+        xGm_.SetGlobalBuffer((__gm__ DTYPE_X*)x, totalCap);
+        yGm_.SetGlobalBuffer((__gm__ DTYPE_Y*)y, totalCap);
+
+        if (cols_ == 0 || rows_ == 0 || rowCount_ == 0) {
+            tileCols_ = 1;
+            return;
+        }
+
+        tileCols_ = tileCols;
+        if (tileCols_ == 0) tileCols_ = 1;
+        if (tileCols_ > cols_) tileCols_ = cols_;
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileCols_ * sizeof(DTYPE_X));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileCols_ * sizeof(DTYPE_Y));
+
+        // Fixed scratch for reductions + scalar ops.
+        constexpr uint32_t kReduceWorkFloats = 4096;
+        constexpr uint32_t kScalarFloats = 256;
+        pipe_.InitBuffer(tmpCalcBuf_, (kReduceWorkFloats + kScalarFloats) * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (rowCount_ == 0 || cols_ == 0) return;
+
+        for (uint32_t r = 0; r < rowCount_; ++r) {
+            const uint32_t rowIdx = startRow_ + r;
+            const uint64_t base = static_cast<uint64_t>(rowIdx) * static_cast<uint64_t>(cols_);
+
+            const float rowMax = RowReduceMaxPipelined(base);
+            const float rowSum = RowReduceExpSumPipelined(base, rowMax);
+
+            float logSum = 0.0f;
+            if (rowSum > 0.0f) logSum = LogScalar(rowSum);
+
+            RowWriteLogSoftmaxPipelined(base, rowMax, logSum);
+        }
+    }
+
+private:
+    __aicore__ inline uint32_t CurCols(uint32_t tileIdx) const
+    {
+        const uint32_t offset = tileIdx * tileCols_;
+        const uint32_t remain = cols_ - offset;
+        return remain >= tileCols_ ? tileCols_ : remain;
+    }
+
+    __aicore__ inline AscendC::LocalTensor<float> ReduceWork()
+    {
+        return tmpCalcBuf_.Get<float>();
+    }
+
+    __aicore__ inline AscendC::LocalTensor<float> ScalarBuf()
+    {
+        AscendC::LocalTensor<float> tmp = tmpCalcBuf_.Get<float>();
+        constexpr uint32_t kReduceWorkFloats = 4096;
+        return tmp[kReduceWorkFloats];
+    }
+
+    __aicore__ inline float LogScalar(float v)
+    {
+        AscendC::LocalTensor<float> s = ScalarBuf();
+        s(0) = v;
+        AscendC::Log(s, s, 1);
+        return s(0);
+    }
+
+    __aicore__ inline float RowReduceMaxPipelined(uint64_t base)
+    {
+        const uint32_t tiles = CeilDivU32(cols_, tileCols_);
+        if (tiles == 0) return -3.402823466e+38f;
+
+        AscendC::LocalTensor<float> work = ReduceWork();
+        AscendC::LocalTensor<float> s = ScalarBuf();
+
+        float curMax = -3.402823466e+38f;
+
+        // Prefetch tile 0
+        {
+            const uint32_t len0 = CurCols(0);
+            AscendC::LocalTensor<DTYPE_X> x0 = inQueueX_.AllocTensor<DTYPE_X>();
+            AscendC::DataCopy(x0, xGm_[base], len0);
+            inQueueX_.EnQue(x0);
+        }
+
+        for (uint32_t t = 0; t < tiles; ++t) {
+            const uint32_t len = CurCols(t);
+            const uint64_t off = base + static_cast<uint64_t>(t) * static_cast<uint64_t>(tileCols_);
+
+            // Prefetch next tile early
+            if (t + 1 < tiles) {
+                const uint32_t lenN = CurCols(t + 1);
+                const uint64_t offN = base + static_cast<uint64_t>(t + 1) * static_cast<uint64_t>(tileCols_);
+                AscendC::LocalTensor<DTYPE_X> xN = inQueueX_.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xN, xGm_[offN], lenN);
+                inQueueX_.EnQue(xN);
+            }
+
+            AscendC::LocalTensor<DTYPE_X> xV = inQueueX_.DeQue<DTYPE_X>();
+
+            AscendC::ReduceMax<float>(s, xV, work, static_cast<int32_t>(len), false);
+            const float tileMax = s(0);
+            if (tileMax > curMax) curMax = tileMax;
+
+            inQueueX_.FreeTensor(xV);
+        }
+        return curMax;
+    }
+
+    __aicore__ inline float RowReduceExpSumPipelined(uint64_t base, float rowMax)
+    {
+        const uint32_t tiles = CeilDivU32(cols_, tileCols_);
+        if (tiles == 0) return 0.0f;
+
+        AscendC::LocalTensor<float> work = ReduceWork();
+        AscendC::LocalTensor<float> s = ScalarBuf();
+
+        float acc = 0.0f;
+
+        // Prefetch tile 0
+        {
+            const uint32_t len0 = CurCols(0);
+            AscendC::LocalTensor<DTYPE_X> x0 = inQueueX_.AllocTensor<DTYPE_X>();
+            AscendC::DataCopy(x0, xGm_[base], len0);
+            inQueueX_.EnQue(x0);
+        }
+
+        for (uint32_t t = 0; t < tiles; ++t) {
+            const uint32_t len = CurCols(t);
+            const uint64_t off = base + static_cast<uint64_t>(t) * static_cast<uint64_t>(tileCols_);
+
+            if (t + 1 < tiles) {
+                const uint32_t lenN = CurCols(t + 1);
+                const uint64_t offN = base + static_cast<uint64_t>(t + 1) * static_cast<uint64_t>(tileCols_);
+                AscendC::LocalTensor<DTYPE_X> xN = inQueueX_.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xN, xGm_[offN], lenN);
+                inQueueX_.EnQue(xN);
+            }
+
+            AscendC::LocalTensor<DTYPE_X> xV = inQueueX_.DeQue<DTYPE_X>();
+
+            AscendC::Adds(xV, xV, (float)(-rowMax), len);
+            AscendC::Exp(xV, xV, len);
+            AscendC::ReduceSum<float>(s, xV, work, static_cast<int32_t>(len));
+            acc += s(0);
+
+            inQueueX_.FreeTensor(xV);
+        }
+        return acc;
+    }
+
+    __aicore__ inline void RowWriteLogSoftmaxPipelined(uint64_t base, float rowMax, float logSum)
+    {
+        const uint32_t tiles = CeilDivU32(cols_, tileCols_);
+        if (tiles == 0) return;
+
+        // Prefetch tile 0
+        {
+            const uint32_t len0 = CurCols(0);
+            AscendC::LocalTensor<DTYPE_X> x0 = inQueueX_.AllocTensor<DTYPE_X>();
+            AscendC::DataCopy(x0, xGm_[base], len0);
+            inQueueX_.EnQue(x0);
+        }
+
+        for (uint32_t t = 0; t < tiles; ++t) {
+            const uint32_t len = CurCols(t);
+            const uint64_t off = base + static_cast<uint64_t>(t) * static_cast<uint64_t>(tileCols_);
+
+            // Prefetch next tile early
+            if (t + 1 < tiles) {
+                const uint32_t lenN = CurCols(t + 1);
+                const uint64_t offN = base + static_cast<uint64_t>(t + 1) * static_cast<uint64_t>(tileCols_);
+                AscendC::LocalTensor<DTYPE_X> xN = inQueueX_.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xN, xGm_[offN], lenN);
+                inQueueX_.EnQue(xN);
+            }
+
+            AscendC::LocalTensor<DTYPE_X> xV = inQueueX_.DeQue<DTYPE_X>();
+            AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY_.AllocTensor<DTYPE_Y>();
+
+            AscendC::Adds(xV, xV, (float)(-rowMax), len);
+            AscendC::Adds(xV, xV, (float)(-logSum), len);
+
+            AscendC::DataCopy(yLocal, xV, len);
+            outQueueY_.EnQue<DTYPE_Y>(yLocal);
+            inQueueX_.FreeTensor(xV);
+
+            AscendC::LocalTensor<DTYPE_Y> yV = outQueueY_.DeQue<DTYPE_Y>();
+            AscendC::DataCopy(yGm_[off], yV, len);
+            outQueueY_.FreeTensor(yV);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tmpCalcBuf_;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm_;
+    AscendC::GlobalTensor<DTYPE_Y> yGm_;
+
+    uint32_t rows_{0};
+    uint32_t cols_{0};
+    uint32_t rowsPerCore_{0};
+    uint32_t tileCols_{1};
+
+    uint32_t startRow_{0};
+    uint32_t rowCount_{0};
+};
+
+extern "C" __global__ __aicore__ void log_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    (void)workspace;
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelLogSoftmax op;
+    op.Init(x, y,
+            tiling_data.rows,
+            tiling_data.cols,
+            tiling_data.rowsPerCore,
+            tiling_data.tileCols);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+void log_softmax_custom_out_impl_npu(const at::Tensor& x, at::Tensor& out) {
+    EXEC_NPU_CMD(aclnnLogSoftmaxCustom, x, out);
+}
+
+at::Tensor log_softmax_custom_impl_npu(const at::Tensor& x) {
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnLogSoftmaxCustom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("log_softmax_custom", &log_softmax_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("log_softmax_custom", &log_softmax_custom_impl_npu, "LogSoftmaxCustom (NPU)");
+    m.def("log_softmax_custom_out", &log_softmax_custom_out_impl_npu, "LogSoftmaxCustom out= (NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'log_softmax_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
+```

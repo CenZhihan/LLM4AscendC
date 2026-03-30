@@ -1,0 +1,343 @@
+```python
+project_json_src='''
+
+[
+  {
+    "op": "MaxReductionOverADimensionCustom",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MaxReductionOverADimensionCustomTilingData)
+    TILING_DATA_FIELD_DEF(uint32_t, totalX);
+    TILING_DATA_FIELD_DEF(uint32_t, totalY);
+    TILING_DATA_FIELD_DEF(uint32_t, batch);
+    TILING_DATA_FIELD_DEF(uint32_t, reduceDim);
+    TILING_DATA_FIELD_DEF(uint32_t, innerDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MaxReductionOverADimensionCustom,
+                           MaxReductionOverADimensionCustomTilingData)
+} // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "max_reduction_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <cstdint>
+
+namespace optiling {
+
+// Specialized fixed contract for this kernel:
+// x: [128,4096,4095] float32, reduce dim=1 -> y: [128,4095]
+static constexpr uint32_t BATCH = 128;
+static constexpr uint32_t REDUCE_DIM = 4096;
+static constexpr uint32_t INNER_DIM = 4095;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MaxReductionOverADimensionCustomTilingData tiling;
+
+    auto inShape = context->GetInputShape(0);
+    if (inShape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    const auto &shape = inShape->GetOriginShape();
+    if (shape.GetDimNum() != 3) {
+        return ge::GRAPH_FAILED;
+    }
+    if ((uint32_t)shape.GetDim(0) != BATCH ||
+        (uint32_t)shape.GetDim(1) != REDUCE_DIM ||
+        (uint32_t)shape.GetDim(2) != INNER_DIM) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t totalX = context->GetInputShape(0)->GetStorageShape().GetShapeSize();
+    uint32_t totalY = context->GetOutputShape(0)->GetStorageShape().GetShapeSize();
+
+    tiling.set_totalX(totalX);
+    tiling.set_totalY(totalY);
+    tiling.set_batch(BATCH);
+    tiling.set_reduceDim(REDUCE_DIM);
+    tiling.set_innerDim(INNER_DIM);
+
+    // One block per batch item (stable mapping, predictable coverage).
+    context->SetBlockDim(BATCH);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ops {
+
+class MaxReductionOverADimensionCustom : public OpDef {
+public:
+    explicit MaxReductionOverADimensionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MaxReductionOverADimensionCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+// Specialized contract:
+// x: [128,4096,4095] float32 contiguous (row-major)
+// reduce along dim=1 => y: [128,4095]
+//
+// Optimization in this round:
+// - Compute 8 output columns (i..i+7) per loop (ILP along inner dimension).
+// - Reduce r with fixed compile-time unroll (8×), branch-free in hot path.
+// - No UB allocations (avoids prior failure patterns), keep launch stable: one block per batch.
+
+class KernelMaxReductionOverADimensionCustom {
+public:
+    __aicore__ inline KernelMaxReductionOverADimensionCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                               uint32_t /*totalX*/, uint32_t /*totalY*/,
+                               uint32_t batch, uint32_t reduceDim, uint32_t innerDim)
+    {
+        batch_ = batch;
+        reduceDim_ = reduceDim;
+        innerDim_ = innerDim;
+        xGm_.SetGlobalBuffer((__gm__ float*)x);
+        yGm_.SetGlobalBuffer((__gm__ float*)y);
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (batch_ == 0 || reduceDim_ == 0 || innerDim_ == 0) return;
+
+        const uint32_t blockNum = (uint32_t)AscendC::GetBlockNum();
+        const uint32_t blockIdx = (uint32_t)AscendC::GetBlockIdx();
+        if (blockNum == 0) return;
+
+        constexpr float NEG_INF = -3.402823466e+38f;
+        constexpr uint32_t I_UNROLL = 8;  // columns per iteration
+        constexpr uint32_t R_UNROLL = 8;  // reduction unroll
+
+        for (uint32_t b = blockIdx; b < batch_; b += blockNum) {
+            const uint64_t inner = (uint64_t)innerDim_;
+            const uint64_t red   = (uint64_t)reduceDim_;
+            const uint64_t batchBase = (uint64_t)b * red * inner;
+            const uint64_t yBase = (uint64_t)b * inner;
+
+            // Main body: groups of 8 columns.
+            const uint32_t iMain = (innerDim_ / I_UNROLL) * I_UNROLL;
+            for (uint32_t i = 0; i < iMain; i += I_UNROLL) {
+                float m0 = NEG_INF, m1 = NEG_INF, m2 = NEG_INF, m3 = NEG_INF;
+                float m4 = NEG_INF, m5 = NEG_INF, m6 = NEG_INF, m7 = NEG_INF;
+
+                const uint64_t base = batchBase + (uint64_t)i;
+
+                uint32_t r = 0;
+                // For this specialized shape REDUCE_DIM=4096, divisible by 8.
+#pragma unroll
+                for (; r + (R_UNROLL - 1) < reduceDim_; r += R_UNROLL) {
+                    // Unrolled r-chunks, each loads 8 columns.
+#pragma unroll
+                    for (uint32_t u = 0; u < R_UNROLL; ++u) {
+                        const uint64_t off = base + (uint64_t)(r + u) * inner;
+                        float v0 = xGm_.GetValue(off + 0);
+                        float v1 = xGm_.GetValue(off + 1);
+                        float v2 = xGm_.GetValue(off + 2);
+                        float v3 = xGm_.GetValue(off + 3);
+                        float v4 = xGm_.GetValue(off + 4);
+                        float v5 = xGm_.GetValue(off + 5);
+                        float v6 = xGm_.GetValue(off + 6);
+                        float v7 = xGm_.GetValue(off + 7);
+
+                        m0 = (v0 > m0) ? v0 : m0;
+                        m1 = (v1 > m1) ? v1 : m1;
+                        m2 = (v2 > m2) ? v2 : m2;
+                        m3 = (v3 > m3) ? v3 : m3;
+                        m4 = (v4 > m4) ? v4 : m4;
+                        m5 = (v5 > m5) ? v5 : m5;
+                        m6 = (v6 > m6) ? v6 : m6;
+                        m7 = (v7 > m7) ? v7 : m7;
+                    }
+                }
+                // Remainder (kept for correctness; should not run for 4096).
+                for (; r < reduceDim_; ++r) {
+                    const uint64_t off = base + (uint64_t)r * inner;
+                    float v0 = xGm_.GetValue(off + 0);
+                    float v1 = xGm_.GetValue(off + 1);
+                    float v2 = xGm_.GetValue(off + 2);
+                    float v3 = xGm_.GetValue(off + 3);
+                    float v4 = xGm_.GetValue(off + 4);
+                    float v5 = xGm_.GetValue(off + 5);
+                    float v6 = xGm_.GetValue(off + 6);
+                    float v7 = xGm_.GetValue(off + 7);
+
+                    m0 = (v0 > m0) ? v0 : m0;
+                    m1 = (v1 > m1) ? v1 : m1;
+                    m2 = (v2 > m2) ? v2 : m2;
+                    m3 = (v3 > m3) ? v3 : m3;
+                    m4 = (v4 > m4) ? v4 : m4;
+                    m5 = (v5 > m5) ? v5 : m5;
+                    m6 = (v6 > m6) ? v6 : m6;
+                    m7 = (v7 > m7) ? v7 : m7;
+                }
+
+                const uint64_t yo = yBase + (uint64_t)i;
+                yGm_.SetValue(yo + 0, m0);
+                yGm_.SetValue(yo + 1, m1);
+                yGm_.SetValue(yo + 2, m2);
+                yGm_.SetValue(yo + 3, m3);
+                yGm_.SetValue(yo + 4, m4);
+                yGm_.SetValue(yo + 5, m5);
+                yGm_.SetValue(yo + 6, m6);
+                yGm_.SetValue(yo + 7, m7);
+            }
+
+            // Tail columns (innerDim=4095 => 7 tail elems).
+            for (uint32_t i = iMain; i < innerDim_; ++i) {
+                const uint64_t base = batchBase + (uint64_t)i;
+                float curMax = NEG_INF;
+
+                uint32_t r = 0;
+#pragma unroll
+                for (; r + 7 < reduceDim_; r += 8) {
+                    float v0 = xGm_.GetValue(base + (uint64_t)(r + 0) * inner);
+                    float v1 = xGm_.GetValue(base + (uint64_t)(r + 1) * inner);
+                    float v2 = xGm_.GetValue(base + (uint64_t)(r + 2) * inner);
+                    float v3 = xGm_.GetValue(base + (uint64_t)(r + 3) * inner);
+                    float v4 = xGm_.GetValue(base + (uint64_t)(r + 4) * inner);
+                    float v5 = xGm_.GetValue(base + (uint64_t)(r + 5) * inner);
+                    float v6 = xGm_.GetValue(base + (uint64_t)(r + 6) * inner);
+                    float v7 = xGm_.GetValue(base + (uint64_t)(r + 7) * inner);
+
+                    curMax = (v0 > curMax) ? v0 : curMax;
+                    curMax = (v1 > curMax) ? v1 : curMax;
+                    curMax = (v2 > curMax) ? v2 : curMax;
+                    curMax = (v3 > curMax) ? v3 : curMax;
+                    curMax = (v4 > curMax) ? v4 : curMax;
+                    curMax = (v5 > curMax) ? v5 : curMax;
+                    curMax = (v6 > curMax) ? v6 : curMax;
+                    curMax = (v7 > curMax) ? v7 : curMax;
+                }
+                for (; r < reduceDim_; ++r) {
+                    float v = xGm_.GetValue(base + (uint64_t)r * inner);
+                    curMax = (v > curMax) ? v : curMax;
+                }
+                yGm_.SetValue(yBase + (uint64_t)i, curMax);
+            }
+        }
+    }
+
+private:
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+    uint32_t batch_{0};
+    uint32_t reduceDim_{0};
+    uint32_t innerDim_{0};
+};
+
+extern "C" __global__ __aicore__ void max_reduction_over_a_dimension_custom(
+    GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    (void)workspace;
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMaxReductionOverADimensionCustom op;
+    op.Init(x, y,
+            tiling_data.totalX, tiling_data.totalY,
+            tiling_data.batch, tiling_data.reduceDim, tiling_data.innerDim);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/extension.h>
+#include <torch/library.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor max_reduction_over_a_dimension_custom_impl_npu(const at::Tensor& x)
+{
+    TORCH_CHECK(x.device().type() == c10::DeviceType::PrivateUse1, "x must be on NPU");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be float32");
+    TORCH_CHECK(x.dim() == 3, "x must be 3D [B, R, I]");
+
+    TORCH_CHECK(x.size(0) == 128 && x.size(1) == 4096 && x.size(2) == 4095,
+                "x shape must be [128,4096,4095] for max_reduction_over_a_dimension_custom");
+
+    auto y = at::empty({128, 4095}, x.options());
+    EXEC_NPU_CMD(aclnnMaxReductionOverADimensionCustom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("max_reduction_over_a_dimension_custom", &max_reduction_over_a_dimension_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("max_reduction_over_a_dimension_custom", &max_reduction_over_a_dimension_custom_impl_npu,
+          "max_reduction_over_a_dimension_custom (NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'max_reduction_over_a_dimension_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
+```

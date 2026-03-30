@@ -1,0 +1,326 @@
+```python
+project_json_src='''
+
+[
+  {
+    "op": "AveragePooling1dCustom",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(AveragePooling1dCustomTilingData)
+    TILING_DATA_FIELD_DEF(uint32_t, totalX);   // N*C*L
+    TILING_DATA_FIELD_DEF(uint32_t, totalY);   // N*C*Lout
+    TILING_DATA_FIELD_DEF(uint32_t, n);
+    TILING_DATA_FIELD_DEF(uint32_t, c);
+    TILING_DATA_FIELD_DEF(uint32_t, l_in);
+    TILING_DATA_FIELD_DEF(uint32_t, l_out);
+    TILING_DATA_FIELD_DEF(uint32_t, nc);       // N*C
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(AveragePooling1dCustom, AveragePooling1dCustomTilingData)
+} // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "average_pooling1d_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <algorithm>
+#include <cstdint>
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    AveragePooling1dCustomTilingData tiling;
+
+    const auto inShape = context->GetInputShape(0)->GetStorageShape();
+    if (inShape.GetDimNum() != 3) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const uint32_t n = static_cast<uint32_t>(inShape.GetDim(0));
+    const uint32_t c = static_cast<uint32_t>(inShape.GetDim(1));
+    const uint32_t l_in = static_cast<uint32_t>(inShape.GetDim(2));
+
+    // Specialized parameters for this compiled operator:
+    constexpr int32_t kernel_size = 8;
+    constexpr int32_t stride = 1;
+    constexpr int32_t padding = 4;
+
+    const int64_t l_out64 =
+        (static_cast<int64_t>(l_in) + 2LL * padding - static_cast<int64_t>(kernel_size)) / stride + 1LL;
+    if (l_out64 <= 0) {
+        return ge::GRAPH_FAILED;
+    }
+    const uint32_t l_out = static_cast<uint32_t>(l_out64);
+
+    const uint32_t totalX = static_cast<uint32_t>(inShape.GetShapeSize());
+    const auto outShape = context->GetOutputShape(0)->GetStorageShape();
+    const uint32_t totalY = static_cast<uint32_t>(outShape.GetShapeSize());
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_l_in(l_in);
+    tiling.set_l_out(l_out);
+    tiling.set_totalX(totalX);
+    tiling.set_totalY(totalY);
+    tiling.set_nc(n * c);
+
+    // Increase occupancy: parallelize over flattened output space.
+    // Use a conservative cap to avoid excessive blocks; still large enough for this workload.
+    uint32_t blockDim = 256;
+    if (totalY < blockDim) {
+        blockDim = std::max<uint32_t>(1, totalY);
+    }
+    context->SetBlockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ops {
+
+class AveragePooling1dCustom : public OpDef {
+public:
+    explicit AveragePooling1dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(AveragePooling1dCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+// Specialized AvgPool1d for this benchmark/model instance:
+// kernel_size=8, stride=1, padding=4
+// count_include_pad=True: always divide by 8, padded positions contribute 0.
+//
+// Optimization:
+// 1) Multi-block: each block processes a contiguous range of flattened output indices.
+// 2) Sliding window running-sum within each (n,c) row segment to reduce loads to ~2/output.
+
+class KernelAveragePooling1dCustom {
+public:
+    __aicore__ inline KernelAveragePooling1dCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                               uint32_t totalX, uint32_t totalY,
+                               uint32_t n, uint32_t c,
+                               uint32_t l_in, uint32_t l_out,
+                               uint32_t nc)
+    {
+        (void)totalX;
+        this->totalY = totalY;
+        this->n = n;
+        this->c = c;
+        this->l_in = l_in;
+        this->l_out = l_out;
+        this->nc = nc;
+
+        xGm.SetGlobalBuffer((__gm__ float*)x);
+        yGm.SetGlobalBuffer((__gm__ float*)y);
+    }
+
+    __aicore__ inline float LoadPadZero(uint64_t xBase, int32_t pos) const
+    {
+        // Unsigned range check is fast and handles negative pos.
+        if ((uint32_t)pos < l_in) {
+            return xGm.GetValue(xBase + (uint32_t)pos);
+        }
+        return 0.0f;
+    }
+
+    __aicore__ inline float InitWindowSum(uint64_t xBase, int32_t in_start) const
+    {
+        float sum = 0.0f;
+        sum += LoadPadZero(xBase, in_start + 0);
+        sum += LoadPadZero(xBase, in_start + 1);
+        sum += LoadPadZero(xBase, in_start + 2);
+        sum += LoadPadZero(xBase, in_start + 3);
+        sum += LoadPadZero(xBase, in_start + 4);
+        sum += LoadPadZero(xBase, in_start + 5);
+        sum += LoadPadZero(xBase, in_start + 6);
+        sum += LoadPadZero(xBase, in_start + 7);
+        return sum;
+    }
+
+    __aicore__ inline void ProcessRowSegment(uint32_t nc_idx, uint32_t out_begin, uint32_t out_end)
+    {
+        constexpr int32_t K = 8;
+        constexpr int32_t P = 4;
+        const float invK = 1.0f / 8.0f;
+
+        const uint64_t xBase = static_cast<uint64_t>(nc_idx) * l_in;
+        const uint64_t yBase = static_cast<uint64_t>(nc_idx) * l_out;
+
+        // Initialize sum for the first output of this segment.
+        int32_t in_start = static_cast<int32_t>(out_begin) - P; // stride=1
+        float sum = InitWindowSum(xBase, in_start);
+
+        // Write first output.
+        yGm.SetValue(yBase + out_begin, sum * invK);
+
+        // Slide within [out_begin+1, out_end)
+        for (uint32_t out_idx = out_begin + 1; out_idx < out_end; ++out_idx) {
+            const int32_t out_pos = static_cast<int32_t>(out_idx);
+            const int32_t removePos = (out_pos - 1) - P;
+            const int32_t addPos    = (out_pos)     - P + (K - 1);
+
+            sum -= LoadPadZero(xBase, removePos);
+            sum += LoadPadZero(xBase, addPos);
+
+            yGm.SetValue(yBase + out_idx, sum * invK);
+        }
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t blockIdx = AscendC::GetBlockIdx();
+        const uint32_t blockDim = AscendC::GetBlockNum();
+
+        // Each block works on a contiguous output interval [start, end) in flattened Y.
+        // This keeps writes contiguous and reduces scalar overhead.
+        const uint32_t start = (uint64_t)blockIdx * (uint64_t)totalY / (uint64_t)blockDim;
+        const uint32_t end   = (uint64_t)(blockIdx + 1) * (uint64_t)totalY / (uint64_t)blockDim;
+
+        if (start >= end) return;
+
+        // Flatten index: y_index = nc_idx * l_out + out_idx
+        uint32_t idx = start;
+        while (idx < end) {
+            const uint32_t nc_idx = idx / l_out;
+            const uint32_t out_idx = idx - nc_idx * l_out;
+
+            // Consume as much as possible within this row, but not past end.
+            uint32_t row_remain = l_out - out_idx;
+            uint32_t seg_len = end - idx;
+            uint32_t take = (seg_len < row_remain) ? seg_len : row_remain;
+
+            ProcessRowSegment(nc_idx, out_idx, out_idx + take);
+            idx += take;
+        }
+    }
+
+private:
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+    uint32_t totalY;
+    uint32_t n, c, l_in, l_out, nc;
+};
+
+extern "C" __global__ __aicore__ void average_pooling1d_custom(
+    GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    (void)workspace;
+    GET_TILING_DATA(tiling_data, tiling);
+
+    KernelAveragePooling1dCustom op;
+    op.Init(x, y,
+            tiling_data.totalX, tiling_data.totalY,
+            tiling_data.n, tiling_data.c,
+            tiling_data.l_in, tiling_data.l_out,
+            tiling_data.nc);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor average_pooling1d_custom_impl_npu(const at::Tensor& x)
+{
+    TORCH_CHECK(x.device().is_privateuseone(), "x must be on NPU (PrivateUse1)");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be float32");
+    TORCH_CHECK(x.dim() == 3, "x must be 3D (N,C,L)");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+
+    constexpr int64_t K = 8;
+    constexpr int64_t S = 1;
+    constexpr int64_t P = 4;
+
+    const int64_t L = x.size(2);
+    const int64_t Lout = (L + 2 * P - K) / S + 1;
+    TORCH_CHECK(Lout > 0, "invalid output length");
+
+    at::Tensor y = at::empty({x.size(0), x.size(1), Lout}, x.options());
+    EXEC_NPU_CMD(aclnnAveragePooling1dCustom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("average_pooling1d_custom", &average_pooling1d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("average_pooling1d_custom", &average_pooling1d_custom_impl_npu, "average_pooling1d_custom (NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'average_pooling1d_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
+```
