@@ -232,6 +232,7 @@ def main() -> int:
 
     device = torch.device("npu:0")
     synchronize = torch_npu.npu.synchronize
+
     correctness, info = execute_template(synchronize, device, ctx)
     if not correctness:
         print(info or "[FAIL] Output mismatch")

@@ -1,0 +1,5 @@
+set(ASCENDC_API_PATH @INSTALL_LIBRARY_DIR@)
+set(ASCENDC_INSTALL_BASE_PATH @CMAKE_INSTALL_PREFIX@/${ASCENDC_API_PATH})
+
+file(MAKE_DIRECTORY  ${ASCENDC_INSTALL_BASE_PATH}/ascendc/include/highlevel_api/utils)
+file(MAKE_DIRECTORY  ${ASCENDC_INSTALL_BASE_PATH}/ascendc/include/highlevel_api/utils/log)

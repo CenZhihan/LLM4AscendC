@@ -1,0 +1,41 @@
+/**
+* Copyright (c) 2025 Huawei Technologies Co., Ltd.
+* This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+* CANN Open Software License Agreement Version 2.0 (the "License").
+* Please refer to the License for details. You may not use this file except in compliance with the License.
+* THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+* INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+* See LICENSE in the root of the software repository for the full text of the License.
+*/
+#include "kernel_operator.h"
+#include <gtest/gtest.h>
+#include <iostream>
+
+class SequenceTestSuite : public testing::Test {
+protected:
+  static void SetUpTestCase() {
+    std::cout << "SequenceTestSuite SetUpTestCase" << std::endl;
+  }
+  static void TearDownTestCase() {
+    std::cout << "SequenceTestSuite TearDownTestCase" << std::endl;
+  }
+  virtual void SetUp() {}
+  virtual void TearDown() {}
+};
+TEST_F(SequenceTestSuite, SequenceTestCase) {
+  auto seq10 = AscendC::Std::make_index_sequence<10>();
+  EXPECT_TRUE(
+      (std::is_same_v<decltype(seq10), AscendC::Std::index_sequence<
+                                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9>>));
+  auto seq0 = AscendC::Std::make_index_sequence<0>();
+  EXPECT_TRUE((std::is_same_v<decltype(seq0), AscendC::Std::index_sequence<>>));
+  auto seq64 = AscendC::Std::make_index_sequence<64>();
+  EXPECT_TRUE(
+      (std::is_same_v<
+          decltype(seq64),
+          AscendC::Std::index_sequence<
+              0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+              19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+              35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+              51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63>>));
+}
