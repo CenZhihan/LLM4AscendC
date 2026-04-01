@@ -149,6 +149,24 @@ def copytree_clean(src: pathlib.Path, dst: pathlib.Path) -> None:
     shutil.copytree(src, dst)
 
 
+def _patch_makeself_tar_format(project_dir: pathlib.Path) -> None:
+    """
+    Makeself uses ustar by default, which may fail when packaging hardlink entries with long link names.
+    Patch the generated makeself.cmake to pass --tar-format posix (path-related robustness).
+    """
+    ms = project_dir / "cmake" / "makeself.cmake"
+    if not ms.exists():
+        return
+    txt = ms.read_text(encoding="utf-8", errors="replace")
+    if "--tar-format" in txt:
+        return
+    needle = "execute_process(COMMAND bash ${CMAKE_CURRENT_LIST_DIR}/util/makeself/makeself.sh"
+    if needle not in txt:
+        return
+    patched = txt.replace(needle, needle + "\n                        --tar-format posix", 1)
+    ms.write_text(patched, encoding="utf-8")
+
+
 def ensure_template_pybind(pybind_dir: pathlib.Path, *, op_cpp_src: pathlib.Path, module_name: str, version: str) -> None:
     # Vendor a minimal pybind build template locally (no MKB runtime dependency).
     template_dir = TOOLS_ROOT / "pybind_template"
@@ -253,6 +271,8 @@ def build_and_install_operator(
             dst.mkdir(parents=True, exist_ok=True)
             shutil.copytree(src, dst, dirs_exist_ok=True)
 
+        _patch_makeself_tar_format(project_dir)
+
         # 3) build and install .run
         log_02 = logs_dir / f"{ts}-02-build.log"
         run_cmd(
@@ -263,8 +283,16 @@ def build_and_install_operator(
             title=f"{spec.op_key}: build.sh",
         )
         log_03 = logs_dir / f"{ts}-03-install-run.log"
+        install_cmd = ["bash", "./custom_opp_ubuntu_aarch64.run"]
+        # Default installation path under /usr/local/Ascend often requires root. Use a user-writable path when configured.
+        if cfg.ascend_custom_opp_path:
+            pathlib.Path(cfg.ascend_custom_opp_path).mkdir(parents=True, exist_ok=True)
+            # The generated .run installer is a makeself archive; in practice it is more robust to:
+            # - run in quiet mode (no xterm / interaction)
+            # - pass install path as --install-path=<path> (some variants don't accept a separate arg)
+            install_cmd += ["--quiet", f"--install-path={cfg.ascend_custom_opp_path}"]
         run_cmd(
-            ["bash", "./custom_opp_ubuntu_aarch64.run"],
+            install_cmd,
             cwd=project_dir / "build_out",
             env=env,
             log_path=log_03,

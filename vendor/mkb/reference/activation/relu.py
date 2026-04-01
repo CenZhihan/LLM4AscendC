@@ -20,8 +20,10 @@ class Model(nn.Module):
         """
         return torch.relu(x)
 
-batch_size = 4096
-dim = 393216
+# batch_size = 4096
+# dim = 393216
+batch_size = 256
+dim = 65536
 
 def get_inputs():
     x = torch.rand(batch_size, dim)
