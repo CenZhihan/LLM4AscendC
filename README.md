@@ -77,19 +77,53 @@ python3 tools/eval_operator.py --txt-dir output/kernelbench165_txt --clean-polic
 - **`artifacts/<op_key>/result_<op_key>.json`**：汇总 `compiled`、`correctness`、`correctness_info`、指纹与日志路径等。  
 - 失败时终端会打印 `[done] FAILED` 并附 summary 路径；成功为 `[done] OK`。
 
-### 2.5 与评测相关的环境变量（非 CLI，但常用）
+### 2.5 环境变量说明
+
+本仓库**直接读取或改写**的环境变量如下（不含 CANN 工具链内部大量 `ASCEND_*`，那些由 `source set_env.sh` 等注入）。
+
+#### 使用者可自行设置（可选）
+
+| 变量 | 典型取值 | 作用 |
+|------|----------|------|
+| `LLM4ASCENDC_REF_ON_CPU` | `1` / `true` / `yes` / `on` | MKB **参考模型 `Model`** 在 **CPU** 上跑，自定义算子仍在 NPU（`vendor/mkb/correctness.py`）。用于对照：NPU 上参考若因图模式/融合与 PyTorch 不一致，可开此项再比一次。 |
+
+#### 由 `eval_operator.py` 在评测子进程中自动设置（一般不必手改）
 
 | 变量 | 作用 |
 |------|------|
-| `LLM4ASCENDC_REF_ON_CPU` | 设为 `1` / `true` / `yes` / `on` 时，MKB **参考模型 `Model`** 在 **CPU** 上执行，自定义算子仍在 NPU（见 `vendor/mkb/correctness.py`）。适用于参考在 NPU 上图模式/融合导致与 PyTorch 不一致时的对照实验。 |
-| `LLM4ASCENDC_OP_MODULE` / `LLM4ASCENDC_OP_DIR` / `LLM4ASCENDC_ROOT` | 由 eval 子进程自动设置，一般无需手改。 |
+| `LLM4ASCENDC_OP_MODULE` | 当前算子对应的 pybind 模块名（与安装的 wheel 一致）。 |
+| `LLM4ASCENDC_OP_DIR` | 当前算子目录绝对路径。 |
+| `LLM4ASCENDC_ROOT` | 项目根目录绝对路径。 |
+| `PYTHONPATH` | 首部追加 `LLM4ASCENDC_ROOT`，保证 `vendor.mkb` 等可导入。 |
+
+#### 由 `tools/common/env.py` 的 `build_subprocess_env()` 在子进程中增强
+
+| 变量 | 作用 |
+|------|------|
+| `LD_LIBRARY_PATH` | 在原有路径前**追加**昇腾 **driver** 库路径（默认见 `EnvConfig.driver_libs`），保证运行时能加载驱动相关 `.so`。 |
+| `ASCEND_CUSTOM_OPP_PATH` | 若 `EnvConfig.ascend_custom_opp_path` 非空（默认 `/workspace/ascend_custom_opp`），则设为该路径，用于找到自定义 OPP 安装内容。 |
+
+路径类默认值（`ascend_set_env.sh`、conda、`ascend_custom_opp_path` 等）写在 **`EnvConfig` 数据类**里，换机器时如与本地不符，应**改 `tools/common/env.py`** 或后续如改为读环境变量再覆盖（当前代码以代码内默认值为主）。
+
+#### pybind 构建时（`tools/pybind_template/setup.py`，通常由流水线注入）
+
+| 变量 | 作用 |
+|------|------|
+| `CUSTOM_OP_NAME` | 扩展模块名；流水线通过 `artifacts/.../pybind/.build_env.json` 等与指纹一并写入，一般无需在 shell 里设。 |
+| `CUSTOM_OP_VERSION` | wheel 版本串。同上。 |
+| `USE_NINJA` | 设为 `1` 时启用 Ninja 编译扩展；可选。 |
+
+#### 与昇腾/CANN 相关、本仓库不定义但运行前需满足
+
+- 需在 shell 中 **`source $ASCEND_HOME_PATH/ascend-toolkit/set_env.sh`**（或你机器上的等价路径）；`ASCEND_HOME_PATH`、`PATH`、`PYTHONPATH` 等由 CANN 脚本统一配置。
+- 自定义 OPP 安装后，通常还需 **`source <ascend_custom_opp_path>/vendors/customize/bin/set_env.bash`**（`eval_operator` 通过 `shell_prefix()` 在子命令里自动拼接）。
 
 正确性试验次数与随机种子见 **`vendor/mkb/mkb_eval_config.py`**（如 `num_correct_trials`、`seed_num`）。
 
-### 2.6 运行环境提示
+### 2.6 其他运行提示
 
-- 需要 **CANN / Ascend 工具链**、`msopgen`、可编译 AscendC 的环境；`tools/common/env.py` 中的 **`EnvConfig`**（如 `ascend_set_env.sh`、`ASCEND_CUSTOM_OPP_PATH`、可选 conda）需与当前机器路径一致，否则请自行改代码或环境。  
-- **`artifacts/`** 体积大，为生成物；若纳入 Git，建议加入 **`.gitignore`**（见仓库维护约定）。
+- 需要 **CANN / Ascend 工具链**、`msopgen`、可编译 AscendC 的环境；**`EnvConfig` 中的路径**需与当前机器一致。  
+- **`artifacts/`** 体积大，为生成物；若纳入 Git，建议加入 **`.gitignore`**。
 
 ---
 
