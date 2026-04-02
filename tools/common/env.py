@@ -15,6 +15,20 @@ class EnvConfig:
     ascend_custom_opp_path: str | None = "/workspace/ascend_custom_opp"
 
 
+_ASCEND_CUSTOM_OPP_ENV = "LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH"
+
+
+def load_env_config() -> EnvConfig:
+    """
+    若设置 LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH，则覆盖默认 ascend_custom_opp_path。
+    用于集群任务：容器内常无权限写 /workspace，可指向共享盘下目录（与调试机侧载 /workspace 时默认路径不同）。
+    """
+    override = os.environ.get(_ASCEND_CUSTOM_OPP_ENV, "").strip()
+    if not override:
+        return EnvConfig()
+    return EnvConfig(ascend_custom_opp_path=override)
+
+
 def build_subprocess_env(cfg: EnvConfig) -> dict[str, str]:
     env = os.environ.copy()
     ld = env.get("LD_LIBRARY_PATH", "")

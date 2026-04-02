@@ -16,7 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.common.env import EnvConfig, build_subprocess_env, shell_prefix  # noqa: E402
+from tools.common.env import EnvConfig, build_subprocess_env, load_env_config, shell_prefix  # noqa: E402
 from tools.common.fingerprint import compute_fingerprint, read_fingerprint, write_fingerprint  # noqa: E402
 from tools.common.runner import now_tag, run_cmd  # noqa: E402
 from tools.txt_operator import materialize_operator_from_txt  # noqa: E402
@@ -24,6 +24,7 @@ from tools.txt_operator import materialize_operator_from_txt  # noqa: E402
 
 OPS_ROOT = ROOT / "operators"
 ART_ROOT = ROOT / "artifacts"
+OUTPUT_ROOT = ROOT / "output"
 TOOLS_ROOT = ROOT / "tools"
 
 
@@ -199,12 +200,13 @@ def build_and_install_operator(
     op_dir: pathlib.Path,
     spec: OperatorSpec,
     *,
+    art_root: pathlib.Path,
     clean_policy: str,
     mode: str,
     cfg: EnvConfig,
 ) -> tuple[pathlib.Path, str]:
     ts = now_tag()
-    art_dir = ART_ROOT / spec.op_key
+    art_dir = art_root / spec.op_key
     work_root = art_dir / "workspace"
     gen_dir = art_dir / "generated"
     pybind_dir = art_dir / "pybind"
@@ -392,13 +394,60 @@ def _resolve_user_path(p: pathlib.Path) -> pathlib.Path:
     return p.resolve()
 
 
-def _execute_pipeline(op_dir: pathlib.Path, *, mode: str, clean_policy: str) -> None:
+def _is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _artifact_group_rel_from_txt_path(txt_path: pathlib.Path) -> pathlib.Path | None:
+    """
+    If txt_path is under LLM4AscendC/output/<group>/..., return the group path
+    relative to output root (mirrors nested folders).
+
+    For a single txt file, the group is its parent directory relative to output root.
+    If the parent is output root itself, returns None (treat as 'wild').
+    """
+    txt_path = txt_path.resolve()
+    out_root = OUTPUT_ROOT.resolve()
+    if not _is_within(txt_path, out_root):
+        return None
+    try:
+        rel_parent = txt_path.parent.relative_to(out_root)
+    except Exception:
+        return None
+    return rel_parent if str(rel_parent) not in (".", "") else None
+
+
+def _artifact_group_rel_from_txt_dir(txt_dir: pathlib.Path) -> pathlib.Path | None:
+    """
+    If txt_dir is under LLM4AscendC/output/<group>/..., return the directory path
+    relative to output root (mirrors nested folders).
+    """
+    txt_dir = txt_dir.resolve()
+    out_root = OUTPUT_ROOT.resolve()
+    if not _is_within(txt_dir, out_root):
+        return None
+    try:
+        rel = txt_dir.relative_to(out_root)
+    except Exception:
+        return None
+    return rel if str(rel) not in (".", "") else None
+
+
+def _artifacts_root_for_group(group_rel: pathlib.Path | None) -> pathlib.Path:
+    return (ART_ROOT / group_rel) if group_rel else ART_ROOT
+
+
+def _execute_pipeline(op_dir: pathlib.Path, *, art_root: pathlib.Path, mode: str, clean_policy: str) -> None:
     """
     Build/install/eval one operator directory. Raises on failure.
     """
     spec = load_operator_spec(op_dir)
-    cfg = EnvConfig()
-    art_dir = ART_ROOT / spec.op_key
+    cfg = load_env_config()
+    art_dir = art_root / spec.op_key
     state_dir = art_dir / "state"
     logs_dir = art_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -414,7 +463,7 @@ def _execute_pipeline(op_dir: pathlib.Path, *, mode: str, clean_policy: str) -> 
     try:
         if mode in ("full", "build-only"):
             _, module_name = build_and_install_operator(
-                op_dir, spec, clean_policy=clean_policy, mode=mode, cfg=cfg
+                op_dir, spec, art_root=art_root, clean_policy=clean_policy, mode=mode, cfg=cfg
             )
             compiled_ok = True
             for k in ["01-msopgen", "02-build", "03-install-run", "04-pybind-build", "05-pybind-install"]:
@@ -534,13 +583,15 @@ def main() -> int:
         txt_dir = _resolve_user_path(pathlib.Path(args.txt_dir))
         if not txt_dir.is_dir():
             raise NotADirectoryError(txt_dir)
+        group_rel = _artifact_group_rel_from_txt_dir(txt_dir)
+        art_root = _artifacts_root_for_group(group_rel)
         files = sorted(txt_dir.glob("*.txt"))
         if not files:
             raise RuntimeError(f"no .txt files in {txt_dir}")
         rc = 0
         for txt_path in files:
             print(f"[batch] === {txt_path.name} ===")
-            staging_root = ROOT / "artifacts" / "_txt_staging" / txt_path.stem
+            staging_root = art_root / "_txt_staging" / txt_path.stem
             if staging_root.exists():
                 shutil.rmtree(staging_root)
             staging_root.mkdir(parents=True, exist_ok=True)
@@ -550,7 +601,7 @@ def main() -> int:
                 soc="ai_core-Ascend910B2",
             )
             try:
-                _execute_pipeline(op_dir, mode=args.mode, clean_policy=args.clean_policy)
+                _execute_pipeline(op_dir, art_root=art_root, mode=args.mode, clean_policy=args.clean_policy)
             except Exception as e:
                 print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
                 rc = 1
@@ -566,7 +617,9 @@ def main() -> int:
         txt_path = _resolve_user_path(pathlib.Path(args.txt))
         if not txt_path.exists():
             raise FileNotFoundError(txt_path)
-        staging_root = ROOT / "artifacts" / "_txt_staging"
+        group_rel = _artifact_group_rel_from_txt_path(txt_path)
+        art_root = _artifacts_root_for_group(group_rel)
+        staging_root = art_root / "_txt_staging" / txt_path.stem
         if staging_root.exists():
             shutil.rmtree(staging_root)
         staging_root.mkdir(parents=True, exist_ok=True)
@@ -576,7 +629,9 @@ def main() -> int:
             soc="ai_core-Ascend910B2",
         )
 
-    _execute_pipeline(op_dir, mode=args.mode, clean_policy=args.clean_policy)
+    if args.op:
+        art_root = ART_ROOT
+    _execute_pipeline(op_dir, art_root=art_root, mode=args.mode, clean_policy=args.clean_policy)
     return 0
 
 
