@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import multiprocessing
 import os
 import pathlib
 import shutil
@@ -11,6 +12,9 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Any
+
+# Upper bound for --workers (txt-dir parallel mode) to avoid accidental huge values.
+_MAX_TXT_DIR_WORKERS = 32
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -555,6 +559,47 @@ def _execute_pipeline(op_dir: pathlib.Path, *, art_root: pathlib.Path, mode: str
         raise
 
 
+def _parallel_worker_main(
+    worker_id: int,
+    base_opp: str,
+    task_q: Any,
+    art_root_str: str,
+    mode: str,
+    clean_policy: str,
+    result_q: Any,
+) -> None:
+    """
+    Runs in a child process (multiprocessing spawn). Each worker uses a fixed
+    OPP install root: <base_opp>/_parallel_w<worker_id> via LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH.
+    Consumes txt paths from task_q until sentinel None.
+    """
+    opp = pathlib.Path(base_opp) / f"_parallel_w{worker_id}"
+    opp.mkdir(parents=True, exist_ok=True)
+    os.environ["LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH"] = str(opp)
+    art_root = pathlib.Path(art_root_str)
+    while True:
+        item = task_q.get()
+        if item is None:
+            break
+        txt_path = pathlib.Path(item)
+        print(f"[batch] [w{worker_id}] === {txt_path.name} ===")
+        staging_root = art_root / "_txt_staging" / txt_path.stem
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
+        staging_root.mkdir(parents=True, exist_ok=True)
+        try:
+            op_dir = materialize_operator_from_txt(
+                out_dir=staging_root / "operator",
+                txt_path=txt_path,
+                soc="ai_core-Ascend910B2",
+            )
+            _execute_pipeline(op_dir, art_root=art_root, mode=mode, clean_policy=clean_policy)
+            result_q.put((txt_path.name, True, None))
+        except Exception as e:
+            print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
+            result_q.put((txt_path.name, False, str(e)))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=(
@@ -577,7 +622,25 @@ def main() -> int:
     )
     ap.add_argument("--mode", default="full", choices=["full", "build-only", "eval-only"])
     ap.add_argument("--clean-policy", default="force", choices=["force", "smart"])
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "only with --txt-dir: number of parallel worker processes (default 1 = sequential). "
+            f"Requires LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH; uses subdirs _parallel_w0.. under that path. "
+            f"Max {_MAX_TXT_DIR_WORKERS}."
+        ),
+    )
     args = ap.parse_args()
+
+    if args.workers < 1:
+        raise ValueError("--workers must be >= 1")
+    if args.workers > _MAX_TXT_DIR_WORKERS:
+        raise ValueError(f"--workers must be <= {_MAX_TXT_DIR_WORKERS}")
+    if args.workers > 1 and args.txt_dir is None:
+        raise ValueError("--workers > 1 is only supported with --txt-dir")
 
     if args.txt_dir:
         txt_dir = _resolve_user_path(pathlib.Path(args.txt_dir))
@@ -588,22 +651,57 @@ def main() -> int:
         files = sorted(txt_dir.glob("*.txt"))
         if not files:
             raise RuntimeError(f"no .txt files in {txt_dir}")
-        rc = 0
-        for txt_path in files:
-            print(f"[batch] === {txt_path.name} ===")
-            staging_root = art_root / "_txt_staging" / txt_path.stem
-            if staging_root.exists():
-                shutil.rmtree(staging_root)
-            staging_root.mkdir(parents=True, exist_ok=True)
-            op_dir = materialize_operator_from_txt(
-                out_dir=staging_root / "operator",
-                txt_path=txt_path,
-                soc="ai_core-Ascend910B2",
+
+        if args.workers == 1:
+            rc = 0
+            for txt_path in files:
+                print(f"[batch] === {txt_path.name} ===")
+                staging_root = art_root / "_txt_staging" / txt_path.stem
+                if staging_root.exists():
+                    shutil.rmtree(staging_root)
+                staging_root.mkdir(parents=True, exist_ok=True)
+                op_dir = materialize_operator_from_txt(
+                    out_dir=staging_root / "operator",
+                    txt_path=txt_path,
+                    soc="ai_core-Ascend910B2",
+                )
+                try:
+                    _execute_pipeline(op_dir, art_root=art_root, mode=args.mode, clean_policy=args.clean_policy)
+                except Exception as e:
+                    print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
+                    rc = 1
+            return rc
+
+        cfg_parallel = load_env_config()
+        if not cfg_parallel.ascend_custom_opp_path:
+            raise RuntimeError(
+                "Parallel --txt-dir (--workers > 1) requires a writable OPP root. "
+                "Set environment variable LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH to an absolute path "
+                "(see tools/common/env.py). Each worker installs to <that path>/_parallel_w<id>."
             )
-            try:
-                _execute_pipeline(op_dir, art_root=art_root, mode=args.mode, clean_policy=args.clean_policy)
-            except Exception as e:
-                print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
+        base_opp = cfg_parallel.ascend_custom_opp_path
+        ctx = multiprocessing.get_context("spawn")
+        task_q = ctx.Queue()
+        result_q = ctx.Queue()
+        for f in files:
+            task_q.put(str(f.resolve()))
+        for _ in range(args.workers):
+            task_q.put(None)
+        procs: list[multiprocessing.Process] = []
+        art_root_str = str(art_root.resolve())
+        for wid in range(args.workers):
+            p = ctx.Process(
+                target=_parallel_worker_main,
+                args=(wid, base_opp, task_q, art_root_str, args.mode, args.clean_policy, result_q),
+            )
+            procs.append(p)
+            p.start()
+        for p in procs:
+            p.join()
+        rc = 0
+        for _ in range(len(files)):
+            _name, ok, _err = result_q.get()
+            if not ok:
                 rc = 1
         return rc
 

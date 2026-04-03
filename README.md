@@ -24,13 +24,15 @@
 python3 tools/eval_operator.py <必选其一：算子来源> [可选参数]
 ```
 
+**运行环境**：完整流水线依赖 **CANN / msopgen / NPU**，须在已配置昇腾环境的机器上执行。常见做法是在宿主机用 **`docker exec -it <容器ID> bash`** 进入侧载了本仓库的容器（示例容器 ID 可与脚本 `scripts/run_matmul17_local.sh`、`scripts/run_matmul_gpt4o_parallel3.sh` 注释中一致），再 `cd` 到容器内的 `LLM4AscendC` 根目录后运行上述命令。
+
 **算子来源（三选一，必选）**
 
 | 参数 | 含义 |
 |------|------|
 | `--op <DIR>` | 已 materialize 的算子目录，例如 `operators/xxx` 或绝对路径。目录内需含 `operator.json`、`op_host/`、`op_kernel/`、`eval/spec.py` 等。 |
 | `--txt <PATH>` | 单个 **MKB 风格 txt 包** 路径（如 `output/gelu.txt`）。脚本会写入 `artifacts/.../_txt_staging/`，并生成临时算子目录再跑流水线；若 txt 位于 `output/<批次目录>/...`，则产物会归档到 `artifacts/<批次目录>/...`。 |
-| `--txt-dir <DIR>` | 目录内所有 `*.txt` **按文件名排序后依次** 评测；每个文件的 **stem = MKB `op_key`**。某次失败会记录错误并继续下一个（返回码非 0）。 |
+| `--txt-dir <DIR>` | 目录内所有 `*.txt` **按文件名排序后** 评测；默认 **单进程顺序** 执行。可用 `--workers N`（`N>1`）改为 **多进程任务队列**：各 worker 从队列取下一个 `*.txt`，**谁空谁取**（等价）。每个文件的 **stem = MKB `op_key`**。某次失败会记录错误并继续其余任务（返回码非 0）。 |
 
 **常用示例**
 
@@ -47,8 +49,12 @@ python3 tools/eval_operator.py --txt output/gelu.txt --mode build-only
 # 在已有成功构建且指纹未变的前提下，只跑 eval
 python3 tools/eval_operator.py --txt output/gelu.txt --mode eval-only
 
-# 批量目录
+# 批量目录（串行，默认）
 python3 tools/eval_operator.py --txt-dir output/kernelbench165_txt --clean-policy smart
+
+# 批量目录（并行 5 worker；须设置 LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH，见下文）
+export LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH="/path/to/writable/ascend_custom_opp"
+python3 tools/eval_operator.py --txt-dir output/gpt-5_selected_shot --workers 5 --mode full
 ```
 
 ### 2.2 可选参数一览
@@ -57,6 +63,7 @@ python3 tools/eval_operator.py --txt-dir output/kernelbench165_txt --clean-polic
 |------|--------|--------|----------------|
 | `--mode` | `full` | `full` / `build-only` / `eval-only` | **`full`**：msopgen → 编译 → 安装 OPP → 构建并安装 pybind wheel → 运行 `eval/spec.py`（正确性或与参考对比）。**`build-only`**：只做到安装 wheel 并写 `state/`，不执行 eval；适合 CI 只验证能否编过。**`eval-only`**：跳过构建，直接跑 eval；要求 `artifacts/<op_key>/state/installed.json` 已存在，且源码指纹与上次构建一致，否则会报错要求先 `full` 或 `build-only`。适合反复调试验证逻辑而不重复长时间编译。 |
 | `--clean-policy` | `force` | `force` / `smart` | **`force`**：每次进入构建阶段前 **删除** `artifacts/<op_key>/workspace` 与 `pybind`，保证从干净目录重编；结果可复现、磁盘与耗时开销较大。**`smart`**：仅当算子目录 **内容指纹**相对上次构建发生变化时，才清理并重编；指纹未变则复用已有构建；若期望复用但从未成功安装过，会报错提示改用 `force`。适合迭代小改或批量任务中减少重复编译。 |
+| `--workers` | `1` | `1` … `32` | **仅与 `--txt-dir` 合用**。`1` 表示与过去行为一致的单进程顺序评测。`N>1` 时使用 `multiprocessing` 的 **spawn** 启动 `N` 个子进程，共享任务队列，依次处理目录中的 `*.txt`。**必须**设置 `LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH`：每个 worker 将自定义 OPP 安装到该路径下的 **`_parallel_w0` … `_parallel_w{N-1}`**，避免多进程同时写入同一 OPP 根目录导致安装冲突。 |
 
 **说明**：
 
@@ -65,6 +72,13 @@ python3 tools/eval_operator.py --txt-dir output/kernelbench165_txt --clean-polic
 - `--txt` / `--txt-dir` 会清理并重建对应的 staging 目录，避免旧内容干扰：
   - 单个 txt：`artifacts/<group可选>/_txt_staging/<op_key>/`
   - 批量目录：`artifacts/<group可选>/_txt_staging/<op_key>/`
+
+**并行 `--txt-dir`（`--workers` > 1）补充说明**：
+
+- **产物路径**：与串行相同，仍为 `artifacts/<group可选>/<op_key>/…`；不同算子由不同 worker 处理，**不会**因并行覆盖彼此的 `result_*.json`（同一 `op_key` 不会在队列中出现两次）。
+- **OPP**：见上表 `--workers`；子目录名为 `_parallel_w0` … `_parallel_w{N-1}`，位于 `LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH` 所指向目录的 **下**（若该路径为 `/a/opp`，则 worker 0 使用 `/a/opp/_parallel_w0`）。
+- **NPU / 显存**：脚本**不**绑定具体卡号；多进程通常共享当前可见设备（如 `ASCEND_VISIBLE_DEVICES=0`）。**同卡多进程会共享 HBM**，大算子并发可能导致 **NPU OOM** 或与单进程顺序跑行为不一致，请按集群显存自行限制 `--workers` 或改为多卡多任务。
+- **pip**：各算子 pybind 包名一般不同，并发 `pip install` 多数可接受；若遇偶发安装冲突，可改为较小 `--workers` 或后续在工具链侧加锁（本版未实现）。
 
 示例：
 
@@ -96,6 +110,7 @@ python3 tools/eval_operator.py --txt-dir output/kernelbench165_txt --clean-polic
 
 | 变量 | 典型取值 | 作用 |
 |------|----------|------|
+| `LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH` | 绝对路径，可写 | 覆盖 `env.py` 中默认的 `ascend_custom_opp_path`，将自定义 OPP 安装到该目录。**并行 `--txt-dir`（`--workers`>1）时必填**，且每个 worker 会使用其下的 `_parallel_w<id>` 子目录，避免多进程安装互踩。 |
 | `LLM4ASCENDC_REF_ON_CPU` | `1` / `true` / `yes` / `on` | MKB **参考模型 `Model`** 在 **CPU** 上跑，自定义算子仍在 NPU（`vendor/mkb/correctness.py`）。用于对照：NPU 上参考若因图模式/融合与 PyTorch 不一致，可开此项再比一次。 |
 
 #### 由 `eval_operator.py` 在评测子进程中自动设置（一般不必手改）
