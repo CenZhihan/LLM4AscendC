@@ -15,6 +15,8 @@ from typing import Any
 
 # Upper bound for --workers (txt-dir parallel mode) to avoid accidental huge values.
 _MAX_TXT_DIR_WORKERS = 32
+# Physical NPU indices 0..7 for --npu (parallel binding via ASCEND_VISIBLE_DEVICES).
+_MAX_VISIBLE_NPU = 8
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -567,12 +569,18 @@ def _parallel_worker_main(
     mode: str,
     clean_policy: str,
     result_q: Any,
+    npu_count: int,
 ) -> None:
     """
     Runs in a child process (multiprocessing spawn). Each worker uses a fixed
     OPP install root: <base_opp>/_parallel_w<worker_id> via LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH.
+    Binds this process to one physical NPU via ASCEND_VISIBLE_DEVICES so that
+    eval/spec.py (torch.device("npu:0")) maps to device_id = worker_id % npu_count.
     Consumes txt paths from task_q until sentinel None.
     """
+    device_id = worker_id % npu_count
+    os.environ["ASCEND_VISIBLE_DEVICES"] = str(device_id)
+    print(f"[batch] [w{worker_id}] ASCEND_VISIBLE_DEVICES={device_id} (npu_count={npu_count})")
     opp = pathlib.Path(base_opp) / f"_parallel_w{worker_id}"
     opp.mkdir(parents=True, exist_ok=True)
     os.environ["LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH"] = str(opp)
@@ -633,6 +641,17 @@ def main() -> int:
             f"Max {_MAX_TXT_DIR_WORKERS}."
         ),
     )
+    ap.add_argument(
+        "--npu",
+        type=int,
+        default=1,
+        metavar="K",
+        help=(
+            "only with --txt-dir and --workers > 1: use K physical NPUs indexed 0..K-1. "
+            f"Each worker sets ASCEND_VISIBLE_DEVICES=(worker_id %% K). Default 1 (all workers on physical card 0). "
+            f"Max { _MAX_VISIBLE_NPU }."
+        ),
+    )
     args = ap.parse_args()
 
     if args.workers < 1:
@@ -641,6 +660,9 @@ def main() -> int:
         raise ValueError(f"--workers must be <= {_MAX_TXT_DIR_WORKERS}")
     if args.workers > 1 and args.txt_dir is None:
         raise ValueError("--workers > 1 is only supported with --txt-dir")
+    if args.workers > 1:
+        if args.npu < 1 or args.npu > _MAX_VISIBLE_NPU:
+            raise ValueError(f"--npu must be between 1 and {_MAX_VISIBLE_NPU} when --workers > 1")
 
     if args.txt_dir:
         txt_dir = _resolve_user_path(pathlib.Path(args.txt_dir))
@@ -692,7 +714,16 @@ def main() -> int:
         for wid in range(args.workers):
             p = ctx.Process(
                 target=_parallel_worker_main,
-                args=(wid, base_opp, task_q, art_root_str, args.mode, args.clean_policy, result_q),
+                args=(
+                    wid,
+                    base_opp,
+                    task_q,
+                    art_root_str,
+                    args.mode,
+                    args.clean_policy,
+                    result_q,
+                    args.npu,
+                ),
             )
             procs.append(p)
             p.start()
