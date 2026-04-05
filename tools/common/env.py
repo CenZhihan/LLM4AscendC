@@ -3,6 +3,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+
+# 项目根目录（env.py 在 tools/common/ 下，往上两层是根目录）
+ROOT_DIR = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -12,7 +17,8 @@ class EnvConfig:
     driver_libs: tuple[str, str] = ("/usr/local/Ascend/driver/lib64/driver", "/usr/local/Ascend/driver/lib64/common")
     # Install custom OPP packages to a user-writable path and expose it via ASCEND_CUSTOM_OPP_PATH.
     # Keep it None to disable.
-    ascend_custom_opp_path: str | None = "/workspace/ascend_custom_opp"
+    # 默认使用项目根目录下的 ascend_custom_opp，而非 Docker 容器内的 /workspace
+    ascend_custom_opp_path: str | None = str(ROOT_DIR / "ascend_custom_opp")
 
 
 def build_subprocess_env(cfg: EnvConfig) -> dict[str, str]:

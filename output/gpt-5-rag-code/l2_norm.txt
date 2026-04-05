@@ -1,0 +1,274 @@
+project_json_src='''
+[
+    {
+        "op": "L2NormCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(L2NormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, tileSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(L2NormCustom, L2NormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "l2_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    L2NormCustomTilingData tiling;
+
+    const auto* inShape = context->GetInputShape(0);
+    uint32_t dimNum = inShape->GetOriginShape().GetDimNum();
+    if (dimNum < 1) {
+        return ge::GRAPH_FAILED;
+    }
+    // Assume normalization along dim=1 for 2D input [N, D]
+    uint32_t rows = (dimNum >= 1) ? static_cast<uint32_t>(inShape->GetOriginShape().GetDim(0)) : 1U;
+    uint32_t cols = (dimNum >= 2) ? static_cast<uint32_t>(inShape->GetOriginShape().GetDim(1)) : 1U;
+
+    // Choose a reasonable tile size for local buffer
+    const uint32_t TILE_SIZE = 1024;
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+    tiling.set_tileSize(TILE_SIZE);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* workspaces = context->GetWorkspaceSizes(1);
+    workspaces[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto in_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, in_dtype);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class L2NormCustom : public OpDef {
+public:
+    explicit L2NormCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(L2NormCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include <cmath>
+
+using DTYPE = float;
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelL2Norm {
+public:
+    __aicore__ inline KernelL2Norm() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalRows, uint32_t cols, uint32_t tileSize)
+    {
+        this->cols = cols;
+        this->tileSize = tileSize;
+
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+
+        this->rowStart = (totalRows * blockIdx) / blockNum;
+        uint32_t rowEnd = (totalRows * (blockIdx + 1)) / blockNum;
+        this->rowsThisBlock = rowEnd - this->rowStart;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE*)x + static_cast<uint64_t>(rowStart) * cols,
+                            static_cast<uint64_t>(rowsThisBlock) * cols);
+        yGm.SetGlobalBuffer((__gm__ DTYPE*)y + static_cast<uint64_t>(rowStart) * cols,
+                            static_cast<uint64_t>(rowsThisBlock) * cols);
+
+        pipe.InitBuffer(inQueue, BUFFER_NUM, this->tileSize * sizeof(DTYPE));
+        pipe.InitBuffer(outQueue, BUFFER_NUM, this->tileSize * sizeof(DTYPE));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = 0; r < rowsThisBlock; ++r) {
+            float norm = ComputeRowNorm(r);
+            float invNorm = 1.0f / sqrtf(norm);
+            ScaleRow(r, invNorm);
+        }
+    }
+
+private:
+    __aicore__ inline float ComputeRowNorm(uint32_t r)
+    {
+        float sumsq = 0.0f;
+        uint32_t offset = 0;
+        while (offset < cols) {
+            uint32_t len = AscendC::min((uint32_t)tileSize, (uint32_t)(cols - offset));
+
+            AscendC::LocalTensor<DTYPE> xLocal = inQueue.AllocTensor<DTYPE>();
+            AscendC::DataCopy(xLocal, xGm[(uint64_t)r * cols + offset], len);
+            inQueue.EnQue(xLocal);
+
+            xLocal = inQueue.DeQue<DTYPE>();
+            AscendC::LocalTensor<DTYPE> sqLocal = outQueue.AllocTensor<DTYPE>();
+            AscendC::Mul(sqLocal, xLocal, xLocal, len);
+            // Reduce sum of squares in sqLocal
+            float part = AscendC::ReduceSum(sqLocal, len);
+            sumsq += part;
+
+            outQueue.FreeTensor(sqLocal);
+            inQueue.FreeTensor(xLocal);
+
+            offset += len;
+        }
+        return sumsq;
+    }
+
+    __aicore__ inline void ScaleRow(uint32_t r, float invNorm)
+    {
+        uint32_t offset = 0;
+        while (offset < cols) {
+            uint32_t len = AscendC::min((uint32_t)tileSize, (uint32_t)(cols - offset));
+
+            AscendC::LocalTensor<DTYPE> xLocal = inQueue.AllocTensor<DTYPE>();
+            AscendC::DataCopy(xLocal, xGm[(uint64_t)r * cols + offset], len);
+            inQueue.EnQue(xLocal);
+
+            AscendC::LocalTensor<DTYPE> yLocal = outQueue.AllocTensor<DTYPE>();
+
+            xLocal = inQueue.DeQue<DTYPE>();
+            AscendC::Muls(yLocal, xLocal, invNorm, len);
+            outQueue.EnQue(yLocal);
+            inQueue.FreeTensor(xLocal);
+
+            yLocal = outQueue.DeQue<DTYPE>();
+            AscendC::DataCopy(yGm[(uint64_t)r * cols + offset], yLocal, len);
+            outQueue.FreeTensor(yLocal);
+
+            offset += len;
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+
+    uint32_t cols;
+    uint32_t tileSize;
+    uint32_t rowStart;
+    uint32_t rowsThisBlock;
+};
+
+extern "C" __global__ __aicore__ void l2_norm_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelL2Norm op;
+    op.Init(x, y, tiling_data.rows, tiling_data.cols, tiling_data.tileSize);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor l2_norm_custom_impl_npu(const at::Tensor& x) {
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnL2NormCustom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("l2_norm_custom", &l2_norm_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("l2_norm_custom", &l2_norm_custom_impl_npu, "L2 normalization over dim=1");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.l2_norm_custom(x)
+'''

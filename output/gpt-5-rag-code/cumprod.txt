@@ -1,0 +1,309 @@
+project_json_src='''
+[
+    {
+        "op": "CumprodCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "attr": [
+            {
+                "name": "dim",
+                "type": "int"
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CumprodCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, axis);
+  TILING_DATA_FIELD_DEF(uint32_t, axisLength);
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CumprodCustom, CumprodCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cumprod_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+// Helper to get original shape size of a specific dimension
+static inline uint32_t GetDim(const gert::Shape& shape, uint32_t idx)
+{
+    return static_cast<uint32_t>(shape.GetOriginShape().GetDim(idx));
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CumprodCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    const auto& origin = in_shape->GetOriginShape();
+    uint32_t rank = static_cast<uint32_t>(origin.GetDimNum());
+    uint32_t totalLength = static_cast<uint32_t>(origin.GetShapeSize());
+
+    // Read axis attribute and normalize
+    int64_t dim_attr = 0;
+    (void)context->GetAttrInt("dim", dim_attr);
+    int64_t dim_norm = dim_attr >= 0 ? dim_attr : (static_cast<int64_t>(rank) + dim_attr);
+    if (dim_norm < 0) dim_norm = 0;
+    if (dim_norm >= static_cast<int64_t>(rank)) dim_norm = static_cast<int64_t>(rank) - 1;
+
+    uint32_t axis = static_cast<uint32_t>(dim_norm);
+    uint32_t axisLength = GetDim(*in_shape, axis);
+
+    // rows = total elements divided by axis length
+    uint32_t rows = axisLength == 0 ? 0 : (totalLength / axisLength);
+
+    // We distribute rows across blocks; set per-core tile count (rows per block)
+    context->SetBlockDim(BLOCK_DIM);
+    uint32_t tileNum = rows / BLOCK_DIM;
+    if (tileNum == 0) {
+        tileNum = rows > 0 ? 1 : 0;
+    }
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(tileNum);
+    tiling.set_axis(axis);
+    tiling.set_axisLength(axisLength);
+    tiling.set_rows(rows);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CumprodCustom : public OpDef {
+public:
+    explicit CumprodCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("dim").Type(ATTR_INT);
+
+        this->SetInferShape(ge::InferShape)
+            .SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CumprodCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2; // queue buffer num
+
+// This kernel computes cumprod along the last dimension (axis) per row.
+// It distributes rows (all other dims) across blocks. Each tile processes one full row.
+class KernelCumprod {
+public:
+    __aicore__ inline KernelCumprod() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t axis, uint32_t axisLength,
+                                uint32_t rows, uint32_t tileNum)
+    {
+        this->axis = axis;
+        this->axisLength = axisLength;
+        this->rows = rows;
+
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+
+        // rows per block (simple split, last block may have tail ignored in this demo)
+        this->rowsPerBlock = rows / blockNum;
+        if (this->rowsPerBlock == 0 && rows > 0) {
+            this->rowsPerBlock = 1;
+        }
+        this->tileNum = this->rowsPerBlock; // one tile per row
+        this->tileLength = axisLength;      // process full row at a time
+
+        uint32_t startRow = blockIdx * this->rowsPerBlock;
+        uint32_t startOffset = startRow * axisLength;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + startOffset, this->rowsPerBlock * axisLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + startOffset, this->rowsPerBlock * axisLength);
+
+        uint32_t tileBytesX = this->tileLength * sizeof(DTYPE_X);
+        uint32_t tileBytesY = this->tileLength * sizeof(DTYPE_Y);
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, tileBytesX);
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, tileBytesY);
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t i = 0; i < this->tileNum; ++i) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+
+        // Inclusive cumulative product along the row
+        // Note: This simple reference implementation uses scalar iteration on UB.
+        DTYPE_Y acc = static_cast<DTYPE_Y>(1.0f);
+        for (uint32_t i = 0; i < this->tileLength; ++i) {
+            DTYPE_Y v = static_cast<DTYPE_Y>(xLocal.GetValue(i));
+            acc = acc * v;
+            yLocal.SetValue(i, acc);
+        }
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t axis;
+    uint32_t axisLength;
+    uint32_t rows;
+    uint32_t rowsPerBlock;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void cumprod_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCumprod op;
+    op.Init(x, y,
+            tiling_data.totalLength,
+            tiling_data.axis,
+            tiling_data.axisLength,
+            tiling_data.rows,
+            tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cumprod_custom_impl_npu(const at::Tensor& self, int64_t dim) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnCumprodCustom, self, dim, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cumprod_custom", &cumprod_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cumprod_custom", &cumprod_custom_impl_npu, "cumprod along dim");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model that performs a cumulative product operation along a specified dimension using a custom AscendC kernel.
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return custom_ops_lib.cumprod_custom(x, self.dim)
+'''

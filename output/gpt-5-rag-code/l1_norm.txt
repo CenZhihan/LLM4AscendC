@@ -1,0 +1,354 @@
+project_json_src='''
+[
+    {
+        "op": "L1NormCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(L1NormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rowNum);
+  TILING_DATA_FIELD_DEF(uint32_t, colNum);
+  TILING_DATA_FIELD_DEF(uint32_t, tileCol);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(L1NormCustom, L1NormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "l1_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t umin(uint32_t a, uint32_t b) { return a < b ? a : b; }
+inline uint32_t udiv_up(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
+}
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    L1NormCustomTilingData tiling;
+
+    const auto *inShape = context->GetInputShape(0);
+    const auto &shape = inShape->GetOriginShape();
+    // Assume 2D input [row, col]
+    uint32_t rowNum = static_cast<uint32_t>(shape.GetDim(0));
+    uint32_t colNum = static_cast<uint32_t>(shape.GetDim(1));
+
+    // Choose a reasonable tile along columns
+    const uint32_t DEFAULT_TILE_COL = 4096; // adjust by UB if needed at compile-time
+    uint32_t tileCol = umin(DEFAULT_TILE_COL, colNum);
+
+    // Set block dim based on rows
+    const uint32_t maxBlocks = 128;
+    uint32_t blk = umin(rowNum, maxBlocks);
+    context->SetBlockDim(blk);
+
+    tiling.set_rowNum(rowNum);
+    tiling.set_colNum(colNum);
+    tiling.set_tileCol(tileCol);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // Workspace for per-row mean (float per row)
+    size_t *ws = context->GetWorkspaceSizes(1);
+    ws[0] = static_cast<size_t>(rowNum) * sizeof(float);
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class L1NormCustom : public OpDef {
+public:
+    explicit L1NormCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(L1NormCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelL1NormCustom {
+public:
+    __aicore__ inline KernelL1NormCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR workspace,
+                                uint32_t rowNum, uint32_t colNum, uint32_t tileCol)
+    {
+        this->rowNum = rowNum;
+        this->colNum = colNum;
+        this->tileCol = tileCol;
+
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+        // Split rows across blocks evenly
+        this->rowsPerBlock = (rowNum + blockNum - 1) / blockNum;
+        this->rowStart = blockIdx * this->rowsPerBlock;
+        this->rowEnd = (this->rowStart + this->rowsPerBlock) > rowNum ? rowNum : (this->rowStart + this->rowsPerBlock);
+        if (this->rowStart >= this->rowEnd) {
+            this->rowsThisBlock = 0;
+        } else {
+            this->rowsThisBlock = this->rowEnd - this->rowStart;
+        }
+
+        // Set GM buffers (flattened)
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + (uint64_t)this->rowStart * this->colNum,
+                            (uint64_t)this->rowsThisBlock * this->colNum);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + (uint64_t)this->rowStart * this->colNum,
+                            (uint64_t)this->rowsThisBlock * this->colNum);
+        meanGm.SetGlobalBuffer((__gm__ float*)workspace + this->rowStart, this->rowsThisBlock);
+
+        // UB buffers for tiles
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileCol * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileCol * sizeof(DTYPE_Y));
+        // a small buffer to hold duplicate denominator per tile
+        pipe.InitBuffer(denomQueue, BUFFER_NUM, this->tileCol * sizeof(float));
+        // a tiny buffer to hold scalar sums
+        pipe.InitBuffer(sumQueue, 1, sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (rowsThisBlock == 0) {
+            return;
+        }
+        for (uint32_t r = 0; r < rowsThisBlock; ++r) {
+            // Phase 1: compute L1 mean for row r
+            float rowSum = 0.0f;
+            uint64_t baseIndex = (uint64_t)r * this->colNum;
+            uint32_t fullTiles = this->colNum / this->tileCol;
+            uint32_t tail = this->colNum % this->tileCol;
+
+            for (uint32_t t = 0; t < fullTiles; ++t) {
+                uint32_t effLen = this->tileCol;
+                // Load tile
+                AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xLocal, xGm[baseIndex + (uint64_t)t * this->tileCol], effLen);
+                inQueueX.EnQue<DTYPE_X>(xLocal);
+
+                // Compute abs and reduce sum
+                AscendC::LocalTensor<DTYPE_X> xTile = inQueueX.DeQue<DTYPE_X>();
+                AscendC::Abs(xTile, xTile, effLen);
+
+                AscendC::LocalTensor<float> sumLocal = sumQueue.AllocTensor<float>();
+                AscendC::ReduceSum(sumLocal, xTile, effLen);
+                // read scalar from local tensor
+                float tileSum = sumLocal.GetValue(0);
+                rowSum += tileSum;
+
+                sumQueue.FreeTensor(sumLocal);
+                inQueueX.FreeTensor(xTile);
+            }
+            if (tail > 0) {
+                AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xLocal, xGm[baseIndex + (uint64_t)fullTiles * this->tileCol], tail);
+                inQueueX.EnQue<DTYPE_X>(xLocal);
+
+                AscendC::LocalTensor<DTYPE_X> xTile = inQueueX.DeQue<DTYPE_X>();
+                AscendC::Abs(xTile, xTile, tail);
+
+                AscendC::LocalTensor<float> sumLocal = sumQueue.AllocTensor<float>();
+                AscendC::ReduceSum(sumLocal, xTile, tail);
+                float tileSum = sumLocal.GetValue(0);
+                rowSum += tileSum;
+
+                sumQueue.FreeTensor(sumLocal);
+                inQueueX.FreeTensor(xTile);
+            }
+
+            float meanVal = rowSum / static_cast<float>(this->colNum);
+            // Store mean for this row to workspace
+            AscendC::LocalTensor<float> meanTmp = sumQueue.AllocTensor<float>();
+            meanTmp.SetValue(0, meanVal);
+            AscendC::DataCopy(meanGm[r], meanTmp, 1);
+            sumQueue.FreeTensor(meanTmp);
+
+            // Phase 2: normalize this row by mean
+            // For each tile, load x, duplicate denom vector, div, write y
+            for (uint32_t t = 0; t < fullTiles; ++t) {
+                uint32_t effLen = this->tileCol;
+
+                AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xLocal, xGm[baseIndex + (uint64_t)t * this->tileCol], effLen);
+                inQueueX.EnQue<DTYPE_X>(xLocal);
+
+                AscendC::LocalTensor<DTYPE_X> xTile = inQueueX.DeQue<DTYPE_X>();
+                AscendC::LocalTensor<float> denomTile = denomQueue.AllocTensor<float>();
+                // duplicate meanVal across denom vector
+                AscendC::Dup(denomTile, meanVal, effLen);
+
+                AscendC::LocalTensor<DTYPE_Y> yTile = outQueueY.AllocTensor<DTYPE_Y>();
+                AscendC::Div(yTile, xTile, denomTile, effLen);
+
+                outQueueY.EnQue<DTYPE_Y>(yTile);
+                denomQueue.FreeTensor(denomTile);
+                inQueueX.FreeTensor(xTile);
+
+                AscendC::LocalTensor<DTYPE_Y> yOut = outQueueY.DeQue<DTYPE_Y>();
+                AscendC::DataCopy(yGm[baseIndex + (uint64_t)t * this->tileCol], yOut, effLen);
+                outQueueY.FreeTensor(yOut);
+            }
+            if (tail > 0) {
+                AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xLocal, xGm[baseIndex + (uint64_t)fullTiles * this->tileCol], tail);
+                inQueueX.EnQue<DTYPE_X>(xLocal);
+
+                AscendC::LocalTensor<DTYPE_X> xTile = inQueueX.DeQue<DTYPE_X>();
+                AscendC::LocalTensor<float> denomTile = denomQueue.AllocTensor<float>();
+                AscendC::Dup(denomTile, meanVal, tail);
+
+                AscendC::LocalTensor<DTYPE_Y> yTile = outQueueY.AllocTensor<DTYPE_Y>();
+                AscendC::Div(yTile, xTile, denomTile, tail);
+
+                outQueueY.EnQue<DTYPE_Y>(yTile);
+                denomQueue.FreeTensor(denomTile);
+                inQueueX.FreeTensor(xTile);
+
+                AscendC::LocalTensor<DTYPE_Y> yOut = outQueueY.DeQue<DTYPE_Y>();
+                AscendC::DataCopy(yGm[baseIndex + (uint64_t)fullTiles * this->tileCol], yOut, tail);
+                outQueueY.FreeTensor(yOut);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> denomQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> sumQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<float> meanGm;
+
+    uint32_t rowNum;
+    uint32_t colNum;
+    uint32_t tileCol;
+
+    uint32_t rowsPerBlock;
+    uint32_t rowStart;
+    uint32_t rowEnd;
+    uint32_t rowsThisBlock;
+};
+
+extern "C" __global__ __aicore__ void l1_norm_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelL1NormCustom op;
+    op.Init(x, y, workspace, tiling_data.rowNum, tiling_data.colNum, tiling_data.tileCol);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor l1_norm_custom_impl_npu(const at::Tensor& x) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnL1NormCustom, x, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("l1_norm_custom", &l1_norm_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("l1_norm_custom", &l1_norm_custom_impl_npu, "L1 normalization along dim=1");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.l1_norm_custom(x)
+
+def get_inputs():
+    batch_size = 32768
+    dim = 65535
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []
+'''
