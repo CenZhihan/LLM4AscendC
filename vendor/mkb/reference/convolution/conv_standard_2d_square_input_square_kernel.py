@@ -3,20 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class Model(nn.Module):
-    def __init__(self, num_classes=1000):
-        super(Model, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=96, kernel_size=11, stride=4, padding=2)
-    
-    def forward(self, x):
-        x = self.conv1(x)
-        return x
+    def __init__(self):
+        super().__init__()
 
-# Test code
-batch_size = 256
-num_classes = 1000
+    def forward(self, x, weight):
+        return F.conv2d(
+            x, weight, None,
+            stride=(1,1),
+            padding=(0,0),
+            dilation=(1,1),
+            groups=1,
+        )
 
 def get_inputs():
-    return [torch.rand(batch_size, 3, 224, 224)]
+    x = torch.rand(16, 16, 1024, 1024)
+    w = torch.rand(128, 16, 3, 3)
+    return [x, w]
 
 def get_init_inputs():
-    return [num_classes]
+    return []

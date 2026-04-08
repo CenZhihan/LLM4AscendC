@@ -1,38 +1,25 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    Model that performs a 3D transposed convolution, applies LeakyReLU, multiplies by a learnable parameter, 
-    applies LeakyReLU again, and performs a max pooling operation.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier_shape):
-        super(Model, self).__init__()
-        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
-        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
-        self.leaky_relu = nn.LeakyReLU(negative_slope=0.2)
-        self.max_pool = nn.MaxPool3d(kernel_size=2)
+    def __init__(self):
+        super().__init__()
 
-    def forward(self, x):
-        x = self.conv_transpose(x)
-        x = self.leaky_relu(x)
-        x = x * self.multiplier
-        x = self.leaky_relu(x)
-        x = self.max_pool(x)
-        return x
-
-batch_size = 16
-in_channels = 16
-out_channels = 32
-depth, height, width = 16, 32, 32
-kernel_size = 3
-stride = 2
-padding = 1
-output_padding = 1
-multiplier_shape = (out_channels, 1, 1, 1)
+    def forward(self, x, weight, conv_bias_opt, scale):
+        cb = conv_bias_opt if conv_bias_opt is not None else None
+        y = F.conv_transpose3d(x, weight, cb, stride=1, padding=0, output_padding=0, dilation=1, groups=1)
+        y = F.leaky_relu(y, 0.01)
+        y = y * scale.view(1, -1, 1, 1, 1)
+        y = F.leaky_relu(y, 0.01)
+        return torch.max(y, dim=2)[0]
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, depth, height, width)]
+    x = torch.rand(4, 32, 16, 16, 16)
+    w = torch.rand(32, 64, 3, 3, 3)
+    cb = torch.rand(64)
+    sc = torch.rand(64)
+    return [x, w, cb, sc]
 
 def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier_shape]
+    return []

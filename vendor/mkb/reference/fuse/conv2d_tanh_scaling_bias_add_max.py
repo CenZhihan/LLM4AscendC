@@ -1,29 +1,26 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
     """
-    A model that performs a convolution, applies tanh, scaling, adds a bias term, and then max-pools.
+    Pybind: (x, weight, conv_bias optional, post_bias [Cout,1,1] or [Cout], scaling_factor scalar tensor).
     """
     def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
         super(Model, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
-        self.scaling_factor = scaling_factor
-        self.bias = nn.Parameter(torch.randn(bias_shape))
-        self.max_pool = nn.MaxPool2d(pool_kernel_size)
+        self.pool_kernel_size = pool_kernel_size
 
-    def forward(self, x):
-        # Convolution
-        x = self.conv(x)
-        # Tanh activation
+    def forward(self, x, weight, conv_bias_opt, post_bias, scaling_factor):
+        s = float(scaling_factor.reshape(-1)[0].item())
+        conv_b = conv_bias_opt if conv_bias_opt is not None else None
+        x = F.conv2d(x, weight, conv_b, stride=1, padding=0, dilation=1)
         x = torch.tanh(x)
-        # Scaling
-        x = x * self.scaling_factor
-        # Bias addition
-        x = x + self.bias
-        # Max-pooling
-        x = self.max_pool(x)
-        return x
+        x = x * s
+        if post_bias.dim() == 1:
+            x = x + post_bias.view(1, -1, 1, 1)
+        else:
+            x = x + post_bias
+        return F.max_pool2d(x, kernel_size=self.pool_kernel_size, stride=self.pool_kernel_size)
 
 batch_size = 128
 in_channels = 8
@@ -35,7 +32,12 @@ bias_shape = (out_channels, 1, 1)
 pool_kernel_size = 4
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, height, width)]
+    x = torch.rand(batch_size, in_channels, height, width)
+    w = torch.rand(out_channels, in_channels, kernel_size, kernel_size)
+    cb = torch.rand(out_channels)
+    pb = torch.randn(bias_shape)
+    sc = torch.tensor(scaling_factor, dtype=torch.float32)
+    return [x, w, cb, pb, sc]
 
 def get_init_inputs():
     return [in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size]

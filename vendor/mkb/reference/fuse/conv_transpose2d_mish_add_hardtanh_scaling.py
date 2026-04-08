@@ -1,38 +1,25 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+def mish(t):
+    return t * torch.tanh(F.softplus(t))
 
 class Model(nn.Module):
-    """
-    Model that performs a transposed convolution, applies Mish activation, adds a value, 
-    applies Hardtanh activation, and scales the output.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale):
-        super(Model, self).__init__()
-        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, output_padding)
-        self.add_value = add_value
-        self.scale = scale
+    def __init__(self):
+        super().__init__()
 
-    def forward(self, x):
-        x = self.conv_transpose(x)
-        x = torch.nn.functional.mish(x) # Mish activation
-        x = x + self.add_value
-        x = torch.nn.functional.hardtanh(x, min_val=-1, max_val=1) # Hardtanh activation
-        x = x * self.scale # Scaling
-        return x
-
-batch_size = 128
-in_channels  = 64  
-out_channels = 64  
-height = width = 128  
-kernel_size  = 3
-stride       = 2  
-padding      = 1
-output_padding = 1
-add_value = 0.5
-scale = 2
+    def forward(self, x, weight, conv_bias_opt):
+        cb = conv_bias_opt if conv_bias_opt is not None else None
+        y = F.conv_transpose2d(x, weight, cb, stride=1, padding=0, output_padding=0, dilation=1, groups=1)
+        y = mish(y + 1.0)
+        return F.hardtanh(y * 1.0, -1.0, 1.0)
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, height, width)]
+    x = torch.rand(8, 64, 32, 32)
+    w = torch.rand(64, 32, 3, 3)
+    cb = torch.rand(32)
+    return [x, w, cb]
 
 def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale]
+    return []

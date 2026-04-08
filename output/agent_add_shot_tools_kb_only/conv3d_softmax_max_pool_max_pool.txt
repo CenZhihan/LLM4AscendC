@@ -1,0 +1,295 @@
+project_json_src='''
+[
+    {
+        "op": "Conv3dSoftmaxMaxPoolMaxPoolCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv3dSoftmaxMaxPoolMaxPoolCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, m);   // N*D*H*W
+  TILING_DATA_FIELD_DEF(uint32_t, k);   // C (last axis length after permute to NDHWC)
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv3dSoftmaxMaxPoolMaxPoolCustom, Conv3dSoftmaxMaxPoolMaxPoolCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv3d_softmax_max_pool_max_pool_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv3dSoftmaxMaxPoolMaxPoolCustomTilingData tiling;
+
+    // Expect input in NDHWC layout before calling the custom kernel
+    const gert::Shape* inShape = context->GetInputShape(0);
+    auto originShape = inShape->GetOriginShape();
+    int64_t dimNum = originShape.GetDimNum();
+
+    if (dimNum != 5) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // NDHWC
+    uint64_t N = static_cast<uint64_t>(originShape.GetDim(0));
+    uint64_t D = static_cast<uint64_t>(originShape.GetDim(1));
+    uint64_t H = static_cast<uint64_t>(originShape.GetDim(2));
+    uint64_t W = static_cast<uint64_t>(originShape.GetDim(3));
+    uint64_t C = static_cast<uint64_t>(originShape.GetDim(4));
+
+    uint64_t m = N * D * H * W;
+    uint64_t k = C;
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_m(static_cast<uint32_t>(m));
+    tiling.set_k(static_cast<uint32_t>(k));
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // Output shape equals input shape (softmax along channel does not change shape)
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv3dSoftmaxMaxPoolMaxPoolCustom : public OpDef {
+public:
+    explicit Conv3dSoftmaxMaxPoolMaxPoolCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv3dSoftmaxMaxPoolMaxPoolCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+
+class KernelSoftmaxChannelsLast {
+public:
+    __aicore__ inline KernelSoftmaxChannelsLast() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t m, uint32_t k)
+    {
+        this->rows = m; // N*D*H*W
+        this->cols = k; // C
+        // global buffers: NDHWC flattened as [m, k], last axis = C
+        xGm.SetGlobalBuffer((__gm__ DTYPE*)x);
+        yGm.SetGlobalBuffer((__gm__ DTYPE*)y);
+
+        // For simplicity, allocate single-buffer queues sized by (m * k).
+        // Note: In real kernels, please tile to fit into local memory.
+        pipe.InitBuffer(inQueueSrc, 1, rows * cols * sizeof(DTYPE));
+        pipe.InitBuffer(sumQueue, 1, rows * (32 / sizeof(DTYPE)) * sizeof(DTYPE));  // block-broadcast buffer
+        pipe.InitBuffer(maxQueue, 1, rows * (32 / sizeof(DTYPE)) * sizeof(DTYPE));
+        pipe.InitBuffer(expMaxQueue, 1, rows * (32 / sizeof(DTYPE)) * sizeof(DTYPE));
+        pipe.InitBuffer(outQueueDst, 1, rows * cols * sizeof(DTYPE));
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<DTYPE> srcLocal = inQueueSrc.AllocTensor<DTYPE>();
+        AscendC::DataCopy(srcLocal, xGm, rows * cols);
+        inQueueSrc.EnQue(srcLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<DTYPE> srcLocal = inQueueSrc.DeQue<DTYPE>();
+        AscendC::LocalTensor<DTYPE> expMaxLocal = expMaxQueue.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<DTYPE> dstLocal = outQueueDst.AllocTensor<DTYPE>();
+
+        // sum/max buffers for reducesum/reducemax results; length of last axis fixed to 32 bytes
+        AscendC::LocalTensor<DTYPE> sumTempLocal = sumQueue.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<DTYPE> maxTempLocal = maxQueue.AllocTensor<DTYPE>();
+
+        // Build SoftMax shape info: [m, k]
+        AscendC::SoftMaxShapeInfo shapeInfo = {rows, cols, rows, cols};
+
+        // Compute tiling in-kernel
+        constexpr bool isUpdate = false;
+        constexpr bool isBasicBlock = false;
+        constexpr bool isDataFormatNZ = false;
+        constexpr bool isFlashOutputBrc = false;
+        auto tiling = AscendC::SoftMaxFlashV2TilingFunc(
+            shapeInfo,
+            sizeof(DTYPE), sizeof(DTYPE),
+            0, // localWorkSpaceSize
+            isUpdate, isBasicBlock, isDataFormatNZ, isFlashOutputBrc
+        );
+
+        // Run SoftmaxFlashV2 with isUpdate = false
+        AscendC::SoftmaxFlashV2<DTYPE, false>(
+            dstLocal, sumTempLocal, maxTempLocal, srcLocal,
+            expMaxLocal, sumTempLocal, maxTempLocal, tiling, shapeInfo
+        );
+
+        outQueueDst.EnQue<DTYPE>(dstLocal);
+        expMaxQueue.FreeTensor(expMaxLocal);
+        maxQueue.FreeTensor(maxTempLocal);
+        sumQueue.FreeTensor(sumTempLocal);
+        inQueueSrc.FreeTensor(srcLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<DTYPE> dstLocal = outQueueDst.DeQue<DTYPE>();
+        AscendC::DataCopy(yGm, dstLocal, rows * cols);
+        outQueueDst.FreeTensor(dstLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueSrc;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> sumQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> maxQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> expMaxQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueDst;
+
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+
+    uint32_t rows; // m
+    uint32_t cols; // k
+};
+
+extern "C" __global__ __aicore__ void conv3d_softmax_max_pool_max_pool_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelSoftmaxChannelsLast op;
+    op.Init(x, y, tiling_data.m, tiling_data.k);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv3d_softmax_max_pool_max_pool_custom_impl_npu(const at::Tensor& x_ndhwc) {
+    at::Tensor result = at::empty_like(x_ndhwc);
+    EXEC_NPU_CMD(aclnnConv3dSoftmaxMaxPoolMaxPoolCustom, x_ndhwc, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv3d_softmax_max_pool_max_pool_custom", &conv3d_softmax_max_pool_max_pool_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv3d_softmax_max_pool_max_pool_custom", &conv3d_softmax_max_pool_max_pool_custom_impl_npu, "softmax over channels (last dim)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model: keep Conv3d on PyTorch, replace Softmax with custom AscendC kernel,
+    and keep subsequent MaxPool3d operations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = torch.nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.pool1 = torch.nn.MaxPool3d(pool_kernel_size)
+        self.pool2 = torch.nn.MaxPool3d(pool_kernel_size)
+
+    def forward(self, x):
+        # x: N, C, D, H, W
+        x = self.conv(x)
+        # Move channels to last dim for channel-wise softmax on last axis
+        x_ndhwc = x.permute(0, 2, 3, 4, 1).contiguous()
+        # Custom kernel computes softmax along last axis (channels)
+        x_ndhwc = custom_ops_lib.conv3d_softmax_max_pool_max_pool_custom(x_ndhwc)
+        # Restore to N, C, D, H, W
+        x = x_ndhwc.permute(0, 4, 1, 2, 3).contiguous()
+        # Apply two max pools
+        x = self.pool1(x)
+        x = self.pool2(x)
+        return x
+'''

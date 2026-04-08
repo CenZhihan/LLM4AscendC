@@ -1,38 +1,25 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    Model that performs a transposed convolution, adds a bias term, clamps, scales, clamps, and divides.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
-        super(Model, self).__init__()
-        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
-        self.bias = nn.Parameter(torch.randn(bias_shape)) 
-        self.scaling_factor = scaling_factor
+    def __init__(self):
+        super().__init__()
 
-    def forward(self, x):
-        x = self.conv_transpose(x)
-        x = x + self.bias
-        x = torch.clamp(x, min=0.0, max=1.0)
-        x = x * self.scaling_factor
-        x = torch.clamp(x, min=0.0, max=1.0)
-        x = x / self.scaling_factor
-        return x
-
-batch_size = 128
-in_channels  = 64  
-out_channels = 64  
-height = width = 128 
-kernel_size = 3
-stride = 2
-padding = 1
-output_padding = 1
-bias_shape = (out_channels, 1, 1)
-scaling_factor = 2.0
+    def forward(self, x, weight, conv_bias_opt, bias):
+        cb = conv_bias_opt if conv_bias_opt is not None else None
+        y = F.conv_transpose2d(x, weight, cb, stride=1, padding=0, output_padding=0, dilation=1, groups=1)
+        y = y + bias.view(1, -1, 1, 1)
+        y = y.clamp(0.0, 1.0)
+        y = y * 2.0
+        return (y / (y + 1e-6)).clamp(0.0, 1.0)
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, height, width)]
+    x = torch.rand(8, 64, 32, 32)
+    w = torch.rand(64, 32, 3, 3)
+    cb = torch.rand(32)
+    b = torch.rand(32, 1, 1)
+    return [x, w, cb, b]
 
 def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor]
+    return []

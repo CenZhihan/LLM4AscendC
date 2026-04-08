@@ -1,32 +1,22 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
     """
-    A model that performs a GEMM, BiasAdd, Hardtanh, Mish, and GroupNorm operations in sequence.
+    Pybind: (x, weight, lin_bias, bias, gn_gamma, gn_beta).
     """
     def __init__(self, in_features, out_features, bias_shape, num_groups):
         super(Model, self).__init__()
-        self.gemm = nn.Linear(in_features, out_features)
-        self.bias = nn.Parameter(torch.randn(bias_shape))
-        self.hardtanh = nn.Hardtanh()
-        self.mish = nn.Mish()
-        self.groupnorm = nn.GroupNorm(num_groups=num_groups, num_channels=out_features)
+        self.num_groups = num_groups
 
-    def forward(self, x):
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, out_features).
-        """
-        x = self.gemm(x)
-        x = x + self.bias
-        x = self.hardtanh(x)
-        x = self.mish(x)
-        x = self.groupnorm(x)
+    def forward(self, x, weight, lin_bias, bias, gn_gamma, gn_beta):
+        x = F.linear(x, weight, lin_bias)
+        x = x + bias
+        x = F.hardtanh(x)
+        x = F.mish(x)
+        x = F.group_norm(x, self.num_groups, gn_gamma, gn_beta)
         return x
-
 
 batch_size = 1024
 in_features = 8192
@@ -35,7 +25,13 @@ bias_shape = (out_features,)
 num_groups = 256
 
 def get_inputs():
-    return [torch.rand(batch_size, in_features)]
+    x = torch.rand(batch_size, in_features)
+    w = torch.rand(out_features, in_features)
+    lin_bias = torch.rand(out_features)
+    bias = torch.rand(out_features)
+    gn_gamma = torch.rand(out_features)
+    gn_beta = torch.rand(out_features)
+    return [x, w, lin_bias, bias, gn_gamma, gn_beta]
 
 def get_init_inputs():
     return [in_features, out_features, bias_shape, num_groups]

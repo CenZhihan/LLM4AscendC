@@ -43,12 +43,15 @@ class Model(nn.Module):
         self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
         self.out_dim = self.cluster_size * feature_size
 
-    def forward(self, x, mask=None):
+    def forward(self, x, clusters, clusters2, bn_weight, bn_bias, bn_mean, bn_var):
         """Aggregates feature maps into a fixed size representation.  In the following
         notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
 
         Args:
             x (th.Tensor): B x N x D
+            clusters: cluster assignments weights
+            clusters2: cluster centers
+            bn_weight, bn_bias, bn_mean, bn_var: batch norm parameters
 
         Returns:
             (th.Tensor): B x DK
@@ -56,19 +59,30 @@ class Model(nn.Module):
         max_sample = x.size()[1]
         x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
 
-        if x.device != self.clusters.device:
-            msg = f"x.device {x.device} != cluster.device {self.clusters.device}"
+        if x.device != clusters.device:
+            msg = f"x.device {x.device} != cluster.device {clusters.device}"
             raise ValueError(msg)
 
-        assignment = th.matmul(x, self.clusters)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
-        assignment = self.batch_norm(assignment)
+        assignment = th.matmul(x, clusters)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+
+        # Apply batch norm with provided parameters
+        if bn_mean is not None and bn_var is not None:
+            bn_mean_exp = bn_mean.unsqueeze(0)
+            bn_var_exp = bn_var.unsqueeze(0)
+            bn_weight_exp = bn_weight.unsqueeze(0) if bn_weight is not None else None
+            bn_bias_exp = bn_bias.unsqueeze(0) if bn_bias is not None else None
+            assignment = (assignment - bn_mean_exp) / (bn_var_exp.sqrt() + 1e-5)
+            if bn_weight_exp is not None:
+                assignment = assignment * bn_weight_exp
+            if bn_bias_exp is not None:
+                assignment = assignment + bn_bias_exp
 
         assignment = F.softmax(assignment, dim=1)  # BN x (K+G) -> BN x (K+G)
         # remove ghost assigments
         assignment = assignment[:, :self.cluster_size]
         assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
         a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
-        a = a_sum * self.clusters2
+        a = a_sum * clusters2
 
         assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
 
@@ -88,11 +102,21 @@ class Model(nn.Module):
 batch_size = 2048
 num_features = 100
 num_clusters = 32
-feature_size = 512
-ghost_clusters = 16
+feature_size = 48  # Must match 165 op: clusters [512, 48]
+ghost_clusters = 480  # K+G = 512, so G = 512 - 32 = 480
 
 def get_inputs():
-  return [torch.rand(batch_size, num_features, feature_size)]
+    x = torch.rand(batch_size, num_features, feature_size)
+    # Must match 165 op: clusters [512, 48] = [K+G, feature_size]
+    clusters = torch.rand(num_clusters + ghost_clusters, feature_size)
+    # Must match 165 op: clusters2 [1, 512, 32] = [1, K+G, K]
+    clusters2 = torch.rand(1, num_clusters + ghost_clusters, num_clusters)
+    # Must match 165 op: bn_* [48]
+    bn_weight = torch.rand(feature_size)
+    bn_bias = torch.rand(feature_size)
+    bn_mean = torch.rand(feature_size)
+    bn_var = torch.rand(feature_size)
+    return [x, clusters, clusters2, bn_weight, bn_bias, bn_mean, bn_var]
 
 def get_init_inputs():
-  return [num_clusters, feature_size, ghost_clusters]
+    return [num_clusters, feature_size, ghost_clusters]

@@ -1,31 +1,20 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
     """
-    Model implementing the pattern "Gemm_Sigmoid_Scaling_ResidualAdd".
+    Pybind: (x, w, b, scaling) with scaling scalar float tensor.
     """
     def __init__(self, input_size, hidden_size, scaling_factor):
         super(Model, self).__init__()
-        self.gemm = nn.Linear(input_size, hidden_size)
-        self.scaling_factor = scaling_factor
+        self.input_size = input_size
+        self.hidden_size = hidden_size
 
-    def forward(self, x):
-        """
-        Forward pass of the model.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, input_size).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, hidden_size).
-        """
-        x = self.gemm(x)
-        original_x = x
-        x = torch.sigmoid(x)
-        x = x * self.scaling_factor
-        x = x + original_x
-        return x
+    def forward(self, x, w, b, scaling):
+        s = float(scaling.detach().cpu().item())
+        y = F.linear(x, w, b)
+        return torch.sigmoid(y) * s + y
 
 batch_size = 1024
 input_size = 8192
@@ -33,7 +22,11 @@ hidden_size = 8192
 scaling_factor = 2.0
 
 def get_inputs():
-    return [torch.rand(batch_size, input_size)]
+    x = torch.rand(batch_size, input_size)
+    w = torch.rand(hidden_size, input_size)
+    b = torch.rand(hidden_size)
+    scaling = torch.tensor(scaling_factor, dtype=torch.float32)
+    return [x, w, b, scaling]
 
 def get_init_inputs():
     return [input_size, hidden_size, scaling_factor]

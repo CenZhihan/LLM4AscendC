@@ -1,27 +1,19 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    Simple model that performs a GEMM, applies Group Normalization, and then HardTanh.
-    """
+    """Pybind: (x, weight, lin_bias, gn_gamma, gn_beta)."""
     def __init__(self, in_features, out_features, num_groups, hardtanh_min, hardtanh_max):
         super(Model, self).__init__()
-        self.gemm = nn.Linear(in_features, out_features)
-        self.group_norm = nn.GroupNorm(num_groups, out_features)
-        self.hardtanh = nn.Hardtanh(min_val=hardtanh_min, max_val=hardtanh_max)
+        self.num_groups = num_groups
+        self.hardtanh_min = hardtanh_min
+        self.hardtanh_max = hardtanh_max
 
-    def forward(self, x):
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, out_features).
-        """
-        x = self.gemm(x)
-        x = self.group_norm(x)
-        x = self.hardtanh(x)
-        return x
+    def forward(self, x, weight, lin_bias, gn_gamma, gn_beta):
+        x = F.linear(x, weight, lin_bias)
+        x = F.group_norm(x, self.num_groups, gn_gamma, gn_beta)
+        return F.hardtanh(x, min_val=self.hardtanh_min, max_val=self.hardtanh_max)
 
 batch_size = 1024
 in_features = 8192
@@ -31,7 +23,12 @@ hardtanh_min = -2.0
 hardtanh_max = 2.0
 
 def get_inputs():
-    return [torch.rand(batch_size, in_features)]
+    x = torch.rand(batch_size, in_features)
+    w = torch.rand(out_features, in_features)
+    lin_bias = torch.rand(out_features)
+    gn_gamma = torch.rand(out_features)
+    gn_beta = torch.rand(out_features)
+    return [x, w, lin_bias, gn_gamma, gn_beta]
 
 def get_init_inputs():
     return [in_features, out_features, num_groups, hardtanh_min, hardtanh_max]

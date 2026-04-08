@@ -1,0 +1,706 @@
+```python
+project_json_src='''
+
+[
+  {
+    "op": "Conv3dGroupNormMinClampDropoutCustom",
+    "input_desc": [
+      { "name": "x",        "param_type": "required", "format": ["ND"], "type": ["float"] },
+      { "name": "weight",   "param_type": "required", "format": ["ND"], "type": ["float"] },
+      { "name": "bias",     "param_type": "required", "format": ["ND"], "type": ["float"] },
+      { "name": "gn_gamma", "param_type": "required", "format": ["ND"], "type": ["float"] },
+      { "name": "gn_beta",  "param_type": "required", "format": ["ND"], "type": ["float"] }
+    ],
+    "output_desc": [
+      { "name": "y", "param_type": "required", "format": ["ND"], "type": ["float"] }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(Conv3dGroupNormMinClampDropoutCustomTilingData)
+  // runtime
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+
+  // specialized constants for kernel
+  TILING_DATA_FIELD_DEF(uint32_t, Cin);
+  TILING_DATA_FIELD_DEF(uint32_t, Din);
+  TILING_DATA_FIELD_DEF(uint32_t, Hin);
+  TILING_DATA_FIELD_DEF(uint32_t, Win);
+
+  TILING_DATA_FIELD_DEF(uint32_t, Cout);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+
+  TILING_DATA_FIELD_DEF(uint32_t, Dout);
+  TILING_DATA_FIELD_DEF(uint32_t, Hout);
+  TILING_DATA_FIELD_DEF(uint32_t, Wout);
+
+  TILING_DATA_FIELD_DEF(uint32_t, G);
+  TILING_DATA_FIELD_DEF(uint32_t, CperG);
+
+  TILING_DATA_FIELD_DEF(uint32_t, DHW);
+  TILING_DATA_FIELD_DEF(uint32_t, elemsPerG);
+  TILING_DATA_FIELD_DEF(float, invElemsPerG);
+  TILING_DATA_FIELD_DEF(float, eps);
+
+  TILING_DATA_FIELD_DEF(float, minValue);
+  TILING_DATA_FIELD_DEF(float, clampMin);
+  TILING_DATA_FIELD_DEF(float, clampMax);
+
+  // Dropout params
+  TILING_DATA_FIELD_DEF(float, dropoutP);
+  TILING_DATA_FIELD_DEF(uint32_t, dropThresholdU32);
+  TILING_DATA_FIELD_DEF(float, invKeepProb);
+
+  // parallel mapping
+  TILING_DATA_FIELD_DEF(uint32_t, tasksPerSample); // == G
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv3dGroupNormMinClampDropoutCustom,
+                           Conv3dGroupNormMinClampDropoutCustomTilingData)
+
+} // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "conv3d_group_norm_min_clamp_dropout_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <cstdint>
+#include <cmath>
+
+namespace optiling {
+
+// Specialized benchmark contract (fixed except N)
+static constexpr uint32_t CIN  = 3;
+static constexpr uint32_t DIN  = 16;
+static constexpr uint32_t HIN  = 64;
+static constexpr uint32_t WIN  = 64;
+
+static constexpr uint32_t COUT = 16;
+static constexpr uint32_t K    = 3;
+
+// Conv3d: stride=1, pad=0, dilation=1
+static constexpr uint32_t STR = 1;
+static constexpr uint32_t PAD = 0;
+static constexpr uint32_t DIL = 1;
+
+static constexpr uint32_t DOUT = (DIN + 2 * PAD - DIL * (K - 1) - 1) / STR + 1; // 14
+static constexpr uint32_t HOUT = (HIN + 2 * PAD - DIL * (K - 1) - 1) / STR + 1; // 62
+static constexpr uint32_t WOUT = (WIN + 2 * PAD - DIL * (K - 1) - 1) / STR + 1; // 62
+
+static constexpr uint32_t G = 8;
+static constexpr float EPS = 1e-5f;
+
+// Min and clamp are specialized exactly to min(.,0) then clamp [0,1]
+static constexpr float MIN_VALUE = 0.0f;
+static constexpr float CLAMP_MIN = 0.0f;
+static constexpr float CLAMP_MAX = 1.0f;
+
+// Dropout always applied (training-like), p=0.2
+static constexpr float DROPOUT_P = 0.2f;
+
+// Raise occupancy: map blocks over N*G tasks
+static constexpr uint32_t MAX_BLOCK_DIM = 96;
+
+static inline uint32_t DropThresholdU32(float p)
+{
+    if (p <= 0.0f) return 0u;
+    if (p >= 1.0f) return 0xFFFFFFFFu;
+    const double scale = 4294967296.0; // 2^32
+    double v = static_cast<double>(p) * scale;
+    if (v < 0.0) v = 0.0;
+    if (v > 4294967295.0) v = 4294967295.0;
+    return static_cast<uint32_t>(v);
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv3dGroupNormMinClampDropoutCustomTilingData tiling;
+
+    const auto* xShape = context->GetInputShape(0);
+    const auto* wShape = context->GetInputShape(1);
+    const auto* bShape = context->GetInputShape(2);
+    const auto* gShape = context->GetInputShape(3);
+    const auto* beShape = context->GetInputShape(4);
+    if (!xShape || !wShape || !bShape || !gShape || !beShape) return ge::GRAPH_FAILED;
+
+    const auto& xOs = xShape->GetOriginShape();
+    const auto& wOs = wShape->GetOriginShape();
+    const auto& bOs = bShape->GetOriginShape();
+    const auto& gOs = gShape->GetOriginShape();
+    const auto& beOs = beShape->GetOriginShape();
+
+    if (xOs.GetDimNum() != 5 || wOs.GetDimNum() != 5) return ge::GRAPH_FAILED;
+    if (bOs.GetDimNum() != 1 || gOs.GetDimNum() != 1 || beOs.GetDimNum() != 1) return ge::GRAPH_FAILED;
+
+    const int64_t N64 = xOs.GetDim(0);
+    if (N64 <= 0) return ge::GRAPH_FAILED;
+
+    if (static_cast<uint32_t>(xOs.GetDim(1)) != CIN ||
+        static_cast<uint32_t>(xOs.GetDim(2)) != DIN ||
+        static_cast<uint32_t>(xOs.GetDim(3)) != HIN ||
+        static_cast<uint32_t>(xOs.GetDim(4)) != WIN) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // weight: [Cout,Cin,K,K,K]
+    if (static_cast<uint32_t>(wOs.GetDim(0)) != COUT ||
+        static_cast<uint32_t>(wOs.GetDim(1)) != CIN ||
+        static_cast<uint32_t>(wOs.GetDim(2)) != K ||
+        static_cast<uint32_t>(wOs.GetDim(3)) != K ||
+        static_cast<uint32_t>(wOs.GetDim(4)) != K) {
+        return ge::GRAPH_FAILED;
+    }
+
+    if (static_cast<uint32_t>(bOs.GetDim(0)) != COUT) return ge::GRAPH_FAILED;
+    if (static_cast<uint32_t>(gOs.GetDim(0)) != COUT) return ge::GRAPH_FAILED;
+    if (static_cast<uint32_t>(beOs.GetDim(0)) != COUT) return ge::GRAPH_FAILED;
+
+    if (G == 0 || (COUT % G) != 0) return ge::GRAPH_FAILED;
+    const uint32_t CperG = COUT / G;
+
+    const uint32_t DHW = DOUT * HOUT * WOUT;
+    const uint32_t elemsPerG = CperG * DHW;
+    if (DHW == 0 || elemsPerG == 0) return ge::GRAPH_FAILED;
+
+    uint32_t N = static_cast<uint32_t>(N64 > 0xFFFFFFFFLL ? 0xFFFFFFFFu : static_cast<uint32_t>(N64));
+
+    // tasks = N*G; cap blockDim conservatively
+    uint64_t tasks64 = static_cast<uint64_t>(N) * static_cast<uint64_t>(G);
+    uint32_t tasks = static_cast<uint32_t>(tasks64 > 0xFFFFFFFFULL ? 0xFFFFFFFFu : static_cast<uint32_t>(tasks64));
+
+    uint32_t blockDim = MAX_BLOCK_DIM;
+    if (tasks > 0 && tasks < blockDim) blockDim = tasks;
+    if (blockDim == 0) blockDim = 1;
+    context->SetBlockDim(blockDim);
+
+    const float keepProb = 1.0f - DROPOUT_P;
+    if (!(keepProb > 0.0f)) return ge::GRAPH_FAILED;
+    const float invKeepProb = 1.0f / keepProb;
+
+    tiling.set_N(N);
+
+    tiling.set_Cin(CIN);
+    tiling.set_Din(DIN);
+    tiling.set_Hin(HIN);
+    tiling.set_Win(WIN);
+
+    tiling.set_Cout(COUT);
+    tiling.set_K(K);
+
+    tiling.set_Dout(DOUT);
+    tiling.set_Hout(HOUT);
+    tiling.set_Wout(WOUT);
+
+    tiling.set_G(G);
+    tiling.set_CperG(CperG);
+
+    tiling.set_DHW(DHW);
+    tiling.set_elemsPerG(elemsPerG);
+    tiling.set_invElemsPerG(1.0f / static_cast<float>(elemsPerG));
+    tiling.set_eps(EPS);
+
+    tiling.set_minValue(MIN_VALUE);
+    tiling.set_clampMin(CLAMP_MIN);
+    tiling.set_clampMax(CLAMP_MAX);
+
+    tiling.set_dropoutP(DROPOUT_P);
+    tiling.set_dropThresholdU32(DropThresholdU32(DROPOUT_P));
+    tiling.set_invKeepProb(invKeepProb);
+
+    tiling.set_tasksPerSample(G);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x = context->GetInputShape(0);
+    if (x == nullptr) return GRAPH_FAILED;
+    if (x->GetDimNum() != 5) return GRAPH_FAILED;
+
+    gert::Shape* y = context->GetOutputShape(0);
+    if (y == nullptr) return GRAPH_FAILED;
+
+    // specialized output: [N,16,14,62,62]
+    y->SetDimNum(5);
+    y->SetDim(0, x->GetDim(0));
+    y->SetDim(1, 16);
+    y->SetDim(2, 14);
+    y->SetDim(3, 62);
+    y->SetDim(4, 62);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    context->SetOutputDataType(0, ge::DT_FLOAT);
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+
+class Conv3dGroupNormMinClampDropoutCustom : public OpDef {
+public:
+    explicit Conv3dGroupNormMinClampDropoutCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("gn_gamma")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("gn_beta")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv3dGroupNormMinClampDropoutCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelConv3dGroupNormMinClampDropoutCustom {
+public:
+    __aicore__ inline KernelConv3dGroupNormMinClampDropoutCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b,
+                               GM_ADDR gn_gamma, GM_ADDR gn_beta,
+                               GM_ADDR y,
+                               uint32_t Cin, uint32_t Din, uint32_t Hin, uint32_t Win,
+                               uint32_t Cout, uint32_t K,
+                               uint32_t Dout, uint32_t Hout, uint32_t Wout,
+                               uint32_t G, uint32_t CperG,
+                               uint32_t DHW, uint32_t elemsPerG,
+                               float invElemsPerG, float eps,
+                               float minValue, float clampMin, float clampMax,
+                               uint32_t dropThresholdU32,
+                               float invKeepProb,
+                               uint32_t N,
+                               uint32_t tasksPerSample)
+    {
+        Cin_ = Cin; Din_ = Din; Hin_ = Hin; Win_ = Win;
+        Cout_ = Cout; K_ = K;
+        Dout_ = Dout; Hout_ = Hout; Wout_ = Wout;
+        G_ = G; CperG_ = CperG;
+        DHW_ = DHW; elemsPerG_ = elemsPerG;
+        invElemsPerG_ = invElemsPerG; eps_ = eps;
+
+        minValue_ = minValue;
+        clampMin_ = clampMin;
+        clampMax_ = clampMax;
+
+        dropThresholdU32_ = dropThresholdU32;
+        invKeepProb_ = invKeepProb;
+
+        N_ = N;
+        tasksPerSample_ = tasksPerSample;
+
+        xBase_ = reinterpret_cast<__gm__ float*>(x);
+        wBase_ = reinterpret_cast<__gm__ float*>(w);
+        bBase_ = reinterpret_cast<__gm__ float*>(b);
+        gammaBase_ = reinterpret_cast<__gm__ float*>(gn_gamma);
+        betaBase_  = reinterpret_cast<__gm__ float*>(gn_beta);
+        yBase_ = reinterpret_cast<__gm__ float*>(y);
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        const uint32_t tasks = N_ * tasksPerSample_;
+        const uint32_t perCore = (tasks + blockNum - 1u) / blockNum;
+        const uint32_t startTask = blockIdx * perCore;
+
+        uint32_t count = 0;
+        if (startTask < tasks) {
+            const uint32_t remain = tasks - startTask;
+            count = (remain < perCore) ? remain : perCore;
+        }
+        taskStart_ = startTask;
+        taskCount_ = count;
+
+        // scalar scratch for Rsqrt(1 element)
+        pipe_.InitBuffer(qSc_, BUFFER_NUM, 64 * sizeof(float));
+        sc_ = qSc_.AllocTensor<float>();
+
+        // cache per-channel params into UB once per block: bias/gamma/beta for 16 channels
+        pipe_.InitBuffer(qParam_, BUFFER_NUM, 3 * 16 * sizeof(float));
+        param_ = qParam_.AllocTensor<float>();
+        #pragma unroll
+        for (uint32_t i = 0; i < 16u; ++i) {
+            param_.SetValue(i + 0u,  bBase_[i]);
+            param_.SetValue(i + 16u, gammaBase_[i]);
+            param_.SetValue(i + 32u, betaBase_[i]);
+        }
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (taskCount_ == 0) {
+            qParam_.FreeTensor(param_);
+            qSc_.FreeTensor(sc_);
+            return;
+        }
+        for (uint32_t t = 0; t < taskCount_; ++t) {
+            ComputeOneTask(taskStart_ + t);
+        }
+        qParam_.FreeTensor(param_);
+        qSc_.FreeTensor(sc_);
+    }
+
+private:
+    __aicore__ inline float Rsqrt1(float v)
+    {
+        sc_.SetValue(0, v);
+        AscendC::Rsqrt<float>(sc_, sc_, 1);
+        return sc_.GetValue(0);
+    }
+
+    __aicore__ inline float ApplyMinClamp(float v) const
+    {
+        // torch.min(v, 0.0): cap values ABOVE 0 down to 0
+        if (v > minValue_) v = minValue_;
+        // clamp [0,1]
+        if (v < clampMin_) v = clampMin_;
+        if (v > clampMax_) v = clampMax_;
+        return v;
+    }
+
+    // Cheaper RNG: per-(n,co) seed and simple LCG per element
+    __aicore__ inline uint32_t Seed(uint32_t n, uint32_t co) const
+    {
+        uint32_t s = 0xD1B54A35u;
+        s ^= (n + 1u) * 0x9E3779B9u;
+        s ^= (co + 1u) * 0x85EBCA6Bu;
+        return s;
+    }
+    __aicore__ inline uint32_t LcgNext(uint32_t s) const
+    {
+        return s * 1664525u + 1013904223u;
+    }
+
+    __aicore__ inline float ConvAt(const uint64_t xBaseN,
+                                   const uint32_t co, const uint32_t od, const uint32_t oh, const uint32_t ow,
+                                   const float biasVal,
+                                   const uint64_t strideC, const uint64_t strideD, const uint64_t strideH) const
+    {
+        // Specialized: Cin=3, K=3, stride=1, pad=0, dil=1
+        float acc = biasVal;
+        const uint64_t wBaseCo = static_cast<uint64_t>(co) * 81ull;
+
+        #pragma unroll
+        for (uint32_t ci = 0; ci < 3u; ++ci) {
+            const uint64_t xBaseNC = xBaseN + static_cast<uint64_t>(ci) * strideC;
+            const uint64_t wBaseCoCi = wBaseCo + static_cast<uint64_t>(ci) * 27ull;
+
+            uint32_t wIdx = 0;
+            #pragma unroll
+            for (uint32_t kd = 0; kd < 3u; ++kd) {
+                const uint32_t id = od + kd;
+                const uint64_t xZ = xBaseNC + static_cast<uint64_t>(id) * strideD;
+
+                #pragma unroll
+                for (uint32_t kh = 0; kh < 3u; ++kh) {
+                    const uint32_t ih = oh + kh;
+                    const uint64_t xY = xZ + static_cast<uint64_t>(ih) * strideH;
+                    const uint64_t xOff = xY + static_cast<uint64_t>(ow);
+
+                    // contiguous in W
+                    const float x0 = xBase_[xOff + 0];
+                    const float x1 = xBase_[xOff + 1];
+                    const float x2 = xBase_[xOff + 2];
+
+                    const float w0 = wBase_[wBaseCoCi + static_cast<uint64_t>(wIdx + 0)];
+                    const float w1 = wBase_[wBaseCoCi + static_cast<uint64_t>(wIdx + 1)];
+                    const float w2 = wBase_[wBaseCoCi + static_cast<uint64_t>(wIdx + 2)];
+                    wIdx += 3;
+
+                    acc += x0 * w0 + x1 * w1 + x2 * w2;
+                }
+            }
+        }
+        return acc;
+    }
+
+    __aicore__ inline void ComputeOneTask(uint32_t taskId)
+    {
+        // taskId maps to (n, group)
+        const uint32_t n = taskId / tasksPerSample_;
+        const uint32_t gg = taskId - n * tasksPerSample_;
+        if (n >= N_ || gg >= G_) return;
+
+        const uint64_t strideH = static_cast<uint64_t>(Win_);
+        const uint64_t strideD = static_cast<uint64_t>(Hin_) * strideH;
+        const uint64_t strideC = static_cast<uint64_t>(Din_) * strideD;
+        const uint64_t xBaseN = static_cast<uint64_t>(n) * static_cast<uint64_t>(Cin_) * strideC;
+
+        const uint64_t yBaseN = static_cast<uint64_t>(n) * static_cast<uint64_t>(Cout_) * static_cast<uint64_t>(DHW_);
+        const uint32_t cStart = gg * CperG_;
+
+        float sum = 0.0f;
+        float sumsq = 0.0f;
+
+        // Pass1: stats over conv outputs in group (pre-affine)
+        for (uint32_t ci = 0; ci < CperG_; ++ci) {
+            const uint32_t co = cStart + ci;
+            const float biasVal = param_.GetValue(co);
+
+            for (uint32_t od = 0; od < Dout_; ++od) {
+                for (uint32_t oh = 0; oh < Hout_; ++oh) {
+                    uint32_t ow = 0;
+                    for (; ow < Wout_; ++ow) {
+                        const float v = ConvAt(xBaseN, co, od, oh, ow, biasVal, strideC, strideD, strideH);
+                        sum += v;
+                        sumsq += v * v;
+                    }
+                }
+            }
+        }
+
+        const float mean = sum * invElemsPerG_;
+        float var = sumsq * invElemsPerG_ - mean * mean;
+        if (var < 0.0f) var = 0.0f;
+        const float invStd = Rsqrt1(var + eps_);
+
+        // Pass2: write outputs with gn affine + min+clamp + dropout
+        for (uint32_t ci = 0; ci < CperG_; ++ci) {
+            const uint32_t co = cStart + ci;
+
+            // hoist per-channel params into registers
+            const float biasVal = param_.GetValue(co);
+            const float gam = param_.GetValue(16u + co);
+            const float bet = param_.GetValue(32u + co);
+
+            const uint64_t yBaseCo = yBaseN + static_cast<uint64_t>(co) * static_cast<uint64_t>(DHW_);
+
+            uint32_t rng = Seed(n, co);
+            uint32_t idx = 0;
+            for (uint32_t od = 0; od < Dout_; ++od) {
+                for (uint32_t oh = 0; oh < Hout_; ++oh) {
+                    for (uint32_t ow = 0; ow < Wout_; ++ow, ++idx) {
+                        float v = ConvAt(xBaseN, co, od, oh, ow, biasVal, strideC, strideD, strideH);
+                        v = (v - mean) * invStd;
+                        v = v * gam + bet;
+
+                        v = ApplyMinClamp(v);
+
+                        rng = LcgNext(rng);
+                        if (rng < dropThresholdU32_) {
+                            v = 0.0f;
+                        } else {
+                            v = v * invKeepProb_;
+                        }
+
+                        yBase_[yBaseCo + static_cast<uint64_t>(idx)] = v;
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> qSc_;
+    AscendC::LocalTensor<float> sc_;
+
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> qParam_;
+    AscendC::LocalTensor<float> param_;
+
+    __gm__ float* xBase_ = nullptr;
+    __gm__ float* wBase_ = nullptr;
+    __gm__ float* bBase_ = nullptr;
+    __gm__ float* gammaBase_ = nullptr;
+    __gm__ float* betaBase_ = nullptr;
+    __gm__ float* yBase_ = nullptr;
+
+    uint32_t Cin_ = 0, Din_ = 0, Hin_ = 0, Win_ = 0;
+    uint32_t Cout_ = 0, K_ = 0;
+    uint32_t Dout_ = 0, Hout_ = 0, Wout_ = 0;
+    uint32_t G_ = 0, CperG_ = 0;
+    uint32_t DHW_ = 0, elemsPerG_ = 0;
+
+    float invElemsPerG_ = 0.0f, eps_ = 1e-5f;
+    float minValue_ = 0.0f, clampMin_ = 0.0f, clampMax_ = 1.0f;
+
+    uint32_t dropThresholdU32_ = 0;
+    float invKeepProb_ = 1.0f;
+
+    uint32_t N_ = 0;
+    uint32_t tasksPerSample_ = 0;
+    uint32_t taskStart_ = 0, taskCount_ = 0;
+};
+
+extern "C" __global__ __aicore__ void conv3d_group_norm_min_clamp_dropout_custom(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR gn_gamma, GM_ADDR gn_beta,
+    GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    (void)workspace;
+    GET_TILING_DATA(t, tiling);
+
+    KernelConv3dGroupNormMinClampDropoutCustom op;
+    op.Init(x, weight, bias, gn_gamma, gn_beta, y,
+            t.Cin, t.Din, t.Hin, t.Win,
+            t.Cout, t.K,
+            t.Dout, t.Hout, t.Wout,
+            t.G, t.CperG,
+            t.DHW, t.elemsPerG,
+            t.invElemsPerG, t.eps,
+            t.minValue, t.clampMin, t.clampMax,
+            t.dropThresholdU32,
+            t.invKeepProb,
+            t.N,
+            t.tasksPerSample);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+static inline void check_1d_param(const at::Tensor& t, const char* name, int64_t expected)
+{
+    TORCH_CHECK(t.defined(), name, " must be defined");
+    TORCH_CHECK(t.device().is_privateuseone(), name, " must be on NPU (PrivateUse1)");
+    TORCH_CHECK(t.scalar_type() == at::kFloat, name, " must be float32");
+    TORCH_CHECK(t.dim() == 1, name, " must be 1D");
+    TORCH_CHECK(t.numel() == expected, name, " must have length ", expected);
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
+at::Tensor conv3d_group_norm_min_clamp_dropout_custom_impl_npu(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
+    const at::Tensor& gn_gamma,
+    const at::Tensor& gn_beta)
+{
+    TORCH_CHECK(x.defined(), "x must be defined");
+    TORCH_CHECK(weight.defined(), "weight must be defined");
+    TORCH_CHECK(bias.defined(), "bias must be defined");
+    TORCH_CHECK(gn_gamma.defined(), "gn_gamma must be defined");
+    TORCH_CHECK(gn_beta.defined(), "gn_beta must be defined");
+
+    TORCH_CHECK(x.device().is_privateuseone(), "x must be on NPU (PrivateUse1)");
+    TORCH_CHECK(weight.device().is_privateuseone(), "weight must be on NPU (PrivateUse1)");
+    TORCH_CHECK(bias.device().is_privateuseone(), "bias must be on NPU (PrivateUse1)");
+    TORCH_CHECK(gn_gamma.device().is_privateuseone(), "gn_gamma must be on NPU (PrivateUse1)");
+    TORCH_CHECK(gn_beta.device().is_privateuseone(), "gn_beta must be on NPU (PrivateUse1)");
+
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be float32");
+    TORCH_CHECK(weight.scalar_type() == at::kFloat, "weight must be float32");
+    TORCH_CHECK(bias.scalar_type() == at::kFloat, "bias must be float32");
+    TORCH_CHECK(gn_gamma.scalar_type() == at::kFloat, "gn_gamma must be float32");
+    TORCH_CHECK(gn_beta.scalar_type() == at::kFloat, "gn_beta must be float32");
+
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
+    TORCH_CHECK(gn_gamma.is_contiguous(), "gn_gamma must be contiguous");
+    TORCH_CHECK(gn_beta.is_contiguous(), "gn_beta must be contiguous");
+
+    TORCH_CHECK(x.dim() == 5, "x must be 5D [N,C,D,H,W]");
+    TORCH_CHECK(weight.dim() == 5, "weight must be 5D [Cout,Cin,K,K,K]");
+
+    // Specialized benchmark contract
+    TORCH_CHECK(x.size(1) == 3, "x.size(1) must be 3");
+    TORCH_CHECK(x.size(2) == 16 && x.size(3) == 64 && x.size(4) == 64,
+                "x must be [N,3,16,64,64]");
+    TORCH_CHECK(weight.size(0) == 16 && weight.size(1) == 3 &&
+                weight.size(2) == 3 && weight.size(3) == 3 && weight.size(4) == 3,
+                "weight must be [16,3,3,3,3]");
+
+    check_1d_param(bias, "bias", 16);
+    check_1d_param(gn_gamma, "gn_gamma", 16);
+    check_1d_param(gn_beta, "gn_beta", 16);
+
+    auto y = at::empty({x.size(0), 16, 14, 62, 62}, x.options().dtype(at::kFloat));
+    EXEC_NPU_CMD(aclnnConv3dGroupNormMinClampDropoutCustom, x, weight, bias, gn_gamma, gn_beta, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv3d_group_norm_min_clamp_dropout_custom",
+           &conv3d_group_norm_min_clamp_dropout_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv3d_group_norm_min_clamp_dropout_custom",
+          &conv3d_group_norm_min_clamp_dropout_custom_impl_npu,
+          "conv3d_group_norm_min_clamp_dropout_custom (NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'conv3d_group_norm_min_clamp_dropout_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
+```
