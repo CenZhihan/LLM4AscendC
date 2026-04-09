@@ -6,10 +6,12 @@
 
 namespace ge {
 
-REG_OP(ReluCustom)
-    .INPUT(x, ge::TensorType::ALL())
-    .OUTPUT(y, ge::TensorType::ALL())
-    .OP_END_FACTORY_REG(ReluCustom);
+REG_OP(VisionAttentionCustom)
+    .INPUT(q, ge::TensorType::ALL())
+    .INPUT(k, ge::TensorType::ALL())
+    .INPUT(v, ge::TensorType::ALL())
+    .OUTPUT(o, ge::TensorType::ALL())
+    .OP_END_FACTORY_REG(VisionAttentionCustom);
 
 }
 

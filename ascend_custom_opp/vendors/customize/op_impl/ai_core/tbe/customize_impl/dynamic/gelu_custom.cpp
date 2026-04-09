@@ -1,126 +1,95 @@
 
 #include "kernel_operator.h"
 
-constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t BUFFER_NUM = 2; // tensor buffers per queue
 
-class KernelGeluCustom {
+class KernelGelu {
 public:
-    __aicore__ inline KernelGeluCustom() {}
-
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                               uint32_t totalLength, uint32_t tileLength, uint32_t tanhTmpBytes)
+    __aicore__ inline KernelGelu() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
     {
-        totalLength_ = totalLength;
-        tileLength_ = tileLength;
-        tanhTmpBytes_ = tanhTmpBytes;
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLength_);
-        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLength_);
+        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe_.InitBuffer(inQueueX_,  BUFFER_NUM, tileLength_ * sizeof(float));
-        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLength_ * sizeof(float));
-
-        pipe_.InitBuffer(tanhTmpBuf_, tanhTmpBytes_);
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        if (totalLength_ == 0) return;
-
-        const uint32_t coreIdx = (uint32_t)AscendC::GetBlockIdx();
-        const uint32_t coreNum = (uint32_t)AscendC::GetBlockNum();
-
-        const uint32_t tiles = (totalLength_ + tileLength_ - 1u) / tileLength_;
-
-        // Grid-stride over tiles: uniform iterations, reduced scalar/tail overhead.
-        for (uint32_t t = coreIdx; t < tiles; t += coreNum) {
-            const uint32_t offset = t * tileLength_;
-            uint32_t count = totalLength_ - offset;
-            if (count > tileLength_) count = tileLength_;
-            if (count == 0) continue;
-
-            CopyIn(offset, count);
-            Compute(count);
-            CopyOut(offset, count);
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t offset, uint32_t count)
+    __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
-        AscendC::DataCopy(xLocal, xGm_[offset], count);
-        inQueueX_.EnQue(xLocal);
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(uint32_t count)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        // GELU(tanh approximation):
-        // y = 0.5*x*(1 + tanh(alpha*(x + beta*x^3)))
-        // Implement with minimal extra UB: reuse yLocal as scratch (x2 then polynomial).
-        constexpr float kAlpha = 0.7978845608028654f; // sqrt(2/pi)
-        constexpr float kBeta  = 0.044715f;
-        constexpr float kHalf  = 0.5f;
+        // Approximate GELU: 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
+        const float K0 = 0.7978845608028654f; // sqrt(2/pi)
+        const float K1 = 0.044715f;
 
-        AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
-        AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
-        AscendC::LocalTensor<uint8_t> tanhTmp = tanhTmpBuf_.Get<uint8_t>();
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
 
-        // yLocal = x*x  (x2)
-        AscendC::Mul(yLocal, xLocal, xLocal, count);
-
-        // yLocal = beta*x2
-        AscendC::Muls(yLocal, yLocal, kBeta, count);
-
-        // yLocal = (beta*x2)*x
-        AscendC::Mul(yLocal, yLocal, xLocal, count);
-
-        // yLocal = x + beta*x^3
-        AscendC::Add(yLocal, xLocal, yLocal, count);
-
-        // yLocal = alpha*(...)
-        AscendC::Muls(yLocal, yLocal, kAlpha, count);
-
+        // yLocal = x * x
+        AscendC::Mul(yLocal, xLocal, xLocal, this->tileLength);
+        // yLocal = yLocal * x  => x^3
+        AscendC::Mul(yLocal, yLocal, xLocal, this->tileLength);
+        // yLocal = yLocal * K1 => 0.044715 * x^3
+        AscendC::Muls(yLocal, yLocal, K1, this->tileLength);
+        // yLocal = yLocal + x => x + 0.044715 * x^3
+        AscendC::Add(yLocal, yLocal, xLocal, this->tileLength);
+        // yLocal = yLocal * K0 => sqrt(2/pi) * (x + 0.044715 * x^3)
+        AscendC::Muls(yLocal, yLocal, K0, this->tileLength);
         // yLocal = tanh(yLocal)
-        AscendC::Tanh(yLocal, yLocal, tanhTmp, count);
+        AscendC::Tanh(yLocal, yLocal, this->tileLength);
+        // yLocal = yLocal + 1
+        AscendC::Adds(yLocal, yLocal, 1.0f, this->tileLength);
+        // yLocal = yLocal * 0.5
+        AscendC::Muls(yLocal, yLocal, 0.5f, this->tileLength);
+        // yLocal = yLocal * x
+        AscendC::Mul(yLocal, yLocal, xLocal, this->tileLength);
 
-        // yLocal = 0.5*(1 + tanh)
-        AscendC::Adds(yLocal, yLocal, 1.0f, count);
-        AscendC::Muls(yLocal, yLocal, kHalf, count);
-
-        // yLocal = x * yLocal
-        AscendC::Mul(yLocal, xLocal, yLocal, count);
-
-        outQueueY_.EnQue<float>(yLocal);
-        inQueueX_.FreeTensor(xLocal);
+        outQueueY.EnQue<float>(yLocal);
+        inQueueX.FreeTensor(xLocal);
     }
 
-    __aicore__ inline void CopyOut(uint32_t offset, uint32_t count)
+    __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<float> yLocal = outQueueY_.DeQue<float>();
-        AscendC::DataCopy(yGm_[offset], yLocal, count);
-        outQueueY_.FreeTensor(yLocal);
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
     }
 
 private:
-    AscendC::TPipe pipe_;
-    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX_;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
-    AscendC::TBuf<> tanhTmpBuf_;
-
-    AscendC::GlobalTensor<float> xGm_;
-    AscendC::GlobalTensor<float> yGm_;
-
-    uint32_t totalLength_ {0};
-    uint32_t tileLength_ {0};
-    uint32_t tanhTmpBytes_ {0};
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
-    (void)workspace;
+extern "C" __global__ __aicore__ void gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelGeluCustom op;
-    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength, tiling_data.tanhTmpBytes);
+    KernelGelu op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }

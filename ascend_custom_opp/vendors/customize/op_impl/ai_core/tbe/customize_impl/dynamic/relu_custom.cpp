@@ -1,108 +1,69 @@
 
 #include "kernel_operator.h"
 
-constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
-class KernelReluCustom {
+class KernelRelu {
 public:
-    __aicore__ inline KernelReluCustom() {}
-
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t totalLength, uint32_t tileLength,
-                                uint32_t fullTiles, uint32_t hasTail)
+    __aicore__ inline KernelRelu() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
     {
-        totalLen_  = totalLength;
-        tileLen_   = tileLength;
-        fullTiles_ = fullTiles;
-        hasTail_   = hasTail;
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        xGm_.SetGlobalBuffer((__gm__ DTYPE_X*)x, totalLen_);
-        yGm_.SetGlobalBuffer((__gm__ DTYPE_Y*)y, totalLen_);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        // Double-buffer UB: 2*X + 2*Y
-        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(DTYPE_X));
-        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(DTYPE_Y));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
     }
-
     __aicore__ inline void Process()
     {
-        if (totalLen_ == 0 || tileLen_ == 0) return;
-
-        const uint32_t blockNum = (uint32_t)AscendC::GetBlockNum();
-        const uint32_t blockIdx = (uint32_t)AscendC::GetBlockIdx();
-
-        // 1) Steady-state loop over full tiles only: fixed len = tileLen_.
-        // Use grid-stride over tile index to avoid per-iteration next-tile planning.
-        for (uint32_t t = blockIdx; t < fullTiles_; t += blockNum) {
-            const uint32_t base = t * tileLen_;
-            // Full tile: len always tileLen_ (no tail checks, improves scalar/pipeline behavior).
-            CopyIn(base, tileLen_);
-            Compute(tileLen_);
-            CopyOut(base, tileLen_);
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
         }
-
-        // 2) Single tail tile (if any): only the block that owns its tile index processes it.
-        if (hasTail_ == 0) return;
-        const uint32_t tailTileIdx = fullTiles_;
-        if (tailTileIdx % blockNum != blockIdx) return;
-
-        const uint32_t base = tailTileIdx * tileLen_;
-        if (base >= totalLen_) return;
-        uint32_t len = totalLen_ - base;  // < tileLen_
-        if (len == 0) return;
-
-        CopyIn(base, len);
-        Compute(len);
-        CopyOut(base, len);
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t gmOffset, uint32_t len)
+    __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX_.AllocTensor<DTYPE_X>();
-        AscendC::DataCopy(xLocal, xGm_[gmOffset], len);
-        inQueueX_.EnQue(xLocal);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
     }
-
-    __aicore__ inline void Compute(uint32_t len)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX_.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY_.AllocTensor<DTYPE_Y>();
-        AscendC::Relu(yLocal, xLocal, len);
-        outQueueY_.EnQue<DTYPE_Y>(yLocal);
-        inQueueX_.FreeTensor(xLocal);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::Relu(yLocal, xLocal, this->tileLength);
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
     }
-
-    __aicore__ inline void CopyOut(uint32_t gmOffset, uint32_t len)
+    __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY_.DeQue<DTYPE_Y>();
-        AscendC::DataCopy(yGm_[gmOffset], yLocal, len);
-        outQueueY_.FreeTensor(yLocal);
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
     }
 
 private:
-    AscendC::TPipe pipe_;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
-
-    AscendC::GlobalTensor<DTYPE_X> xGm_;
-    AscendC::GlobalTensor<DTYPE_Y> yGm_;
-
-    uint32_t totalLen_ {0};
-    uint32_t tileLen_ {0};
-    uint32_t fullTiles_ {0};
-    uint32_t hasTail_ {0};
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
-    (void)workspace;
+extern "C" __global__ __aicore__ void relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelReluCustom op;
-    op.Init(x, y,
-            tiling_data.totalLength,
-            tiling_data.tileLength,
-            tiling_data.fullTilesPerBlock,
-            tiling_data.hasTail);
+    KernelRelu op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
