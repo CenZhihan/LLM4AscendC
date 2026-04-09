@@ -1,37 +1,25 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    Model that performs a 3D transposed convolution, followed by a sum, 
-    a residual add, a multiplication, and another residual add.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
-        super(Model, self).__init__()
-        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
-        self.bias = nn.Parameter(torch.randn(bias_shape))
+    def __init__(self):
+        super().__init__()
 
-    def forward(self, x):
-        x = self.conv_transpose(x)
-        original_x = x.clone().detach()
-        x = x + self.bias
-        x = x + original_x
-        x = x * original_x
-        x = x + original_x
-        return x
-
-batch_size = 16
-in_channels = 32
-out_channels = 64
-depth, height, width = 16, 32, 32
-kernel_size = 3
-stride = 2
-padding = 1
-output_padding = 1
-bias_shape = (out_channels, 1, 1, 1)
+    def forward(self, x, weight, conv_bias_opt, residual):
+        cb = conv_bias_opt if conv_bias_opt is not None else None
+        y = F.conv_transpose3d(x, weight, cb, stride=1, padding=0, output_padding=0, dilation=1, groups=1)
+        y = y + residual
+        y = y * 2.0
+        y = y + residual
+        return y
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, depth, height, width)]
+    x = torch.rand(4, 32, 16, 16, 16)
+    w = torch.rand(32, 64, 3, 3, 3)
+    cb = torch.rand(64)
+    r = torch.rand(4, 64, 18, 18, 18)
+    return [x, w, cb, r]
 
 def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape]
+    return []

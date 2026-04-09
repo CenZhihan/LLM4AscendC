@@ -1,41 +1,31 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    Model that performs a sequence of operations:
-        - Matrix multiplication
-        - Summation
-        - Max
-        - Average pooling
-        - LogSumExp
-        - LogSumExp
-    """
+    """Pybind: (x, w, b)."""
     def __init__(self, in_features, out_features):
         super(Model, self).__init__()
-        self.linear = nn.Linear(in_features, out_features)
+        self.in_features = in_features
+        self.out_features = out_features
 
-    def forward(self, x):
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, 1).
-        """
-        x = self.linear(x)  # (batch_size, out_features)
-        x = torch.sum(x, dim=1, keepdim=True) # (batch_size, 1)
-        x = torch.max(x, dim=1, keepdim=True)[0] # (batch_size, 1)
-        x = torch.mean(x, dim=1, keepdim=True) # (batch_size, 1)
-        x = torch.logsumexp(x, dim=1, keepdim=True) # (batch_size, 1)
-        x = torch.logsumexp(x, dim=1, keepdim=True) # (batch_size, 1)
-        return x
+    def forward(self, x, w, b):
+        x = F.linear(x, w, b)
+        x = torch.sum(x, dim=1, keepdim=True)
+        x = torch.max(x, dim=1, keepdim=True)[0]
+        x = torch.mean(x, dim=1, keepdim=True)
+        x = torch.logsumexp(x, dim=1, keepdim=True)
+        return torch.logsumexp(x, dim=1, keepdim=True)
 
 batch_size = 1024
-in_features  = 8192  
+in_features  = 8192
 out_features = 8192
 
 def get_inputs():
-    return [torch.rand(batch_size, in_features)]
+    x = torch.rand(batch_size, in_features)
+    w = torch.rand(out_features, in_features)
+    b = torch.rand(out_features)
+    return [x, w, b]
 
 def get_init_inputs():
     return [in_features, out_features]

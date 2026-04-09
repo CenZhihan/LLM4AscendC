@@ -1,56 +1,33 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
-        """
-        Initialize the LSTM model.
+    """Pybind: (x,h0,c0,w_ih,w_hh,b_ih,b_hh,fc_w,fc_b) -> [B,O]. Weights follow kernel packing; reference uses nn.LSTM+Linear of same dims."""
 
-        :param input_size: The number of expected features in the input `x`
-        :param hidden_size: The number of features in the hidden state `h`
-        :param num_layers: Number of recurrent layers
-        :param output_size: The number of output features
-        :param dropout: If non-zero, introduces a Dropout layer on the outputs of each LSTM layer except the last layer
-        """
-        super(Model, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True, dropout=dropout, bidirectional=False)
-        self.fc = nn.Linear(hidden_size, output_size)
+    def __init__(self):
+        super().__init__()
+        self.lstm = nn.LSTM(128, 256, 6, batch_first=True)
+        self.fc = nn.Linear(256, 10)
 
-    def forward(self, x, h0=None, c0=None):
-        """
-        Forward pass through the LSTM model.
+    def forward(self, x, h0, c0, w_ih, w_hh, b_ih, b_hh, fc_w, fc_b):
+        out, _ = self.lstm(x, (h0, c0))
+        return F.linear(out[:, -1, :], fc_w, fc_b)
 
-        :param x: The input tensor, shape (batch_size, sequence_length, input_size)
-        :param h0: Optional initial hidden state (num_layers, batch_size, hidden_size)
-        :param c0: Optional initial cell state (num_layers, batch_size, hidden_size)
-        :return: The output tensor, shape (batch_size, output_size)
-        """
-        batch_size = x.size(0)
-
-        if h0 is None:
-            h0 = torch.randn(self.num_layers, batch_size, self.hidden_size, device=x.device)
-        if c0 is None:
-            c0 = torch.randn(self.num_layers, batch_size, self.hidden_size, device=x.device)
-
-        out, _ = self.lstm(x, (h0, c0))  # out: (batch_size, seq_length, hidden_size)
-        out = self.fc(out[:, -1, :])     # out: (batch_size, output_size)
-
-        return out
-
-# === Test configuration ===
-batch_size = 10
-sequence_length = 512
-input_size = 128
-hidden_size = 256
-num_layers = 6
-output_size = 10
-dropout = 0.0
+B, S, I, H, L, O = 10, 512, 128, 256, 6, 10
+ROWS = L * 4 * H
 
 def get_inputs():
-    return [torch.rand(batch_size, sequence_length, input_size)]
+    x = torch.rand(B, S, I)
+    h0 = torch.rand(L, B, H)
+    c0 = torch.rand(L, B, H)
+    w_ih = torch.rand(ROWS, H)
+    w_hh = torch.rand(ROWS, H)
+    b_ih = torch.rand(ROWS)
+    b_hh = torch.rand(ROWS)
+    fc_w = torch.rand(O, H)
+    fc_b = torch.rand(O)
+    return [x, h0, c0, w_ih, w_hh, b_ih, b_hh, fc_w, fc_b]
 
 def get_init_inputs():
-    return [input_size, hidden_size, num_layers, output_size, dropout]
+    return []

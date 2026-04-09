@@ -24,13 +24,15 @@
 python3 tools/eval_operator.py <必选其一：算子来源> [可选参数]
 ```
 
+**运行环境**：完整流水线依赖 **CANN / msopgen / NPU**，须在已配置昇腾环境的机器上执行。常见做法是在宿主机用 **`docker exec -it <容器ID> bash`** 进入侧载了本仓库的容器（示例容器 ID 可与脚本 `scripts/run_matmul17_local.sh`、`scripts/run_matmul_gpt4o_parallel3.sh` 注释中一致），再 `cd` 到容器内的 `LLM4AscendC` 根目录后运行上述命令。
+
 **算子来源（三选一，必选）**
 
 | 参数 | 含义 |
 |------|------|
 | `--op <DIR>` | 已 materialize 的算子目录，例如 `operators/xxx` 或绝对路径。目录内需含 `operator.json`、`op_host/`、`op_kernel/`、`eval/spec.py` 等。 |
-| `--txt <PATH>` | 单个 **MKB 风格 txt 包** 路径（如 `output/gelu.txt`）。脚本会写入 `artifacts/_txt_staging/`，并生成临时算子目录再跑流水线。 |
-| `--txt-dir <DIR>` | 目录内所有 `*.txt` **按文件名排序后依次** 评测；每个文件的 **stem = MKB `op_key`**。某次失败会记录错误并继续下一个（返回码非 0）。 |
+| `--txt <PATH>` | 单个 **MKB 风格 txt 包** 路径（如 `output/gelu.txt`）。脚本会写入 `artifacts/.../_txt_staging/`，并生成临时算子目录再跑流水线；若 txt 位于 `output/<批次目录>/...`，则产物会归档到 `artifacts/<批次目录>/...`。 |
+| `--txt-dir <DIR>` | 目录内所有 `*.txt` **按文件名排序后** 评测；默认 **单进程顺序** 执行。可用 `--workers N`（`N>1`）改为 **多进程任务队列**：各 worker 从队列取下一个 `*.txt`，**谁空谁取**（等价）。每个文件的 **stem = MKB `op_key`**。某次失败会记录错误并继续其余任务（返回码非 0）。 |
 
 **常用示例**
 
@@ -47,8 +49,15 @@ python3 tools/eval_operator.py --txt output/gelu.txt --mode build-only
 # 在已有成功构建且指纹未变的前提下，只跑 eval
 python3 tools/eval_operator.py --txt output/gelu.txt --mode eval-only
 
-# 批量目录
+# 批量目录（串行，默认）
 python3 tools/eval_operator.py --txt-dir output/kernelbench165_txt --clean-policy smart
+
+# 批量目录（并行 5 worker；须设置 LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH，见下文）
+export LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH="/path/to/writable/ascend_custom_opp"
+python3 tools/eval_operator.py --txt-dir output/gpt-5_selected_shot --workers 5 --mode full
+
+# 并行且多卡分散（例如 7 worker、3 张物理卡：device_id = worker_id % 3）
+python3 tools/eval_operator.py --txt-dir output/gpt-5_selected_shot --workers 7 --npu 3 --mode full
 ```
 
 ### 2.2 可选参数一览
@@ -57,8 +66,34 @@ python3 tools/eval_operator.py --txt-dir output/kernelbench165_txt --clean-polic
 |------|--------|--------|----------------|
 | `--mode` | `full` | `full` / `build-only` / `eval-only` | **`full`**：msopgen → 编译 → 安装 OPP → 构建并安装 pybind wheel → 运行 `eval/spec.py`（正确性或与参考对比）。**`build-only`**：只做到安装 wheel 并写 `state/`，不执行 eval；适合 CI 只验证能否编过。**`eval-only`**：跳过构建，直接跑 eval；要求 `artifacts/<op_key>/state/installed.json` 已存在，且源码指纹与上次构建一致，否则会报错要求先 `full` 或 `build-only`。适合反复调试验证逻辑而不重复长时间编译。 |
 | `--clean-policy` | `force` | `force` / `smart` | **`force`**：每次进入构建阶段前 **删除** `artifacts/<op_key>/workspace` 与 `pybind`，保证从干净目录重编；结果可复现、磁盘与耗时开销较大。**`smart`**：仅当算子目录 **内容指纹**相对上次构建发生变化时，才清理并重编；指纹未变则复用已有构建；若期望复用但从未成功安装过，会报错提示改用 `force`。适合迭代小改或批量任务中减少重复编译。 |
+| `--workers` | `1` | `1` … `32` | **仅与 `--txt-dir` 合用**。`1` 表示与过去行为一致的单进程顺序评测。`N>1` 时使用 `multiprocessing` 的 **spawn** 启动 `N` 个子进程，共享任务队列，依次处理目录中的 `*.txt`。**必须**设置 `LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH`：每个 worker 将自定义 OPP 安装到该路径下的 **`_parallel_w0` … `_parallel_w{N-1}`**，避免多进程同时写入同一 OPP 根目录导致安装冲突。 |
+| `--npu` | `1` | `1` … `8` | **仅当 `--txt-dir` 且 `--workers` > 1 时生效**（`--workers` 为 `1` 时忽略）。使用 `K` 张物理 NPU（索引 `0..K-1`），每个 worker 在子进程内设置 `ASCEND_VISIBLE_DEVICES = (worker_id % K)`，使 `eval/spec.py` 中的 `torch.device("npu:0")` 映射到对应物理卡，减轻同卡多进程导致的 **NPU OOM** 或超时波动。默认 `K=1` 表示所有 worker 仍只看到物理卡 0（与未传 `--npu` 时一致）。 |
 
-**说明**：`--txt` / `--txt-dir` 会清理并重建 `artifacts/_txt_staging/`（单 txt 时为 staging 根；batch 时为每个 stem 子目录），避免旧内容干扰。
+**说明**：
+
+- 若 `--txt/--txt-dir` 的路径位于 `output/` 下，则会将评测产物与 staging **按 output 的相对路径镜像归档**到 `artifacts/<output相对路径>/...`，用于区分不同批次（例如 `gpt-5_selected_shot`、其下的 `_batch_first10` 等）。
+- 若 `--txt/--txt-dir` 不在 `output/` 下，则按“野生”方式落在 `artifacts/` 根下（保持兼容）。
+- `--txt` / `--txt-dir` 会清理并重建对应的 staging 目录，避免旧内容干扰：
+  - 单个 txt：`artifacts/<group可选>/_txt_staging/<op_key>/`
+  - 批量目录：`artifacts/<group可选>/_txt_staging/<op_key>/`
+
+**并行 `--txt-dir`（`--workers` > 1）补充说明**：
+
+- **产物路径**：与串行相同，仍为 `artifacts/<group可选>/<op_key>/…`；不同算子由不同 worker 处理，**不会**因并行覆盖彼此的 `result_*.json`（同一 `op_key` 不会在队列中出现两次）。
+- **OPP**：见上表 `--workers`；子目录名为 `_parallel_w0` … `_parallel_w{N-1}`，位于 `LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH` 所指向目录的 **下**（若该路径为 `/a/opp`，则 worker 0 使用 `/a/opp/_parallel_w0`）。
+- **NPU / 显存（`--npu K`）**：当 `--workers` > 1 时，可为 `--npu` 指定参与轮询的物理卡数量 `K`（默认 `1`）。映射公式：**`device_id = worker_id % K`**（例如 `--workers 7 --npu 3`：worker 0/3/6 → 物理卡 0，1/4 → 卡 1，2/5 → 卡 2）。子进程在跑流水线前设置 `ASCEND_VISIBLE_DEVICES=device_id`，与 `eval/spec.py` 中固定的 `npu:0` 配合使用。若 `K < workers`，仍会有同卡多进程，需结合显存与稳定性自行调参。`K=1` 时等价于所有 worker 绑定到物理卡 0。
+- **pip**：各算子 pybind 包名一般不同，并发 `pip install` 多数可接受；若遇偶发安装冲突，可改为较小 `--workers` 或后续在工具链侧加锁（本版未实现）。
+
+**手动验证建议（并行 + 分卡）**：
+
+1. **基线**：`--workers=3` 且不传 `--npu`（默认 `npu=1`），与单进程顺序跑对比失败类型与 `artifacts/<group>/<op_key>/result_*.json` 是否一致。
+2. **分卡**：在有多张卡的环境下使用 `--workers=3 --npu=3`，对比 **NPU out of memory**、`507014`（aicore timeout）等错误出现频率是否较「三进程同卡」明显下降。
+3. **检查产物**：每个算子的评测结果在 **`artifacts/<group可选>/<op_key>/result_*.json`**；各步骤日志在 **`artifacts/<group可选>/<op_key>/logs/`**（如 `*-06-eval.log`）。并行时终端会打印 `[w<id>] ASCEND_VISIBLE_DEVICES=...` 便于确认绑定。
+
+示例：
+
+- `--txt output/gpt-5_selected_shot/relu.txt` → `artifacts/gpt-5_selected_shot/relu/` 与 `artifacts/gpt-5_selected_shot/_txt_staging/relu/`
+- `--txt-dir output/gpt-5_selected_shot/_batch_first10` → `artifacts/gpt-5_selected_shot/_batch_first10/<op_key>/...`
 
 ### 2.3 流水线在做什么（`full` / `build-only` 的构建部分）
 
@@ -70,11 +105,11 @@ python3 tools/eval_operator.py --txt-dir output/kernelbench165_txt --clean-polic
 6. **pybind**：基于模板生成扩展、`bdist_wheel` 并 `pip install`。  
 7. **eval**（仅 `full`）：在独立子进程中执行 `eval/spec.py`，通常会加载 MKB reference 与自定义 `ModelNew` 做对比。
 
-各步骤日志位于 **`artifacts/<op_key>/logs/`**，文件名带时间戳与序号，例如 `*-01-msopgen.log` … `*-06-eval.log`。
+各步骤日志位于 **`artifacts/<group可选>/<op_key>/logs/`**，文件名带时间戳与序号，例如 `*-01-msopgen.log` … `*-06-eval.log`。
 
 ### 2.4 结果输出
 
-- **`artifacts/<op_key>/result_<op_key>.json`**：汇总 `compiled`、`correctness`、`correctness_info`、指纹与日志路径等。  
+- **`artifacts/<group可选>/<op_key>/result_<op_key>.json`**：汇总 `compiled`、`correctness`、`correctness_info`、指纹与日志路径等。  
 - 失败时终端会打印 `[done] FAILED` 并附 summary 路径；成功为 `[done] OK`。
 
 ### 2.5 环境变量说明
@@ -85,6 +120,7 @@ python3 tools/eval_operator.py --txt-dir output/kernelbench165_txt --clean-polic
 
 | 变量 | 典型取值 | 作用 |
 |------|----------|------|
+| `LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH` | 绝对路径，可写 | 覆盖 `env.py` 中默认的 `ascend_custom_opp_path`，将自定义 OPP 安装到该目录。**并行 `--txt-dir`（`--workers`>1）时必填**，且每个 worker 会使用其下的 `_parallel_w<id>` 子目录，避免多进程安装互踩。 |
 | `LLM4ASCENDC_REF_ON_CPU` | `1` / `true` / `yes` / `on` | MKB **参考模型 `Model`** 在 **CPU** 上跑，自定义算子仍在 NPU（`vendor/mkb/correctness.py`）。用于对照：NPU 上参考若因图模式/融合与 PyTorch 不一致，可开此项再比一次。 |
 
 #### 由 `eval_operator.py` 在评测子进程中自动设置（一般不必手改）
@@ -136,4 +172,4 @@ python3 tools/eval_operator.py --txt-dir output/kernelbench165_txt --clean-polic
 | `vendor/mkb/dataset.py` | 合法 `op_key` 与类别映射 |
 | `vendor/mkb/correctness.py` | 正确性对比模板 |
 | `output/*.txt` | 示例/批次的 MKB 风格算子 txt 包 |
-| `artifacts/<op_key>/` | 每算子构建产物、日志与结果 JSON |
+| `artifacts/<group可选>/<op_key>/` | 每算子构建产物、日志与结果 JSON（`<group可选>` 为 output 下相对路径镜像归档） |

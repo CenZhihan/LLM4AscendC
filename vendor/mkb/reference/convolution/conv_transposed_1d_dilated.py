@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
     """
@@ -16,19 +17,25 @@ class Model(nn.Module):
     """
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
         super(Model, self).__init__()
-        self.conv1d_transpose = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=bias)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+    def forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         """
         Performs the transposed 1D convolution.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, in_channels, length).
+            weight: Transposed convolution weights
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, out_channels, length_out).
         """
-        return self.conv1d_transpose(x)
+        return F.conv_transpose1d(x, weight, stride=self.stride, padding=self.padding, dilation=self.dilation)
 
 # Test code
 batch_size = 32
@@ -42,7 +49,9 @@ dilation = 3
 
 def get_inputs():
     x = torch.rand(batch_size, in_channels, length)
-    return [x]
+    # weight shape for conv_transpose1d: (in_channels, out_channels, kernel_size)
+    weight = torch.rand(in_channels, out_channels, kernel_size)
+    return [x, weight]
 
 def get_init_inputs():
     return [in_channels, out_channels, kernel_size, stride, padding, dilation]

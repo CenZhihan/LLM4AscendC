@@ -1,28 +1,21 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    Model that performs a matrix multiplication (Gemm), followed by LogSumExp, LeakyReLU, 
-    LeakyReLU, GELU, and GELU activations.
-    """
+    """Pybind: (x, w, b)."""
     def __init__(self, in_features, out_features, bias=True):
         super(Model, self).__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.in_features = in_features
+        self.out_features = out_features
 
-    def forward(self, x):
-        # Gemm
-        x = self.linear(x)
-        # LogSumExp
+    def forward(self, x, w, b):
+        x = F.linear(x, w, b)
         x = torch.logsumexp(x, dim=1, keepdim=True)
-        # LeakyReLU
-        x = torch.nn.functional.leaky_relu(x, negative_slope=0.01)
-        # LeakyReLU
-        x = torch.nn.functional.leaky_relu(x, negative_slope=0.01)
-        # GELU
-        x = torch.nn.functional.gelu(x)
-        # GELU
-        x = torch.nn.functional.gelu(x)
+        x = F.leaky_relu(x, negative_slope=0.01)
+        x = F.leaky_relu(x, negative_slope=0.01)
+        x = F.gelu(x)
+        x = F.gelu(x)
         return x
 
 batch_size = 1024
@@ -30,7 +23,10 @@ in_features = 8192
 out_features = 8192
 
 def get_inputs():
-    return [torch.rand(batch_size, in_features)]
+    x = torch.rand(batch_size, in_features)
+    w = torch.rand(out_features, in_features)
+    b = torch.rand(out_features)
+    return [x, w, b]
 
 def get_init_inputs():
     return [in_features, out_features]

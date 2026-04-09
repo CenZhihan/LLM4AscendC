@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import multiprocessing
 import os
 import pathlib
 import shutil
@@ -12,11 +13,16 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
+# Upper bound for --workers (txt-dir parallel mode) to avoid accidental huge values.
+_MAX_TXT_DIR_WORKERS = 32
+# Physical NPU indices 0..7 for --npu (parallel binding via ASCEND_VISIBLE_DEVICES).
+_MAX_VISIBLE_NPU = 8
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.common.env import EnvConfig, build_subprocess_env, shell_prefix  # noqa: E402
+from tools.common.env import EnvConfig, build_subprocess_env, load_env_config, shell_prefix  # noqa: E402
 from tools.common.fingerprint import compute_fingerprint, read_fingerprint, write_fingerprint  # noqa: E402
 from tools.common.runner import now_tag, run_cmd  # noqa: E402
 from tools.txt_operator import materialize_operator_from_txt  # noqa: E402
@@ -24,6 +30,7 @@ from tools.txt_operator import materialize_operator_from_txt  # noqa: E402
 
 OPS_ROOT = ROOT / "operators"
 ART_ROOT = ROOT / "artifacts"
+OUTPUT_ROOT = ROOT / "output"
 TOOLS_ROOT = ROOT / "tools"
 
 
@@ -199,12 +206,13 @@ def build_and_install_operator(
     op_dir: pathlib.Path,
     spec: OperatorSpec,
     *,
+    art_root: pathlib.Path,
     clean_policy: str,
     mode: str,
     cfg: EnvConfig,
 ) -> tuple[pathlib.Path, str]:
     ts = now_tag()
-    art_dir = ART_ROOT / spec.op_key
+    art_dir = art_root / spec.op_key
     work_root = art_dir / "workspace"
     gen_dir = art_dir / "generated"
     pybind_dir = art_dir / "pybind"
@@ -392,13 +400,60 @@ def _resolve_user_path(p: pathlib.Path) -> pathlib.Path:
     return p.resolve()
 
 
-def _execute_pipeline(op_dir: pathlib.Path, *, mode: str, clean_policy: str) -> None:
+def _is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _artifact_group_rel_from_txt_path(txt_path: pathlib.Path) -> pathlib.Path | None:
+    """
+    If txt_path is under LLM4AscendC/output/<group>/..., return the group path
+    relative to output root (mirrors nested folders).
+
+    For a single txt file, the group is its parent directory relative to output root.
+    If the parent is output root itself, returns None (treat as 'wild').
+    """
+    txt_path = txt_path.resolve()
+    out_root = OUTPUT_ROOT.resolve()
+    if not _is_within(txt_path, out_root):
+        return None
+    try:
+        rel_parent = txt_path.parent.relative_to(out_root)
+    except Exception:
+        return None
+    return rel_parent if str(rel_parent) not in (".", "") else None
+
+
+def _artifact_group_rel_from_txt_dir(txt_dir: pathlib.Path) -> pathlib.Path | None:
+    """
+    If txt_dir is under LLM4AscendC/output/<group>/..., return the directory path
+    relative to output root (mirrors nested folders).
+    """
+    txt_dir = txt_dir.resolve()
+    out_root = OUTPUT_ROOT.resolve()
+    if not _is_within(txt_dir, out_root):
+        return None
+    try:
+        rel = txt_dir.relative_to(out_root)
+    except Exception:
+        return None
+    return rel if str(rel) not in (".", "") else None
+
+
+def _artifacts_root_for_group(group_rel: pathlib.Path | None) -> pathlib.Path:
+    return (ART_ROOT / group_rel) if group_rel else ART_ROOT
+
+
+def _execute_pipeline(op_dir: pathlib.Path, *, art_root: pathlib.Path, mode: str, clean_policy: str) -> None:
     """
     Build/install/eval one operator directory. Raises on failure.
     """
     spec = load_operator_spec(op_dir)
-    cfg = EnvConfig()
-    art_dir = ART_ROOT / spec.op_key
+    cfg = load_env_config()
+    art_dir = art_root / spec.op_key
     state_dir = art_dir / "state"
     logs_dir = art_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -414,7 +469,7 @@ def _execute_pipeline(op_dir: pathlib.Path, *, mode: str, clean_policy: str) -> 
     try:
         if mode in ("full", "build-only"):
             _, module_name = build_and_install_operator(
-                op_dir, spec, clean_policy=clean_policy, mode=mode, cfg=cfg
+                op_dir, spec, art_root=art_root, clean_policy=clean_policy, mode=mode, cfg=cfg
             )
             compiled_ok = True
             for k in ["01-msopgen", "02-build", "03-install-run", "04-pybind-build", "05-pybind-install"]:
@@ -506,6 +561,53 @@ def _execute_pipeline(op_dir: pathlib.Path, *, mode: str, clean_policy: str) -> 
         raise
 
 
+def _parallel_worker_main(
+    worker_id: int,
+    base_opp: str,
+    task_q: Any,
+    art_root_str: str,
+    mode: str,
+    clean_policy: str,
+    result_q: Any,
+    npu_count: int,
+) -> None:
+    """
+    Runs in a child process (multiprocessing spawn). Each worker uses a fixed
+    OPP install root: <base_opp>/_parallel_w<worker_id> via LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH.
+    Binds this process to one physical NPU via ASCEND_VISIBLE_DEVICES so that
+    eval/spec.py (torch.device("npu:0")) maps to device_id = worker_id % npu_count.
+    Consumes txt paths from task_q until sentinel None.
+    """
+    device_id = worker_id % npu_count
+    os.environ["ASCEND_VISIBLE_DEVICES"] = str(device_id)
+    print(f"[batch] [w{worker_id}] ASCEND_VISIBLE_DEVICES={device_id} (npu_count={npu_count})")
+    opp = pathlib.Path(base_opp) / f"_parallel_w{worker_id}"
+    opp.mkdir(parents=True, exist_ok=True)
+    os.environ["LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH"] = str(opp)
+    art_root = pathlib.Path(art_root_str)
+    while True:
+        item = task_q.get()
+        if item is None:
+            break
+        txt_path = pathlib.Path(item)
+        print(f"[batch] [w{worker_id}] === {txt_path.name} ===")
+        staging_root = art_root / "_txt_staging" / txt_path.stem
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
+        staging_root.mkdir(parents=True, exist_ok=True)
+        try:
+            op_dir = materialize_operator_from_txt(
+                out_dir=staging_root / "operator",
+                txt_path=txt_path,
+                soc="ai_core-Ascend910B2",
+            )
+            _execute_pipeline(op_dir, art_root=art_root, mode=mode, clean_policy=clean_policy)
+            result_q.put((txt_path.name, True, None))
+        except Exception as e:
+            print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
+            result_q.put((txt_path.name, False, str(e)))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=(
@@ -528,31 +630,109 @@ def main() -> int:
     )
     ap.add_argument("--mode", default="full", choices=["full", "build-only", "eval-only"])
     ap.add_argument("--clean-policy", default="force", choices=["force", "smart"])
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "only with --txt-dir: number of parallel worker processes (default 1 = sequential). "
+            f"Requires LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH; uses subdirs _parallel_w0.. under that path. "
+            f"Max {_MAX_TXT_DIR_WORKERS}."
+        ),
+    )
+    ap.add_argument(
+        "--npu",
+        type=int,
+        default=1,
+        metavar="K",
+        help=(
+            "only with --txt-dir and --workers > 1: use K physical NPUs indexed 0..K-1. "
+            f"Each worker sets ASCEND_VISIBLE_DEVICES=(worker_id %% K). Default 1 (all workers on physical card 0). "
+            f"Max { _MAX_VISIBLE_NPU }."
+        ),
+    )
     args = ap.parse_args()
+
+    if args.workers < 1:
+        raise ValueError("--workers must be >= 1")
+    if args.workers > _MAX_TXT_DIR_WORKERS:
+        raise ValueError(f"--workers must be <= {_MAX_TXT_DIR_WORKERS}")
+    if args.workers > 1 and args.txt_dir is None:
+        raise ValueError("--workers > 1 is only supported with --txt-dir")
+    if args.workers > 1:
+        if args.npu < 1 or args.npu > _MAX_VISIBLE_NPU:
+            raise ValueError(f"--npu must be between 1 and {_MAX_VISIBLE_NPU} when --workers > 1")
 
     if args.txt_dir:
         txt_dir = _resolve_user_path(pathlib.Path(args.txt_dir))
         if not txt_dir.is_dir():
             raise NotADirectoryError(txt_dir)
+        group_rel = _artifact_group_rel_from_txt_dir(txt_dir)
+        art_root = _artifacts_root_for_group(group_rel)
         files = sorted(txt_dir.glob("*.txt"))
         if not files:
             raise RuntimeError(f"no .txt files in {txt_dir}")
-        rc = 0
-        for txt_path in files:
-            print(f"[batch] === {txt_path.name} ===")
-            staging_root = ROOT / "artifacts" / "_txt_staging" / txt_path.stem
-            if staging_root.exists():
-                shutil.rmtree(staging_root)
-            staging_root.mkdir(parents=True, exist_ok=True)
-            op_dir = materialize_operator_from_txt(
-                out_dir=staging_root / "operator",
-                txt_path=txt_path,
-                soc="ai_core-Ascend910B2",
+
+        if args.workers == 1:
+            rc = 0
+            for txt_path in files:
+                print(f"[batch] === {txt_path.name} ===")
+                staging_root = art_root / "_txt_staging" / txt_path.stem
+                if staging_root.exists():
+                    shutil.rmtree(staging_root)
+                staging_root.mkdir(parents=True, exist_ok=True)
+                op_dir = materialize_operator_from_txt(
+                    out_dir=staging_root / "operator",
+                    txt_path=txt_path,
+                    soc="ai_core-Ascend910B2",
+                )
+                try:
+                    _execute_pipeline(op_dir, art_root=art_root, mode=args.mode, clean_policy=args.clean_policy)
+                except Exception as e:
+                    print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
+                    rc = 1
+            return rc
+
+        cfg_parallel = load_env_config()
+        if not cfg_parallel.ascend_custom_opp_path:
+            raise RuntimeError(
+                "Parallel --txt-dir (--workers > 1) requires a writable OPP root. "
+                "Set environment variable LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH to an absolute path "
+                "(see tools/common/env.py). Each worker installs to <that path>/_parallel_w<id>."
             )
-            try:
-                _execute_pipeline(op_dir, mode=args.mode, clean_policy=args.clean_policy)
-            except Exception as e:
-                print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
+        base_opp = cfg_parallel.ascend_custom_opp_path
+        ctx = multiprocessing.get_context("spawn")
+        task_q = ctx.Queue()
+        result_q = ctx.Queue()
+        for f in files:
+            task_q.put(str(f.resolve()))
+        for _ in range(args.workers):
+            task_q.put(None)
+        procs: list[multiprocessing.Process] = []
+        art_root_str = str(art_root.resolve())
+        for wid in range(args.workers):
+            p = ctx.Process(
+                target=_parallel_worker_main,
+                args=(
+                    wid,
+                    base_opp,
+                    task_q,
+                    art_root_str,
+                    args.mode,
+                    args.clean_policy,
+                    result_q,
+                    args.npu,
+                ),
+            )
+            procs.append(p)
+            p.start()
+        for p in procs:
+            p.join()
+        rc = 0
+        for _ in range(len(files)):
+            _name, ok, _err = result_q.get()
+            if not ok:
                 rc = 1
         return rc
 
@@ -566,7 +746,9 @@ def main() -> int:
         txt_path = _resolve_user_path(pathlib.Path(args.txt))
         if not txt_path.exists():
             raise FileNotFoundError(txt_path)
-        staging_root = ROOT / "artifacts" / "_txt_staging"
+        group_rel = _artifact_group_rel_from_txt_path(txt_path)
+        art_root = _artifacts_root_for_group(group_rel)
+        staging_root = art_root / "_txt_staging" / txt_path.stem
         if staging_root.exists():
             shutil.rmtree(staging_root)
         staging_root.mkdir(parents=True, exist_ok=True)
@@ -576,7 +758,9 @@ def main() -> int:
             soc="ai_core-Ascend910B2",
         )
 
-    _execute_pipeline(op_dir, mode=args.mode, clean_policy=args.clean_policy)
+    if args.op:
+        art_root = ART_ROOT
+    _execute_pipeline(op_dir, art_root=art_root, mode=args.mode, clean_policy=args.clean_policy)
     return 0
 
 

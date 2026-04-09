@@ -1,36 +1,27 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+NUM_GROUPS = 8
 
 class Model(nn.Module):
-    """
-    Model that performs a 3D convolution, applies Group Normalization, minimum, clamp, and dropout.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, groups, min_value, max_value, dropout_p):
-        super(Model, self).__init__()
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
-        self.norm = nn.GroupNorm(groups, out_channels)
-        self.dropout = nn.Dropout(dropout_p)
+    def __init__(self):
+        super().__init__()
 
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.norm(x)
-        x = torch.min(x, torch.tensor(min_value, device=x.device))
-        x = torch.clamp(x, min=min_value, max=max_value)
-        x = self.dropout(x)
-        return x
-
-batch_size = 128
-in_channels = 3
-out_channels = 16
-depth, height, width = 16, 64, 64
-kernel_size = 3
-groups = 8
-min_value = 0.0
-max_value = 1.0
-dropout_p = 0.2
+    def forward(self, x, weight, bias, gamma, beta):
+        y = F.conv3d(x, weight, bias, stride=1, padding=0, dilation=1, groups=1)
+        y = F.group_norm(y, NUM_GROUPS, gamma, beta, eps=1e-5)
+        y = torch.min(y, dim=2)[0]
+        y = y.clamp(0.0, 1.0)
+        return F.dropout(y, p=0.0, training=False)
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, depth, height, width)]
+    x = torch.rand(16, 3, 16, 64, 64)
+    w = torch.rand(16, 3, 3, 3, 3)
+    b = torch.rand(16)
+    gamma = torch.rand(16)
+    bt = torch.rand(16)
+    return [x, w, b, gamma, bt]
 
 def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, groups, min_value, max_value, dropout_p]
+    return []

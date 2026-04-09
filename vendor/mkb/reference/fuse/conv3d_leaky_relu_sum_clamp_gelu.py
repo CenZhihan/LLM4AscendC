@@ -1,32 +1,26 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    Model that performs a 3D convolution, applies LeakyReLU, sums with a tensor, clamps, and applies GELU activation.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, sum_tensor_shape):
-        super(Model, self).__init__()
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
-        self.sum_tensor = nn.Parameter(torch.randn(sum_tensor_shape))
+    def __init__(self):
+        super().__init__()
 
-    def forward(self, x):
-        x = self.conv(x)
-        x = torch.nn.functional.leaky_relu(x, negative_slope=0.2)
-        x = x + self.sum_tensor
-        x = torch.clamp(x, min=-1.0, max=1.0)
-        x = torch.nn.functional.gelu(x)
-        return x
-
-batch_size = 128
-in_channels = 8
-out_channels = 64
-depth, height, width = 16, 64, 64
-kernel_size = 3
-sum_tensor_shape = (out_channels, 1, 1, 1)
+    def forward(self, x, weight, bias_opt, sum_tensor):
+        b = bias_opt if bias_opt is not None else None
+        y = F.conv3d(x, weight, b, stride=1, padding=0, dilation=1, groups=1)
+        y = F.leaky_relu(y, 0.01)
+        sf = sum_tensor.view(1, -1, 1, 1, 1)
+        y = y + sf
+        y = y.clamp(-1e6, 1e6)
+        return F.gelu(y)
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, depth, height, width)]
+    x = torch.rand(128, 8, 16, 64, 64)
+    w = torch.rand(64, 8, 3, 3, 3)
+    cb = torch.rand(64)
+    st = torch.rand(64, 1, 1, 1)
+    return [x, w, cb, st]
 
 def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, sum_tensor_shape]
+    return []

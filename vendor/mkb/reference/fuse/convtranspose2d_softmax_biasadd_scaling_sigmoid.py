@@ -1,37 +1,25 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    Model that performs a transposed convolution, applies softmax, adds a bias term, scales the result, and applies sigmoid.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
-        super(Model, self).__init__()
-        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
-        self.bias = nn.Parameter(torch.randn(bias_shape)) 
-        self.scaling_factor = scaling_factor
+    def __init__(self):
+        super().__init__()
 
-    def forward(self, x):
-        x = self.conv_transpose(x)
-        x = torch.softmax(x, dim=1)
-        x = x + self.bias
-        x = x * self.scaling_factor
-        x = torch.sigmoid(x)
-        return x
-
-batch_size = 128
-in_channels = 64
-out_channels = 128
-height, width = 64, 64
-kernel_size = 4
-stride = 2
-padding = 1
-output_padding = 1
-bias_shape = (out_channels, 1, 1)
-scaling_factor = 2.0
+    def forward(self, x, weight, conv_bias_opt, bias):
+        cb = conv_bias_opt if conv_bias_opt is not None else None
+        y = F.conv_transpose2d(x, weight, cb, stride=2, padding=1, output_padding=1, dilation=1, groups=1)
+        y = F.softmax(y, dim=1)
+        y = y + bias.view(1, -1, 1, 1)
+        y = y * 2.0
+        return torch.sigmoid(y)
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, height, width)]
+    x = torch.rand(8, 64, 32, 32)
+    w = torch.rand(64, 32, 3, 3)
+    cb = torch.rand(32)
+    b = torch.rand(32, 1, 1)
+    return [x, w, cb, b]
 
 def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor]
+    return []

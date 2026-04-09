@@ -1,34 +1,26 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    Model that performs a 3D convolution, scales the output, applies tanh, multiplies by a scaling factor, and applies sigmoid.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape):
-        super(Model, self).__init__()
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
-        self.scaling_factor = nn.Parameter(torch.randn(bias_shape))
-        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+    def __init__(self):
+        super().__init__()
 
-    def forward(self, x):
-        x = self.conv(x)
-        x = x * self.scaling_factor 
-        x = torch.tanh(x)
-        x = x * self.bias
-        x = torch.sigmoid(x)
-        return x
-
-batch_size = 128
-in_channels = 3
-out_channels = 16
-depth, height, width = 16, 64, 64
-kernel_size = 3
-scaling_factor = 2
-bias_shape = (out_channels, 1, 1, 1)
+    def forward(self, x, weight, conv_bias_opt, scaling_factor, bias):
+        b = conv_bias_opt if conv_bias_opt is not None else None
+        y = F.conv3d(x, weight, b, stride=1, padding=0, dilation=1, groups=1)
+        y = y * scaling_factor.view(1, -1, 1, 1, 1) + bias.view(1, -1, 1, 1, 1)
+        y = torch.tanh(y)
+        y = y * torch.sigmoid(y)
+        return y
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, depth, height, width)]
+    x = torch.rand(128, 8, 16, 64, 64)
+    w = torch.rand(64, 8, 3, 3, 3)
+    cb = torch.rand(64)
+    sc = torch.rand(64)
+    bi = torch.rand(64)
+    return [x, w, cb, sc, bi]
 
 def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, scaling_factor, bias_shape]
+    return []

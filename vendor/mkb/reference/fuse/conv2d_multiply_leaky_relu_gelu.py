@@ -1,22 +1,18 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    Model that performs a convolution, multiplies by a learnable scalar, applies LeakyReLU, and then GELU.
-    """
+    """Pybind: (x, weight, bias optional, multiplier tensor [Cout,1,1] or broadcast)."""
     def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape):
         super(Model, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
-        self.multiplier = nn.Parameter(torch.randn(multiplier_shape)) 
-        self.leaky_relu = nn.LeakyReLU()
 
-    def forward(self, x):
-        x = self.conv(x)
-        x = x * self.multiplier
-        x = self.leaky_relu(x)
-        x = torch.nn.functional.gelu(x)
-        return x
+    def forward(self, x, weight, bias_opt, multiplier):
+        conv_b = bias_opt if bias_opt is not None else None
+        x = F.conv2d(x, weight, conv_b, stride=1, padding=0, dilation=1)
+        x = x * multiplier
+        x = F.leaky_relu(x, negative_slope=0.01)
+        return F.gelu(x)
 
 batch_size = 64
 in_channels = 64
@@ -26,7 +22,11 @@ kernel_size = 3
 multiplier_shape = (out_channels, 1, 1)
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, height, width)]
+    x = torch.rand(batch_size, in_channels, height, width)
+    w = torch.rand(out_channels, in_channels, kernel_size, kernel_size)
+    b = torch.rand(out_channels)
+    m = torch.randn(multiplier_shape)
+    return [x, w, b, m]
 
 def get_init_inputs():
     return [in_channels, out_channels, kernel_size, multiplier_shape]

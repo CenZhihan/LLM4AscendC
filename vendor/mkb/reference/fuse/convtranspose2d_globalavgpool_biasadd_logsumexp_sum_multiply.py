@@ -1,33 +1,25 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    Model that performs a transposed convolution, global average pooling, adds a bias, applies log-sum-exp, sum, and multiplication.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
-        super(Model, self).__init__()
-        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size)
-        self.bias = nn.Parameter(torch.randn(bias_shape))
+    def __init__(self):
+        super().__init__()
 
-    def forward(self, x):
-        x = self.conv_transpose(x)
-        x = torch.mean(x, dim=(2, 3), keepdim=True)  # Global average pooling
-        x = x + self.bias
-        x = torch.logsumexp(x, dim=1, keepdim=True)  # Log-sum-exp
-        x = torch.sum(x, dim=(2, 3))  # Sum
-        x = x * 10.0  # Multiplication
-        return x
-
-batch_size = 16
-in_channels = 64
-out_channels = 128
-height = width = 512
-kernel_size = 3
-bias_shape = (out_channels, 1, 1)
+    def forward(self, x, weight, conv_bias_opt, bias):
+        cb = conv_bias_opt if conv_bias_opt is not None else None
+        y = F.conv_transpose2d(x, weight, cb, stride=1, padding=0, output_padding=0, dilation=1, groups=1)
+        y = F.adaptive_avg_pool2d(y, 1)
+        y = y + bias.view(1, -1, 1, 1)
+        y = torch.logsumexp(y.flatten(1), dim=1, keepdim=True).view(1, 1, 1, 1)  # scalar
+        return y * y.sum()
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, height, width)]
+    x = torch.rand(8, 64, 32, 32)
+    w = torch.rand(64, 32, 3, 3)
+    cb = torch.rand(32)
+    b = torch.rand(32, 1, 1)
+    return [x, w, cb, b]
 
 def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, bias_shape]
+    return []

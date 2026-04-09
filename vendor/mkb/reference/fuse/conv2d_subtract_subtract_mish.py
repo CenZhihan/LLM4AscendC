@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
     """
@@ -7,12 +8,14 @@ class Model(nn.Module):
     """
     def __init__(self, in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2):
         super(Model, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
         self.subtract_value_1 = subtract_value_1
         self.subtract_value_2 = subtract_value_2
 
-    def forward(self, x):
-        x = self.conv(x)
+    def forward(self, x, weight, conv_bias=None):
+        x = F.conv2d(x, weight, conv_bias, stride=1, padding=0)
         x = x - self.subtract_value_1
         x = x - self.subtract_value_2
         x = torch.nn.functional.mish(x)
@@ -27,7 +30,10 @@ subtract_value_1 = 0.5
 subtract_value_2 = 0.2
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, height, width)]
+    x = torch.rand(batch_size, in_channels, height, width)
+    weight = torch.rand(out_channels, in_channels, kernel_size, kernel_size)
+    conv_bias = torch.rand(out_channels) if out_channels > 1 else None
+    return [x, weight, conv_bias]
 
 def get_init_inputs():
     return [in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2]

@@ -1,23 +1,24 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
     """
-    Model that performs a GEMM, scaling, hardtanh, and GELU activation.
+    Pybind: (x, w, b, scaling, hardtanh_min, hardtanh_max) — scalar float tensors.
     """
     def __init__(self, in_features, out_features, scaling_factor, hardtanh_min, hardtanh_max):
         super(Model, self).__init__()
-        self.gemm = nn.Linear(in_features, out_features)
-        self.scaling_factor = scaling_factor
-        self.hardtanh = nn.Hardtanh(min_val=hardtanh_min, max_val=hardtanh_max)
-        self.gelu = nn.GELU()
+        self.in_features = in_features
+        self.out_features = out_features
 
-    def forward(self, x):
-        x = self.gemm(x)
-        x = x * self.scaling_factor
-        x = self.hardtanh(x)
-        x = self.gelu(x)
-        return x
+    def forward(self, x, w, b, scaling, hardtanh_min, hardtanh_max):
+        s = float(scaling.detach().cpu().item())
+        mn = float(hardtanh_min.detach().cpu().item())
+        mx = float(hardtanh_max.detach().cpu().item())
+        x = F.linear(x, w, b)
+        x = x * s
+        x = F.hardtanh(x, min_val=mn, max_val=mx)
+        return F.gelu(x)
 
 batch_size = 2048
 in_features = 8192
@@ -27,7 +28,13 @@ hardtanh_min = -2
 hardtanh_max = 2
 
 def get_inputs():
-    return [torch.rand(batch_size, in_features)]
+    x = torch.rand(batch_size, in_features)
+    w = torch.rand(out_features, in_features)
+    b = torch.rand(out_features)
+    scaling = torch.tensor(scaling_factor, dtype=torch.float32)
+    ht_min = torch.tensor(float(hardtanh_min), dtype=torch.float32)
+    ht_max = torch.tensor(float(hardtanh_max), dtype=torch.float32)
+    return [x, w, b, scaling, ht_min, ht_max]
 
 def get_init_inputs():
     return [in_features, out_features, scaling_factor, hardtanh_min, hardtanh_max]

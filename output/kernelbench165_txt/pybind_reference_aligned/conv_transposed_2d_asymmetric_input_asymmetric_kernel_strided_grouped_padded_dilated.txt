@@ -1,0 +1,371 @@
+```python
+project_json_src='''
+
+[
+  {
+    "op": "ConvTransposed2dAsymmetricInputAsymmetricKernelStridedGroupedPaddedDilatedCustom",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTransposed2dAsymmetricInputAsymmetricKernelStridedGroupedPaddedDilatedCustomTilingData)
+    TILING_DATA_FIELD_DEF(uint32_t, totalX);     // N*Cin*Hin*Win (informational)
+    TILING_DATA_FIELD_DEF(uint32_t, totalW);     // Cin*(Cout/groups)*Kh*Kw
+    TILING_DATA_FIELD_DEF(uint32_t, totalY);     // N*Cout*Hout*Wout
+    TILING_DATA_FIELD_DEF(uint32_t, blockDim);   // launch blocks
+    TILING_DATA_FIELD_DEF(uint32_t, tileElems);  // linear y elements per block iteration
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(
+    ConvTransposed2dAsymmetricInputAsymmetricKernelStridedGroupedPaddedDilatedCustom,
+    ConvTransposed2dAsymmetricInputAsymmetricKernelStridedGroupedPaddedDilatedCustomTilingData)
+} // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "conv_transposed2d_asymmetric_input_asymmetric_kernel_strided_grouped_padded_dilated_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <string.h>
+#include <algorithm>
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTransposed2dAsymmetricInputAsymmetricKernelStridedGroupedPaddedDilatedCustomTilingData tiling;
+
+    uint32_t totalX = context->GetInputShape(0)->GetStorageShape().GetShapeSize();
+    uint32_t totalW = context->GetInputShape(1)->GetStorageShape().GetShapeSize();
+    uint32_t totalY = context->GetOutputShape(0)->GetStorageShape().GetShapeSize();
+
+    tiling.set_totalX(totalX);
+    tiling.set_totalW(totalW);
+    tiling.set_totalY(totalY);
+
+    // Expose parallelism over output elements; keep moderate to avoid device/context stress.
+    // 24 blocks generally gives good occupancy on 910B without extreme launch configurations.
+    uint32_t blockDim = 24;
+    tiling.set_blockDim(blockDim);
+
+    // Each block processes y in chunks; tune for less loop overhead but keep register pressure modest.
+    uint32_t tileElems = 256;
+    tiling.set_tileElems(tileElems);
+
+    context->SetBlockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ops {
+
+class ConvTransposed2dAsymmetricInputAsymmetricKernelStridedGroupedPaddedDilatedCustom : public OpDef {
+public:
+    explicit ConvTransposed2dAsymmetricInputAsymmetricKernelStridedGroupedPaddedDilatedCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTransposed2dAsymmetricInputAsymmetricKernelStridedGroupedPaddedDilatedCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+// Output-stationary gather ConvTranspose2d specialized for:
+// x:      [16,32,128,256]
+// weight: [32,16,3,5]  (Cin, Cout/groups, Kh, Kw)
+// stride=(2,3), padding=(1,2), dilation=(2,1), groups=4, bias=False
+// y:      [16,64,255,766]
+//
+// This version parallelizes over output elements (no races, no atomics).
+// For each output (n,co,ho,wo), it finds valid (hi,wi) for each (kh,kw) by solving:
+// ho = hi*SH - PH + kh*DH  => hi = (ho + PH - kh*DH) / SH  if divisible
+// wo = wi*SW - PW + kw*DW  => wi = (wo + PW - kw*DW) / SW  if divisible
+// and sums over ci within the same group.
+
+class KernelConvTransposed2dOutStationaryFp32 {
+public:
+    __aicore__ inline KernelConvTransposed2dOutStationaryFp32() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                               uint32_t totalY, uint32_t totalX, uint32_t totalW,
+                               uint32_t blockDim, uint32_t tileElems)
+    {
+        (void)totalX; (void)totalW;
+        xGm.SetGlobalBuffer((__gm__ float*)x);
+        wGm.SetGlobalBuffer((__gm__ float*)w);
+        yGm.SetGlobalBuffer((__gm__ float*)y);
+        this->totalY = totalY;
+        this->blockDim = blockDim;
+        this->tileElems = tileElems;
+    }
+
+    __aicore__ inline void Process()
+    {
+        constexpr int N = 16;
+        constexpr int CIN = 32;
+        constexpr int HIN = 128;
+        constexpr int WIN = 256;
+
+        constexpr int COUT = 64;
+        constexpr int KH = 3;
+        constexpr int KW = 5;
+
+        constexpr int SH = 2;
+        constexpr int SW = 3;
+        constexpr int PH = 1;
+        constexpr int PW = 2;
+        constexpr int DH = 2;
+        constexpr int DW = 1;
+
+        constexpr int GROUPS = 4;
+        constexpr int CIN_G = CIN / GROUPS;   // 8
+        constexpr int COUT_G = COUT / GROUPS; // 16
+
+        constexpr int HOUT = (HIN - 1) * SH - 2 * PH + DH * (KH - 1) + 1; // 255
+        constexpr int WOUT = (WIN - 1) * SW - 2 * PW + DW * (KW - 1) + 1; // 766
+
+        // Guard against mismatched shapes to avoid OOB in specialization context.
+        const uint32_t expectedY = (uint32_t)(N * COUT * HOUT * WOUT);
+        if (totalY != expectedY) return;
+
+        const uint32_t bid = (uint32_t)AscendC::GetBlockIdx();
+
+        // Linear tiling over y
+        const uint32_t stride = blockDim * tileElems;
+        uint32_t base = bid * tileElems;
+
+        while (base < totalY) {
+            uint32_t end = base + tileElems;
+            if (end > totalY) end = totalY;
+
+            for (uint32_t yLinear = base; yLinear < end; ++yLinear) {
+                // Decode yLinear -> (n, co, ho, wo)
+                uint32_t t = yLinear;
+                const int wo = (int)(t % WOUT); t /= WOUT;
+                const int ho = (int)(t % HOUT); t /= HOUT;
+                const int co = (int)(t % COUT); t /= COUT;
+                const int n  = (int)t;
+
+                const int g = co / COUT_G;
+                const int coInG = co - g * COUT_G;
+                const int ciBase = g * CIN_G;
+
+                float acc = 0.0f;
+
+                // Iterate over kernel taps; only a few will match stride congruence.
+                // Precompute hoTerm and woTerm for each tap.
+                for (int kh = 0; kh < KH; ++kh) {
+                    const int hoTerm = ho + PH - kh * DH;
+                    // hoTerm must be divisible by SH and produce hi in [0,HIN)
+                    if ((unsigned)hoTerm >= 0x80000000u) {
+                        // negative: skip quickly
+                    }
+                    if ((hoTerm & (SH - 1)) != 0) continue;
+                    const int hi = hoTerm / SH;
+                    if ((unsigned)hi >= (unsigned)HIN) continue;
+
+                    for (int kw = 0; kw < KW; ++kw) {
+                        const int woTerm = wo + PW - kw * DW;
+                        // SW=3 not power of two; use modulus.
+                        // Fast reject negative first:
+                        if (woTerm < 0) continue;
+                        const int rem = woTerm - (woTerm / SW) * SW;
+                        if (rem != 0) continue;
+                        const int wi = woTerm / SW;
+                        if ((unsigned)wi >= (unsigned)WIN) continue;
+
+                        // Now sum over Cin in group
+                        const int64_t xBase =
+                            (((int64_t)n * CIN) * HIN + (int64_t)hi) * WIN + (int64_t)wi;
+
+                        // Weight index uses global ci (as stored), but group correctness comes from restricting ci range
+                        for (int ciInG = 0; ciInG < CIN_G; ++ciInG) {
+                            const int ci = ciBase + ciInG;
+                            const float xf = xGm.GetValue(xBase + (int64_t)ci * (int64_t)HIN * (int64_t)WIN);
+
+                            // wIdx = (((ci * COUT_G + coInG) * KH + kh) * KW + kw)
+                            const int64_t wIdx =
+                                (((int64_t)ci * COUT_G + (int64_t)coInG) * KH + (int64_t)kh) * KW + (int64_t)kw;
+                            const float wf = wGm.GetValue(wIdx);
+                            acc += xf * wf;
+                        }
+                    }
+                }
+
+                yGm.SetValue((int64_t)yLinear, acc);
+            }
+
+            base += stride;
+        }
+    }
+
+private:
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> wGm;
+    AscendC::GlobalTensor<float> yGm;
+    uint32_t totalY;
+    uint32_t blockDim;
+    uint32_t tileElems;
+};
+
+extern "C" __global__ __aicore__ void conv_transposed2d_asymmetric_input_asymmetric_kernel_strided_grouped_padded_dilated_custom(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    (void)workspace;
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConvTransposed2dOutStationaryFp32 op;
+    op.Init(x, weight, y,
+            tiling_data.totalY, tiling_data.totalX, tiling_data.totalW,
+            tiling_data.blockDim, tiling_data.tileElems);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/extension.h>
+#include <torch/library.h>
+#include "pytorch_npu_helper.hpp"
+
+static inline int64_t convtranspose2d_out(int64_t in, int64_t stride, int64_t pad, int64_t dil, int64_t k)
+{
+    return (in - 1) * stride - 2 * pad + dil * (k - 1) + 1;
+}
+
+at::Tensor conv_transposed2d_asymmetric_input_asymmetric_kernel_strided_grouped_padded_dilated_custom_impl_npu(
+    const at::Tensor& x,
+    const at::Tensor& weight)
+{
+    TORCH_CHECK(x.device().type() == c10::DeviceType::PrivateUse1, "x must be on NPU");
+    TORCH_CHECK(weight.device().type() == c10::DeviceType::PrivateUse1, "weight must be on NPU");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be float32");
+    TORCH_CHECK(weight.scalar_type() == at::kFloat, "weight must be float32");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous (NCHW)");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(x.dim() == 4, "x must be NCHW 4D");
+    TORCH_CHECK(weight.dim() == 4, "weight must be [Cin, Cout/groups, Kh, Kw] 4D");
+
+    // Fixed params from the target model instance
+    const int64_t stride_h = 2, stride_w = 3;
+    const int64_t pad_h = 1, pad_w = 2;
+    const int64_t dilation_h = 2, dilation_w = 1;
+    const int64_t groups = 4;
+
+    const int64_t N = x.size(0);
+    const int64_t Cin = x.size(1);
+    const int64_t Hin = x.size(2);
+    const int64_t Win = x.size(3);
+
+    TORCH_CHECK(N == 16 && Cin == 32 && Hin == 128 && Win == 256,
+                "specialized for x=[16,32,128,256]");
+
+    const int64_t wCin = weight.size(0);
+    const int64_t wCoutPerG = weight.size(1);
+    const int64_t Kh = weight.size(2);
+    const int64_t Kw = weight.size(3);
+
+    TORCH_CHECK(wCin == 32 && wCoutPerG == 16 && Kh == 3 && Kw == 5,
+                "specialized for weight=[32,16,3,5]");
+
+    TORCH_CHECK(groups > 0, "groups must be > 0");
+    TORCH_CHECK(Cin % groups == 0, "Cin must be divisible by groups");
+
+    const int64_t Cout = wCoutPerG * groups; // 64
+    const int64_t Hout = convtranspose2d_out(Hin, stride_h, pad_h, dilation_h, Kh); // 255
+    const int64_t Wout = convtranspose2d_out(Win, stride_w, pad_w, dilation_w, Kw); // 766
+
+    at::Tensor y = at::empty({N, Cout, Hout, Wout}, x.options());
+
+    EXEC_NPU_CMD(aclnnConvTransposed2dAsymmetricInputAsymmetricKernelStridedGroupedPaddedDilatedCustom,
+                 x, weight, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transposed2d_asymmetric_input_asymmetric_kernel_strided_grouped_padded_dilated_custom",
+           &conv_transposed2d_asymmetric_input_asymmetric_kernel_strided_grouped_padded_dilated_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transposed2d_asymmetric_input_asymmetric_kernel_strided_grouped_padded_dilated_custom",
+          &conv_transposed2d_asymmetric_input_asymmetric_kernel_strided_grouped_padded_dilated_custom_impl_npu,
+          "conv_transposed2d_asymmetric_input_asymmetric_kernel_strided_grouped_padded_dilated_custom (NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'conv_transposed2d_asymmetric_input_asymmetric_kernel_strided_grouped_padded_dilated_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
+```

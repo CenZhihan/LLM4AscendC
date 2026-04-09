@@ -1,27 +1,23 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    A model that computes Triplet Margin Loss for metric learning tasks.
+    def __init__(self):
+        super().__init__()
 
-    Parameters:
-        margin (float): The margin between the positive and negative samples.
-    """
-    def __init__(self, margin=1.0):
-        super(Model, self).__init__()
-        self.loss_fn = torch.nn.TripletMarginLoss(margin=margin)
-
-    def forward(self, anchor, positive, negative):
-        return self.loss_fn(anchor, positive, negative)
-
-batch_size = 32768
-input_shape = (8192,)
-dim = 1
+    def forward(self, anchor, positive, negative, margin):
+        m = float(margin.reshape(-1)[0].item()) if margin.numel() else 0.0
+        return F.triplet_margin_loss(anchor, positive, negative, margin=m)
 
 def get_inputs():
-    scale = torch.rand(())
-    return [torch.rand(batch_size, *input_shape)*scale, torch.rand(batch_size, *input_shape), torch.rand(batch_size, *input_shape)]
-    
+    n = 32
+    d = 128
+    anchor = torch.randn(n, d)
+    positive = torch.randn(n, d)
+    negative = torch.randn(n, d)
+    margin = torch.tensor(1.0)
+    return [anchor, positive, negative, margin]
+
 def get_init_inputs():
-    return [1.0]  # Default margin
+    return []

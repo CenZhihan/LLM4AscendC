@@ -3,26 +3,14 @@ import torch.nn as nn
 
 class Model(nn.Module):
     """
-    A model that performs a masked cumulative sum, only summing elements that satisfy a condition.
-
-    Parameters:
-        dim (int): The dimension along which to perform the masked cumulative sum.
+    Masked cumulative sum along one dimension.
+    Pybind contract: masked_cumsum_custom(Tensor x, Tensor mask, int dim).
     """
-
-    def __init__(self, dim):
+    def __init__(self):
         super(Model, self).__init__()
-        self.dim = dim
 
-    def forward(self, x, mask):
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
-            mask (torch.Tensor): Boolean mask of the same shape as x.
-
-        Returns:
-            torch.Tensor: Cumulative sum of elements where mask is True.
-        """
-        return torch.cumsum(x * mask, dim=self.dim)
+    def forward(self, x, mask, dim: int):
+        return torch.cumsum(x * mask, dim=dim)
 
 batch_size = 32768
 input_shape = (32768,)
@@ -30,8 +18,8 @@ dim = 1
 
 def get_inputs():
     x = torch.rand(batch_size, *input_shape)
-    mask = torch.randint(0, 2, x.shape).bool()  # Random boolean mask
-    return [x, mask]
+    mask = torch.randint(0, 2, x.shape).bool()
+    return [x, mask, dim]
 
 def get_init_inputs():
-    return [dim]
+    return []

@@ -2,56 +2,36 @@ import torch
 import torch.nn as nn
 
 class Model(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, output_size: int):
-        """
-        Initialize the Vanilla RNN model.
+    """Pybind: (x, h0, w_i2h, b_i2h, w_h2o, b_h2o) -> y [T,B,O]. One tanh cell + output projection."""
 
-        :param input_size: The number of input features (int).
-        :param hidden_size: The size of the hidden state (int).
-        :param output_size: The number of output features (int).
-        """
-        super(Model, self).__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.output_size = output_size
+    def __init__(self):
+        super().__init__()
 
-        # Define the RNN cell components (input to hidden, hidden to hidden, and hidden to output)
-        self.i2h = nn.Linear(input_size + hidden_size, hidden_size)  # Input to hidden
-        self.h2o = nn.Linear(hidden_size, output_size)  # Hidden to output
-        self.tanh = nn.Tanh()  # Activation function for hidden state
+    def forward(self, x, h0, w_i2h, b_i2h, w_h2o, b_h2o):
+        T, B, I = x.shape
+        H, K = w_i2h.shape
+        h = h0
+        outs = []
+        for t in range(T):
+            inp = torch.cat([x[t], h], dim=-1)
+            pre = inp @ w_i2h.t() + b_i2h
+            h = torch.tanh(pre)
+            y_t = h @ w_h2o.t() + b_h2o
+            outs.append(y_t)
+        return torch.stack(outs, dim=0)
 
-    def forward(self, x: torch.Tensor, h0: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the Vanilla RNN.
-
-        :param x: Input tensor of shape (seq_len, batch_size, input_size)
-        :param h0: Initial hidden state tensor of shape (batch_size, hidden_size)
-        :return: Output tensor of shape (seq_len, batch_size, output_size)
-        """
-        seq_len, batch_size, _ = x.size()
-        hidden = h0.to(x.device)
-        outputs = []
-
-        for t in range(seq_len):
-            combined = torch.cat((x[t], hidden), dim=1)  # Concatenate input and hidden state
-            hidden = self.tanh(self.i2h(combined))  # Update hidden state
-            output = self.h2o(hidden)  # Compute output
-            outputs.append(output)
-
-        return torch.stack(outputs, dim=0)  # (seq_len, batch_size, output_size)
-
-# === Test configuration ===
-batch_size = 8
-input_size = 1024
-hidden_size = 256
-output_size = 128
-sequence_length = 256
+T, B, I = 256, 8, 1024
+H, O = 256, 128
+K = I + H
 
 def get_inputs():
-    return [
-        torch.rand(sequence_length, batch_size, input_size),
-        torch.rand(batch_size, hidden_size)
-    ]
+    x = torch.rand(T, B, I)
+    h0 = torch.rand(B, H)
+    w_i2h = torch.rand(H, K)
+    b_i2h = torch.rand(H)
+    w_h2o = torch.rand(O, H)
+    b_h2o = torch.rand(O)
+    return [x, h0, w_i2h, b_i2h, w_h2o, b_h2o]
 
 def get_init_inputs():
-    return [input_size, hidden_size, output_size]
+    return []

@@ -1,31 +1,28 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
-    """
-    A 3D convolutional transpose layer followed by Batch Normalization and subtraction.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=True):
-        super(Model, self).__init__()
-        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
-        self.batch_norm = nn.BatchNorm3d(out_channels)
+    def __init__(self):
+        super().__init__()
 
-    def forward(self, x):
-        x = self.conv_transpose(x)
-        x = self.batch_norm(x)
-        x = x - torch.mean(x, dim=(2, 3, 4), keepdim=True)  # Subtract mean along spatial dimensions
-        return x
-
-batch_size = 16
-in_channels = 16
-out_channels = 32
-depth, height, width = 16, 32, 32
-kernel_size = 3
-stride = 2
-padding = 1
+    def forward(self, x, weight, conv_bias, bn_weight, bn_bias):
+        y = F.conv_transpose3d(
+            x, weight, conv_bias, stride=1, padding=0, output_padding=0, dilation=1, groups=1,
+        )
+        c = y.size(1)
+        rm = torch.zeros(c, device=y.device, dtype=y.dtype)
+        rv = torch.ones(c, device=y.device, dtype=y.dtype)
+        y = F.batch_norm(y, rm, rv, bn_weight, bn_bias, training=False, momentum=0.0)
+        return y - y.mean(dim=(2, 3, 4), keepdim=True)
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, depth, height, width)]
+    x = torch.rand(4, 32, 16, 16, 16)
+    w = torch.rand(32, 64, 3, 3, 3)
+    cb = torch.rand(64)
+    bw = torch.rand(64)
+    bb = torch.rand(64)
+    return [x, w, cb, bw, bb]
 
 def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, stride, padding]
+    return []

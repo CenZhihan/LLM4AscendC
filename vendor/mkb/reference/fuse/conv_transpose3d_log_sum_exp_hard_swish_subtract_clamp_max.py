@@ -1,34 +1,29 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+def hard_swish(t):
+    return t * F.relu6(t + 3.0) / 6.0
 
 class Model(nn.Module):
-    """
-    Model that performs a 3D transposed convolution, LogSumExp, HardSwish, subtraction, clamp operations.
-    """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
-        super(Model, self).__init__()
-        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
-        self.bias = nn.Parameter(torch.randn(1, 1, 1, 1)) 
+    def __init__(self):
+        super().__init__()
 
-    def forward(self, x):
-        x = self.conv_transpose(x)
-        x = torch.logsumexp(x, dim=1, keepdim=True)
-        x = x * torch.sigmoid(x + 3) / 6
-        x = x - self.bias
-        x = torch.clamp(x, min=-1, max=1)
-        return x
-
-batch_size = 128
-in_channels = 3
-out_channels = 16
-depth, height, width = 16, 32, 32
-kernel_size = 3
-stride = 2
-padding = 1
-bias_shape = (1, 1, 1, 1)  
+    def forward(self, x, weight, conv_bias_opt, sub):
+        cb = conv_bias_opt if conv_bias_opt is not None else None
+        y = F.conv_transpose3d(x, weight, cb, stride=1, padding=0, output_padding=0, dilation=1, groups=1)
+        y = torch.logsumexp(y, dim=1, keepdim=True)
+        y = hard_swish(y)
+        y = y - sub.view(1, -1, 1, 1, 1)
+        y = y.clamp(0.0, 1.0)
+        return y.max(dim=2)[0]
 
 def get_inputs():
-    return [torch.rand(batch_size, in_channels, depth, height, width)]
+    x = torch.rand(4, 32, 16, 16, 16)
+    w = torch.rand(32, 64, 3, 3, 3)
+    cb = torch.rand(64)
+    su = torch.rand(64)
+    return [x, w, cb, su]
 
 def get_init_inputs():
-    return [in_channels, out_channels, kernel_size, stride, padding, bias_shape]
+    return []

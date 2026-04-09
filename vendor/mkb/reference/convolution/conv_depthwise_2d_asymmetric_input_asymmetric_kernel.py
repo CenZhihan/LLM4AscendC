@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class Model(nn.Module):
     """
@@ -21,19 +22,28 @@ class Model(nn.Module):
     """
     def __init__(self, in_channels: int, out_channels: int, kernel_size_h: int, kernel_size_w: int, stride_h: int = 1, stride_w: int = 1, padding_h: int = 0, padding_w: int = 0, dilation_h: int = 1, dilation_w: int = 1, groups: int = 1, bias: bool = False):
         super(Model, self).__init__()
-        self.conv2d = nn.Conv2d(in_channels, in_channels, (kernel_size_h, kernel_size_w), stride=(stride_h, stride_w), padding=(padding_h, padding_w), dilation=(dilation_h, dilation_w), groups=in_channels, bias=bias)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.in_channels = in_channels
+        self.kernel_size_h = kernel_size_h
+        self.kernel_size_w = kernel_size_w
+        self.stride_h = stride_h
+        self.stride_w = stride_w
+        self.padding_h = padding_h
+        self.padding_w = padding_w
+        self.dilation_h = dilation_h
+        self.dilation_w = dilation_w
+
+    def forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         """
         Performs the depthwise 2D convolution.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+            weight: Convolution weights
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, out_channels, height_out, width_out).
         """
-        return self.conv2d(x)
+        return F.conv2d(x, weight, stride=(self.stride_h, self.stride_w), padding=(self.padding_h, self.padding_w), dilation=(self.dilation_h, self.dilation_w), groups=self.in_channels)
 
 # Test code
 batch_size = 32
@@ -53,7 +63,9 @@ groups = in_channels
 
 def get_inputs():
     x = torch.rand(batch_size, in_channels, height, width)
-    return [x]
+    # weight shape for depthwise: (in_channels, 1, kernel_size_h, kernel_size_w)
+    weight = torch.rand(in_channels, 1, kernel_size_h, kernel_size_w)
+    return [x, weight]
 
 def get_init_inputs():
     return [in_channels, out_channels, kernel_size_h, kernel_size_w, stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w, groups]
