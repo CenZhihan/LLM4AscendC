@@ -8,7 +8,14 @@ from typing import Dict, Any, Tuple
 from langchain_core.messages import HumanMessage
 
 from ..agent_state import GeneratorAgentState, MAX_QUERY_ROUNDS
-from ..agent_config import AgentToolMode
+from ..agent_config import (
+    AgentToolMode,
+    ToolType,
+    NO_TOOL,
+    has_kb,
+    has_web,
+    has_code_rag,
+)
 
 
 def _openai_completion(
@@ -99,13 +106,13 @@ def _build_tool_selection_prompt(
 ) -> str:
     """Build prompt for tool selection."""
 
-    # Describe available tools
+    # Build tools description dynamically
     tools_desc: list = []
-    if tool_mode.has_kb():
+    if has_kb(tool_mode):
         tools_desc.append("知识库查询（KB）- 查询华为 Ascend C API 文档")
-    if tool_mode.has_web():
+    if has_web(tool_mode):
         tools_desc.append("网页搜索（WEB）- 搜索相关技术文档和博客")
-    if tool_mode.has_code_rag():
+    if has_code_rag(tool_mode):
         tools_desc.append("代码检索（CODE_RAG）- 检索 Ascend C 代码库中的相似实现")
 
     if not tools_desc:
@@ -114,15 +121,20 @@ def _build_tool_selection_prompt(
     tools_line = "、".join(tools_desc)
     at_max = round_count >= MAX_QUERY_ROUNDS
 
-    # Build few-shot examples
+    # Build few-shot examples dynamically (order matches tools_desc)
     examples: list = []
-    if tool_mode.has_kb():
-        examples.append("示例1（查知识库）：\nKB\nAscend C GELU kernel implementation")
-    if tool_mode.has_web():
-        examples.append("示例2（网页搜索）：\nWEB\nAscend C custom operator tutorial")
-    if tool_mode.has_code_rag():
-        examples.append("示例3（代码检索）：\nCODE_RAG\nAscend C softmax kernel example")
-    examples.append("示例4（直接回答）：\nANSWER")
+    example_idx = 1
+    for tool_type in [ToolType.KB, ToolType.WEB, ToolType.CODE_RAG]:
+        if tool_type in tool_mode:
+            tool_name = tool_type.value.upper()
+            if tool_type == ToolType.KB:
+                examples.append(f"示例{example_idx}（查知识库）：\nKB\nAscend C GELU kernel implementation")
+            elif tool_type == ToolType.WEB:
+                examples.append(f"示例{example_idx}（网页搜索）：\nWEB\nAscend C custom operator tutorial")
+            elif tool_type == ToolType.CODE_RAG:
+                examples.append(f"示例{example_idx}（代码检索）：\nCODE_RAG\nAscend C softmax kernel example")
+            example_idx += 1
+    examples.append("示例（直接回答）：\nANSWER")
     few_shot = "\n\n".join(examples)
 
     # Build prompt
@@ -158,7 +170,7 @@ def choose_tool_node(
         state: Current agent state
         client: OpenAI client
         model: Model name
-        tool_mode: Enabled tool mode
+        tool_mode: Enabled tool mode (FrozenSet[ToolType])
 
     Returns:
         Dict with next_action and current_query
@@ -168,7 +180,7 @@ def choose_tool_node(
     round_count = state.get("query_round_count", 0)
 
     # No tools enabled -> direct answer
-    if tool_mode == AgentToolMode.NO_TOOL or (not tool_mode.has_kb() and not tool_mode.has_web() and not tool_mode.has_code_rag()):
+    if tool_mode == NO_TOOL:
         return {"next_action": "ANSWER", "current_query": ""}
 
     # Build and call LLM
@@ -191,30 +203,26 @@ def choose_tool_node(
     elif "ANSWER" in first or first == "ANSWER":
         next_action = "ANSWER"
         current_query = ""
-    elif "KB" in first and tool_mode.has_kb():
+    elif "KB" in first and has_kb(tool_mode):
         next_action = "KB"
         current_query = query_line or user_question
-    elif "WEB" in first and tool_mode.has_web():
+    elif "WEB" in first and has_web(tool_mode):
         next_action = "WEB"
         current_query = query_line or user_question
-    elif "CODE_RAG" in first and tool_mode.has_code_rag():
-        next_action = "CODE_RAG"
-        current_query = query_line or user_question
-    elif tool_mode.has_kb():
-        # Fallback to KB
-        next_action = "KB"
-        current_query = query_line or user_question
-    elif tool_mode.has_web():
-        # Fallback to WEB
-        next_action = "WEB"
-        current_query = query_line or user_question
-    elif tool_mode.has_code_rag():
-        # Fallback to CODE_RAG
+    elif "CODE_RAG" in first and has_code_rag(tool_mode):
         next_action = "CODE_RAG"
         current_query = query_line or user_question
     else:
-        next_action = "ANSWER"
-        current_query = ""
+        # Fallback: choose first available tool
+        if has_kb(tool_mode):
+            next_action = "KB"
+        elif has_web(tool_mode):
+            next_action = "WEB"
+        elif has_code_rag(tool_mode):
+            next_action = "CODE_RAG"
+        else:
+            next_action = "ANSWER"
+        current_query = query_line or user_question
 
     print(f"[choose_tool] 模型回复: {raw_response[:100]!r} -> next_action={next_action}")
     return {"next_action": next_action, "current_query": current_query}

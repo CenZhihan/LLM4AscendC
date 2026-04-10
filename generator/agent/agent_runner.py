@@ -4,11 +4,18 @@ Agent runner: high-level API for kernel generation with agent.
 Provides generate_kernel_with_agent() function for easy integration.
 """
 from dataclasses import dataclass
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Union
 
 from langchain_core.messages import HumanMessage
 
-from .agent_config import AgentToolMode, get_llm_config_compatible
+from .agent_config import (
+    AgentToolMode,
+    NO_TOOL,
+    has_kb,
+    parse_tool_mode,
+    tool_mode_to_string,
+    get_llm_config_compatible,
+)
 from .agent_state import GeneratorAgentState, create_initial_state
 from .agent_builder import build_agent_app
 from .retrievers import KBRetriever, WebRetriever, CodeRetriever
@@ -104,7 +111,7 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
 
 def generate_kernel_with_agent(
     task: KernelGenerationTask,
-    tool_mode: AgentToolMode = AgentToolMode.NO_TOOL,
+    tool_mode: Union[AgentToolMode, str] = NO_TOOL,
     retriever: Optional[CodeRetriever] = None,
     llm_config: Optional[Dict[str, Any]] = None,
 ) -> AgentGenerationResult:
@@ -113,7 +120,7 @@ def generate_kernel_with_agent(
 
     Args:
         task: KernelGenerationTask with language, op, strategy_name, category
-        tool_mode: AgentToolMode specifying which retrieval tools to use
+        tool_mode: Tool mode (FrozenSet[ToolType] or string like "kb_only", "kb,web", "all")
         retriever: Optional pre-loaded CodeRetriever for Code RAG
         llm_config: Optional LLM config (api_key, base_url, model)
 
@@ -127,19 +134,22 @@ def generate_kernel_with_agent(
             strategy_name="add_shot",
             category="activation"
         )
-        result = generate_kernel_with_agent(task, AgentToolMode.ALL)
+        result = generate_kernel_with_agent(task, "all")
         print(result.generated_code)
     """
+    # Parse tool mode if string
+    parsed_mode = parse_tool_mode(tool_mode) if isinstance(tool_mode, str) else tool_mode
+
     # 1. Build base prompt using existing prompt_generators
     base_prompt = _build_base_prompt(task.language, task.strategy_name, task.op)
 
     # 2. Add KB hint if KB is enabled
-    if tool_mode.has_kb():
+    if has_kb(parsed_mode):
         base_prompt = _add_kb_hint(base_prompt)
 
     # 3. Build and invoke agent
     app = build_agent_app(
-        tool_mode=tool_mode,
+        tool_mode=parsed_mode,
         llm_config=llm_config,
         code_retriever=retriever,
     )
@@ -154,7 +164,8 @@ def generate_kernel_with_agent(
     )
 
     # 5. Invoke agent
-    print(f"[INFO] Starting agent for op={task.op}, tool_mode={tool_mode.value}")
+    mode_str = tool_mode_to_string(parsed_mode)
+    print(f"[INFO] Starting agent for op={task.op}, tool_mode={mode_str}")
     final_state = app.invoke(initial_state)
 
     # 6. Extract results
@@ -177,7 +188,7 @@ def generate_ascendc_kernel(
     op: str,
     category: str = "activation",
     strategy: str = "add_shot",
-    tool_mode: str = "no_tool",
+    tool_mode: Union[str, AgentToolMode] = "no_tool",
 ) -> str:
     """
     Simple function to generate Ascend C kernel.
@@ -186,7 +197,7 @@ def generate_ascendc_kernel(
         op: Operator name
         category: Operator category
         strategy: Prompt strategy
-        tool_mode: Tool mode string
+        tool_mode: Tool mode (string like "kb_only", "kb,web", "all" or FrozenSet[ToolType])
 
     Returns:
         Generated kernel code
@@ -197,5 +208,5 @@ def generate_ascendc_kernel(
         strategy_name=strategy,
         category=category,
     )
-    result = generate_kernel_with_agent(task, AgentToolMode(tool_mode))
+    result = generate_kernel_with_agent(task, tool_mode)
     return result.generated_code

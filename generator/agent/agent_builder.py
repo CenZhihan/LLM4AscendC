@@ -3,13 +3,22 @@ Agent builder: construct LangGraph StateGraph for kernel generation.
 
 Builds a workflow with tool selection, retrieval nodes, and answer generation.
 """
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union
 
 from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
 from .agent_state import GeneratorAgentState, MAX_QUERY_ROUNDS
-from .agent_config import AgentToolMode, get_llm_config_compatible
+from .agent_config import (
+    AgentToolMode,
+    ToolType,
+    NO_TOOL,
+    has_kb,
+    has_web,
+    has_code_rag,
+    parse_tool_mode,
+    get_llm_config_compatible,
+)
 from .nodes import (
     choose_tool_node,
     kb_query_node,
@@ -28,7 +37,7 @@ def _entry_node(state: GeneratorAgentState) -> dict:
 def _route_entry(tool_mode: AgentToolMode):
     """Create entry router function."""
     def router(state: GeneratorAgentState) -> str:
-        if tool_mode == AgentToolMode.NO_TOOL:
+        if tool_mode == NO_TOOL:
             return "answer"
         return "choose_tool"
     return router
@@ -47,11 +56,11 @@ def _route_after_choose_tool(tool_mode: AgentToolMode):
         # Route based on action
         if action == "ANSWER":
             return "answer"
-        elif action == "KB" and tool_mode.has_kb():
+        elif action == "KB" and has_kb(tool_mode):
             return "kb_query"
-        elif action == "WEB" and tool_mode.has_web():
+        elif action == "WEB" and has_web(tool_mode):
             return "web_search"
-        elif action == "CODE_RAG" and tool_mode.has_code_rag():
+        elif action == "CODE_RAG" and has_code_rag(tool_mode):
             return "code_rag"
         else:
             return "answer"  # Fallback
@@ -70,7 +79,7 @@ def build_agent_app(
     Build LangGraph StateGraph for kernel generation agent.
 
     Args:
-        tool_mode: Tool mode specifying enabled retrieval tools
+        tool_mode: Tool mode (FrozenSet[ToolType]) specifying enabled retrieval tools
         llm_config: Optional LLM config (api_key, base_url, model)
         kb_retriever: Optional pre-initialized KB retriever
         web_retriever: Optional pre-initialized Web retriever
@@ -87,10 +96,10 @@ def build_agent_app(
     )
     model = config["model"]
 
-    # Initialize retrievers
-    _kb_retriever = kb_retriever or (KBRetriever() if tool_mode.has_kb() else None)
-    _web_retriever = web_retriever or (WebRetriever() if tool_mode.has_web() else None)
-    _code_retriever = code_retriever or (CodeRetriever() if tool_mode.has_code_rag() else None)
+    # Initialize retrievers (only if tool is enabled)
+    _kb_retriever = kb_retriever or (KBRetriever() if has_kb(tool_mode) else None)
+    _web_retriever = web_retriever or (WebRetriever() if has_web(tool_mode) else None)
+    _code_retriever = code_retriever or (CodeRetriever() if has_code_rag(tool_mode) else None)
 
     # Create node functions with closures
     def choose_tool_fn(state: GeneratorAgentState) -> dict:
@@ -115,11 +124,12 @@ def build_agent_app(
     workflow.add_node("entry", _entry_node)
     workflow.add_node("choose_tool", choose_tool_fn)
 
-    if tool_mode.has_kb():
+    # Add retrieval nodes only if corresponding tool is enabled
+    if has_kb(tool_mode):
         workflow.add_node("kb_query", kb_query_fn)
-    if tool_mode.has_web():
+    if has_web(tool_mode):
         workflow.add_node("web_search", web_search_fn)
-    if tool_mode.has_code_rag():
+    if has_code_rag(tool_mode):
         workflow.add_node("code_rag", code_rag_fn)
 
     workflow.add_node("answer", answer_fn)
@@ -137,11 +147,11 @@ def build_agent_app(
     # Add conditional edges from choose_tool
     route_after_choose = _route_after_choose_tool(tool_mode)
     conditional_map = {"answer": "answer"}
-    if tool_mode.has_kb():
+    if has_kb(tool_mode):
         conditional_map["kb_query"] = "kb_query"
-    if tool_mode.has_web():
+    if has_web(tool_mode):
         conditional_map["web_search"] = "web_search"
-    if tool_mode.has_code_rag():
+    if has_code_rag(tool_mode):
         conditional_map["code_rag"] = "code_rag"
 
     workflow.add_conditional_edges(
@@ -151,11 +161,11 @@ def build_agent_app(
     )
 
     # Add edges back to choose_tool from retrieval nodes
-    if tool_mode.has_kb():
+    if has_kb(tool_mode):
         workflow.add_edge("kb_query", "choose_tool")
-    if tool_mode.has_web():
+    if has_web(tool_mode):
         workflow.add_edge("web_search", "choose_tool")
-    if tool_mode.has_code_rag():
+    if has_code_rag(tool_mode):
         workflow.add_edge("code_rag", "choose_tool")
 
     # Answer leads to END
@@ -165,20 +175,28 @@ def build_agent_app(
     return workflow.compile()
 
 
-# Convenience function for quick app creation
 def create_agent(
-    tool_mode: str = "no_tool",
+    tool_mode: Union[str, AgentToolMode] = "no_tool",
     **kwargs,
 ):
     """
-    Create agent app with string tool mode.
+    Create agent app with flexible tool mode input.
 
     Args:
-        tool_mode: Tool mode string (no_tool, kb_only, web_only, etc.)
+        tool_mode: Tool mode specification, can be:
+            - str: "no_tool", "kb_only", "kb,web", "all", etc.
+            - AgentToolMode: FrozenSet[ToolType]
         **kwargs: Additional args passed to build_agent_app
 
     Returns:
         Compiled StateGraph application
+
+    Examples:
+        create_agent("no_tool")
+        create_agent("kb_only")
+        create_agent("kb,web")
+        create_agent("all")
+        create_agent(frozenset({ToolType.KB, ToolType.WEB}))
     """
-    mode = AgentToolMode(tool_mode)
+    mode = parse_tool_mode(tool_mode)
     return build_agent_app(mode, **kwargs)

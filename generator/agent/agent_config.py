@@ -1,63 +1,168 @@
 """
 Agent configuration for LangGraph-based kernel generation agent.
 
-Extends AgentToolMode to support KB, WEB, and CODE_RAG retrieval.
+Uses FrozenSet-based tool mode design for extensibility.
+Adding new tools only requires adding a ToolType enum value, no need to define all combinations.
 """
 import os
 from enum import Enum
+from typing import FrozenSet, Set, Union, Optional
 
 
-class AgentToolMode(str, Enum):
+class ToolType(str, Enum):
     """
-    Tool mode enum for specifying which retrieval tools to use.
+    Individual tool type for retrieval.
 
-    Modes:
-    - NO_TOOL: No retrieval, direct LLM generation (default)
-    - KB_ONLY: Only KB knowledge base (API documentation)
-    - WEB_ONLY: Only Web search
-    - CODE_RAG_ONLY: Only Code RAG retrieval
-    - KB_AND_WEB: KB + Web
-    - KB_AND_CODE_RAG: KB + Code RAG
-    - WEB_AND_CODE_RAG: Web + Code RAG
-    - ALL: KB + Web + Code RAG (full retrieval power)
+    Each tool represents a retrieval source:
+    - KB: Knowledge base (API documentation)
+    - WEB: Web search (technical blogs, tutorials)
+    - CODE_RAG: Code RAG (similar implementations from code library)
+
+    Future tools can be easily added:
+    - DOC_RAG: Documentation RAG
+    - API_SEARCH: API search engine
+    - STACKOVERFLOW: Stack Overflow search
     """
-    NO_TOOL = "no_tool"
-    KB_ONLY = "kb_only"
-    WEB_ONLY = "web_only"
-    CODE_RAG_ONLY = "code_rag_only"
-    KB_AND_WEB = "kb_and_web"
-    KB_AND_CODE_RAG = "kb_and_code_rag"
-    WEB_AND_CODE_RAG = "web_and_code_rag"
-    ALL = "all"
-
-    def has_kb(self) -> bool:
-        """Check if KB knowledge base is enabled."""
-        return self in (
-            AgentToolMode.KB_ONLY,
-            AgentToolMode.KB_AND_WEB,
-            AgentToolMode.KB_AND_CODE_RAG,
-            AgentToolMode.ALL,
-        )
-
-    def has_web(self) -> bool:
-        """Check if Web search is enabled."""
-        return self in (
-            AgentToolMode.WEB_ONLY,
-            AgentToolMode.KB_AND_WEB,
-            AgentToolMode.WEB_AND_CODE_RAG,
-            AgentToolMode.ALL,
-        )
-
-    def has_code_rag(self) -> bool:
-        """Check if Code RAG is enabled."""
-        return self in (
-            AgentToolMode.CODE_RAG_ONLY,
-            AgentToolMode.KB_AND_CODE_RAG,
-            AgentToolMode.WEB_AND_CODE_RAG,
-            AgentToolMode.ALL,
-        )
+    KB = "kb"
+    WEB = "web"
+    CODE_RAG = "code_rag"
 
 
+# Type alias for tool mode (FrozenSet for immutability and dict key usage)
+AgentToolMode = FrozenSet[ToolType]
+
+
+# ===== Predefined common modes (for backward compatibility and convenience) =====
+NO_TOOL: AgentToolMode = frozenset()
+KB_ONLY: AgentToolMode = frozenset({ToolType.KB})
+WEB_ONLY: AgentToolMode = frozenset({ToolType.WEB})
+CODE_RAG_ONLY: AgentToolMode = frozenset({ToolType.CODE_RAG})
+KB_AND_WEB: AgentToolMode = frozenset({ToolType.KB, ToolType.WEB})
+KB_AND_CODE_RAG: AgentToolMode = frozenset({ToolType.KB, ToolType.CODE_RAG})
+WEB_AND_CODE_RAG: AgentToolMode = frozenset({ToolType.WEB, ToolType.CODE_RAG})
+ALL: AgentToolMode = frozenset({ToolType.KB, ToolType.WEB, ToolType.CODE_RAG})
+
+
+# ===== Helper functions =====
+def has_tool(mode: AgentToolMode, tool: ToolType) -> bool:
+    """Check if a specific tool is enabled in the mode."""
+    return tool in mode
+
+
+def has_kb(mode: AgentToolMode) -> bool:
+    """Check if KB knowledge base is enabled."""
+    return has_tool(mode, ToolType.KB)
+
+
+def has_web(mode: AgentToolMode) -> bool:
+    """Check if Web search is enabled."""
+    return has_tool(mode, ToolType.WEB)
+
+
+def has_code_rag(mode: AgentToolMode) -> bool:
+    """Check if Code RAG is enabled."""
+    return has_tool(mode, ToolType.CODE_RAG)
+
+
+def _parse_tool_type(tool_str: str) -> Optional[ToolType]:
+    """Parse a single tool string to ToolType."""
+    tool_str = tool_str.lower().strip()
+    # Try by value first (kb, web, code_rag)
+    try:
+        return ToolType(tool_str)
+    except ValueError:
+        pass
+    # Try by name (KB, WEB, CODE_RAG)
+    try:
+        return ToolType[tool_str.upper()]
+    except KeyError:
+        pass
+    return None
+
+
+def parse_tool_mode(mode_str: Union[str, Set[str], FrozenSet[str], AgentToolMode]) -> AgentToolMode:
+    """
+    Parse tool mode from various input formats.
+
+    Args:
+        mode_str: Can be:
+            - AgentToolMode (FrozenSet[ToolType]): returned directly
+            - str: comma-separated tool names (e.g., "kb,web" or "all")
+            - Set[str]: set of tool name strings
+            - FrozenSet[str]: frozen set of tool name strings
+
+    Returns:
+        AgentToolMode (FrozenSet[ToolType])
+
+    Examples:
+        parse_tool_mode("kb") -> KB_ONLY
+        parse_tool_mode("kb,web") -> KB_AND_WEB
+        parse_tool_mode("all") -> ALL
+        parse_tool_mode({"kb", "web"}) -> KB_AND_WEB
+        parse_tool_mode(ALL) -> ALL (direct return)
+    """
+    # Already an AgentToolMode
+    if isinstance(mode_str, frozenset):
+        # Check if it's already ToolType elements
+        if all(isinstance(t, ToolType) for t in mode_str):
+            return mode_str
+        # Convert string elements to ToolType
+        return frozenset({_parse_tool_type(t) for t in mode_str if _parse_tool_type(t) is not None})
+
+    # Set of strings
+    if isinstance(mode_str, set):
+        return frozenset({_parse_tool_type(t) for t in mode_str if _parse_tool_type(t) is not None})
+
+    # String input
+    if isinstance(mode_str, str):
+        mode_str_lower = mode_str.lower().strip()
+
+        # Handle predefined mode names
+        predefined_modes = {
+            "no_tool": NO_TOOL,
+            "kb_only": KB_ONLY,
+            "web_only": WEB_ONLY,
+            "code_rag_only": CODE_RAG_ONLY,
+            "kb_and_web": KB_AND_WEB,
+            "kb_and_code_rag": KB_AND_CODE_RAG,
+            "web_and_code_rag": WEB_AND_CODE_RAG,
+            "all": ALL,
+        }
+        if mode_str_lower in predefined_modes:
+            return predefined_modes[mode_str_lower]
+
+        # Handle comma-separated tools
+        tools = [t.strip() for t in mode_str.split(",") if t.strip()]
+        return frozenset({_parse_tool_type(t) for t in tools if _parse_tool_type(t) is not None})
+
+    # Fallback
+    return NO_TOOL
+
+
+def tool_mode_to_string(mode: AgentToolMode) -> str:
+    """Convert AgentToolMode to string representation."""
+    if not mode:
+        return "no_tool"
+
+    # Check predefined modes first
+    predefined_map = {
+        NO_TOOL: "no_tool",
+        KB_ONLY: "kb_only",
+        WEB_ONLY: "web_only",
+        CODE_RAG_ONLY: "code_rag_only",
+        KB_AND_WEB: "kb_and_web",
+        KB_AND_CODE_RAG: "kb_and_code_rag",
+        WEB_AND_CODE_RAG: "web_and_code_rag",
+        ALL: "all",
+    }
+    if mode in predefined_map:
+        return predefined_map[mode]
+
+    # Custom combination
+    return ",".join(sorted(t.value for t in mode))
+
+
+# ===== LLM Configuration =====
 def get_llm_config_from_env() -> dict:
     """
     Get LLM configuration from environment variables (Agent_kernel style).
