@@ -9,16 +9,16 @@ class Model(nn.Module):
     def forward(self, x, weight):
         return F.conv_transpose2d(
             x, weight, None,
-            stride=(1,1),
-            padding=(0,0),
-            output_padding=(0,0),
-            groups=1,
-            dilation=(1,1),
+            stride=(2, 3),
+            padding=(1, 2),
+            output_padding=(0, 0),
+            groups=4,
+            dilation=(2, 1),
         )
 
 def get_inputs():
-    x = torch.rand(16, 64, 32, 32)
-    w = torch.rand(64, 128, 3, 3)
+    x = torch.rand(16, 32, 128, 256)
+    w = torch.rand(32, 16, 3, 5)
     return [x, w]
 
 def get_init_inputs():

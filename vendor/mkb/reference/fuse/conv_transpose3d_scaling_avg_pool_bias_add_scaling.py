@@ -9,18 +9,18 @@ class Model(nn.Module):
     def forward(self, x, weight, conv_bias_opt, scale1, bias, scale2):
         cb = conv_bias_opt if conv_bias_opt is not None else None
         y = F.conv_transpose3d(x, weight, cb, stride=1, padding=0, output_padding=0, dilation=1, groups=1)
-        y = y * scale1.view(1, -1, 1, 1, 1)
+        y = y * scale1
         y = F.adaptive_avg_pool3d(y, 1)
-        y = y + bias.view(1, -1, 1, 1, 1)
-        return y * scale2.view(1, -1, 1, 1, 1)
+        y = y + bias.unsqueeze(0)
+        return y * scale2
 
 def get_inputs():
-    x = torch.rand(4, 32, 16, 16, 16)
-    w = torch.rand(32, 64, 3, 3, 3)
-    cb = torch.rand(64)
-    s1 = torch.rand(64)
-    b = torch.rand(64, 1, 1, 1)
-    s2 = torch.rand(64)
+    x = torch.rand(128, 3, 16, 32, 32)
+    w = torch.rand(3, 16, 3, 3, 3)
+    cb = torch.rand(16)
+    s1 = torch.rand(1)
+    b = torch.rand(16, 1, 1, 1)
+    s2 = torch.rand(1)
     return [x, w, cb, s1, b, s2]
 
 def get_init_inputs():

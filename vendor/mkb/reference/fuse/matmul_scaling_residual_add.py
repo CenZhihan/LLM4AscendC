@@ -23,7 +23,7 @@ def get_inputs():
     x = torch.rand(batch_size, in_features)
     w = torch.rand(out_features, in_features)
     b = torch.rand(out_features)
-    scaling = torch.tensor(scaling_factor, dtype=torch.float32)
+    scaling = torch.tensor([scaling_factor], dtype=torch.float32).contiguous()
     return [x, w, b, scaling]
 
 def get_init_inputs():

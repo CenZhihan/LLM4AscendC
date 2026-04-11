@@ -18,7 +18,7 @@ class Model(nn.Module):
 
 def get_inputs():
     x = torch.rand(8, 48, 64, 64, 64)
-    w = torch.rand(48, 32, 3, 3, 3)
+    w = torch.rand(48, 48, 3, 3, 3)
     return [x, w]
 
 def get_init_inputs():

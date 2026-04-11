@@ -16,9 +16,9 @@ class Model(nn.Module):
         return F.hardtanh(y * 1.0, -1.0, 1.0)
 
 def get_inputs():
-    x = torch.rand(8, 64, 32, 32)
-    w = torch.rand(64, 32, 3, 3)
-    cb = torch.rand(32)
+    x = torch.rand(128, 64, 128, 128)
+    w = torch.rand(64, 64, 3, 3)
+    cb = torch.rand(64)
     return [x, w, cb]
 
 def get_init_inputs():

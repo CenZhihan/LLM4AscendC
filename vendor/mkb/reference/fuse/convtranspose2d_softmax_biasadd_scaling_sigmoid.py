@@ -10,15 +10,15 @@ class Model(nn.Module):
         cb = conv_bias_opt if conv_bias_opt is not None else None
         y = F.conv_transpose2d(x, weight, cb, stride=2, padding=1, output_padding=1, dilation=1, groups=1)
         y = F.softmax(y, dim=1)
-        y = y + bias.view(1, -1, 1, 1)
+        y = y + bias.unsqueeze(0)
         y = y * 2.0
         return torch.sigmoid(y)
 
 def get_inputs():
-    x = torch.rand(8, 64, 32, 32)
-    w = torch.rand(64, 32, 3, 3)
-    cb = torch.rand(32)
-    b = torch.rand(32, 1, 1)
+    x = torch.rand(128, 64, 32, 32)
+    w = torch.rand(64, 128, 4, 4)
+    cb = torch.rand(128)
+    b = torch.rand(128, 1, 1)
     return [x, w, cb, b]
 
 def get_init_inputs():

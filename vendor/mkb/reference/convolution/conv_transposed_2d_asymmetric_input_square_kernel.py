@@ -11,7 +11,7 @@ class Model(nn.Module):
             x, weight, None,
             stride=(1,1),
             padding=(1,1),
-            output_padding=(1,1),
+            output_padding=(0,0),
             groups=1,
             dilation=(1,1),
         )
