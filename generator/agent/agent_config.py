@@ -26,6 +26,7 @@ class ToolType(str, Enum):
     KB = "kb"
     WEB = "web"
     CODE_RAG = "code_rag"
+    ENV_CHECK = "env_check"
 
 
 # Type alias for tool mode (FrozenSet for immutability and dict key usage)
@@ -62,6 +63,11 @@ def has_web(mode: AgentToolMode) -> bool:
 def has_code_rag(mode: AgentToolMode) -> bool:
     """Check if Code RAG is enabled."""
     return has_tool(mode, ToolType.CODE_RAG)
+
+
+def has_env_check(mode: AgentToolMode) -> bool:
+    """Check if Environment Check is enabled."""
+    return has_tool(mode, ToolType.ENV_CHECK)
 
 
 def _parse_tool_type(tool_str: str) -> Optional[ToolType]:

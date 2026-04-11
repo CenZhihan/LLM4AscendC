@@ -58,6 +58,7 @@ class GeneratorAgentState(MessagesState):
     kb_results: Annotated[List[str], _add_list]
     web_results: Annotated[List[str], _add_list]
     code_rag_results: Annotated[List[str], _add_list]
+    env_check_results: Annotated[List[str], _add_list]
 
     # Tool call logging
     tool_calls_log: Annotated[List[Dict[str, Any]], _add_tool_calls]
@@ -108,6 +109,7 @@ def create_initial_state(
         "kb_results": [],
         "web_results": [],
         "code_rag_results": [],
+        "env_check_results": [],
         "tool_calls_log": [],
         "query_round_count": 0,
     }

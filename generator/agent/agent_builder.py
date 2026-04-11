@@ -16,6 +16,7 @@ from .agent_config import (
     has_kb,
     has_web,
     has_code_rag,
+    has_env_check,
     parse_tool_mode,
     get_llm_config_compatible,
 )
@@ -24,9 +25,11 @@ from .nodes import (
     kb_query_node,
     web_search_node,
     code_rag_node,
+    env_check_node,
     answer_node,
 )
 from .retrievers import KBRetriever, WebRetriever, CodeRetriever
+from .retrievers.env_checker import EnvCheckRetriever
 
 
 def _entry_node(state: GeneratorAgentState) -> dict:
@@ -62,6 +65,8 @@ def _route_after_choose_tool(tool_mode: AgentToolMode):
             return "web_search"
         elif action == "CODE_RAG" and has_code_rag(tool_mode):
             return "code_rag"
+        elif action == "ENV_CHECK" and has_env_check(tool_mode):
+            return "env_check"
         else:
             return "answer"  # Fallback
 
@@ -100,6 +105,7 @@ def build_agent_app(
     _kb_retriever = kb_retriever or (KBRetriever() if has_kb(tool_mode) else None)
     _web_retriever = web_retriever or (WebRetriever() if has_web(tool_mode) else None)
     _code_retriever = code_retriever or (CodeRetriever() if has_code_rag(tool_mode) else None)
+    _env_retriever = EnvCheckRetriever() if has_env_check(tool_mode) else None
 
     # Create node functions with closures
     def choose_tool_fn(state: GeneratorAgentState) -> dict:
@@ -113,6 +119,9 @@ def build_agent_app(
 
     def code_rag_fn(state: GeneratorAgentState) -> dict:
         return code_rag_node(state, _code_retriever)
+
+    def env_check_fn(state: GeneratorAgentState) -> dict:
+        return env_check_node(state, _env_retriever)
 
     def answer_fn(state: GeneratorAgentState) -> dict:
         return answer_node(state, client, model)
@@ -131,6 +140,8 @@ def build_agent_app(
         workflow.add_node("web_search", web_search_fn)
     if has_code_rag(tool_mode):
         workflow.add_node("code_rag", code_rag_fn)
+    if has_env_check(tool_mode):
+        workflow.add_node("env_check", env_check_fn)
 
     workflow.add_node("answer", answer_fn)
 
@@ -153,6 +164,8 @@ def build_agent_app(
         conditional_map["web_search"] = "web_search"
     if has_code_rag(tool_mode):
         conditional_map["code_rag"] = "code_rag"
+    if has_env_check(tool_mode):
+        conditional_map["env_check"] = "env_check"
 
     workflow.add_conditional_edges(
         "choose_tool",
@@ -167,6 +180,8 @@ def build_agent_app(
         workflow.add_edge("web_search", "choose_tool")
     if has_code_rag(tool_mode):
         workflow.add_edge("code_rag", "choose_tool")
+    if has_env_check(tool_mode):
+        workflow.add_edge("env_check", "choose_tool")
 
     # Answer leads to END
     workflow.add_edge("answer", END)

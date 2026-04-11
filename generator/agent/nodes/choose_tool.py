@@ -15,6 +15,7 @@ from ..agent_config import (
     has_kb,
     has_web,
     has_code_rag,
+    has_env_check,
 )
 
 
@@ -87,6 +88,7 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
     kb_results = state.get("kb_results", [])
     web_results = state.get("web_results", [])
     code_rag_results = state.get("code_rag_results", [])
+    env_check_results = state.get("env_check_results", [])
 
     existing = ""
     if kb_results:
@@ -95,6 +97,8 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
         existing += "已搜网页结果（节选）：\n" + "\n".join(web_results[:2]) + "\n\n"
     if code_rag_results:
         existing += "已检索代码结果（节选）：\n" + "\n".join(code_rag_results[:1]) + "\n\n"
+    if env_check_results:
+        existing += "环境检查结果（节选）：\n" + "\n".join(env_check_results[:1]) + "\n\n"
     return existing
 
 
@@ -114,6 +118,8 @@ def _build_tool_selection_prompt(
         tools_desc.append("网页搜索（WEB）- 搜索相关技术文档和博客")
     if has_code_rag(tool_mode):
         tools_desc.append("代码检索（CODE_RAG）- 检索 Ascend C 代码库中的相似实现")
+    if has_env_check(tool_mode):
+        tools_desc.append("环境检查（ENV_CHECK）- 检查 CANN 环境及 API 兼容性")
 
     if not tools_desc:
         return ""  # No tools, will return ANSWER
@@ -124,7 +130,7 @@ def _build_tool_selection_prompt(
     # Build few-shot examples dynamically (order matches tools_desc)
     examples: list = []
     example_idx = 1
-    for tool_type in [ToolType.KB, ToolType.WEB, ToolType.CODE_RAG]:
+    for tool_type in [ToolType.KB, ToolType.WEB, ToolType.CODE_RAG, ToolType.ENV_CHECK]:
         if tool_type in tool_mode:
             tool_name = tool_type.value.upper()
             if tool_type == ToolType.KB:
@@ -133,6 +139,8 @@ def _build_tool_selection_prompt(
                 examples.append(f"示例{example_idx}（网页搜索）：\nWEB\nAscend C custom operator tutorial")
             elif tool_type == ToolType.CODE_RAG:
                 examples.append(f"示例{example_idx}（代码检索）：\nCODE_RAG\nAscend C softmax kernel example")
+            elif tool_type == ToolType.ENV_CHECK:
+                examples.append(f"示例{example_idx}（环境检查）：\nENV_CHECK\ncheck if AscendC::DataCopy is available")
             example_idx += 1
     examples.append("示例（直接回答）：\nANSWER")
     few_shot = "\n\n".join(examples)
@@ -141,8 +149,8 @@ def _build_tool_selection_prompt(
     prompt = (
         f"用户问题：\n{user_question}\n\n"
         f"当前可选工具：{tools_line}，或直接回答（ANSWER）。根据需要选择合适的工具。\n"
-        "规则：只输出两行。第一行为动作（KB/WEB/CODE_RAG/ANSWER）；"
-        "若选 KB/WEB/CODE_RAG，第二行必须是一句完整的英文查询。\n"
+        "规则：只输出两行。第一行为动作（KB/WEB/CODE_RAG/ENV_CHECK/ANSWER）；"
+        "若选 KB/WEB/CODE_RAG/ENV_CHECK，第二行必须是一句完整的英文查询。\n"
     )
 
     if existing_results:
@@ -203,14 +211,17 @@ def choose_tool_node(
     elif "ANSWER" in first or first == "ANSWER":
         next_action = "ANSWER"
         current_query = ""
+    elif "CODE_RAG" in first and has_code_rag(tool_mode):
+        next_action = "CODE_RAG"
+        current_query = query_line or user_question
+    elif "ENV_CHECK" in first and has_env_check(tool_mode):
+        next_action = "ENV_CHECK"
+        current_query = query_line or user_question
     elif "KB" in first and has_kb(tool_mode):
         next_action = "KB"
         current_query = query_line or user_question
     elif "WEB" in first and has_web(tool_mode):
         next_action = "WEB"
-        current_query = query_line or user_question
-    elif "CODE_RAG" in first and has_code_rag(tool_mode):
-        next_action = "CODE_RAG"
         current_query = query_line or user_question
     else:
         # Fallback: choose first available tool
@@ -220,6 +231,8 @@ def choose_tool_node(
             next_action = "WEB"
         elif has_code_rag(tool_mode):
             next_action = "CODE_RAG"
+        elif has_env_check(tool_mode):
+            next_action = "ENV_CHECK"
         else:
             next_action = "ANSWER"
         current_query = query_line or user_question
