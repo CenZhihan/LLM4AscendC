@@ -15,7 +15,9 @@ from ..agent_config import (
     has_kb,
     has_web,
     has_code_rag,
-    has_env_check,
+    has_env_check_env,
+    has_env_check_npu,
+    has_env_check_api,
 )
 
 
@@ -118,8 +120,12 @@ def _build_tool_selection_prompt(
         tools_desc.append("网页搜索（WEB）- 搜索相关技术文档和博客")
     if has_code_rag(tool_mode):
         tools_desc.append("代码检索（CODE_RAG）- 检索 Ascend C 代码库中的相似实现")
-    if has_env_check(tool_mode):
-        tools_desc.append("环境检查（ENV_CHECK）- 检查 CANN 环境及 API 兼容性")
+    if has_env_check_env(tool_mode):
+        tools_desc.append("环境检查（ENV_CHECK_ENV）- 检查 CANN 环境配置及 API 兼容性")
+    if has_env_check_npu(tool_mode):
+        tools_desc.append("NPU查询（ENV_CHECK_NPU）- 查询 NPU 设备状态和资源使用")
+    if has_env_check_api(tool_mode):
+        tools_desc.append("API检查（ENV_CHECK_API）- 验证 Ascend C API 是否在头文件中存在")
 
     if not tools_desc:
         return ""  # No tools, will return ANSWER
@@ -130,7 +136,8 @@ def _build_tool_selection_prompt(
     # Build few-shot examples dynamically (order matches tools_desc)
     examples: list = []
     example_idx = 1
-    for tool_type in [ToolType.KB, ToolType.WEB, ToolType.CODE_RAG, ToolType.ENV_CHECK]:
+    for tool_type in [ToolType.KB, ToolType.WEB, ToolType.CODE_RAG,
+                      ToolType.ENV_CHECK_ENV, ToolType.ENV_CHECK_NPU, ToolType.ENV_CHECK_API]:
         if tool_type in tool_mode:
             tool_name = tool_type.value.upper()
             if tool_type == ToolType.KB:
@@ -139,8 +146,12 @@ def _build_tool_selection_prompt(
                 examples.append(f"示例{example_idx}（网页搜索）：\nWEB\nAscend C custom operator tutorial")
             elif tool_type == ToolType.CODE_RAG:
                 examples.append(f"示例{example_idx}（代码检索）：\nCODE_RAG\nAscend C softmax kernel example")
-            elif tool_type == ToolType.ENV_CHECK:
-                examples.append(f"示例{example_idx}（环境检查）：\nENV_CHECK\ncheck if AscendC::DataCopy is available")
+            elif tool_type == ToolType.ENV_CHECK_ENV:
+                examples.append(f"示例{example_idx}（环境检查）：\nENV_CHECK_ENV\ncheck CANN environment")
+            elif tool_type == ToolType.ENV_CHECK_NPU:
+                examples.append(f"示例{example_idx}（NPU查询）：\nENV_CHECK_NPU\nquery npu device status")
+            elif tool_type == ToolType.ENV_CHECK_API:
+                examples.append(f"示例{example_idx}（API检查）：\nENV_CHECK_API\ncheck if AscendC::DataCopy exists")
             example_idx += 1
     examples.append("示例（直接回答）：\nANSWER")
     few_shot = "\n\n".join(examples)
@@ -149,8 +160,8 @@ def _build_tool_selection_prompt(
     prompt = (
         f"用户问题：\n{user_question}\n\n"
         f"当前可选工具：{tools_line}，或直接回答（ANSWER）。根据需要选择合适的工具。\n"
-        "规则：只输出两行。第一行为动作（KB/WEB/CODE_RAG/ENV_CHECK/ANSWER）；"
-        "若选 KB/WEB/CODE_RAG/ENV_CHECK，第二行必须是一句完整的英文查询。\n"
+        "规则：只输出两行。第一行为动作（KB/WEB/CODE_RAG/ENV_CHECK_ENV/ENV_CHECK_NPU/ENV_CHECK_API/ANSWER）；"
+        "若选 KB/WEB/CODE_RAG/ENV_CHECK_*/ANSWER，第二行必须是一句完整的英文查询。\n"
     )
 
     if existing_results:
@@ -214,8 +225,14 @@ def choose_tool_node(
     elif "CODE_RAG" in first and has_code_rag(tool_mode):
         next_action = "CODE_RAG"
         current_query = query_line or user_question
-    elif "ENV_CHECK" in first and has_env_check(tool_mode):
-        next_action = "ENV_CHECK"
+    elif "ENV_CHECK_API" in first and has_env_check_api(tool_mode):
+        next_action = "ENV_CHECK_API"
+        current_query = query_line or user_question
+    elif "ENV_CHECK_NPU" in first and has_env_check_npu(tool_mode):
+        next_action = "ENV_CHECK_NPU"
+        current_query = query_line or user_question
+    elif "ENV_CHECK_ENV" in first and has_env_check_env(tool_mode):
+        next_action = "ENV_CHECK_ENV"
         current_query = query_line or user_question
     elif "KB" in first and has_kb(tool_mode):
         next_action = "KB"
@@ -231,8 +248,12 @@ def choose_tool_node(
             next_action = "WEB"
         elif has_code_rag(tool_mode):
             next_action = "CODE_RAG"
-        elif has_env_check(tool_mode):
-            next_action = "ENV_CHECK"
+        elif has_env_check_env(tool_mode):
+            next_action = "ENV_CHECK_ENV"
+        elif has_env_check_npu(tool_mode):
+            next_action = "ENV_CHECK_NPU"
+        elif has_env_check_api(tool_mode):
+            next_action = "ENV_CHECK_API"
         else:
             next_action = "ANSWER"
         current_query = query_line or user_question

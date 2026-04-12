@@ -60,6 +60,11 @@ class GeneratorAgentState(MessagesState):
     code_rag_results: Annotated[List[str], _add_list]
     env_check_results: Annotated[List[str], _add_list]
 
+    # Structured env check results (for programmatic access)
+    env_check_env_result: NotRequired[Dict[str, Any]]    # Environment overview
+    env_check_npu_result: NotRequired[Dict[str, Any]]    # NPU device query
+    env_check_api_result: NotRequired[Dict[str, Any]]    # API compatibility check
+
     # Tool call logging
     tool_calls_log: Annotated[List[Dict[str, Any]], _add_tool_calls]
 

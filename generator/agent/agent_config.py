@@ -17,6 +17,9 @@ class ToolType(str, Enum):
     - KB: Knowledge base (API documentation)
     - WEB: Web search (technical blogs, tutorials)
     - CODE_RAG: Code RAG (similar implementations from code library)
+    - ENV_CHECK_ENV: Environment overview check (CANN version, tools, OPP packages)
+    - ENV_CHECK_NPU: NPU device query (npu-smi info/list/memory/temp/power/usages)
+    - ENV_CHECK_API: API compatibility check (search API in CANN headers)
 
     Future tools can be easily added:
     - DOC_RAG: Documentation RAG
@@ -26,7 +29,9 @@ class ToolType(str, Enum):
     KB = "kb"
     WEB = "web"
     CODE_RAG = "code_rag"
-    ENV_CHECK = "env_check"
+    ENV_CHECK_ENV = "env_check_env"
+    ENV_CHECK_NPU = "env_check_npu"
+    ENV_CHECK_API = "env_check_api"
 
 
 # Type alias for tool mode (FrozenSet for immutability and dict key usage)
@@ -41,7 +46,8 @@ CODE_RAG_ONLY: AgentToolMode = frozenset({ToolType.CODE_RAG})
 KB_AND_WEB: AgentToolMode = frozenset({ToolType.KB, ToolType.WEB})
 KB_AND_CODE_RAG: AgentToolMode = frozenset({ToolType.KB, ToolType.CODE_RAG})
 WEB_AND_CODE_RAG: AgentToolMode = frozenset({ToolType.WEB, ToolType.CODE_RAG})
-ALL: AgentToolMode = frozenset({ToolType.KB, ToolType.WEB, ToolType.CODE_RAG})
+ALL: AgentToolMode = frozenset({ToolType.KB, ToolType.WEB, ToolType.CODE_RAG,
+                                ToolType.ENV_CHECK_ENV, ToolType.ENV_CHECK_NPU, ToolType.ENV_CHECK_API})
 
 
 # ===== Helper functions =====
@@ -65,9 +71,19 @@ def has_code_rag(mode: AgentToolMode) -> bool:
     return has_tool(mode, ToolType.CODE_RAG)
 
 
-def has_env_check(mode: AgentToolMode) -> bool:
-    """Check if Environment Check is enabled."""
-    return has_tool(mode, ToolType.ENV_CHECK)
+def has_env_check_env(mode: AgentToolMode) -> bool:
+    """Check if Environment Check (env overview) is enabled."""
+    return has_tool(mode, ToolType.ENV_CHECK_ENV)
+
+
+def has_env_check_npu(mode: AgentToolMode) -> bool:
+    """Check if NPU Device Query is enabled."""
+    return has_tool(mode, ToolType.ENV_CHECK_NPU)
+
+
+def has_env_check_api(mode: AgentToolMode) -> bool:
+    """Check if API Compatibility Check is enabled."""
+    return has_tool(mode, ToolType.ENV_CHECK_API)
 
 
 def _parse_tool_type(tool_str: str) -> Optional[ToolType]:

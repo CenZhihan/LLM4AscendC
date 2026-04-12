@@ -1,15 +1,21 @@
 """
 Environment Checker for Ascend C kernel development agent.
 
+Provides three structured tools:
+1. check_env()       — CANN environment overview (version, tools, OPP packages)
+2. query_npu_devices() — NPU device information via npu-smi
+3. check_api_exists()  — API compatibility check in CANN headers
+
 Adapts the CANN skill's environment checking capability (scripts/check_env.sh,
-scripts/npu_info.sh) into a Python retriever for agent use.
+scripts/npu_info.sh) into Python functions with structured return types.
 """
 import os
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 
 # Default CANN paths
@@ -18,6 +24,57 @@ _CANN_TOOLKIT_CANDIDATES = [
     os.path.expanduser("~/Ascend/ascend-toolkit/latest"),
 ]
 
+# NPU query type -> npu-smi command mapping
+_NPU_QUERY_MAP = {
+    "info": "npu-smi info",
+    "list": "npu-smi list",
+    "memory": "npu-smi info -t memory",
+    "temp": "npu-smi info -t temp",
+    "power": "npu-smi info -t power",
+    "usages": "npu-smi info -t usages",
+}
+
+
+# ============================================================
+# Structured result types
+# ============================================================
+
+@dataclass
+class EnvCheckResult:
+    """Result of CANN environment overview check."""
+    all_passed: bool
+    cann_version: str
+    cann_home: Optional[str]
+    opp_path: Optional[str]
+    ld_library_path: str
+    tools: Dict[str, bool]          # {"msprof": True, "cannsim": False, "npu-smi": True}
+    custom_opps: List[str]          # installed vendor names
+    errors: int
+    warnings: int
+    details: str                    # human-readable summary
+
+
+@dataclass
+class NpuDeviceResult:
+    """Result of NPU device query."""
+    available: bool
+    query_type: str                 # "info" / "list" / "memory" / ...
+    raw_output: str
+
+
+@dataclass
+class ApiCheckResult:
+    """Result of API compatibility check."""
+    found: bool
+    api_name: str
+    header_files: List[str]         # matching header file paths
+    matches: List[str]              # first 5 matching lines
+    summary: str                    # human-readable summary
+
+
+# ============================================================
+# Internal helpers (reused from original implementation)
+# ============================================================
 
 def _find_cann_home() -> Optional[str]:
     """Find CANN Toolkit installation root."""
@@ -43,17 +100,307 @@ def _run_cmd(cmd: str, timeout: float = 10.0) -> str:
 
 def _check_tool(name: str) -> Optional[str]:
     """Check if a command-line tool is available, return its path."""
-    path = shutil.which(name)
-    return path
+    return shutil.which(name)
 
+
+def _get_cann_version(cann_home: Optional[str]) -> str:
+    """Get CANN version from ops/version.info."""
+    if not cann_home:
+        return "未知 (CANN 路径未找到)"
+    version_file = os.path.join(cann_home, "ops", "version.info")
+    if os.path.isfile(version_file):
+        version = ""
+        version_dir = ""
+        with open(version_file, "r") as f:
+            for line in f:
+                if line.startswith("Version="):
+                    version = line.split("=", 1)[1].strip()
+                elif line.startswith("version_dir="):
+                    version_dir = line.split("=", 1)[1].strip()
+        if version and version_dir:
+            return f"{version} ({version_dir})"
+        return version or version_dir or "未知"
+    return "未知 (version.info 未找到)"
+
+
+def _search_api_in_headers(
+    cann_home: Optional[str],
+    api_name: str,
+) -> List[str]:
+    """Search for API in CANN header files. Returns list of 'file:line:content' strings."""
+    if not cann_home:
+        return []
+
+    # Search directories for AscendC headers
+    search_dirs = [
+        os.path.join(cann_home, "aarch64-linux/ascendc/act/include"),
+        os.path.join(cann_home, "aarch64-linux/include/ascendc"),
+        os.path.join(cann_home, "include"),
+    ]
+    # Also search the opp include directory
+    opp_path = os.environ.get("ASCEND_OPP_PATH", "").strip()
+    if opp_path:
+        search_dirs.append(os.path.join(opp_path, "include"))
+
+    # Filter to existing directories
+    search_dirs = [d for d in search_dirs if os.path.isdir(d)]
+
+    if not search_dirs:
+        return []
+
+    results: List[str] = []
+    api_name_stripped = api_name.strip().lstrip("AscendC::").lstrip("ascendc::")
+
+    for search_dir in search_dirs:
+        try:
+            grep_cmd = (
+                f"grep -rn --include='*.h' --include='*.hpp' "
+                f"-i '{api_name_stripped}' '{search_dir}' 2>/dev/null || true"
+            )
+            output = _run_cmd(grep_cmd, timeout=15.0)
+            if output:
+                for line in output.splitlines():
+                    results.append(line)
+        except Exception:
+            pass
+
+    return results
+
+
+# ============================================================
+# Tool 1: check_env
+# ============================================================
+
+def check_env() -> EnvCheckResult:
+    """
+    Check CANN environment configuration.
+
+    Checks in Python (avoids ANSI color code parsing from bash scripts):
+    - ASCEND_HOME_PATH and CANN version
+    - ASCEND_OPP_PATH and vendors directory
+    - CANN tools (msprof, cannsim, npu-smi)
+    - Custom OPP packages
+    - LD_LIBRARY_PATH configuration
+    - Debug settings (ASCEND_SLOG_PRINT_TO_STDOUT)
+
+    Returns:
+        EnvCheckResult with structured fields
+    """
+    cann_home = _find_cann_home()
+    cann_version = _get_cann_version(cann_home)
+    opp_path = os.environ.get("ASCEND_OPP_PATH", "").strip()
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+
+    errors = 0
+    warnings = 0
+    detail_lines: List[str] = []
+
+    # 1. ASCEND_HOME_PATH
+    if cann_home:
+        detail_lines.append(f"[OK] ASCEND_HOME_PATH = {cann_home}")
+    else:
+        detail_lines.append("[ERROR] ASCEND_HOME_PATH 未设置")
+        errors += 1
+
+    # 2. CANN version
+    detail_lines.append(f"[CANN 版本] {cann_version}")
+
+    # 3. ASCEND_OPP_PATH
+    if opp_path and os.path.isdir(opp_path):
+        detail_lines.append(f"[OK] ASCEND_OPP_PATH = {opp_path}")
+        vendors_dir = os.path.join(opp_path, "vendors")
+        if os.path.isdir(vendors_dir):
+            vendors = [d for d in os.listdir(vendors_dir)
+                       if os.path.isdir(os.path.join(vendors_dir, d))]
+            detail_lines.append(f"[OK] CANN Ops vendors: {len(vendors)} 个")
+        else:
+            detail_lines.append("[WARN] ASCEND_OPP_PATH/vendors 目录不存在")
+            warnings += 1
+    else:
+        detail_lines.append("[WARN] ASCEND_OPP_PATH 未设置（编译时可跳过，运行时必需）")
+        warnings += 1
+
+    # 4. CANN tools
+    tools = {}
+    for tool in ["msprof", "cannsim", "npu-smi", "msopgen"]:
+        path = _check_tool(tool)
+        if path:
+            tools[tool] = True
+            detail_lines.append(f"[OK] {tool} 可用: {path}")
+        else:
+            tools[tool] = False
+            if tool in ("npu-smi", "msopgen"):
+                detail_lines.append(f"[WARN] {tool} 不可用")
+                warnings += 1
+            else:
+                detail_lines.append(f"[INFO] {tool} 不可用（可选）")
+
+    # 5. Custom OPP packages
+    custom_opps: List[str] = []
+    if cann_home:
+        vendor_base = os.path.join(cann_home, "opp", "vendors")
+        if os.path.isdir(vendor_base):
+            for d in os.listdir(vendor_base):
+                vendor_dir = os.path.join(vendor_base, d)
+                if not os.path.isdir(vendor_dir):
+                    continue
+                # Check multiple possible lib paths
+                op_api_lib = None
+                for lib_path in ["op_api/lib", "op_impl/ai_core/tbe/op_api/lib"]:
+                    candidate = os.path.join(vendor_dir, lib_path)
+                    if os.path.isdir(candidate):
+                        op_api_lib = candidate
+                        break
+                if op_api_lib:
+                    custom_opps.append(d)
+                    detail_lines.append(f"[OK] 自定义算子包 {d}: 已安装")
+                    if op_api_lib not in ld_path:
+                        detail_lines.append(
+                            f"[WARN] LD_LIBRARY_PATH 未包含 {op_api_lib}"
+                        )
+                        warnings += 1
+                else:
+                    detail_lines.append(f"[INFO] vendors/{d}: 目录存在但无算子库")
+
+    # 6. Debug settings
+    slog = os.environ.get("ASCEND_SLOG_PRINT_TO_STDOUT", "")
+    if slog == "1":
+        detail_lines.append("[OK] 日志打屏已开启 (ASCEND_SLOG_PRINT_TO_STDOUT=1)")
+    else:
+        detail_lines.append("[INFO] 建议: export ASCEND_SLOG_PRINT_TO_STDOUT=1")
+
+    all_passed = errors == 0
+    return EnvCheckResult(
+        all_passed=all_passed,
+        cann_version=cann_version,
+        cann_home=cann_home,
+        opp_path=opp_path if opp_path else None,
+        ld_library_path=ld_path,
+        tools=tools,
+        custom_opps=custom_opps,
+        errors=errors,
+        warnings=warnings,
+        details="\n".join(detail_lines),
+    )
+
+
+# ============================================================
+# Tool 2: query_npu_devices
+# ============================================================
+
+def query_npu_devices(
+    device_id: Optional[int] = None,
+    query_type: str = "info",
+) -> NpuDeviceResult:
+    """
+    Query NPU device information via npu-smi.
+
+    Args:
+        device_id: Specific device ID (None = all devices)
+        query_type: One of "info", "list", "memory", "temp", "power", "usages"
+
+    Returns:
+        NpuDeviceResult with raw output
+    """
+    query_type = query_type.lower().strip()
+    base_cmd = _NPU_QUERY_MAP.get(query_type, _NPU_QUERY_MAP["info"])
+
+    # Append device ID if specified
+    if device_id is not None:
+        base_cmd += f" -i {device_id}"
+
+    npu_smi_path = _check_tool("npu-smi")
+    if npu_smi_path:
+        cmd = base_cmd.replace("npu-smi", npu_smi_path, 1)
+    else:
+        cmd = base_cmd
+
+    output = _run_cmd(cmd, timeout=15.0)
+    available = bool(output) and "error" not in output.lower()
+
+    return NpuDeviceResult(
+        available=available,
+        query_type=query_type,
+        raw_output=output or "npu-smi 不可用或命令执行失败",
+    )
+
+
+# ============================================================
+# Tool 3: check_api_exists
+# ============================================================
+
+def check_api_exists(api_name: str) -> ApiCheckResult:
+    """
+    Check if an Ascend C API exists in CANN header files.
+
+    Searches in:
+    - aarch64-linux/ascendc/act/include
+    - aarch64-linux/include/ascendc
+    - include/
+    - ASCEND_OPP_PATH/include
+
+    Args:
+        api_name: API name (e.g., "DataCopy", "Muls", "AscendC::Cast")
+
+    Returns:
+        ApiCheckResult with match details
+    """
+    cann_home = _find_cann_home()
+    results = _search_api_in_headers(cann_home, api_name)
+
+    if not results:
+        search_dirs = [
+            os.path.join(cann_home, "aarch64-linux/ascendc/act/include") if cann_home else "N/A",
+            os.path.join(cann_home, "aarch64-linux/include/ascendc") if cann_home else "N/A",
+            os.path.join(cann_home, "include") if cann_home else "N/A",
+        ]
+        search_dirs = [d for d in search_dirs if d != "N/A"]
+        opp_path = os.environ.get("ASCEND_OPP_PATH", "").strip()
+        if opp_path:
+            search_dirs.append(os.path.join(opp_path, "include"))
+
+        return ApiCheckResult(
+            found=False,
+            api_name=api_name,
+            header_files=[],
+            matches=[],
+            summary=(
+                f"在 CANN 头文件中未找到 API: {api_name}\n"
+                f"搜索路径: {', '.join(search_dirs)}\n"
+                f"可能原因: API 名称不正确、或该 API 是宏/模板而非函数声明、或 CANN 版本不支持"
+            ),
+        )
+
+    # Extract unique header file paths from results
+    header_files = set()
+    for r in results:
+        parts = r.split(":", 2)
+        if len(parts) >= 1:
+            header_files.add(parts[0])
+
+    return ApiCheckResult(
+        found=True,
+        api_name=api_name,
+        header_files=sorted(header_files),
+        matches=results[:5],
+        summary=f"找到 {len(results)} 处匹配，涉及 {len(header_files)} 个头文件",
+    )
+
+
+# ============================================================
+# Backward-compatible EnvCheckRetriever class
+# ============================================================
 
 class EnvCheckRetriever:
     """
     Wrapper for Ascend C environment checking.
 
-    Provides two main capabilities:
-    1. Environment overview: CANN version, env vars, tools, NPU devices
-    2. API compatibility check: verify if a specific API exists in CANN headers
+    Provides three main capabilities as structured methods:
+    1. check_env()       — CANN environment overview
+    2. query_npu_devices() — NPU device query
+    3. check_api_exists()  — API compatibility check
+
+    Also retains the legacy retrieve() method for backward compatibility.
     """
 
     def __init__(self):
@@ -63,225 +410,28 @@ class EnvCheckRetriever:
         """Check if CANN environment exists."""
         return self.cann_home is not None
 
-    def _get_cann_version(self) -> str:
-        """Get CANN version from ops/version.info."""
-        if not self.cann_home:
-            return "未知 (CANN 路径未找到)"
-        version_file = os.path.join(self.cann_home, "ops", "version.info")
-        if os.path.isfile(version_file):
-            version = ""
-            version_dir = ""
-            with open(version_file, "r") as f:
-                for line in f:
-                    if line.startswith("Version="):
-                        version = line.split("=", 1)[1].strip()
-                    elif line.startswith("version_dir="):
-                        version_dir = line.split("=", 1)[1].strip()
-            if version and version_dir:
-                return f"{version} ({version_dir})"
-            return version or version_dir or "未知"
-        return "未知 (version.info 未找到)"
+    def check_env(self) -> EnvCheckResult:
+        """Check CANN environment configuration."""
+        return check_env()
 
-    def _check_env_vars(self) -> List[str]:
-        """Check key environment variables."""
-        lines: List[str] = []
-        for var in ["ASCEND_HOME_PATH", "ASCEND_OPP_PATH", "LD_LIBRARY_PATH"]:
-            val = os.environ.get(var, "")
-            if val:
-                lines.append(f"[OK] {var} = {val}")
-            else:
-                lines.append(f"[WARN] {var} 未设置")
-        return lines
+    def query_npu_devices(
+        self,
+        device_id: Optional[int] = None,
+        query_type: str = "info",
+    ) -> NpuDeviceResult:
+        """Query NPU device information."""
+        return query_npu_devices(device_id, query_type)
 
-    def _check_cann_tools(self) -> List[str]:
-        """Check availability of key CANN tools."""
-        lines: List[str] = []
-        tools = {
-            "msopgen": "算子代码生成工具",
-            "msprof": "性能分析工具",
-            "npu-smi": "NPU 设备管理工具",
-        }
-        for tool, desc in tools.items():
-            path = _check_tool(tool)
-            if path:
-                lines.append(f"[OK] {tool} ({desc}): {path}")
-            else:
-                lines.append(f"[WARN] {tool} ({desc}) 不可用")
-        return lines
-
-    def _get_npu_info(self) -> str:
-        """Get NPU device information."""
-        output = _run_cmd("npu-smi info 2>/dev/null")
-        if output:
-            return output
-        # Try with full path
-        npu_smi = _check_tool("npu-smi")
-        if npu_smi:
-            return _run_cmd(f"{npu_smi} info 2>/dev/null")
-        return "npu-smi 不可用，无法获取 NPU 设备信息"
-
-    def _check_custom_opps(self) -> List[str]:
-        """Check custom OPP package status."""
-        lines: List[str] = []
-        opp_path = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "").strip()
-        if not opp_path:
-            opp_path = os.environ.get("ASCEND_OPP_PATH", "").strip()
-
-        if opp_path and os.path.isdir(opp_path):
-            vendor_dir = os.path.join(opp_path, "vendors")
-            if os.path.isdir(vendor_dir):
-                vendors = [d for d in os.listdir(vendor_dir)
-                           if os.path.isdir(os.path.join(vendor_dir, d))]
-                lines.append(f"[OK] OPP vendors: {', '.join(vendors) if vendors else '无'}")
-            else:
-                lines.append("[WARN] vendors 目录不存在")
-
-            # Check lib paths
-            ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-            if "op_api/lib" in ld_path:
-                lines.append("[OK] LD_LIBRARY_PATH 包含 op_api/lib")
-            else:
-                lines.append("[WARN] LD_LIBRARY_PATH 可能未包含 op_api/lib")
-        else:
-            lines.append("[WARN] 自定义算子包路径未设置")
-        return lines
-
-    def _search_api_in_headers(self, api_name: str) -> List[str]:
-        """Search for API in CANN header files."""
-        if not self.cann_home:
-            return ["[ERROR] CANN 路径未找到，无法搜索 API"]
-
-        # Search directories for AscendC headers
-        search_dirs = [
-            os.path.join(self.cann_home, "aarch64-linux/ascendc/act/include"),
-            os.path.join(self.cann_home, "aarch64-linux/include/ascendc"),
-            os.path.join(self.cann_home, "include"),
-        ]
-        # Also search the opp include directory
-        opp_path = os.environ.get("ASCEND_OPP_PATH", "").strip()
-        if opp_path:
-            search_dirs.append(os.path.join(opp_path, "include"))
-
-        # Filter to existing directories
-        search_dirs = [d for d in search_dirs if os.path.isdir(d)]
-
-        if not search_dirs:
-            return ["[WARN] 未找到 AscendC 头文件目录"]
-
-        results: List[str] = []
-        api_name_stripped = api_name.strip().lstrip("AscendC::").lstrip("ascendc::")
-
-        # Search for the API name in headers
-        for search_dir in search_dirs:
-            try:
-                grep_cmd = f"grep -rn --include='*.h' --include='*.hpp' -i '{api_name_stripped}' '{search_dir}' 2>/dev/null || true"
-                output = _run_cmd(grep_cmd, timeout=15.0)
-                if output:
-                    for line in output.splitlines():
-                        results.append(line)
-            except Exception:
-                pass
-
-        if not results:
-            return [
-                f"[未找到] 在 CANN 头文件中未找到 API: {api_name}",
-                f"搜索路径: {', '.join(search_dirs)}",
-                "可能原因: API 名称不正确、或该 API 是宏/模板而非函数声明、或 CANN 版本不支持",
-            ]
-
-        return results
-
-    def _get_troubleshooting_hint(self, query: str) -> Optional[str]:
-        """Provide troubleshooting hints based on query keywords."""
-        query_lower = query.lower()
-        hints = {
-            "561003": "错误 561003: Kernel 查找失败。检查 LD_LIBRARY_PATH 是否包含 op_api/lib，确认算子包已正确安装。",
-            "561107": "错误 561107: 环境变量配置错误。请使用 source set_env.sh 配置，不要手动 export ASCEND_OPP_PATH。",
-            "device not found": "NPU 设备未找到。检查: 1) npu-smi list 是否识别设备 2) 驱动是否安装 3) 容器是否正确映射设备",
-            "libascend": "运行时库依赖问题。export LD_LIBRARY_PATH=$ASCEND_HOME_PATH/runtime/lib64:$LD_LIBRARY_PATH",
-        }
-        for keyword, hint in hints.items():
-            if keyword in query_lower:
-                return hint
-        return None
-
-    def _build_env_overview(self) -> List[str]:
-        """Build comprehensive environment overview report."""
-        lines: List[str] = []
-        lines.append("=" * 50)
-        lines.append("Ascend C 环境检查报告")
-        lines.append("=" * 50)
-        lines.append("")
-
-        # CANN version
-        lines.append(f"[CANN 版本] {self._get_cann_version()}")
-        lines.append(f"[CANN 路径] {self.cann_home or '未找到'}")
-        lines.append("")
-
-        # Environment variables
-        lines.append("[环境变量]")
-        lines.extend(self._check_env_vars())
-        lines.append("")
-
-        # CANN tools
-        lines.append("[CANN 工具]")
-        lines.extend(self._check_cann_tools())
-        lines.append("")
-
-        # NPU info
-        lines.append("[NPU 设备]")
-        npu_info = self._get_npu_info()
-        for npu_line in npu_info.splitlines():
-            lines.append(f"  {npu_line}")
-        lines.append("")
-
-        # Custom OPPs
-        lines.append("[自定义算子包]")
-        lines.extend(self._check_custom_opps())
-        lines.append("")
-
-        lines.append("=" * 50)
-        return lines
-
-    def _build_api_check_report(self, query: str, api_name: str) -> List[str]:
-        """Build API compatibility check report."""
-        lines: List[str] = []
-        lines.append("=" * 50)
-        lines.append(f"API 兼容性检查: {api_name}")
-        lines.append("=" * 50)
-        lines.append(f"[CANN 版本] {self._get_cann_version()}")
-        lines.append("")
-
-        results = self._search_api_in_headers(api_name)
-        if results:
-            if results[0].startswith("[未找到]"):
-                lines.append(f"[结果] API '{api_name}' 在头文件中未找到")
-                lines.append("")
-                for r in results:
-                    lines.append(f"  {r}")
-            else:
-                # Found matches - summarize
-                header_files = set()
-                for r in results:
-                    parts = r.split(":", 2)
-                    if len(parts) >= 2:
-                        header_files.add(parts[0])
-
-                lines.append(f"[结果] 找到 {len(results)} 处匹配")
-                lines.append(f"[头文件] {', '.join(sorted(header_files))}")
-                lines.append("")
-                # Show first few matches
-                for r in results[:5]:
-                    lines.append(f"  {r}")
-                if len(results) > 5:
-                    lines.append(f"  ... 还有 {len(results) - 5} 处匹配")
-        lines.append("")
-        lines.append("=" * 50)
-        return lines
+    def check_api_exists(self, api_name: str) -> ApiCheckResult:
+        """Check if an API exists in CANN headers."""
+        return check_api_exists(api_name)
 
     def retrieve(self, query: str) -> List[str]:
         """
-        Perform environment check or API compatibility verification.
+        Legacy interface: perform environment check or API compatibility verification.
+
+        Dispatches to the appropriate structured tool based on query keywords,
+        then formats the result as a list of strings for backward compatibility.
 
         Args:
             query: Query string describing what to check:
@@ -295,7 +445,7 @@ class EnvCheckRetriever:
         """
         query_lower = query.lower().strip()
 
-        # Check for troubleshooting keywords first
+        # Troubleshooting hints
         hint = self._get_troubleshooting_hint(query)
         if hint:
             return [f"[诊断提示]\n{hint}"]
@@ -304,50 +454,126 @@ class EnvCheckRetriever:
         if any(kw in query_lower for kw in [
             "环境", "environment", "check env", "检查环境", "概览", "overview"
         ]):
-            return self._build_env_overview()
+            result = check_env()
+            return self._format_env_result(result)
 
         # NPU device info
         if any(kw in query_lower for kw in [
             "npu", "device", "设备", "npu-smi", "卡"
         ]):
-            npu_info = self._get_npu_info()
+            result = query_npu_devices()
             return [
                 "=" * 50,
                 "NPU 设备信息",
                 "=" * 50,
-                npu_info,
+                result.raw_output,
                 "=" * 50,
             ]
 
         # API compatibility check
         api_name = ""
-        # Pattern: "检查 API: XXX" / "check if XXX exists" / "is XXX available"
         match = re.search(r"(?:检查\s*api[:：]?\s*|check\s*(?:if\s*)?(?:api\s*)?[:：]?\s*|is\s+)(\w+)", query_lower)
         if match:
             api_name = match.group(1)
-        # Also try: "API XXX" / "XXX API"
         if not api_name:
             match = re.search(r"(\w+)\s*(?:api|函数|function|算子)", query_lower)
             if match:
                 api_name = match.group(1)
-        # If query is short and looks like an API name (camelCase, PascalCase)
         if not api_name and re.match(r"^[A-Za-z_]\w{2,}$", query.strip()):
             api_name = query.strip()
 
         if api_name:
-            return self._build_api_check_report(query, api_name)
+            result = check_api_exists(api_name)
+            return self._format_api_result(result)
 
-        # Fallback: treat query as API name if it's not empty
+        # Fallback: treat query as API name
         if query.strip():
-            return self._build_api_check_report(query, query.strip())
+            result = check_api_exists(query.strip())
+            return self._format_api_result(result)
 
         # Default to environment overview
-        return self._build_env_overview()
+        result = check_env()
+        return self._format_env_result(result)
+
+    @staticmethod
+    def _format_env_result(result: EnvCheckResult) -> List[str]:
+        """Format EnvCheckResult for display (backward compatibility)."""
+        lines = [
+            "=" * 50,
+            "Ascend C 环境检查报告",
+            "=" * 50,
+            "",
+            f"[CANN 版本] {result.cann_version}",
+            f"[CANN 路径] {result.cann_home or '未找到'}",
+            "",
+        ]
+        lines.append("[环境变量]")
+        lines.append(f"  ASCEND_HOME_PATH = {result.cann_home or '(未设置)'}")
+        lines.append(f"  ASCEND_OPP_PATH = {result.opp_path or '(未设置)'}")
+        lines.append(f"  LD_LIBRARY_PATH = {result.ld_library_path[:80]}...")
+        lines.append("")
+        lines.append("[CANN 工具]")
+        for tool, ok in result.tools.items():
+            status = "可用" if ok else "不可用"
+            lines.append(f"  {tool}: {status}")
+        lines.append("")
+        if result.custom_opps:
+            lines.append(f"[自定义算子包] {', '.join(result.custom_opps)}")
+        else:
+            lines.append("[自定义算子包] 未安装")
+        lines.append("")
+        lines.append(f"[结果] {'通过' if result.all_passed else f'发现 {result.errors} 个错误'}")
+        if result.warnings > 0:
+            lines.append(f"  警告: {result.warnings} 个")
+        lines.append("")
+        lines.append("=" * 50)
+        return lines
+
+    @staticmethod
+    def _format_api_result(result: ApiCheckResult) -> List[str]:
+        """Format ApiCheckResult for display (backward compatibility)."""
+        lines = [
+            "=" * 50,
+            f"API 兼容性检查: {result.api_name}",
+            "=" * 50,
+        ]
+        if result.found:
+            lines.append(f"[结果] 找到 {len(result.matches)} 处匹配")
+            lines.append(f"[头文件] {', '.join(result.header_files)}")
+            lines.append("")
+            for m in result.matches:
+                lines.append(f"  {m}")
+        else:
+            lines.append(f"[结果] API '{result.api_name}' 在头文件中未找到")
+            lines.append("")
+            lines.append(result.summary)
+        lines.append("")
+        lines.append("=" * 50)
+        return lines
+
+    @staticmethod
+    def _get_troubleshooting_hint(query: str) -> Optional[str]:
+        """Provide troubleshooting hints based on query keywords."""
+        query_lower = query.lower()
+        hints = {
+            "561003": "错误 561003: Kernel 查找失败。检查 LD_LIBRARY_PATH 是否包含 op_api/lib，确认算子包已正确安装。",
+            "561107": "错误 561107: 环境变量配置错误。请使用 source set_env.sh 配置，不要手动 export ASCEND_OPP_PATH。",
+            "device not found": "NPU 设备未找到。检查: 1) npu-smi list 是否识别设备 2) 驱动是否安装 3) 容器是否正确映射设备",
+            "libascend": "运行时库依赖问题。export LD_LIBRARY_PATH=$ASCEND_HOME_PATH/runtime/lib64:$LD_LIBRARY_PATH",
+        }
+        for keyword, hint in hints.items():
+            if keyword in query_lower:
+                return hint
+        return None
 
 
-def check_env(query: str = "") -> List[str]:
+# ============================================================
+# Convenience functions
+# ============================================================
+
+def check_env_convenience(query: str = "") -> List[str]:
     """
-    Convenience function for environment check.
+    Convenience function for environment check (legacy interface).
 
     Args:
         query: What to check (empty for full overview)
