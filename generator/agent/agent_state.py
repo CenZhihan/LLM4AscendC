@@ -59,11 +59,31 @@ class GeneratorAgentState(MessagesState):
     web_results: Annotated[List[str], _add_list]
     code_rag_results: Annotated[List[str], _add_list]
     env_check_results: Annotated[List[str], _add_list]
+    kb_shell_search_results: Annotated[List[str], _add_list]
+    api_lookup_results: Annotated[List[str], _add_list]
+    api_constraint_results: Annotated[List[str], _add_list]
+    api_alternative_results: Annotated[List[str], _add_list]
+    tiling_calc_results: Annotated[List[str], _add_list]
+    tiling_validate_results: Annotated[List[str], _add_list]
+    npu_arch_results: Annotated[List[str], _add_list]
+    code_style_results: Annotated[List[str], _add_list]
+    security_check_results: Annotated[List[str], _add_list]
 
     # Structured env check results (for programmatic access)
     env_check_env_result: NotRequired[Dict[str, Any]]    # Environment overview
     env_check_npu_result: NotRequired[Dict[str, Any]]    # NPU device query
     env_check_api_result: NotRequired[Dict[str, Any]]    # API compatibility check
+
+    # Structured new tool results
+    kb_shell_search_result: NotRequired[Dict[str, Any]]  # KB shell search
+    api_lookup_result: NotRequired[Dict[str, Any]]       # API signature lookup
+    api_constraint_result: NotRequired[Dict[str, Any]]   # API constraint check
+    api_alternative_result: NotRequired[Dict[str, Any]]  # API alternative finder
+    tiling_calc_result: NotRequired[Dict[str, Any]]      # Tiling calculation
+    tiling_validate_result: NotRequired[Dict[str, Any]]  # Tiling validation
+    npu_arch_result: NotRequired[Dict[str, Any]]         # NPU architecture query
+    code_style_result: NotRequired[Dict[str, Any]]       # Code style check
+    security_check_result: NotRequired[Dict[str, Any]]   # Security pattern check
 
     # Tool call logging
     tool_calls_log: Annotated[List[Dict[str, Any]], _add_tool_calls]
@@ -115,6 +135,15 @@ def create_initial_state(
         "web_results": [],
         "code_rag_results": [],
         "env_check_results": [],
+        "kb_shell_search_results": [],
+        "api_lookup_results": [],
+        "api_constraint_results": [],
+        "api_alternative_results": [],
+        "tiling_calc_results": [],
+        "tiling_validate_results": [],
+        "npu_arch_results": [],
+        "code_style_results": [],
+        "security_check_results": [],
         "tool_calls_log": [],
         "query_round_count": 0,
     }

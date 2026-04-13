@@ -32,6 +32,15 @@ class ToolType(str, Enum):
     ENV_CHECK_ENV = "env_check_env"
     ENV_CHECK_NPU = "env_check_npu"
     ENV_CHECK_API = "env_check_api"
+    KB_SHELL_SEARCH = "kb_shell_search"
+    API_LOOKUP = "api_lookup"
+    API_CONSTRAINT = "api_constraint"
+    API_ALTERNATIVE = "api_alternative"
+    TILING_CALC = "tiling_calc"
+    TILING_VALIDATE = "tiling_validate"
+    NPU_ARCH = "npu_arch"
+    CODE_STYLE = "code_style"
+    SECURITY_CHECK = "security_check"
 
 
 # Type alias for tool mode (FrozenSet for immutability and dict key usage)
@@ -84,6 +93,51 @@ def has_env_check_npu(mode: AgentToolMode) -> bool:
 def has_env_check_api(mode: AgentToolMode) -> bool:
     """Check if API Compatibility Check is enabled."""
     return has_tool(mode, ToolType.ENV_CHECK_API)
+
+
+def has_kb_shell_search(mode: AgentToolMode) -> bool:
+    """Check if KB Shell Search is enabled."""
+    return has_tool(mode, ToolType.KB_SHELL_SEARCH)
+
+
+def has_api_lookup(mode: AgentToolMode) -> bool:
+    """Check if API Lookup is enabled."""
+    return has_tool(mode, ToolType.API_LOOKUP)
+
+
+def has_api_constraint(mode: AgentToolMode) -> bool:
+    """Check if API Constraint Check is enabled."""
+    return has_tool(mode, ToolType.API_CONSTRAINT)
+
+
+def has_api_alternative(mode: AgentToolMode) -> bool:
+    """Check if API Alternative Finder is enabled."""
+    return has_tool(mode, ToolType.API_ALTERNATIVE)
+
+
+def has_tiling_calc(mode: AgentToolMode) -> bool:
+    """Check if Tiling Calculator is enabled."""
+    return has_tool(mode, ToolType.TILING_CALC)
+
+
+def has_tiling_validate(mode: AgentToolMode) -> bool:
+    """Check if Tiling Validator is enabled."""
+    return has_tool(mode, ToolType.TILING_VALIDATE)
+
+
+def has_npu_arch(mode: AgentToolMode) -> bool:
+    """Check if NPU Architecture Query is enabled."""
+    return has_tool(mode, ToolType.NPU_ARCH)
+
+
+def has_code_style(mode: AgentToolMode) -> bool:
+    """Check if Code Style Check is enabled."""
+    return has_tool(mode, ToolType.CODE_STYLE)
+
+
+def has_security_check(mode: AgentToolMode) -> bool:
+    """Check if Security Pattern Check is enabled."""
+    return has_tool(mode, ToolType.SECURITY_CHECK)
 
 
 def _parse_tool_type(tool_str: str) -> Optional[ToolType]:

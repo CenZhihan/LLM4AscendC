@@ -18,6 +18,15 @@ from ..agent_config import (
     has_env_check_env,
     has_env_check_npu,
     has_env_check_api,
+    has_kb_shell_search,
+    has_api_lookup,
+    has_api_constraint,
+    has_api_alternative,
+    has_tiling_calc,
+    has_tiling_validate,
+    has_npu_arch,
+    has_code_style,
+    has_security_check,
 )
 
 
@@ -91,6 +100,15 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
     web_results = state.get("web_results", [])
     code_rag_results = state.get("code_rag_results", [])
     env_check_results = state.get("env_check_results", [])
+    kb_shell_results = state.get("kb_shell_search_results", [])
+    api_lookup_results = state.get("api_lookup_results", [])
+    api_constraint_results = state.get("api_constraint_results", [])
+    api_alternative_results = state.get("api_alternative_results", [])
+    tiling_calc_results = state.get("tiling_calc_results", [])
+    tiling_validate_results = state.get("tiling_validate_results", [])
+    npu_arch_results = state.get("npu_arch_results", [])
+    code_style_results = state.get("code_style_results", [])
+    security_check_results = state.get("security_check_results", [])
 
     existing = ""
     if kb_results:
@@ -101,6 +119,24 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
         existing += "已检索代码结果（节选）：\n" + "\n".join(code_rag_results[:1]) + "\n\n"
     if env_check_results:
         existing += "环境检查结果（节选）：\n" + "\n".join(env_check_results[:1]) + "\n\n"
+    if kb_shell_results:
+        existing += "知识库搜索结果（节选）：\n" + "\n".join(kb_shell_results[:1]) + "\n\n"
+    if api_lookup_results:
+        existing += "API 签名查询结果（节选）：\n" + "\n".join(api_lookup_results[:1]) + "\n\n"
+    if api_constraint_results:
+        existing += "API 约束检查结果（节选）：\n" + "\n".join(api_constraint_results[:1]) + "\n\n"
+    if api_alternative_results:
+        existing += "API 替代方案结果（节选）：\n" + "\n".join(api_alternative_results[:1]) + "\n\n"
+    if tiling_calc_results:
+        existing += "Tiling 计算结果（节选）：\n" + "\n".join(tiling_calc_results[:1]) + "\n\n"
+    if tiling_validate_results:
+        existing += "Tiling 验证结果（节选）：\n" + "\n".join(tiling_validate_results[:1]) + "\n\n"
+    if npu_arch_results:
+        existing += "NPU 架构查询结果（节选）：\n" + "\n".join(npu_arch_results[:1]) + "\n\n"
+    if code_style_results:
+        existing += "代码风格检查结果（节选）：\n" + "\n".join(code_style_results[:1]) + "\n\n"
+    if security_check_results:
+        existing += "安全检查结果（节选）：\n" + "\n".join(security_check_results[:1]) + "\n\n"
     return existing
 
 
@@ -126,6 +162,24 @@ def _build_tool_selection_prompt(
         tools_desc.append("NPU查询（ENV_CHECK_NPU）- 查询 NPU 设备状态和资源使用")
     if has_env_check_api(tool_mode):
         tools_desc.append("API检查（ENV_CHECK_API）- 验证 Ascend C API 是否在头文件中存在")
+    if has_kb_shell_search(tool_mode):
+        tools_desc.append("知识库搜索（KB_SHELL_SEARCH）- 使用 grep/find 在知识库文档中搜索")
+    if has_api_lookup(tool_mode):
+        tools_desc.append("API签名查询（API_LOOKUP）- 查询 API 签名、支持的数据类型、repeatTimes 限制")
+    if has_api_constraint(tool_mode):
+        tools_desc.append("API约束检查（API_CONSTRAINT）- 检查 API 的对齐要求、blockCount 限制等平台约束")
+    if has_api_alternative(tool_mode):
+        tools_desc.append("API替代方案（API_ALTERNATIVE）- 当目标 API 不可用时查找等价替代方案")
+    if has_tiling_calc(tool_mode):
+        tools_desc.append("Tiling计算（TILING_CALC）- 根据算子类型和数据量自动计算最优 Tiling 参数")
+    if has_tiling_validate(tool_mode):
+        tools_desc.append("Tiling验证（TILING_VALIDATE）- 验证 Tiling 参数是否满足硬件约束")
+    if has_npu_arch(tool_mode):
+        tools_desc.append("NPU架构查询（NPU_ARCH）- 查询目标芯片的关键硬件参数")
+    if has_code_style(tool_mode):
+        tools_desc.append("代码风格检查（CODE_STYLE）- 检查代码是否符合 Ascend C 编码规范")
+    if has_security_check(tool_mode):
+        tools_desc.append("安全检查（SECURITY_CHECK）- 检查代码中的安全隐患（内存泄漏、越界等）")
 
     if not tools_desc:
         return ""  # No tools, will return ANSWER
@@ -137,7 +191,10 @@ def _build_tool_selection_prompt(
     examples: list = []
     example_idx = 1
     for tool_type in [ToolType.KB, ToolType.WEB, ToolType.CODE_RAG,
-                      ToolType.ENV_CHECK_ENV, ToolType.ENV_CHECK_NPU, ToolType.ENV_CHECK_API]:
+                      ToolType.ENV_CHECK_ENV, ToolType.ENV_CHECK_NPU, ToolType.ENV_CHECK_API,
+                      ToolType.KB_SHELL_SEARCH, ToolType.API_LOOKUP, ToolType.API_CONSTRAINT,
+                      ToolType.API_ALTERNATIVE, ToolType.TILING_CALC, ToolType.TILING_VALIDATE,
+                      ToolType.NPU_ARCH, ToolType.CODE_STYLE, ToolType.SECURITY_CHECK]:
         if tool_type in tool_mode:
             tool_name = tool_type.value.upper()
             if tool_type == ToolType.KB:
@@ -152,6 +209,24 @@ def _build_tool_selection_prompt(
                 examples.append(f"示例{example_idx}（NPU查询）：\nENV_CHECK_NPU\nquery npu device status")
             elif tool_type == ToolType.ENV_CHECK_API:
                 examples.append(f"示例{example_idx}（API检查）：\nENV_CHECK_API\ncheck if AscendC::DataCopy exists")
+            elif tool_type == ToolType.KB_SHELL_SEARCH:
+                examples.append(f"示例{example_idx}（知识库搜索）：\nKB_SHELL_SEARCH\nsearch DataCopy API in Knowledge/api/")
+            elif tool_type == ToolType.API_LOOKUP:
+                examples.append(f"示例{example_idx}（API签名查询）：\nAPI_LOOKUP\nlookup AscendC::DataCopy signature")
+            elif tool_type == ToolType.API_CONSTRAINT:
+                examples.append(f"示例{example_idx}（API约束检查）：\nAPI_CONSTRAINT\ncheck DataCopy constraints with count=512 dtype=half")
+            elif tool_type == ToolType.API_ALTERNATIVE:
+                examples.append(f"示例{example_idx}（API替代方案）：\nAPI_ALTERNATIVE\nfind alternative for GlobalTensor::SetValue")
+            elif tool_type == ToolType.TILING_CALC:
+                examples.append(f"示例{example_idx}（Tiling计算）：\nTILING_CALC\ncalculate tiling for 1024 float elements elementwise")
+            elif tool_type == ToolType.TILING_VALIDATE:
+                examples.append(f"示例{example_idx}（Tiling验证）：\nTILING_VALIDATE\nvalidate tiling params with chip=DAV_2201")
+            elif tool_type == ToolType.NPU_ARCH:
+                examples.append(f"示例{example_idx}（NPU架构查询）：\nNPU_ARCH\nquery Ascend910B2 chip specs")
+            elif tool_type == ToolType.CODE_STYLE:
+                examples.append(f"示例{example_idx}（代码风格检查）：\nCODE_STYLE\ncheck code style for kernel implementation")
+            elif tool_type == ToolType.SECURITY_CHECK:
+                examples.append(f"示例{example_idx}（安全检查）：\nSECURITY_CHECK\ncheck security patterns in elementwise kernel")
             example_idx += 1
     examples.append("示例（直接回答）：\nANSWER")
     few_shot = "\n\n".join(examples)
@@ -160,8 +235,10 @@ def _build_tool_selection_prompt(
     prompt = (
         f"用户问题：\n{user_question}\n\n"
         f"当前可选工具：{tools_line}，或直接回答（ANSWER）。根据需要选择合适的工具。\n"
-        "规则：只输出两行。第一行为动作（KB/WEB/CODE_RAG/ENV_CHECK_ENV/ENV_CHECK_NPU/ENV_CHECK_API/ANSWER）；"
-        "若选 KB/WEB/CODE_RAG/ENV_CHECK_*/ANSWER，第二行必须是一句完整的英文查询。\n"
+        "规则：只输出两行。第一行为动作（KB/WEB/CODE_RAG/ENV_CHECK_ENV/ENV_CHECK_NPU/ENV_CHECK_API/"
+        "KB_SHELL_SEARCH/API_LOOKUP/API_CONSTRAINT/API_ALTERNATIVE/TILING_CALC/TILING_VALIDATE/"
+        "NPU_ARCH/CODE_STYLE/SECURITY_CHECK/ANSWER）；"
+        "若选任何工具或ANSWER，第二行必须是一句完整的英文查询。\n"
     )
 
     if existing_results:
@@ -234,6 +311,33 @@ def choose_tool_node(
     elif "ENV_CHECK_ENV" in first and has_env_check_env(tool_mode):
         next_action = "ENV_CHECK_ENV"
         current_query = query_line or user_question
+    elif "KB_SHELL_SEARCH" in first and has_kb_shell_search(tool_mode):
+        next_action = "KB_SHELL_SEARCH"
+        current_query = query_line or user_question
+    elif "API_LOOKUP" in first and has_api_lookup(tool_mode):
+        next_action = "API_LOOKUP"
+        current_query = query_line or user_question
+    elif "API_CONSTRAINT" in first and has_api_constraint(tool_mode):
+        next_action = "API_CONSTRAINT"
+        current_query = query_line or user_question
+    elif "API_ALTERNATIVE" in first and has_api_alternative(tool_mode):
+        next_action = "API_ALTERNATIVE"
+        current_query = query_line or user_question
+    elif "TILING_CALC" in first and has_tiling_calc(tool_mode):
+        next_action = "TILING_CALC"
+        current_query = query_line or user_question
+    elif "TILING_VALIDATE" in first and has_tiling_validate(tool_mode):
+        next_action = "TILING_VALIDATE"
+        current_query = query_line or user_question
+    elif "NPU_ARCH" in first and has_npu_arch(tool_mode):
+        next_action = "NPU_ARCH"
+        current_query = query_line or user_question
+    elif "CODE_STYLE" in first and has_code_style(tool_mode):
+        next_action = "CODE_STYLE"
+        current_query = query_line or user_question
+    elif "SECURITY_CHECK" in first and has_security_check(tool_mode):
+        next_action = "SECURITY_CHECK"
+        current_query = query_line or user_question
     elif "KB" in first and has_kb(tool_mode):
         next_action = "KB"
         current_query = query_line or user_question
@@ -254,6 +358,24 @@ def choose_tool_node(
             next_action = "ENV_CHECK_NPU"
         elif has_env_check_api(tool_mode):
             next_action = "ENV_CHECK_API"
+        elif has_kb_shell_search(tool_mode):
+            next_action = "KB_SHELL_SEARCH"
+        elif has_api_lookup(tool_mode):
+            next_action = "API_LOOKUP"
+        elif has_api_constraint(tool_mode):
+            next_action = "API_CONSTRAINT"
+        elif has_api_alternative(tool_mode):
+            next_action = "API_ALTERNATIVE"
+        elif has_tiling_calc(tool_mode):
+            next_action = "TILING_CALC"
+        elif has_tiling_validate(tool_mode):
+            next_action = "TILING_VALIDATE"
+        elif has_npu_arch(tool_mode):
+            next_action = "NPU_ARCH"
+        elif has_code_style(tool_mode):
+            next_action = "CODE_STYLE"
+        elif has_security_check(tool_mode):
+            next_action = "SECURITY_CHECK"
         else:
             next_action = "ANSWER"
         current_query = query_line or user_question

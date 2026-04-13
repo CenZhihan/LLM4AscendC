@@ -19,6 +19,15 @@ from .agent_config import (
     has_env_check_env,
     has_env_check_npu,
     has_env_check_api,
+    has_kb_shell_search,
+    has_api_lookup,
+    has_api_constraint,
+    has_api_alternative,
+    has_tiling_calc,
+    has_tiling_validate,
+    has_npu_arch,
+    has_code_style,
+    has_security_check,
     parse_tool_mode,
     get_llm_config_compatible,
 )
@@ -30,10 +39,24 @@ from .nodes import (
     env_check_env_node,
     env_check_npu_node,
     env_check_api_node,
+    npu_arch_node,
+    tiling_calc_node,
+    tiling_validate_node,
+    api_lookup_node,
+    api_constraint_node,
+    api_alternative_node,
+    code_style_node,
+    security_check_node,
+    kb_shell_search_node,
     answer_node,
 )
 from .retrievers import KBRetriever, WebRetriever, CodeRetriever
 from .retrievers.env_checker import EnvCheckRetriever
+from .retrievers.npu_arch_retriever import NpuArchRetriever
+from .retrievers.tiling_retriever import TilingRetriever
+from .retrievers.api_doc_retriever import ApiDocRetriever
+from .retrievers.code_quality_retriever import CodeQualityRetriever
+from .retrievers.kb_shell_search import KBShellSearchRetriever
 
 
 def _entry_node(state: GeneratorAgentState) -> dict:
@@ -75,6 +98,24 @@ def _route_after_choose_tool(tool_mode: AgentToolMode):
             return "env_check_npu"
         elif action == "ENV_CHECK_API" and has_env_check_api(tool_mode):
             return "env_check_api"
+        elif action == "KB_SHELL_SEARCH" and has_kb_shell_search(tool_mode):
+            return "kb_shell_search"
+        elif action == "API_LOOKUP" and has_api_lookup(tool_mode):
+            return "api_lookup"
+        elif action == "API_CONSTRAINT" and has_api_constraint(tool_mode):
+            return "api_constraint"
+        elif action == "API_ALTERNATIVE" and has_api_alternative(tool_mode):
+            return "api_alternative"
+        elif action == "TILING_CALC" and has_tiling_calc(tool_mode):
+            return "tiling_calc"
+        elif action == "TILING_VALIDATE" and has_tiling_validate(tool_mode):
+            return "tiling_validate"
+        elif action == "NPU_ARCH" and has_npu_arch(tool_mode):
+            return "npu_arch"
+        elif action == "CODE_STYLE" and has_code_style(tool_mode):
+            return "code_style"
+        elif action == "SECURITY_CHECK" and has_security_check(tool_mode):
+            return "security_check"
         else:
             return "answer"  # Fallback
 
@@ -116,6 +157,17 @@ def build_agent_app(
     _env_retriever = EnvCheckRetriever() if (
         has_env_check_env(tool_mode) or has_env_check_npu(tool_mode) or has_env_check_api(tool_mode)
     ) else None
+    _npu_arch_retriever = NpuArchRetriever() if has_npu_arch(tool_mode) else None
+    _tiling_retriever = TilingRetriever() if (
+        has_tiling_calc(tool_mode) or has_tiling_validate(tool_mode)
+    ) else None
+    _api_retriever = ApiDocRetriever() if (
+        has_api_lookup(tool_mode) or has_api_constraint(tool_mode) or has_api_alternative(tool_mode)
+    ) else None
+    _code_quality_retriever = CodeQualityRetriever() if (
+        has_code_style(tool_mode) or has_security_check(tool_mode)
+    ) else None
+    _kb_shell_retriever = KBShellSearchRetriever() if has_kb_shell_search(tool_mode) else None
 
     # Create node functions with closures
     def choose_tool_fn(state: GeneratorAgentState) -> dict:
@@ -138,6 +190,33 @@ def build_agent_app(
 
     def env_check_api_fn(state: GeneratorAgentState) -> dict:
         return env_check_api_node(state, _env_retriever)
+
+    def npu_arch_fn(state: GeneratorAgentState) -> dict:
+        return npu_arch_node(state, _npu_arch_retriever)
+
+    def tiling_calc_fn(state: GeneratorAgentState) -> dict:
+        return tiling_calc_node(state, _tiling_retriever)
+
+    def tiling_validate_fn(state: GeneratorAgentState) -> dict:
+        return tiling_validate_node(state, _tiling_retriever)
+
+    def api_lookup_fn(state: GeneratorAgentState) -> dict:
+        return api_lookup_node(state, _api_retriever)
+
+    def api_constraint_fn(state: GeneratorAgentState) -> dict:
+        return api_constraint_node(state, _api_retriever)
+
+    def api_alternative_fn(state: GeneratorAgentState) -> dict:
+        return api_alternative_node(state, _api_retriever)
+
+    def code_style_fn(state: GeneratorAgentState) -> dict:
+        return code_style_node(state, _code_quality_retriever)
+
+    def security_check_fn(state: GeneratorAgentState) -> dict:
+        return security_check_node(state, _code_quality_retriever)
+
+    def kb_shell_search_fn(state: GeneratorAgentState) -> dict:
+        return kb_shell_search_node(state, _kb_shell_retriever)
 
     def answer_fn(state: GeneratorAgentState) -> dict:
         return answer_node(state, client, model)
@@ -162,6 +241,24 @@ def build_agent_app(
         workflow.add_node("env_check_npu", env_check_npu_fn)
     if has_env_check_api(tool_mode):
         workflow.add_node("env_check_api", env_check_api_fn)
+    if has_kb_shell_search(tool_mode):
+        workflow.add_node("kb_shell_search", kb_shell_search_fn)
+    if has_api_lookup(tool_mode):
+        workflow.add_node("api_lookup", api_lookup_fn)
+    if has_api_constraint(tool_mode):
+        workflow.add_node("api_constraint", api_constraint_fn)
+    if has_api_alternative(tool_mode):
+        workflow.add_node("api_alternative", api_alternative_fn)
+    if has_tiling_calc(tool_mode):
+        workflow.add_node("tiling_calc", tiling_calc_fn)
+    if has_tiling_validate(tool_mode):
+        workflow.add_node("tiling_validate", tiling_validate_fn)
+    if has_npu_arch(tool_mode):
+        workflow.add_node("npu_arch", npu_arch_fn)
+    if has_code_style(tool_mode):
+        workflow.add_node("code_style", code_style_fn)
+    if has_security_check(tool_mode):
+        workflow.add_node("security_check", security_check_fn)
 
     workflow.add_node("answer", answer_fn)
 
@@ -190,6 +287,24 @@ def build_agent_app(
         conditional_map["env_check_npu"] = "env_check_npu"
     if has_env_check_api(tool_mode):
         conditional_map["env_check_api"] = "env_check_api"
+    if has_kb_shell_search(tool_mode):
+        conditional_map["kb_shell_search"] = "kb_shell_search"
+    if has_api_lookup(tool_mode):
+        conditional_map["api_lookup"] = "api_lookup"
+    if has_api_constraint(tool_mode):
+        conditional_map["api_constraint"] = "api_constraint"
+    if has_api_alternative(tool_mode):
+        conditional_map["api_alternative"] = "api_alternative"
+    if has_tiling_calc(tool_mode):
+        conditional_map["tiling_calc"] = "tiling_calc"
+    if has_tiling_validate(tool_mode):
+        conditional_map["tiling_validate"] = "tiling_validate"
+    if has_npu_arch(tool_mode):
+        conditional_map["npu_arch"] = "npu_arch"
+    if has_code_style(tool_mode):
+        conditional_map["code_style"] = "code_style"
+    if has_security_check(tool_mode):
+        conditional_map["security_check"] = "security_check"
 
     workflow.add_conditional_edges(
         "choose_tool",
@@ -210,6 +325,24 @@ def build_agent_app(
         workflow.add_edge("env_check_npu", "choose_tool")
     if has_env_check_api(tool_mode):
         workflow.add_edge("env_check_api", "choose_tool")
+    if has_kb_shell_search(tool_mode):
+        workflow.add_edge("kb_shell_search", "choose_tool")
+    if has_api_lookup(tool_mode):
+        workflow.add_edge("api_lookup", "choose_tool")
+    if has_api_constraint(tool_mode):
+        workflow.add_edge("api_constraint", "choose_tool")
+    if has_api_alternative(tool_mode):
+        workflow.add_edge("api_alternative", "choose_tool")
+    if has_tiling_calc(tool_mode):
+        workflow.add_edge("tiling_calc", "choose_tool")
+    if has_tiling_validate(tool_mode):
+        workflow.add_edge("tiling_validate", "choose_tool")
+    if has_npu_arch(tool_mode):
+        workflow.add_edge("npu_arch", "choose_tool")
+    if has_code_style(tool_mode):
+        workflow.add_edge("code_style", "choose_tool")
+    if has_security_check(tool_mode):
+        workflow.add_edge("security_check", "choose_tool")
 
     # Answer leads to END
     workflow.add_edge("answer", END)
