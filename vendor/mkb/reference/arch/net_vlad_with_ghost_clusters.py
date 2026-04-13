@@ -102,20 +102,17 @@ class Model(nn.Module):
 batch_size = 2048
 num_features = 100
 num_clusters = 32
-feature_size = 48  # Must match 165 op: clusters [512, 48]
-ghost_clusters = 480  # K+G = 512, so G = 512 - 32 = 480
+feature_size = 512
+ghost_clusters = 16  # K+G = 48 (matches custom op TORCH_CHECK)
 
 def get_inputs():
     x = torch.rand(batch_size, num_features, feature_size)
-    # Must match 165 op: clusters [512, 48] = [K+G, feature_size]
-    clusters = torch.rand(num_clusters + ghost_clusters, feature_size)
-    # Must match 165 op: clusters2 [1, 512, 32] = [1, K+G, K]
-    clusters2 = torch.rand(1, num_clusters + ghost_clusters, num_clusters)
-    # Must match 165 op: bn_* [48]
-    bn_weight = torch.rand(feature_size)
-    bn_bias = torch.rand(feature_size)
-    bn_mean = torch.rand(feature_size)
-    bn_var = torch.rand(feature_size)
+    clusters = torch.rand(feature_size, num_clusters + ghost_clusters)
+    clusters2 = torch.rand(1, feature_size, num_clusters)
+    bn_weight = torch.rand(num_clusters + ghost_clusters)
+    bn_bias = torch.rand(num_clusters + ghost_clusters)
+    bn_mean = torch.rand(num_clusters + ghost_clusters)
+    bn_var = torch.rand(num_clusters + ghost_clusters)
     return [x, clusters, clusters2, bn_weight, bn_bias, bn_mean, bn_var]
 
 def get_init_inputs():

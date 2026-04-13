@@ -31,9 +31,9 @@ def get_inputs():
     x = torch.rand(batch_size, in_features)
     w = torch.rand(out_features, in_features)
     b = torch.rand(out_features)
-    scaling = torch.tensor(scaling_factor, dtype=torch.float32)
-    ht_min = torch.tensor(float(hardtanh_min), dtype=torch.float32)
-    ht_max = torch.tensor(float(hardtanh_max), dtype=torch.float32)
+    scaling = torch.tensor([scaling_factor], dtype=torch.float32).contiguous()
+    ht_min = torch.tensor([float(hardtanh_min)], dtype=torch.float32).contiguous()
+    ht_max = torch.tensor([float(hardtanh_max)], dtype=torch.float32).contiguous()
     return [x, w, b, scaling, ht_min, ht_max]
 
 def get_init_inputs():

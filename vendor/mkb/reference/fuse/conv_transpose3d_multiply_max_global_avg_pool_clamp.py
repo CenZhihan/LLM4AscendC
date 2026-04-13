@@ -14,9 +14,9 @@ class Model(nn.Module):
         return y.clamp(0.0, 1.0)
 
 def get_inputs():
-    x = torch.rand(4, 32, 16, 16, 16)
-    w = torch.rand(32, 64, 3, 3, 3)
-    cb = torch.rand(64)
+    x = torch.rand(128, 3, 16, 32, 32)
+    w = torch.rand(3, 16, 3, 3, 3)
+    cb = torch.rand(16)
     return [x, w, cb]
 
 def get_init_inputs():

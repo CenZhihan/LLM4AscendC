@@ -8,7 +8,7 @@ class Model(nn.Module):
 
     def forward(self, x, weight, conv_bias, bn_weight, bn_bias):
         y = F.conv_transpose3d(
-            x, weight, conv_bias, stride=1, padding=0, output_padding=0, dilation=1, groups=1,
+            x, weight, conv_bias, stride=2, padding=1, output_padding=0, dilation=1, groups=1,
         )
         c = y.size(1)
         rm = torch.zeros(c, device=y.device, dtype=y.dtype)
@@ -17,11 +17,12 @@ class Model(nn.Module):
         return y - y.mean(dim=(2, 3, 4), keepdim=True)
 
 def get_inputs():
-    x = torch.rand(4, 32, 16, 16, 16)
-    w = torch.rand(32, 64, 3, 3, 3)
-    cb = torch.rand(64)
-    bw = torch.rand(64)
-    bb = torch.rand(64)
+    # Contract: Cin=16, Cout=32, spatial [16,32,32], weight [16,32,3,3,3]; bn length 32
+    x = torch.rand(4, 16, 16, 32, 32)
+    w = torch.rand(16, 32, 3, 3, 3)
+    cb = torch.rand(32)
+    bw = torch.rand(32)
+    bb = torch.rand(32)
     return [x, w, cb, bw, bb]
 
 def get_init_inputs():

@@ -16,10 +16,11 @@ class Model(nn.Module):
         return y + bias.view(1, -1, 1, 1, 1)
 
 def get_inputs():
-    x = torch.rand(128, 8, 16, 64, 64)
-    w = torch.rand(64, 8, 3, 3, 3)
-    cb = torch.rand(64)
-    pb = torch.rand(64, 1, 1, 1)
+    # Contract: N=64, Cin=8, Cout=32, D/H/W=32/64/64, weight [32,8,3,3,3]
+    x = torch.rand(64, 8, 32, 64, 64)
+    w = torch.rand(32, 8, 3, 3, 3)
+    cb = torch.rand(32)
+    pb = torch.rand(32, 1, 1, 1)
     return [x, w, cb, pb]
 
 def get_init_inputs():

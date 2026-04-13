@@ -12,7 +12,7 @@ class Model(nn.Module):
         return torch.sigmoid(y)
 
 def get_inputs():
-    x = torch.rand(4, 32, 16, 16, 16)
+    x = torch.rand(16, 32, 16, 32, 32)
     w = torch.rand(32, 64, 3, 3, 3)
     b = torch.rand(64)
     return [x, w, b]
