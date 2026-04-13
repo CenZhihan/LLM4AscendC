@@ -14,6 +14,139 @@
 
 ---
 
+## 1.5 使用 LLM 生成 AscendC 算子（可选）
+
+本仓库在 **`generation/`** 内提供 **MKB 风格 `*.txt` 算子包** 的生成逻辑（由历史 MultiKernelBench / AscendC 流程迁入并裁剪），**与 `tools/eval_operator.py` 的评测代码相互独立**：评测行为与接口不变，生成仅为额外能力。
+
+### 1.5.1 算子范围与 prompt 策略
+
+- **算子集合**：仅包含在 **`kernelbench165_eval_report.txt`** 第三节列出的 **102 个**数值通过算子（见 **`generation/kernelbench102_ops.py`**）。`--categories all` 表示对这 102 个全集再按 MKB `category` 过滤；不再是 300+ 全量数据集。
+- **策略（仅两种）**：
+  - **`none`**：无代码 few-shot，仅当前 `op` 的 `vendor/mkb/reference/<category>/<op>.py` + 输出格式说明。
+  - **`one_shot`**：few-shot 固定为 **leaky_relu**：原始架构见 **`generation/prompts/cuda_model_leaky_relu.py`**（与 MKB reference 一致），转换后示例为 **`generation/prompts/ascendc_new_model_leaky_relu.py`**（由 `output/kernelbench165_txt/leaky_relu.txt` 快照得到，入库后不依赖外部仓库路径）。
+
+### 1.5.2 API 配置（直连与 Agent 相同）
+
+**方式 A：文件配置（与 MultiKernelBench `USE_API_CONFIG=1` 类似）**
+
+```bash
+cp generation/local_api_config.example.py generation/local_api_config.py
+# 编辑 local_api_config.py，填写 XI_AI_API_KEY、XI_AI_BASE_URL、XI_AI_MODEL
+export USE_API_CONFIG=1
+python3 tools/generate_ascendc_operators.py ...
+```
+
+- **`generation/local_api_config.py`** 已写入 **`.gitignore`**，勿提交。
+- 支持 **`XI_AI_*`** 或回退 **`OPENAI_API_KEY` / `OPENAI_API_BASE` / `MODEL`**（与旧 `api_config.py` 命名兼容）。
+- 未设置 `XI_AI_BASE_URL` 且未设置 `OPENAI_API_BASE` 时，默认 **`https://api-2.xi-ai.cn/v1`**。
+
+**方式 B：环境变量**（未设置 `USE_API_CONFIG=1` 时使用）
+
+| 变量 | 说明 |
+|------|------|
+| **`XI_AI_API_KEY`** | 必填 |
+| **`XI_AI_BASE_URL`** | 可选，默认 `https://api-2.xi-ai.cn/v1` |
+| **`XI_AI_MODEL`** | 可选，默认 `gpt-5` |
+
+命令行 **`--model`** 可覆盖实际请求的模型名（不传则用文件或环境中的模型名）。
+
+### 1.5.3 依赖安装
+
+**拆分环境（推荐与 CANN 容器习惯一致）**：纯评测只用根目录 **`requirements.txt`**（另装 **`torch_npu`** 官方 wheel，与 CANN 版本对齐）。纯生成可只装 **`openai`** 或整份 **`requirements-generation.txt`**（见该文件头注释）。
+
+**同一 conda（例如 `czh_environ`）同时生成 + 评测**时，在 **`LLM4AscendC/`** 下按顺序执行（勿再按 `requirements-generation.txt` 里「先装 CPU torch」那套，避免覆盖 **`torch==2.1.0`**）：
+
+```bash
+source /root/miniconda3/etc/profile.d/conda.sh   # 路径按本机修改
+conda activate czh_environ
+cd /root/czh/LLM4AscendC
+
+pip install -U pip
+pip install -r requirements.txt
+# 与 CANN / torch 2.1.0 匹配的 torch_npu（wheel 路径以本机 ascend-toolkit 为准，勿从 PyPI 装）：
+# pip install /path/to/torch_npu-2.1.0.*-cp310-cp310-linux_aarch64.whl
+
+pip install -r requirements-generation.txt -c constraints-czh-unified.txt
+```
+
+**`constraints-czh-unified.txt`** 用于在装生成依赖时 **钉死 `torch==2.1.0`、`numpy==1.26.0`**，防止 `sentence-transformers` 等把 PyTorch 升到带 CUDA 的大包。KB 用的嵌入仍在 CPU 上跑，与 NPU 评测的 `torch_npu` 并存（同一 `torch` 版本需与 wheel 一致）。
+
+仅直连生成、且不用统一环境时：
+
+```bash
+pip install openai
+pip install -r requirements-generation.txt
+```
+
+**知识库（可选）**：Agent 的 KB 默认使用 **`generation/agent/chroma_db`** 与 **`generation/agent/models/bge-m3`**，可通过环境变量覆盖（见下节）。
+
+### 1.5.4 知识库：PDF、建库与检索
+
+- **PDF 源文件**：放在 **`generation/agent/Knowledge/*.pdf`**（仓库内已附带示例 Ascend C API 文档 PDF，可增删后重建库）。
+- **Chroma 持久化目录**：默认 **`generation/agent/chroma_db/`**，已写入 **`.gitignore`**，不提交；换机器需自行建库或拷贝该目录。
+- **嵌入模型**：默认 **`generation/agent/models/bge-m3`**（需自行下载，见 **`requirements-generation.txt`** 中 ModelScope 说明），可用 **`BGE_M3_PATH`** 指向其它目录。
+- **更新方式**：原项目无增量追加脚本；更新 PDF 后 **全量重建**：设置 **`KB_REBUILD=1`**（默认即为 `1`）后运行建库脚本，会先删除旧 **`chroma_db`** 再写入。
+
+**常用环境变量**
+
+| 变量 | 含义 |
+|------|------|
+| **`KB_PERSIST_DIR`** | Chroma 持久化路径，默认 `generation/agent/chroma_db` |
+| **`KB_COLLECTION`** | 集合名，默认 `ascend_c_knowledge` |
+| **`BGE_M3_PATH`** | 本地 BGE-M3 目录 |
+| **`KB_KNOWLEDGE_DIR`** | PDF 目录，默认 `generation/agent/Knowledge` |
+| **`KB_REBUILD`** | `1` 表示建库前删除已有 `KB_PERSIST_DIR` |
+| **`KB_SKIP_FIRST_PAGES`** | 跳过 PDF 前 N 页（目录页），默认 `22` |
+| **`KB_INSERT_BATCH_SIZE`** | 写入批次大小，默认 `2` |
+
+**建库脚本**（在仓库根目录、已激活 `czh_environ` 等生成环境后）：
+
+```bash
+# 可选：减轻 OpenBLAS 在多核机器上的线程告警，并略控 CPU 占用
+export OPENBLAS_NUM_THREADS=8
+
+# 标准：优先 unstructured 按章节切分，缺依赖时退回 pypdf
+KB_REBUILD=1 python generation/agent/db_related/build_knowledge_base.py
+
+# 低内存：仅用 pypdf 分块读页
+KB_REBUILD=1 python generation/agent/db_related/build_knowledge_base_lowmem.py
+```
+
+**调试**：`python generation/agent/db_related/dump_chroma_chunks.py -k 5` 按序打印若干 chunk。
+
+**检索自测**：`python generation/agent/db_related/knowledge_query.py "你的英文问句"`（需已建库且模型路径正确）。
+
+### 1.5.5 入口命令与产物路径
+
+在仓库根目录执行：
+
+```bash
+# 102 子集 + one_shot，直连 LLM，4 线程
+export XI_AI_API_KEY=...
+python3 tools/generate_ascendc_operators.py --strategy one_shot --categories all --workers 4 --model gpt-5
+
+# 仅某几个类别（在 102 子集内过滤）
+python3 tools/generate_ascendc_operators.py --strategy none --categories activation matmul
+
+# Agent + 知识库
+python3 tools/generate_ascendc_operators.py --use_agent --agent_tools kb_only --agent_workers 2 --strategy one_shot --categories all
+```
+
+**产物目录（与旧版 MultiKernelBench 风格一致）**：
+
+- 直连：`output/ascendc/{none|one_shot}/<temperature>-<top_p>/<model>/run<N>/<op>.txt`
+- Agent：`output/ascendc/agent_{none|one_shot}_tools={no_tool|kb_only|web_only|kb_and_web}/<temperature>-<top_p>/<model>/run<N>/<op>.txt`
+
+采样参数 **`temperature` / `top_p`** 见 **`generation/gen_config.py`**（不影响评测）。
+
+生成完成后，用既有评测命令消费，例如：
+
+```bash
+python3 tools/eval_operator.py --txt output/ascendc/one_shot/0.0-1.0/<model>/run0/relu.txt
+```
+
+---
+
 ## 2. 如何评测算子
 
 ### 2.1 入口命令
@@ -24,7 +157,9 @@
 python3 tools/eval_operator.py <必选其一：算子来源> [可选参数]
 ```
 
-**运行环境**：完整流水线依赖 **CANN / msopgen / NPU**，须在已配置昇腾环境的机器上执行。常见做法是在宿主机用 **`docker exec -it <容器ID> bash`** 进入侧载了本仓库的容器（示例容器 ID 可与脚本 `scripts/run_matmul17_local.sh`、`scripts/run_matmul_gpt4o_parallel3.sh` 注释中一致），再 `cd` 到容器内的 `LLM4AscendC` 根目录后运行上述命令。
+**运行环境**：完整流水线依赖 **CANN / msopgen / NPU**，须在已配置昇腾环境的机器上执行。常见做法是在宿主机用 **`docker exec -it <容器ID> bash`** 进入侧载了本仓库的容器，再 `cd` 到仓库根目录后运行上述命令。辅助脚本按目录区分：**`scripts/pj-lab/`**（本机/容器便捷脚本）、**`scripts/xlance-lab/`**（原 xlance 集群与固定仓库路径的批跑脚本）。
+
+若 **`czh_environ`** 里 **只装过生成依赖、未装 `requirements.txt`**，跑评测时 CANN `build.sh` 会缺 **`decorator`** 等，出现 **`ModuleNotFoundError: decorator`** 与后续 **`binary/config`** 缺失。请按 **§1.5.3「同一 conda」** 装好 **`requirements.txt`** 与 **`torch_npu`**，或改用 **`multi-kernel-bench`** 等已配评测栈的环境。
 
 **算子来源（三选一，必选）**
 
@@ -168,6 +303,10 @@ python3 tools/eval_operator.py --txt-dir output/gpt-5_selected_shot --workers 7 
 | 路径 | 说明 |
 |------|------|
 | `tools/eval_operator.py` | 统一评测入口 |
+| `tools/generate_ascendc_operators.py` | LLM 生成 MKB 风格 `*.txt`（kernelbench102 子集，`none` / `one_shot`） |
+| `generation/` | 生成逻辑：prompt、`XI_AI_*` 客户端、可选 Agent |
+| `scripts/pj-lab/` | 本机/容器便捷脚本（如 `run_kernelbench_local.sh`） |
+| `scripts/xlance-lab/` | 原 xlance 集群与固定 `REPO_ROOT` 的批跑、提交示例脚本 |
 | `vendor/mkb/reference/` | MKB PyTorch 参考实现（按类别分子目录） |
 | `vendor/mkb/dataset.py` | 合法 `op_key` 与类别映射 |
 | `vendor/mkb/correctness.py` | 正确性对比模板 |

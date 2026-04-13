@@ -34,6 +34,11 @@ OUTPUT_ROOT = ROOT / "output"
 TOOLS_ROOT = ROOT / "tools"
 
 
+def _is_mkb_operator_txt_path(p: pathlib.Path) -> bool:
+    """True for MKB bundle *.txt; False for CoT sidecars (e.g. leaky_relu_cot.txt)."""
+    return p.is_file() and p.suffix == ".txt" and not p.stem.endswith("_cot")
+
+
 @dataclass(frozen=True)
 class OperatorSpec:
     op_key: str
@@ -670,9 +675,11 @@ def main() -> int:
             raise NotADirectoryError(txt_dir)
         group_rel = _artifact_group_rel_from_txt_dir(txt_dir)
         art_root = _artifacts_root_for_group(group_rel)
-        files = sorted(txt_dir.glob("*.txt"))
+        files = sorted(p for p in txt_dir.glob("*.txt") if _is_mkb_operator_txt_path(p))
         if not files:
-            raise RuntimeError(f"no .txt files in {txt_dir}")
+            raise RuntimeError(
+                f"no MKB operator .txt files in {txt_dir} (files ending with _cot.txt are skipped)"
+            )
 
         if args.workers == 1:
             rc = 0
@@ -746,6 +753,12 @@ def main() -> int:
         txt_path = _resolve_user_path(pathlib.Path(args.txt))
         if not txt_path.exists():
             raise FileNotFoundError(txt_path)
+        if txt_path.stem.endswith("_cot"):
+            sugg = txt_path.stem.removesuffix("_cot") + ".txt"
+            raise ValueError(
+                f"refusing to evaluate CoT sidecar {txt_path.name!r}: use the MKB bundle "
+                f"(typically {sugg!r} in the same directory)"
+            )
         group_rel = _artifact_group_rel_from_txt_path(txt_path)
         art_root = _artifacts_root_for_group(group_rel)
         staging_root = art_root / "_txt_staging" / txt_path.stem
