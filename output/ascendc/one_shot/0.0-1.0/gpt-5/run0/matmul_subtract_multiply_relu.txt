@@ -1,0 +1,440 @@
+project_json_src='''
+[
+  {
+    "op": "MatmulSubtractMultiplyReluCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "w",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "b",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "subtract_value",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "0.0"
+      },
+      {
+        "name": "multiply_value",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "1.0"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulSubtractMultiplyReluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, redTile);   // reduction tile on N
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(float, subtractValue);
+  TILING_DATA_FIELD_DEF(float, multiplyValue);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulSubtractMultiplyReluCustom, MatmulSubtractMultiplyReluCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+#include "matmul_subtract_multiply_relu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) {
+    return (a == 0u) ? x : (x / a) * a;
+}
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (a + b - 1u) / b;
+}
+} // namespace
+
+namespace optiling {
+
+// UB usage per reduction chunk:
+//   xChunk: 1 * redTile
+//   wChunk: 1 * redTile
+//   tmpVec: 1 * redTile
+//   scalars/scratch negligible
+// Total floats ~= 3 * redTile => bytes ~= 12 * redTile
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // per-core conservative
+static constexpr uint32_t ALIGN_ELEMS     = 1024;        // favor aligned DMA
+static constexpr uint32_t HARD_CAP_ELEMS  = 65536;       // safety cap
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    MatmulSubtractMultiplyReluCustomTilingData tiling;
+
+    // Shapes:
+    // x: [M, N], w: [K, N], b: [K] ; y: [M, K]
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+    const gert::Shape *b_shape = context->GetInputShape(2);
+
+    if (x_shape->GetOriginShape().GetDimNum() != 2 ||
+        w_shape->GetOriginShape().GetDimNum() != 2) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+
+    const uint32_t M = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    const uint32_t N = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    const uint32_t K = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(0));
+    const uint32_t WN = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(1));
+
+    if (WN != N) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    if (b_shape->GetOriginShape().GetShapeSize() != K) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const float *subtractValue = attrs->GetAttrPointer<float>(0);
+    const float *multiplyValue = attrs->GetAttrPointer<float>(1);
+
+    // Compute reduction tile length on N from UB budget
+    uint32_t maxRedTile = UB_BUDGET_BYTES / 12; // elements
+    maxRedTile = AlignDown(maxRedTile, ALIGN_ELEMS);
+    if (maxRedTile < ALIGN_ELEMS) maxRedTile = ALIGN_ELEMS;
+    if (maxRedTile > HARD_CAP_ELEMS) maxRedTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t redTile = (N >= maxRedTile) ? maxRedTile : AlignDown(N, ALIGN_ELEMS);
+    if (redTile == 0) redTile = N; // small N
+
+    // Grid over output space M*K with grid-stride
+    const uint64_t totalOutputs64 = static_cast<uint64_t>(M) * static_cast<uint64_t>(K);
+    uint32_t blockDim = 1;
+    if (totalOutputs64 > 0) {
+        uint32_t desired = static_cast<uint32_t>(totalOutputs64);
+        if (desired > 24u) desired = 24u;
+        if (desired < 8u) desired = (totalOutputs64 >= 8u) ? 8u : static_cast<uint32_t>(totalOutputs64);
+        blockDim = (desired == 0u) ? 1u : desired;
+    }
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_m(M);
+    tiling.set_n(N);
+    tiling.set_k(K);
+    tiling.set_redTile(redTile);
+    tiling.set_blockDim(blockDim);
+    tiling.set_subtractValue(*subtractValue);
+    tiling.set_multiplyValue(*multiplyValue);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+
+    if (x_shape->GetOriginShape().GetDimNum() != 2 ||
+        w_shape->GetOriginShape().GetDimNum() != 2) {
+        return GRAPH_PARAM_INVALID;
+    }
+
+    const int64_t M = x_shape->GetOriginShape().GetDim(0);
+    const int64_t N = x_shape->GetOriginShape().GetDim(1);
+    const int64_t K = w_shape->GetOriginShape().GetDim(0);
+    const int64_t WN = w_shape->GetOriginShape().GetDim(1);
+    if (N != WN) return GRAPH_PARAM_INVALID;
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, M);
+    y_shape->SetDim(1, K);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    if (x_dtype != ge::DT_FLOAT) return GRAPH_PARAM_INVALID;
+    if (context->GetInputDataType(1) != ge::DT_FLOAT) return GRAPH_PARAM_INVALID;
+    if (context->GetInputDataType(2) != ge::DT_FLOAT) return GRAPH_PARAM_INVALID;
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class MatmulSubtractMultiplyReluCustom : public OpDef {
+public:
+    explicit MatmulSubtractMultiplyReluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("subtract_value").AttrType(OPTIONAL).Float(0.0);
+        this->Attr("multiply_value").AttrType(OPTIONAL).Float(1.0);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulSubtractMultiplyReluCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelMatmulSubtractMultiplyReluCustom {
+public:
+    __aicore__ inline KernelMatmulSubtractMultiplyReluCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                uint32_t m, uint32_t n, uint32_t k,
+                                uint32_t redTile,
+                                float subtractValue, float multiplyValue)
+    {
+        M_ = m;
+        N_ = n;
+        K_ = k;
+        redTile_ = redTile;
+        subVal_ = subtractValue;
+        mulVal_ = multiplyValue;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint64_t>(M_) * N_);
+        wGm_.SetGlobalBuffer((__gm__ float*)w, static_cast<uint64_t>(K_) * N_);
+        bGm_.SetGlobalBuffer((__gm__ float*)b, K_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint64_t>(M_) * K_);
+
+        // Queues for streaming reduction chunks and temporaries
+        const uint32_t bytes = redTile_ * sizeof(float);
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, bytes);
+        pipe_.InitBuffer(inQueueW_, BUFFER_NUM, bytes);
+        pipe_.InitBuffer(tmpQueue_, 2, bytes);              // tmp vec / scalar buffers
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, sizeof(float) * redTile_);
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (M_ == 0 || N_ == 0 || K_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        const uint64_t total = static_cast<uint64_t>(M_) * static_cast<uint64_t>(K_);
+        if (blockIdx >= total) return;
+
+        for (uint64_t outIdx = blockIdx; outIdx < total; outIdx += blockNum) {
+            const uint32_t m = static_cast<uint32_t>(outIdx / K_);
+            const uint32_t k = static_cast<uint32_t>(outIdx % K_);
+
+            // accumulator scalar in UB
+            AscendC::LocalTensor<float> acc = tmpQueue_.AllocTensor<float>();
+            AscendC::Duplicate(acc, 0.0f, 1);
+
+            // reduction along N in chunks of redTile_
+            for (uint32_t c = 0; c < N_; c += redTile_) {
+                uint32_t len = N_ - c;
+                if (len > redTile_) len = redTile_;
+
+                // Load X[m, c:c+len]
+                AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+                AscendC::DataCopy(xLocal, xGm_[static_cast<uint64_t>(m) * N_ + c], len);
+                inQueueX_.EnQue(xLocal);
+
+                // Load W[k, c:c+len]
+                AscendC::LocalTensor<float> wLocal = inQueueW_.AllocTensor<float>();
+                AscendC::DataCopy(wLocal, wGm_[static_cast<uint64_t>(k) * N_ + c], len);
+                inQueueW_.EnQue(wLocal);
+
+                // Compute partial dot
+                AscendC::LocalTensor<float> xDe = inQueueX_.DeQue<float>();
+                AscendC::LocalTensor<float> wDe = inQueueW_.DeQue<float>();
+                AscendC::LocalTensor<float> mulTmp = tmpQueue_.AllocTensor<float>();
+                AscendC::Mul(mulTmp, xDe, wDe, len);
+
+                AscendC::LocalTensor<float> sumTmp = tmpQueue_.AllocTensor<float>();
+                AscendC::ReduceSum(sumTmp, mulTmp, len);
+
+                AscendC::Add(acc, acc, sumTmp, 1);
+
+                tmpQueue_.FreeTensor(sumTmp);
+                tmpQueue_.FreeTensor(mulTmp);
+                inQueueW_.FreeTensor(wDe);
+                inQueueX_.FreeTensor(xDe);
+            }
+
+            // y = ((acc + b[k]) - subVal_) * mulVal_, then ReLU
+            AscendC::LocalTensor<float> bLocal = tmpQueue_.AllocTensor<float>();
+            AscendC::DataCopy(bLocal, bGm_[k], 1);
+
+            AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+            AscendC::Add(yLocal, acc, bLocal, 1);
+
+            // subtract value via adding negative
+            AscendC::LocalTensor<float> subLocal = tmpQueue_.AllocTensor<float>();
+            AscendC::Duplicate(subLocal, -subVal_, 1);
+            AscendC::Add(yLocal, yLocal, subLocal, 1);
+
+            // multiply
+            AscendC::Muls(yLocal, yLocal, mulVal_, 1);
+
+            // ReLU: y = y - min(y, 0)
+            AscendC::LocalTensor<float> minTmp = tmpQueue_.AllocTensor<float>();
+            AscendC::Mins(minTmp, yLocal, 0.0f, 1);
+            AscendC::Muls(minTmp, minTmp, -1.0f, 1);
+            AscendC::Add(yLocal, yLocal, minTmp, 1);
+
+            // store out
+            AscendC::DataCopy(yGm_[static_cast<uint64_t>(m) * K_ + k], yLocal, 1);
+
+            // free temporaries
+            outQueueY_.FreeTensor(yLocal);
+            tmpQueue_.FreeTensor(minTmp);
+            tmpQueue_.FreeTensor(subLocal);
+            tmpQueue_.FreeTensor(bLocal);
+            tmpQueue_.FreeTensor(acc);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueW_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 2>         tmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> bGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t M_{0};
+    uint32_t N_{0};
+    uint32_t K_{0};
+    uint32_t redTile_{0};
+    float subVal_{0.0f};
+    float mulVal_{1.0f};
+};
+
+extern "C" __global__ __aicore__ void matmul_subtract_multiply_relu_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulSubtractMultiplyReluCustom op;
+    op.Init(x, w, b, y,
+            tiling_data.m, tiling_data.n, tiling_data.k,
+            tiling_data.redTile,
+            tiling_data.subtractValue, tiling_data.multiplyValue);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor matmul_sub_mul_relu_impl_npu(const at::Tensor& x,
+                                        const at::Tensor& w,
+                                        const at::Tensor& b,
+                                        const at::Tensor& sub,
+                                        const at::Tensor& mul) {
+    TORCH_CHECK(sub.numel() == 1 && mul.numel() == 1, \"sub/mul must be scalar tensors\");
+    const double subtract_value = sub.item<double>();
+    const double multiply_value = mul.item<double>();
+    // Output [M, K]
+    at::Tensor result = at::empty({x.size(0), w.size(0)}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulSubtractMultiplyReluCustom, x, w, b, subtract_value, multiply_value, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_subtract_multiply_relu_custom", &matmul_sub_mul_relu_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_subtract_multiply_relu_custom",
+          &matmul_sub_mul_relu_impl_npu,
+          "Fused MatMul + Subtract + Multiply + ReLU (MatmulSubtractMultiplyReluCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'matmul_subtract_multiply_relu_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_features, out_features, subtract_value, multiply_value):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.subtract_value = subtract_value
+        self.multiply_value = multiply_value
+
+    def forward(self, x, w, b, sub, mul):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, w, b, sub, mul)
+'''

@@ -1,0 +1,430 @@
+project_json_src='''
+[
+  {
+    "op": "StandardMatrixMultiplicationCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "A",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "B",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "C",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": []
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(StandardMatrixMultiplicationCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, M);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, tileM);
+  TILING_DATA_FIELD_DEF(uint32_t, tileN);
+  TILING_DATA_FIELD_DEF(uint32_t, kStep);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(StandardMatrixMultiplicationCustom, StandardMatrixMultiplicationCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+#include "standard_matrix_multiplication_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+} // namespace
+
+namespace optiling {
+
+// UB memory model per core (float):
+//   A_block: tileM * kStep
+//   B_block: kStep * tileN
+//   C_accum: tileM * tileN
+//   tmpVec:  tileN
+// Total floats = tileM*kStep + kStep*tileN + tileM*tileN + tileN
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024; // conservative
+static constexpr uint32_t ALIGN_ELEMS = 16;             // prefer vector alignment
+static constexpr uint32_t TILEM_MAX = 64;
+static constexpr uint32_t TILEN_MAX = 1024;
+static constexpr uint32_t KSTEP_MAX = 512;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    StandardMatrixMultiplicationCustomTilingData tiling;
+
+    const gert::Shape *A_shape = context->GetInputShape(0);
+    const gert::Shape *B_shape = context->GetInputShape(1);
+    const gert::Shape &Ao = A_shape->GetOriginShape();
+    const gert::Shape &Bo = B_shape->GetOriginShape();
+
+    const uint32_t M = static_cast<uint32_t>(Ao.GetDim(0));
+    const uint32_t K = static_cast<uint32_t>(Ao.GetDim(1));
+    const uint32_t Kb = static_cast<uint32_t>(Bo.GetDim(0));
+    const uint32_t N = static_cast<uint32_t>(Bo.GetDim(1));
+
+    // Basic validation
+    if (K != Kb) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Initial heuristic tile sizes
+    uint32_t tileM = (M >= 32) ? 32u : ((M >= 16) ? 16u : ((M >= 8) ? 8u : 4u));
+    uint32_t tileN = (N >= 512) ? 512u : ((N >= 256) ? 256u : ((N >= 128) ? 128u : 64u));
+    uint32_t kStep = (K >= 256) ? 256u : ((K >= 128) ? 128u : ((K >= 64) ? 64u : 32u));
+
+    tileM = std::min(tileM, TILEM_MAX);
+    tileN = std::min(tileN, TILEN_MAX);
+    kStep = std::min(kStep, KSTEP_MAX);
+
+    // Align down
+    tileM = std::max(1u, AlignDown(tileM, ALIGN_ELEMS));
+    tileN = std::max(ALIGN_ELEMS, AlignDown(tileN, ALIGN_ELEMS));
+    kStep = std::max(ALIGN_ELEMS, AlignDown(kStep, ALIGN_ELEMS));
+
+    if (tileM > M) tileM = std::max(1u, AlignDown(M, ALIGN_ELEMS));
+    if (tileN > N) tileN = std::max(ALIGN_ELEMS, AlignDown(N, ALIGN_ELEMS));
+    if (kStep > K) kStep = std::max(1u, AlignDown(K, ALIGN_ELEMS));
+
+    // Ensure UB budget
+    auto bytesNeeded = [&](uint32_t tm, uint32_t tn, uint32_t ks) -> uint64_t {
+        uint64_t floats = static_cast<uint64_t>(tm) * ks
+                        + static_cast<uint64_t>(ks) * tn
+                        + static_cast<uint64_t>(tm) * tn
+                        + tn;
+        return floats * 4u;
+    };
+
+    while (bytesNeeded(tileM, tileN, kStep) > UB_BUDGET_BYTES) {
+        if (tileN > ALIGN_ELEMS * 4) {
+            tileN = AlignDown(tileN / 2u, ALIGN_ELEMS);
+            if (tileN < ALIGN_ELEMS) tileN = ALIGN_ELEMS;
+        } else if (kStep > ALIGN_ELEMS * 2) {
+            kStep = AlignDown(kStep / 2u, ALIGN_ELEMS);
+            if (kStep < ALIGN_ELEMS) kStep = ALIGN_ELEMS;
+        } else if (tileM > ALIGN_ELEMS) {
+            tileM = AlignDown(tileM / 2u, ALIGN_ELEMS);
+            if (tileM < 1u) tileM = 1u;
+        } else {
+            break;
+        }
+    }
+
+    if (tileM == 0) tileM = 1;
+    if (tileN == 0) tileN = ALIGN_ELEMS;
+    if (kStep == 0) kStep = 1;
+
+    const uint32_t tilesM = (tileM == 0) ? 1u : CeilDiv(M, tileM);
+    const uint32_t tilesN = (tileN == 0) ? 1u : CeilDiv(N, tileN);
+    uint32_t totalTiles = tilesM * tilesN;
+
+    uint32_t blockDim = totalTiles;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 32u) blockDim = 32u;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_M(M);
+    tiling.set_N(N);
+    tiling.set_K(K);
+    tiling.set_tileM(tileM);
+    tiling.set_tileN(tileN);
+    tiling.set_kStep(kStep);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *A_shape = context->GetInputShape(0);
+    const gert::Shape *B_shape = context->GetInputShape(1);
+    const gert::Shape &Ao = A_shape->GetOriginShape();
+    const gert::Shape &Bo = B_shape->GetOriginShape();
+    if (Ao.GetDimNum() != 2 || Bo.GetDimNum() != 2) return GRAPH_FAILED;
+    if (Ao.GetDim(1) != Bo.GetDim(0)) return GRAPH_FAILED;
+
+    gert::Shape *C_shape = context->GetOutputShape(0);
+    C_shape->SetDimNum(2);
+    C_shape->SetDim(0, Ao.GetDim(0));
+    C_shape->SetDim(1, Bo.GetDim(1));
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType a_dtype = context->GetInputDataType(0);
+    const ge::DataType b_dtype = context->GetInputDataType(1);
+    if (a_dtype != ge::DT_FLOAT || b_dtype != ge::DT_FLOAT) return GRAPH_FAILED;
+    context->SetOutputDataType(0, a_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class StandardMatrixMultiplicationCustom : public OpDef {
+public:
+    explicit StandardMatrixMultiplicationCustom(const char* name) : OpDef(name)
+    {
+        this->Input("A")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("B")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("C")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(StandardMatrixMultiplicationCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+static inline __aicore__ uint32_t CeilDivU32(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+
+class KernelStandardMatrixMultiplicationCustom {
+public:
+    __aicore__ inline KernelStandardMatrixMultiplicationCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR A, GM_ADDR B, GM_ADDR C,
+                                uint32_t M, uint32_t N, uint32_t K,
+                                uint32_t tileM, uint32_t tileN, uint32_t kStep)
+    {
+        M_ = M; N_ = N; K_ = K;
+        tileM_ = (tileM == 0) ? 1u : tileM;
+        tileN_ = (tileN == 0) ? 16u : tileN;
+        kStep_ = (kStep == 0) ? 16u : kStep;
+
+        aGm_.SetGlobalBuffer((__gm__ float*)A, static_cast<uint64_t>(M_) * K_);
+        bGm_.SetGlobalBuffer((__gm__ float*)B, static_cast<uint64_t>(K_) * N_);
+        cGm_.SetGlobalBuffer((__gm__ float*)C, static_cast<uint64_t>(M_) * N_);
+
+        // UB buffers
+        pipe_.InitBuffer(inQueueA_, BUFFER_NUM, tileM_ * kStep_ * sizeof(float));
+        pipe_.InitBuffer(inQueueB_, BUFFER_NUM, kStep_ * tileN_ * sizeof(float));
+        pipe_.InitBuffer(outQueueC_, BUFFER_NUM, tileM_ * tileN_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, BUFFER_NUM, tileN_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (M_ == 0 || N_ == 0 || K_ == 0) return;
+
+        const uint32_t tilesM = CeilDivU32(M_, tileM_);
+        const uint32_t tilesN = CeilDivU32(N_, tileN_);
+        const uint32_t totalTiles = tilesM * tilesN;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        for (uint32_t t = blockIdx; t < totalTiles; t += blockNum) {
+            const uint32_t tileRow = t / tilesN;
+            const uint32_t tileCol = t % tilesN;
+
+            const uint32_t mBase = tileRow * tileM_;
+            const uint32_t nBase = tileCol * tileN_;
+            uint32_t mLen = M_ - mBase;
+            if (mLen > tileM_) mLen = tileM_;
+            uint32_t nLen = N_ - nBase;
+            if (nLen > tileN_) nLen = tileN_;
+
+            ComputeOneTile(mBase, nBase, mLen, nLen);
+        }
+    }
+
+private:
+    __aicore__ inline void ZeroLocal(AscendC::LocalTensor<float>& t, uint32_t len)
+    {
+        AscendC::Dup(t, 0.0f, len);
+    }
+
+    __aicore__ inline float GetLocalScalar(const AscendC::LocalTensor<float>& t, uint32_t idx) {
+        // AscendC provides element access via GetValue for LocalTensor
+        return t.GetValue(idx);
+    }
+
+    __aicore__ inline void LoadABlocks(uint32_t mBase, uint32_t nBase, uint32_t kBase,
+                                       uint32_t mLen, uint32_t nLen, uint32_t kLen,
+                                       AscendC::LocalTensor<float>& aLocal,
+                                       AscendC::LocalTensor<float>& bLocal)
+    {
+        // Load A block: mLen rows x kLen cols
+        for (uint32_t i = 0; i < mLen; ++i) {
+            const uint64_t aGmOffset = static_cast<uint64_t>(mBase + i) * K_ + kBase;
+            AscendC::DataCopy(aLocal[i * kStep_], aGm_[aGmOffset], kLen);
+        }
+
+        // Load B block: kLen rows x nLen cols
+        for (uint32_t kk = 0; kk < kLen; ++kk) {
+            const uint64_t bGmOffset = static_cast<uint64_t>(kBase + kk) * N_ + nBase;
+            AscendC::DataCopy(bLocal[kk * tileN_], bGm_[bGmOffset], nLen);
+        }
+    }
+
+    __aicore__ inline void StoreCTile(uint32_t mBase, uint32_t nBase, uint32_t mLen, uint32_t nLen,
+                                      AscendC::LocalTensor<float>& cLocal)
+    {
+        for (uint32_t i = 0; i < mLen; ++i) {
+            const uint64_t cGmOffset = static_cast<uint64_t>(mBase + i) * N_ + nBase;
+            AscendC::DataCopy(cGm_[cGmOffset], cLocal[i * tileN_], nLen);
+        }
+    }
+
+    __aicore__ inline void ComputeOneTile(uint32_t mBase, uint32_t nBase, uint32_t mLen, uint32_t nLen)
+    {
+        // Allocate UB buffers
+        AscendC::LocalTensor<float> aLocal = inQueueA_.AllocTensor<float>();
+        AscendC::LocalTensor<float> bLocal = inQueueB_.AllocTensor<float>();
+        AscendC::LocalTensor<float> cLocal = outQueueC_.AllocTensor<float>();
+        AscendC::LocalTensor<float> tmpVec = tmpQueue_.AllocTensor<float>();
+
+        // Zero C tile
+        ZeroLocal(cLocal, mLen * tileN_);
+
+        // K reduction in steps
+        for (uint32_t kBase = 0; kBase < K_; kBase += kStep_) {
+            uint32_t kLen = K_ - kBase;
+            if (kLen > kStep_) kLen = kStep_;
+
+            // Load A and B sub-blocks for this k-slice
+            LoadABlocks(mBase, nBase, kBase, mLen, nLen, kLen, aLocal, bLocal);
+
+            // Accumulate: for kk in [0, kLen)
+            for (uint32_t kk = 0; kk < kLen; ++kk) {
+                AscendC::LocalTensor<float> bRow = bLocal[kk * tileN_];
+                // For each output row i, c[i,:] += a[i,kk] * bRow
+                for (uint32_t i = 0; i < mLen; ++i) {
+                    const float aScalar = GetLocalScalar(aLocal, i * kStep_ + kk);
+                    // tmpVec = aScalar * bRow
+                    AscendC::Muls(tmpVec, bRow, aScalar, nLen);
+                    AscendC::LocalTensor<float> cRow = cLocal[i * tileN_];
+                    AscendC::Add(cRow, cRow, tmpVec, nLen);
+                }
+            }
+        }
+
+        // Write back
+        outQueueC_.EnQue<float>(cLocal);
+        AscendC::LocalTensor<float> cOut = outQueueC_.DeQue<float>();
+        StoreCTile(mBase, nBase, mLen, nLen, cOut);
+
+        // Free tensors
+        outQueueC_.FreeTensor(cOut);
+        inQueueA_.FreeTensor(aLocal);
+        inQueueB_.FreeTensor(bLocal);
+        tmpQueue_.FreeTensor(tmpVec);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueA_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueB_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueC_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue_;
+
+    AscendC::GlobalTensor<float> aGm_;
+    AscendC::GlobalTensor<float> bGm_;
+    AscendC::GlobalTensor<float> cGm_;
+
+    uint32_t M_{0}, N_{0}, K_{0};
+    uint32_t tileM_{0}, tileN_{0}, kStep_{0};
+};
+
+extern "C" __global__ __aicore__ void standard_matrix_multiplication_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelStandardMatrixMultiplicationCustom op;
+    op.Init(A, B, C,
+            tiling_data.M, tiling_data.N, tiling_data.K,
+            tiling_data.tileM, tiling_data.tileN, tiling_data.kStep);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor standard_matmul_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "Inputs must be 2D");
+    TORCH_CHECK(A.size(1) == B.size(0), "Incompatible shapes for matmul");
+    auto C = at::empty({A.size(0), B.size(1)}, A.options());
+    EXEC_NPU_CMD(aclnnStandardMatrixMultiplicationCustom, A, B, C);
+    return C;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("standard_matrix_multiplication_custom", &standard_matmul_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("standard_matrix_multiplication_custom", &standard_matmul_impl_npu, "Standard MatMul (StandardMatrixMultiplicationCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'standard_matrix_multiplication_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
