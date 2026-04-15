@@ -47,6 +47,16 @@ class ToolType(str, Enum):
 AgentToolMode = FrozenSet[ToolType]
 
 
+# ===== Enum-based AgentToolMode for CLI script compatibility =====
+# The CLI script (tools/generate_ascendc_operators.py) expects AgentToolMode as an Enum.
+# This Enum mirrors the FrozenSet-based modes above for argparse integration.
+class AgentToolModeEnum(str, Enum):
+    NO_TOOL = "no_tool"
+    KB_ONLY = "kb_only"
+    WEB_ONLY = "web_only"
+    KB_AND_WEB = "kb_and_web"
+
+
 # ===== Predefined common modes (for backward compatibility and convenience) =====
 NO_TOOL: AgentToolMode = frozenset()
 KB_ONLY: AgentToolMode = frozenset({ToolType.KB})
@@ -57,6 +67,15 @@ KB_AND_CODE_RAG: AgentToolMode = frozenset({ToolType.KB, ToolType.CODE_RAG})
 WEB_AND_CODE_RAG: AgentToolMode = frozenset({ToolType.WEB, ToolType.CODE_RAG})
 ALL: AgentToolMode = frozenset({ToolType.KB, ToolType.WEB, ToolType.CODE_RAG,
                                 ToolType.ENV_CHECK_ENV, ToolType.ENV_CHECK_NPU, ToolType.ENV_CHECK_API})
+
+
+# Map from Enum string values to FrozenSet-based AgentToolMode (for script compatibility)
+AGENT_TOOL_MODE_MAP = {
+    AgentToolModeEnum.NO_TOOL: NO_TOOL,
+    AgentToolModeEnum.KB_ONLY: KB_ONLY,
+    AgentToolModeEnum.WEB_ONLY: WEB_ONLY,
+    AgentToolModeEnum.KB_AND_WEB: KB_AND_WEB,
+}
 
 
 # ===== Helper functions =====
@@ -265,41 +284,40 @@ def get_llm_config_compatible() -> dict:
     Get LLM configuration with fallback support.
 
     Priority:
-    1. XI_AI_API_KEY environment variable (Agent_kernel style)
-    2. generator/utils api_config.py
+    1. USE_API_CONFIG=1 + generation/local_api_config.py
+    2. XI_AI_API_KEY environment variable (Agent_kernel style)
+    3. Fallback: deepseek-chat default
 
     Returns dict with api_key, base_url, model.
     """
-    # Try Agent_kernel style first
+    # Priority 1: generation/local_api_config.py
+    if os.environ.get("USE_API_CONFIG", "").strip().lower() in ("1", "true"):
+        import importlib.util
+        _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        local_config_path = os.path.join(_project_root, "generation", "local_api_config.py")
+        if os.path.exists(local_config_path):
+            try:
+                spec = importlib.util.spec_from_file_location("local_api_config", local_config_path)
+                lac = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(lac)
+                key = (getattr(lac, "XI_AI_API_KEY", None) or getattr(lac, "OPENAI_API_KEY", None) or "").strip()
+                base = (getattr(lac, "XI_AI_BASE_URL", None) or getattr(lac, "OPENAI_API_BASE", None) or "").strip()
+                model = (getattr(lac, "XI_AI_MODEL", None) or getattr(lac, "MODEL", None) or "").strip()
+                if key:
+                    return {
+                        "api_key": key,
+                        "base_url": base or "https://api-2.xi-ai.cn/v1",
+                        "model": model or "gpt-5",
+                    }
+            except Exception:
+                pass
+
+    # Priority 2: XI_AI_API_KEY environment variable
     env_config = get_llm_config_from_env()
     if env_config:
         return env_config
 
-    # Fallback to generator style
-    try:
-        from generator.utils.utils import get_client, get_default_model_from_config
-        model = get_default_model_from_config() or "deepseek-chat"
-        # generator uses api_config.py which is imported by get_client
-        # We need to extract the config from there
-        import importlib.util
-        import os as _os
-        api_config_path = _os.path.join(
-            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-            "utils", "api_config.py"
-        )
-        if _os.path.exists(api_config_path):
-            spec = importlib.util.spec_from_file_location("api_config", api_config_path)
-            api_config = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(api_config)
-            return {
-                "api_key": getattr(api_config, "API_KEY", ""),
-                "base_url": getattr(api_config, "BASE_URL", "https://api.deepseek.com/v1"),
-                "model": getattr(api_config, "MODEL", model),
-            }
-    except Exception:
-        pass
-
-    # Final fallback
+    # Priority 3: Final fallback
     return {
         "api_key": "",
         "base_url": "https://api.deepseek.com/v1",

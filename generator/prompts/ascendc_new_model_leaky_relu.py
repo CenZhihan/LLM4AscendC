@@ -1,107 +1,137 @@
 project_json_src='''
-[
-    {
-        "op": "LeakyReluCustom",
-        "language": "cpp",
-        "input_desc": [
-            {
-                "name": "x",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            }
-        ],
-        "output_desc": [
-            {
-                "name": "y",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            }
-        ],
-        "attr": [
-            {
-                "name": "negative_slope",
-                "param_type": "optional",
-                "type": "float",
-                "default_value": "0.1"
-            }
-        ]
-    }
-]
 
+[
+  {
+    "op": "LeakyReluCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "negative_slope",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "0.01"
+      }
+    ]
+  }
+]
 '''
 
 host_tiling_src="""
+
 #include "register/tilingdata_base.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(LeakyReluCustomTilingData)
-TILING_DATA_FIELD_DEF(uint32_t, blockLength);
-TILING_DATA_FIELD_DEF(uint32_t, lastBlockLength);
-TILING_DATA_FIELD_DEF(uint32_t, tileLength);
-TILING_DATA_FIELD_DEF(float, negativeSlope);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(float, negativeSlope);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(LeakyReluCustom, LeakyReluCustomTilingData)
-}
+}  // namespace optiling
 """
 
-
 host_operator_src="""
+
 #include "leaky_relu_custom_tiling.h"
 #include "register/op_def_registry.h"
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 48;
-const uint32_t ALIGN_NUM = 8;
-const uint32_t MAX_TILE_LENGTH = 8192; 
+
+// UB model for this kernel:
+//   inQueueX: 2 * tile
+//   outQueueY: 2 * tile
+//   tmpQueue: 1 * tile
+// Total floats = 5 * tile => bytes = 20 * tile
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
+static constexpr uint32_t ALIGN_ELEMS = 2048;            // favor larger DMA bursts
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;        // avoid too-large per-iter latency
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return (x / a) * a;
+}
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (a + b - 1u) / b;
+}
 
 static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
     LeakyReluCustomTilingData tiling;
-    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    const uint32_t totalLength =
+        static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+
     const gert::RuntimeAttrs *attrs = context->GetAttrs();
     const float *negativeSlope = attrs->GetAttrPointer<float>(0);
-    
-    uint32_t blockLength = totalLength / BLOCK_DIM;
-    blockLength = (blockLength / ALIGN_NUM) * ALIGN_NUM;
-    uint32_t lastBlockLength = totalLength - blockLength * (BLOCK_DIM - 1);
-    
-    context->SetBlockDim(BLOCK_DIM);
-    tiling.set_blockLength(blockLength);
-    tiling.set_lastBlockLength(lastBlockLength);
-    tiling.set_tileLength(MAX_TILE_LENGTH);
+
+    // tileLen from UB budget: bytes = 20 * tileLen
+    uint32_t maxTile = UB_BUDGET_BYTES / 20;  // elements
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t tileLen = maxTile;
+    if (totalLength < tileLen) {
+        const uint32_t aligned = AlignDown(totalLength, ALIGN_ELEMS);
+        tileLen = (aligned > 0) ? aligned : totalLength;
+    }
+
+    // Adaptive blockDim based on number of tiles; keep conservative for stability.
+    const uint32_t numTiles = (tileLen == 0) ? 1u : CeilDiv(totalLength, tileLen);
+    uint32_t blockDim = numTiles;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileLength(tileLen);
+    tiling.set_blockDim(blockDim);
     tiling.set_negativeSlope(*negativeSlope);
 
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
+
 } // namespace optiling
 
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext *context)
 {
-    const gert::Shape *x1_shape = context->GetInputShape(0);
+    const gert::Shape *x_shape = context->GetInputShape(0);
     gert::Shape *y_shape = context->GetOutputShape(0);
-    *y_shape = *x1_shape;
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const ge::DataType x1_dtype = context->GetInputDataType(0);
-    context->SetOutputDataType(0, x1_dtype);
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
     return GRAPH_SUCCESS;
 }
 } // namespace ge
@@ -116,132 +146,151 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Attr("negative_slope").AttrType(OPTIONAL).Float(0.1);
+
+        this->Attr("negative_slope").AttrType(OPTIONAL).Float(0.01);
+
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(LeakyReluCustom);
-}
+} // namespace ops
 """
 
-
 kernel_src="""
+
 #include "kernel_operator.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+constexpr int32_t BUFFER_NUM = 2;
 
-class KernelLeakyRelu {
+class KernelLeakyReluCustom {
 public:
-    __aicore__ inline KernelLeakyRelu() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t blockLength, uint32_t lastBlockLength, uint32_t tileLength, float negativeSlope)
-    {
-        this->negativeSlope = static_cast<float>(negativeSlope);
-        this->tileLength = tileLength;
-        
-        if (AscendC::GetBlockIdx() == AscendC::GetBlockNum() - 1) {
-            this->blockLength = lastBlockLength;
-        } else {
-            this->blockLength = blockLength;
-        }
-        
-        if (this->blockLength == 0) return;
-        
-        this->tileNum = this->blockLength / this->tileLength;
-        this->tailLength = this->blockLength % this->tileLength;
+    __aicore__ inline KernelLeakyReluCustom() {}
 
-        uint32_t offset = blockLength * AscendC::GetBlockIdx();
-        xGm.SetGlobalBuffer((__gm__ float *)x + offset, this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ float *)y + offset, this->blockLength);
-        
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpBuffer2, this->tileLength * sizeof(float));
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileLength,
+                                float negativeSlope)
+    {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+        negativeSlope_ = negativeSlope;
+        negCorr_ = negativeSlope_ - 1.0f;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
     }
+
     __aicore__ inline void Process()
     {
-        if (this->blockLength == 0) return;
-        for (int32_t i = 0; i < this->tileNum; i++) {
-            CopyIn(i, this->tileLength);
-            Compute(i, this->tileLength);
-            CopyOut(i, this->tileLength);
-        }
-        if (this->tailLength > 0) {
-            CopyIn(this->tileNum, this->tailLength);
-            Compute(this->tileNum, this->tailLength);
-            CopyOut(this->tileNum, this->tailLength);
+        if (totalLen_ == 0 || tileLen_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        // Tile-granularity grid-stride to improve load balance and occupancy.
+        const uint32_t strideElems = blockNum * tileLen_;
+        uint32_t base = blockIdx * tileLen_;
+        if (base >= totalLen_) return;
+
+        // Prefetch first tile
+        uint32_t curLen = totalLen_ - base;
+        if (curLen > tileLen_) curLen = tileLen_;
+        CopyIn(base, curLen);
+
+        while (true) {
+            // Prefetch next tile early for overlap
+            const uint32_t nextBase = base + strideElems;
+            uint32_t nextLen = 0;
+            if (nextBase < totalLen_) {
+                nextLen = totalLen_ - nextBase;
+                if (nextLen > tileLen_) nextLen = tileLen_;
+                CopyIn(nextBase, nextLen);
+            }
+
+            Compute(curLen);
+            CopyOut(base, curLen);
+
+            if (nextLen == 0) break;
+            base = nextBase;
+            curLen = nextLen;
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress, uint32_t length)
+    __aicore__ inline void CopyIn(uint32_t gmOffset, uint32_t len)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], length);
-        inQueueX.EnQue(xLocal);
+        AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm_[gmOffset], len);
+        inQueueX_.EnQue(xLocal);
     }
-    __aicore__ inline void Compute(int32_t progress, uint32_t length)
+
+    __aicore__ inline void Compute(uint32_t len)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
-        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-        AscendC::LocalTensor<float> tmpTensor1 = tmpBuffer1.Get<float>();
-        AscendC::LocalTensor<float> tmpTensor2 = tmpBuffer2.Get<float>();
-        float inputVal = 0.0;
-        
-        // Pad length to multiple of 8 (or 16 bytes for float, 32 bytes for datamove) for computation if needed
-        // but Maxs/Mins support length
-        AscendC::Maxs(tmpTensor1, xLocal, inputVal, length);
-        AscendC::Mins(tmpTensor2, xLocal, inputVal, length);
-        AscendC::Muls(tmpTensor2, tmpTensor2, this->negativeSlope, length);
-        AscendC::Add(yLocal, tmpTensor1, tmpTensor2, length);
-        
-        outQueueY.EnQue<float>(yLocal);
-        inQueueX.FreeTensor(xLocal);
+        AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+        AscendC::LocalTensor<float> tLocal = tmpQueue_.AllocTensor<float>();
+
+        // y = x + (negativeSlope - 1) * min(x, 0)
+        AscendC::Mins(tLocal, xLocal, 0.0f, len);
+        AscendC::Muls(tLocal, tLocal, negCorr_, len);
+        AscendC::Add(yLocal, xLocal, tLocal, len);
+
+        tmpQueue_.FreeTensor(tLocal);
+        outQueueY_.EnQue<float>(yLocal);
+        inQueueX_.FreeTensor(xLocal);
     }
-    __aicore__ inline void CopyOut(int32_t progress, uint32_t length)
+
+    __aicore__ inline void CopyOut(uint32_t gmOffset, uint32_t len)
     {
-        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, length);
-        outQueueY.FreeTensor(yLocal);
+        AscendC::LocalTensor<float> yLocal = outQueueY_.DeQue<float>();
+        AscendC::DataCopy(yGm_[gmOffset], yLocal, len);
+        outQueueY_.FreeTensor(yLocal);
     }
 
 private:
-    AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2;
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::GlobalTensor<float> xGm, yGm;
-    uint32_t blockLength;
-    uint32_t tileNum;
-    uint32_t tailLength;
-    uint32_t tileLength;
-    float negativeSlope;
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalLen_ {0};
+    uint32_t tileLen_ {0};
+    float negativeSlope_ {0.01f};
+    float negCorr_ {-0.99f};
 };
 
-extern "C" __global__ __aicore__ void leaky_relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+extern "C" __global__ __aicore__ void leaky_relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
     GET_TILING_DATA(tiling_data, tiling);
-    KernelLeakyRelu op;
-    op.Init(x, y, tiling_data.blockLength, tiling_data.lastBlockLength, tiling_data.tileLength, tiling_data.negativeSlope);
+    KernelLeakyReluCustom op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength, tiling_data.negativeSlope);
     op.Process();
 }
 """
 
-
 python_bind_src="""
+
 #include <torch/library.h>
-#include <torch/csrc/autograd/custom_function.h>
-#include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
 
 at::Tensor leaky_relu_impl_npu(const at::Tensor& self, double negative_slope) {
-    // float argument not supported now, so use double negative_slope
     at::Tensor result = at::empty_like(self);
     EXEC_NPU_CMD(aclnnLeakyReluCustom, self, negative_slope, result);
     return result;
@@ -252,7 +301,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("leaky_relu_custom", &leaky_relu_impl_npu, "LeakyReLU activation");
+    m.def("leaky_relu_custom", &leaky_relu_impl_npu, "LeakyReLU activation (LeakyReluCustom on NPU)");
 }
 """
 
@@ -260,11 +309,14 @@ model_src='''
 import torch
 import torch_npu
 import custom_ops_lib
+
+_FN = 'leaky_relu_custom'
+
 class ModelNew(torch.nn.Module):
-    def __init__(self, negative_slope: float = 0.1):
+    def __init__(self, *init_inputs):
         super(ModelNew, self).__init__()
-        self.negative_slope = negative_slope
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return custom_ops_lib.leaky_relu_custom(x, self.negative_slope)
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
 '''

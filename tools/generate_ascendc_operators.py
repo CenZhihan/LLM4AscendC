@@ -20,14 +20,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import generation.prompt_generators  # noqa: F401 — registers ascendc none / one_shot
+import generator.prompt_generators  # noqa: F401 — registers ascendc none / one_shot
 
-from generation import gen_config
-from generation.agent.agent_config import AgentToolMode
-from generation.direct_generate import generate_and_write_single
-from generation.kernelbench102_ops import KERNELBENCH102_OP_KEYS
-from generation.llm_config import get_xi_model_name, get_xi_openai_client
-from generation.prompt_generators.prompt_registry import PROMPT_REGISTRY
+from generator import config as gen_config
+from generator.agent.agent_config import AgentToolModeEnum as AgentToolMode
+from generator.direct_generate import generate_and_write_single
+from generator.kernelbench102_ops import KERNELBENCH102_OP_KEYS
+from generator.llm_config import get_xi_model_name, get_xi_openai_client
+from generator.prompt_generators.prompt_registry import PROMPT_REGISTRY
 from vendor.mkb import dataset as mkb_dataset
 
 
@@ -92,7 +92,11 @@ def _generate_one_agent(
     model_name: str,
     run: int,
 ) -> tuple[str, Exception | None]:
-    from generation.agent.agent_runner import AgentResult, KernelTask, generate_kernel_with_agent
+    from generator.agent.agent_runner import (
+        AgentGenerationResult as AgentResult,
+        KernelGenerationTask as KernelTask,
+        generate_kernel_with_agent,
+    )
 
     base = _agent_output_dir_base("ascendc", strategy, model_name, tool_mode)
     out_dir = os.path.join(ROOT, base, f"run{run}")

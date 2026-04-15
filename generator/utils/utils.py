@@ -1,5 +1,6 @@
 import os
 import sys
+import importlib.util
 # 添加项目根目录到 sys.path
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _project_root not in sys.path:
@@ -10,7 +11,26 @@ import torch
 from generator.config import ref_impl_base_path
 from generator.dataset import dataset
 
-def _load_api_config():
+def _load_file_api_config():
+    """加载 generation/local_api_config.py 配置。返回 (api_key, base_url, model) 或 None。"""
+    if os.environ.get("USE_API_CONFIG", "").strip().lower() not in ("1", "true"):
+        return None
+    config_path = os.path.join(_project_root, "generation", "local_api_config.py")
+    if not os.path.exists(config_path):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("local_api_config", config_path)
+        lac = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lac)
+    except Exception:
+        return None
+    key = (getattr(lac, "XI_AI_API_KEY", None) or getattr(lac, "OPENAI_API_KEY", None) or "").strip()
+    base = (getattr(lac, "XI_AI_BASE_URL", None) or getattr(lac, "OPENAI_API_BASE", None) or "").strip()
+    model = (getattr(lac, "XI_AI_MODEL", None) or getattr(lac, "MODEL", None) or "").strip()
+    return (key, base, model) if key else None
+
+
+def _load_openai_api_config():
     """若设置 USE_API_CONFIG=1 且存在 api_config.py，则返回 (api_key, base_url, model)；否则返回 None。"""
     if os.environ.get("USE_API_CONFIG", "").strip().lower() not in ("1", "true"):
         return None
@@ -28,13 +48,36 @@ def _load_api_config():
 
 
 def get_default_model_from_config():
-    """当使用 api_config 时返回其中的 MODEL，否则返回 None。"""
-    cfg = _load_api_config()
+    """从配置文件获取默认模型名。优先 local_api_config.py，其次 api_config.py。"""
+    cfg = _load_file_api_config()
+    if cfg and cfg[2]:
+        return cfg[2]
+    cfg = _load_openai_api_config()
     return cfg[2] if cfg else None
 
 
 def get_client(model):
+    """获取 OpenAI 兼容 API 客户端。
+
+    配置优先级：
+    1. USE_API_CONFIG=1 + generation/local_api_config.py（统一 OpenAI 兼容端点）
+    2. USE_API_CONFIG=1 + api_config.py（仅 gpt 模型）
+    3. 模型前缀专用环境变量（DEEPSEEK_API_KEY / DASHSCOPE_API_KEY 等）
+    """
     from openai import OpenAI
+
+    # 优先级 1: generation/local_api_config.py — 统一 OpenAI 兼容端点
+    file_cfg = _load_file_api_config()
+    if file_cfg and file_cfg[0] and file_cfg[1]:
+        api_key, base_url, _ = file_cfg
+        return OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=10000000,
+            max_retries=3,
+        )
+
+    # 按模型前缀使用专用端点
     if model.startswith('deepseek'):
         DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY")
         client = OpenAI(
@@ -60,7 +103,8 @@ def get_client(model):
             max_retries=3,
         )
     elif model.startswith('gpt'):
-        cfg = _load_api_config()
+        # 优先级 2: api_config.py
+        cfg = _load_openai_api_config()
         if cfg is not None:
             api_key, base_url, _ = cfg
             client = OpenAI(

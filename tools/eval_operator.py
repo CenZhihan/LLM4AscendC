@@ -339,7 +339,7 @@ def build_and_install_operator(
         prefix = shell_prefix(cfg)
         log_04 = logs_dir / f"{ts}-04-pybind-build.log"
         run_cmd(
-            ["bash", "-lc", f"{prefix} && python3 setup.py build bdist_wheel"],
+            ["bash", "-c", f"{prefix} && python3 setup.py build bdist_wheel"],
             cwd=pybind_dir,
             env=env2,
             log_path=log_04,
@@ -351,7 +351,7 @@ def build_and_install_operator(
         wheel_path = wheels[-1]
         log_05 = logs_dir / f"{ts}-05-pybind-install.log"
         run_cmd(
-            ["bash", "-lc", f"{prefix} && pip3 install '{wheel_path}' --force-reinstall"],
+            ["bash", "-c", f"{prefix} && pip3 install '{wheel_path}' --force-reinstall"],
             cwd=pybind_dir,
             env=env2,
             log_path=log_05,
@@ -391,10 +391,9 @@ def run_eval(op_dir: pathlib.Path, spec: OperatorSpec, *, module_name: str, art_
     env["LLM4ASCENDC_OP_DIR"] = str(op_dir)
     env["LLM4ASCENDC_ROOT"] = str(ROOT)
     env["PYTHONPATH"] = f"{ROOT}:{env.get('PYTHONPATH','')}"
-
     # Ensure Ascend env + conda in shell context when running python.
     prefix = shell_prefix(cfg)
-    cmd = ["bash", "-lc", f"{prefix} && python3 '{eval_spec_path}'"]
+    cmd = ["bash", "-c", f"{prefix} && python3 '{eval_spec_path}'"]
     run_cmd(cmd, cwd=ROOT, env=env, log_path=log_path, title=f"{spec.op_key}: eval")
     return 0
 

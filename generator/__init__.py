@@ -19,16 +19,20 @@ from .config import (
     agent_code_rag_top_k, agent_max_query_rounds,
 )
 
-# Agent module exports
-from .agent import (
-    generate_kernel_with_agent,
-    generate_ascendc_kernel,
-    AgentToolMode,
-    KernelGenerationTask,
-    AgentGenerationResult,
-    GeneratorAgentState,
-    build_agent_app,
-)
+# Agent module exports (lazy import — agent has heavy dependencies)
+try:
+    from .agent import (
+        generate_kernel_with_agent,
+        generate_ascendc_kernel,
+        AgentToolMode,
+        KernelGenerationTask,
+        AgentGenerationResult,
+        GeneratorAgentState,
+        build_agent_app,
+    )
+    _agent_available = True
+except Exception:
+    _agent_available = False
 
 __all__ = [
     'dataset', 'category2exampleop',
@@ -39,8 +43,11 @@ __all__ = [
     'agent_kb_persist_dir', 'agent_kb_collection_name',
     'agent_web_max_results', 'agent_web_max_fetch_urls',
     'agent_code_rag_top_k', 'agent_max_query_rounds',
-    # Agent API
-    'generate_kernel_with_agent', 'generate_ascendc_kernel',
-    'AgentToolMode', 'KernelGenerationTask', 'AgentGenerationResult',
-    'GeneratorAgentState', 'build_agent_app',
 ]
+if _agent_available:
+    __all__.extend([
+        # Agent API
+        'generate_kernel_with_agent', 'generate_ascendc_kernel',
+        'AgentToolMode', 'KernelGenerationTask', 'AgentGenerationResult',
+        'GeneratorAgentState', 'build_agent_app',
+    ])
