@@ -173,6 +173,10 @@ python3 tools/eval_operator.py --txt-dir output/gpt-5_selected_shot --workers 7 
 
 ### 3.2 入口命令
 
+项目提供两套生成入口：
+
+#### （1）`tools/generate_operator.py` — 基于 RAG 提示
+
 ```bash
 # 构建 RAG 代码索引（首次使用前执行一次）
 python3 tools/generate_operator.py --build-index --code-dir ascendCode
@@ -185,12 +189,98 @@ python3 tools/generate_operator.py --model deepseek-chat --strategy rag --catego
 
 | 参数 | 默认值 | 含义 |
 |------|--------|------|
-| `--model` | `deepseek-chat` | 使用的 LLM 模型名称（需在 `api_config.py` 或环境变量中配置 API 地址与密钥） |
+| `--model` | `deepseek-chat` | 使用的 LLM 模型名称 |
 | `--strategy` | `rag` | 提示策略：`rag`（检索增强）、`add_shot`（添加示例）、`selected_shot`（按类别选择示例） |
-| `--categories` | `all` | 算子类别，逗号分隔或 `all` 表示全部生成 |
-| `--workers` | `1` | 并行生成的 worker 数量 |
+| `--categories` | `all` | 算子类别列表，或 `all` 表示全部生成 |
+| `--workers` | `4` | 并行生成的 worker 数量 |
 | `--build-index` | — | 构建 RAG 代码索引（与 `--code-dir` 配合使用） |
-| `--code-dir` | — | 待索引的 AscendC 代码库目录 |
+| `--code-dir` | `ascendCode` | 待索引的 AscendC 代码库目录 |
+
+#### （2）`generator/scripts/generation/generate_agent.py` — 基于 LangGraph Agent
+
+```bash
+# Agent + Code RAG only 生成全部算子
+python3 generator/scripts/generation/generate_agent.py \
+  --tool-mode code_rag_only --strategy add_shot --categories all --workers 4
+
+# Agent + 仅使用 102 个已验证算子（kernelbench102）
+python3 generator/scripts/generation/generate_agent.py \
+  --tool-mode code_rag_only --strategy add_shot --kernelbench102 --workers 4
+
+# Agent + KB + Code RAG 组合
+python3 generator/scripts/generation/generate_agent.py \
+  --tool-mode kb_and_code_rag --strategy add_shot --categories activation --workers 4
+```
+
+**Agent 专用参数**
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `--tool-mode` | `no_tool` | 工具模式：`no_tool` / `kb_only` / `web_only` / `code_rag_only` / `kb_and_web` / `kb_and_code_rag` / `web_and_code_rag` / `all` |
+| `--strategy` | `add_shot` | Prompt 策略名称，由 `prompt_generators/` 注册表提供 |
+| `--kernelbench102` | — | 只生成 `generator/kernelbench102_ops.py` 中登记的 102 个已验证算子 |
+| `--categories` | `all` | 算子类别列表 |
+| `--workers` | `4` | 并行 worker 数量 |
+| `--start-from` | — | 从指定算子开始生成（断点续传） |
+| `--runs` | `1` | 运行轮数 |
+
+> **注意**：Agent 方式需要提前构建 RAG 索引（同 `tools/generate_operator.py --build-index`），且 LLM 配置需通过环境变量 `XI_AI_API_KEY` / `XI_AI_BASE_URL` / `XI_AI_MODEL` 或 `api_config.py` 提供。
+
+#### （3）Python API — 自定义工具组合
+
+除了 CLI 预定义的模式，还可以通过 `frozenset` 自由组合任意 `ToolType`，实现更精细的工具控制：
+
+```python
+from generator.agent import (
+    generate_kernel_with_agent,
+    KernelGenerationTask,
+    ToolType,
+    parse_tool_mode,
+)
+
+# 使用 frozenset 自定义工具组合
+from generator.agent.agent_config import KB_ONLY, CODE_RAG_ONLY
+custom_mode = frozenset({ToolType.KB, ToolType.CODE_RAG, ToolType.ENV_CHECK_ENV})
+
+task = KernelGenerationTask(
+    language="ascendc",
+    op="gelu",
+    strategy_name="add_shot",
+    category="activation",
+)
+result = generate_kernel_with_agent(task, custom_mode)
+print(result.generated_code)
+```
+
+也支持直接传入字符串，内部自动解析：
+
+```python
+# 字符串自动解析
+result = generate_kernel_with_agent(task, "kb,code_rag,env_check_env")
+
+# 等价于
+result = generate_kernel_with_agent(task, parse_tool_mode("kb,code_rag,env_check_env"))
+```
+
+可用 `ToolType` 完整列表：
+
+| ToolType | 说明 |
+|----------|------|
+| `KB` | 知识库查询（ChromaDB Ascend C API 文档） |
+| `WEB` | 网页搜索（DuckDuckGo） |
+| `CODE_RAG` | 代码检索（`generator/rag/` 索引中的相似实现） |
+| `ENV_CHECK_ENV` | 环境概览检查（CANN 版本、工具链状态） |
+| `ENV_CHECK_NPU` | NPU 设备查询（状态、显存、温度、功耗） |
+| `ENV_CHECK_API` | API 兼容性检查（搜索 CANN 头文件中的 API） |
+| `KB_SHELL_SEARCH` | 基于 shell 命令的知识库搜索 |
+| `API_LOOKUP` | API 文档查找 |
+| `API_CONSTRAINT` | API 约束检查 |
+| `API_ALTERNATIVE` | API 替代方案查找 |
+| `TILING_CALC` | Tiling 计算 |
+| `TILING_VALIDATE` | Tiling 验证 |
+| `NPU_ARCH` | NPU 架构查询 |
+| `CODE_STYLE` | 代码风格检查 |
+| `SECURITY_CHECK` | 安全模式检查 |
 
 ### 3.3 提示策略（`generator/prompt_generators/`）
 
@@ -219,7 +309,18 @@ Agent 是一个基于 LangGraph StateGraph 的多轮工作流，LLM 在每轮自
 | 知识库查询 | `KB` | ChromaDB 中的 Ascend C API 文档 | 查询本地索引的昇腾 API 文档片段 |
 | 网页搜索 | `WEB` | DuckDuckGo（`ddgs` 包） | 搜索技术文档、博客与教程 |
 | 代码检索 | `CODE_RAG` | `generator/rag/` 索引 | 检索代码库中的相似实现 |
-| 环境检查 | `ENV_CHECK` | CANN 头文件与运行时环境 | 检查 CANN 版本、NPU 设备状态、API 兼容性 |
+| 环境检查 | `ENV_CHECK_ENV` | CANN 头文件与运行时环境 | 检查 CANN 版本、工具链状态 |
+| NPU 查询 | `ENV_CHECK_NPU` | `npu-smi` | 查询设备状态、显存、温度、功耗 |
+| API 兼容 | `ENV_CHECK_API` | CANN 头文件 | 检查 API 是否在 CANN 头文件中存在 |
+| KB Shell 搜索 | `KB_SHELL_SEARCH` | 本地知识库 | 通过 shell 命令搜索知识库 |
+| API 查找 | `API_LOOKUP` | CANN API 文档 | 查找特定 API 的详细文档 |
+| API 约束 | `API_CONSTRAINT` | CANN API 文档 | 检查 API 的参数约束与限制 |
+| API 替代 | `API_ALTERNATIVE` | CANN API 文档 | 查找 API 的替代方案 |
+| Tiling 计算 | `TILING_CALC` | 算子参数推导 | 根据输入 shape 计算 Tiling 参数 |
+| Tiling 验证 | `TILING_VALIDATE` | 算子参数推导 | 验证 Tiling 参数的合法性 |
+| NPU 架构 | `NPU_ARCH` | 架构知识库 | 查询 NPU 芯片型号与架构特性 |
+| 代码风格 | `CODE_STYLE` | 代码规范 | 检查代码风格是否符合 Ascend C 规范 |
+| 安全检查 | `SECURITY_CHECK` | 安全规范 | 检查代码中的安全模式问题 |
 
 每种工具均以 Retriever 类封装，提供 `is_available()` 与 `retrieve(query)` 两个标准方法，便于在节点中统一调用。
 
@@ -256,54 +357,80 @@ entry
                     ├─ KB ──→ kb_query ──→ choose_tool (循环)
                     ├─ WEB ──→ web_search ──→ choose_tool (循环)
                     ├─ CODE_RAG ──→ code_rag ──→ choose_tool (循环)
-                    ├─ ENV_CHECK ──→ env_check ──→ choose_tool (循环)
+                    ├─ ENV_CHECK_ENV ──→ env_check_env ──→ choose_tool (循环)
+                    ├─ ENV_CHECK_NPU ──→ env_check_npu ──→ choose_tool (循环)
+                    ├─ ENV_CHECK_API ──→ env_check_api ──→ choose_tool (循环)
+                    ├─ KB_SHELL_SEARCH ──→ kb_shell_search ──→ choose_tool (循环)
+                    ├─ API_LOOKUP ──→ api_lookup ──→ choose_tool (循环)
+                    ├─ API_CONSTRAINT ──→ api_constraint ──→ choose_tool (循环)
+                    ├─ API_ALTERNATIVE ──→ api_alternative ──→ choose_tool (循环)
+                    ├─ TILING_CALC ──→ tiling_calc ──→ choose_tool (循环)
+                    ├─ TILING_VALIDATE ──→ tiling_validate ──→ choose_tool (循环)
+                    ├─ NPU_ARCH ──→ npu_arch ──→ choose_tool (循环)
+                    ├─ CODE_STYLE ──→ code_style ──→ choose_tool (循环)
+                    ├─ SECURITY_CHECK ──→ security_check ──→ choose_tool (循环)
                     └─ ANSWER ──→ answer → END
 ```
 
 - **`entry`**：入口节点，根据是否启用工具决定走向。
-- **`choose_tool`**：LLM 根据当前已有信息选择下一步动作（KB / WEB / CODE_RAG / ENV_CHECK / ANSWER）。每轮输出一行动作标识和一行英文查询。
+- **`choose_tool`**：LLM 根据当前已有信息选择下一步动作。每轮输出一行动作标识和一行英文查询。
 - **检索节点**：执行对应工具的 `retrieve(query)`，将结果追加到 Agent 状态中。
 - **`answer`**：综合所有检索结果，由 LLM 生成最终算子代码。
 - 最大查询轮数由 `agent_max_query_rounds` 控制（默认 3 轮），达到上限后强制进入 `answer`。
 
 #### 3.5.4 使用示例
 
-```python
-from generator.agent.agent_builder import create_agent
-from generator.agent.agent_state import create_initial_state
-from generator.prompt_generators.rag_prompt_generator import rag_prompt
+**CLI 方式**（推荐，最简单）：
 
-# 构建初始状态
-state = create_initial_state(
-    base_prompt=rag_prompt("gelu", "activation"),
-    op_name="gelu",
-    category="activation",
-    strategy_name="rag",
+```bash
+# 使用 Agent + Code RAG 生成单个算子
+python3 generator/scripts/generation/generate_agent.py \
+  --tool-mode code_rag_only --strategy add_shot \
+  --categories activation --workers 4
+```
+
+**Python API 方式**（适合脚本调用）：
+
+```python
+from generator.agent import (
+    generate_kernel_with_agent,
+    KernelGenerationTask,
+    ToolType,
+    parse_tool_mode,
 )
 
-# 创建并调用 Agent
-agent = create_agent("all")  # 或 "kb,web,code_rag,env_check"
-result = agent.invoke(state)
+# 使用字符串（自动解析）
+task = KernelGenerationTask(
+    language="ascendc",
+    op="gelu",
+    strategy_name="add_shot",
+    category="activation",
+)
+result = generate_kernel_with_agent(task, "code_rag_only")
+print(result.generated_code)
 
-# 获取生成结果
-generated_code = result["messages"][-1].content
-tool_log = result.get("tool_calls_log", [])
+# 使用 frozenset 自定义组合
+custom_mode = frozenset({ToolType.KB, ToolType.CODE_RAG, ToolType.ENV_CHECK_ENV})
+result = generate_kernel_with_agent(task, custom_mode)
 ```
 
 #### 3.5.5 Agent LLM 配置
 
 Agent 使用独立于生成器的 LLM 配置，优先级为：
 
-1. 环境变量 `XI_AI_API_KEY` + `XI_AI_BASE_URL` + `XI_AI_MODEL`
-2. `generator/utils/api_config.py` 中的 `API_KEY` / `BASE_URL` / `MODEL`
-3. 默认回退到 `deepseek-chat`（`https://api.deepseek.com/v1`）
+1. `USE_API_CONFIG=1` + `generation/local_api_config.py`（最高优先级）
+2. 环境变量 `XI_AI_API_KEY` + `XI_AI_BASE_URL` + `XI_AI_MODEL`
+3. `api_config.py` 或 `generator/utils/api_config.py` 中的配置
+4. 默认回退到 `deepseek-chat`（`https://api.deepseek.com/v1`）
 
 ### 3.6 配置与依赖
 
 | 文件 | 作用 |
 |------|------|
 | `generator/config.py` | 生成器与 Agent 的配置（模型路径、RAG 参数、Agent 参数等） |
-| `generator/utils/api_config.py`（可选） | LLM API 密钥、基地址、模型名称 |
+| `generator/agent/agent_config.py` | Agent 工具类型、ToolType 枚举、parse_tool_mode、LLM 配置 |
+| `generator/kernelbench102_ops.py` | 预定义的 102 个通过数值正确性验证的算子列表 |
+| `api_config.py`（可选） | LLM API 密钥、基地址、模型名称 |
 | `tools/common/env.py` | CANN/NPU 环境配置（与评测流水线共享） |
 | `requirements.txt` | Python 依赖列表 |
 
@@ -314,11 +441,13 @@ Agent 使用独立于生成器的 LLM 配置，优先级为：
 | 路径 | 说明 |
 |------|------|
 | `tools/eval_operator.py` | 统一评测入口 |
-| `tools/generate_operator.py` | LLM 算子生成入口 |
-| `generator/` | 生成模块：提示策略、RAG 检索、LangGraph Agent |
-| `generator/agent/` | LangGraph 智能 Agent（KB、WEB、CODE_RAG、ENV_CHECK 工具） |
+| `tools/generate_operator.py` | LLM 算子生成入口（RAG 策略） |
+| `generator/scripts/generation/generate_agent.py` | Agent 生成入口（LangGraph 多轮工作流） |
+| `generator/agent/` | LangGraph 智能 Agent（15+ ToolType） |
+| `generator/agent/agent_config.py` | ToolType 枚举、parse_tool_mode、AgentToolMode、LLM 配置 |
 | `generator/rag/` | RAG 代码索引与嵌入检索（ChromaDB + BGE-M3） |
 | `generator/prompt_generators/` | 提示策略实现（rag、add_shot、selected_shot 等） |
+| `generator/kernelbench102_ops.py` | 102 个通过数值验证的算子列表 |
 | `vendor/mkb/reference/` | MKB PyTorch 参考实现（按类别分子目录） |
 | `vendor/mkb/dataset.py` | 合法 `op_key` 与类别映射 |
 | `vendor/mkb/correctness.py` | 正确性对比模板 |

@@ -12,9 +12,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from generator.agent import (
     generate_kernel_with_agent,
-    AgentToolMode,
     KernelGenerationTask,
 )
+from generator.agent.agent_config import parse_tool_mode
 from generator.dataset import dataset
 from generator.rag import EmbeddingRetriever
 from generator.config import rag_index_path, rag_embedding_model
@@ -137,10 +137,15 @@ def main():
         default=None,
         help="自定义输出目录"
     )
+    parser.add_argument(
+        "--kernelbench102",
+        action="store_true",
+        help="只生成 kernelbench102 中的 102 个算子"
+    )
 
     args = parser.parse_args()
 
-    tool_mode = AgentToolMode(args.tool_mode)
+    tool_mode = parse_tool_mode(args.tool_mode)
     strategy = args.strategy
     workers = args.workers
 
@@ -153,6 +158,11 @@ def main():
     all_ops = list(dataset.keys())
     if args.categories != ['all']:
         all_ops = [op for op in all_ops if dataset[op]['category'] in args.categories]
+
+    if args.kernelbench102:
+        from generator.kernelbench102_ops import KERNELBENCH102_OP_SET
+        all_ops = [op for op in all_ops if op in KERNELBENCH102_OP_SET]
+        print(f"[INFO] KernelBench102 filter: {len(all_ops)} ops")
 
     all_ops = sorted(all_ops)
     print(f"[INFO] Total ops to generate: {len(all_ops)}")
