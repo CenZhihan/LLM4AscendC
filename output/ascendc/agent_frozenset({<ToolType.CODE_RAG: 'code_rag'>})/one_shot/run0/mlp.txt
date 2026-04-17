@@ -1,0 +1,538 @@
+project_json_src='''
+[
+  {
+    "op": "MlpCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "w_packed",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "b_packed",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": []
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(MlpCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, inSize);
+  TILING_DATA_FIELD_DEF(uint32_t, h1);
+  TILING_DATA_FIELD_DEF(uint32_t, h2);
+  TILING_DATA_FIELD_DEF(uint32_t, outSize);
+  TILING_DATA_FIELD_DEF(uint32_t, tileK);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MlpCustom, MlpCustomTilingData)
+
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "mlp_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+static inline uint32_t HighestPow2LE(uint32_t x) {
+    if (x == 0) return 0;
+    uint32_t p = 1u;
+    while ((p << 1u) <= x) p <<= 1u;
+    return p;
+}
+
+// Solve dims (h1, h2, out) from K=cols, Lw=|w_packed|, Lb=|b_packed|.
+// Equations:
+//   Lb = h1 + h2 + out
+//   Lw = h1*K + h2*h1 + out*h2
+// Derive: Lw = h1*K + h2*(Lb - h2) => h1 = (Lw - h2*(Lb - h2)) / K
+static inline bool SolveDims(uint64_t K, uint64_t Lw, uint64_t Lb,
+                             uint32_t &h1, uint32_t &h2, uint32_t &out)
+{
+    if (K == 0 || Lb < 3) return false;
+    for (uint64_t h2_try = 1; h2_try + 1 < Lb; ++h2_try) {
+        int64_t rhs = static_cast<int64_t>(Lw) - static_cast<int64_t>(h2_try) * static_cast<int64_t>(Lb - h2_try);
+        if (rhs <= 0) continue;
+        if (rhs % static_cast<int64_t>(K) != 0) continue;
+        uint64_t h1_try = static_cast<uint64_t>(rhs / static_cast<int64_t>(K));
+        if (h1_try == 0) continue;
+        if (h1_try + h2_try >= Lb) continue;
+        uint64_t out_try = Lb - h1_try - h2_try;
+        // Validate
+        if (h1_try * K + h2_try * h1_try + out_try * h2_try == Lw) {
+            h1 = static_cast<uint32_t>(h1_try);
+            h2 = static_cast<uint32_t>(h2_try);
+            out = static_cast<uint32_t>(out_try);
+            return true;
+        }
+    }
+    return false;
+}
+} // anonymous
+
+namespace optiling {
+
+// UB model for this kernel:
+//
+// We reuse a single VECCALC queue with buffers of size tileK floats for:
+//   - xSeg: 1 * tileK
+//   - wSeg: 1 * tileK
+//   - tmp:  1 * tileK
+//   - acc:  1 * tileK (only first element used)
+// Total floats per-core UB ~ 4 * tileK => bytes = 16 * tileK
+//
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
+static constexpr uint32_t ALIGN_ELEMS = 1024;            // align for DMA efficiency
+static constexpr uint32_t MIN_TILEK = 256;               // keep reasonable vector length
+static constexpr uint32_t MAX_BLOCKS = 24;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+    const gert::Shape *b_shape = context->GetInputShape(2);
+
+    if (x_shape->GetStorageShape().GetDimNum() != 2 ||
+        w_shape->GetStorageShape().GetDimNum() < 1 ||
+        b_shape->GetStorageShape().GetDimNum() < 1) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const uint64_t B  = static_cast<uint64_t>(x_shape->GetStorageShape().GetDim(0));
+    const uint64_t K  = static_cast<uint64_t>(x_shape->GetStorageShape().GetDim(1));
+    const uint64_t Lw = static_cast<uint64_t>(w_shape->GetStorageShape().GetShapeSize());
+    const uint64_t Lb = static_cast<uint64_t>(b_shape->GetStorageShape().GetShapeSize());
+
+    uint32_t h1=0, h2=0, out=0;
+    if (!SolveDims(K, Lw, Lb, h1, h2, out)) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Derive tileK from UB budget: bytes = 16 * tileK
+    uint32_t maxTileElems = UB_BUDGET_BYTES / 16; // elements
+    if (maxTileElems < MIN_TILEK) maxTileElems = MIN_TILEK;
+    maxTileElems = AlignDown(maxTileElems, ALIGN_ELEMS);
+    if (maxTileElems == 0) maxTileElems = ALIGN_ELEMS;
+
+    // Limit by largest inner dimension among {K, h1, h2}
+    uint32_t innerMax = static_cast<uint32_t>(K);
+    if (h1 > innerMax) innerMax = h1;
+    if (h2 > innerMax) innerMax = h2;
+
+    uint32_t tileK = maxTileElems;
+    if (tileK > innerMax) {
+        // don't overshoot the real inner dim
+        tileK = AlignDown(innerMax, ALIGN_ELEMS);
+        if (tileK == 0) tileK = HighestPow2LE(innerMax);
+    }
+    // force tileK to power-of-two for simple reduction
+    tileK = HighestPow2LE(tileK);
+    if (tileK < MIN_TILEK) tileK = MIN_TILEK;
+    if (tileK > ALIGN_ELEMS * 16) {
+        // keep tile reasonable
+        tileK = ALIGN_ELEMS * 16;
+    }
+
+    // BlockDim over batch rows
+    uint32_t blockDim = static_cast<uint32_t>(B);
+    if (blockDim == 0) blockDim = 1;
+    if (blockDim > MAX_BLOCKS) blockDim = MAX_BLOCKS;
+    context->SetBlockDim(blockDim);
+
+    MlpCustomTilingData tiling;
+    tiling.set_batch(static_cast<uint32_t>(B));
+    tiling.set_inSize(static_cast<uint32_t>(K));
+    tiling.set_h1(h1);
+    tiling.set_h2(h2);
+    tiling.set_outSize(out);
+    tiling.set_tileK(tileK);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // Workspace for intermediate hidden activations: B*(h1+h2) floats
+    size_t *ws = context->GetWorkspaceSizes(1);
+    ws[0] = static_cast<size_t>(B) * (static_cast<size_t>(h1) + static_cast<size_t>(h2)) * sizeof(float);
+
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+    const gert::Shape *b_shape = context->GetInputShape(2);
+
+    const uint64_t B  = static_cast<uint64_t>(x_shape->GetStorageShape().GetDim(0));
+    const uint64_t K  = static_cast<uint64_t>(x_shape->GetStorageShape().GetDim(1));
+    const uint64_t Lw = static_cast<uint64_t>(w_shape->GetStorageShape().GetShapeSize());
+    const uint64_t Lb = static_cast<uint64_t>(b_shape->GetStorageShape().GetShapeSize());
+
+    uint32_t h1=0, h2=0, out=0;
+    if (!SolveDims(K, Lw, Lb, h1, h2, out)) {
+        return ge::GRAPH_FAILED;
+    }
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    std::vector<int64_t> out_dims = { static_cast<int64_t>(B), static_cast<int64_t>(out) };
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, out_dims[0]);
+    y_shape->SetDim(1, out_dims[1]);
+
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+
+class MlpCustom : public OpDef {
+public:
+    explicit MlpCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("w_packed")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("b_packed")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MlpCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 4;
+
+class KernelMlpCustom {
+public:
+    __aicore__ inline KernelMlpCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace,
+                                uint32_t batch, uint32_t inSize,
+                                uint32_t h1, uint32_t h2, uint32_t outSize,
+                                uint32_t tileK)
+    {
+        B_ = batch;
+        K_ = inSize;
+        H1_ = h1;
+        H2_ = h2;
+        O_ = outSize;
+        tileK_ = tileK;
+
+        // Offsets in packed arrays
+        w1off_ = 0u;
+        w2off_ = H1_ * K_;
+        w3off_ = w2off_ + H2_ * H1_;
+        b1off_ = 0u;
+        b2off_ = H1_;
+        b3off_ = H1_ + H2_;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint64_t>(B_) * K_);
+        wGm_.SetGlobalBuffer((__gm__ float*)w, static_cast<uint64_t>(w3off_) + static_cast<uint64_t>(O_) * H2_);
+        bGm_.SetGlobalBuffer((__gm__ float*)b, static_cast<uint64_t>(b3off_) + O_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint64_t>(B_) * O_);
+
+        // Workspace: hidden1 [B * H1], hidden2 [B * H2]
+        const uint64_t h1Size = static_cast<uint64_t>(B_) * H1_;
+        const uint64_t h2Size = static_cast<uint64_t>(B_) * H2_;
+        h1Gm_.SetGlobalBuffer((__gm__ float*)workspace, h1Size);
+        h2Gm_.SetGlobalBuffer((__gm__ float*)workspace + h1Size, h2Size);
+
+        pipe_.InitBuffer(bufQ_, BUFFER_NUM, tileK_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (B_ == 0 || K_ == 0 || O_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        for (uint32_t row = blockIdx; row < B_; row += blockNum) {
+            ComputeLayer1(row);
+            ComputeLayer2(row);
+            ComputeLayer3(row);
+        }
+    }
+
+private:
+    __aicore__ inline void ReduceSumPow2(AscendC::LocalTensor<float> &buf, uint32_t lenPow2)
+    {
+        // lenPow2 must be power-of-two; result placed at buf[0]
+        uint32_t cur = lenPow2;
+        while (cur > 1u) {
+            uint32_t half = cur >> 1u;
+            AscendC::Add(buf, buf, buf[half], half);
+            cur = half;
+        }
+    }
+
+    __aicore__ inline void DotAddBiasStore(bool withRelu,
+                                           AscendC::GlobalTensor<float> &srcVec, uint32_t srcBase, uint32_t srcLen,
+                                           AscendC::GlobalTensor<float> &wRow, uint32_t wBase, uint32_t wLen,
+                                           AscendC::GlobalTensor<float> &bVec, uint32_t bIndex,
+                                           AscendC::GlobalTensor<float> &dstVec, uint32_t dstIndex)
+    {
+        AscendC::LocalTensor<float> xLocal = bufQ_.AllocTensor<float>();
+        AscendC::LocalTensor<float> wLocal = bufQ_.AllocTensor<float>();
+        AscendC::LocalTensor<float> tmp = bufQ_.AllocTensor<float>();
+        AscendC::LocalTensor<float> acc = bufQ_.AllocTensor<float>();
+
+        // acc = bias
+        AscendC::DataCopy(acc, bVec[bIndex], 1);
+
+        uint32_t processed = 0;
+        while (processed < srcLen) {
+            uint32_t cur = srcLen - processed;
+            if (cur > tileK_) cur = tileK_;
+
+            // tmp = 0
+            AscendC::Dup(tmp, 0.0f, tileK_);
+
+            // load segments
+            AscendC::DataCopy(xLocal, srcVec[srcBase + processed], cur);
+            AscendC::DataCopy(wLocal, wRow[wBase + processed], cur);
+
+            // tmp[0:cur] = xLocal * wLocal; tmp[cur:tileK_] remain zero
+            AscendC::Muls(tmp, xLocal, wLocal, cur);
+
+            // Reduce across tileK_ (power-of-two), padding zeros keep correctness
+            ReduceSumPow2(tmp, tileK_);
+
+            // acc += tmp[0]
+            AscendC::Add(acc, acc, tmp, 1);
+
+            processed += cur;
+        }
+
+        if (withRelu) {
+            AscendC::Maxs(acc, acc, 0.0f, 1);
+        }
+
+        AscendC::DataCopy(dstVec[dstIndex], acc, 1);
+
+        bufQ_.FreeTensor(acc);
+        bufQ_.FreeTensor(tmp);
+        bufQ_.FreeTensor(wLocal);
+        bufQ_.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void ComputeLayer1(uint32_t row)
+    {
+        // For each neuron j in H1: y1[row, j] = relu( dot(x[row,:], w1[j,:]) + b1[j] )
+        const uint32_t srcBase = row * K_;
+        const uint32_t dstBase = row * H1_;
+        for (uint32_t j = 0; j < H1_; ++j) {
+            const uint32_t wBase = w1off_ + j * K_;
+            DotAddBiasStore(true,  xGm_, srcBase, K_,
+                                  wGm_, wBase, K_,
+                                  bGm_, b1off_ + j,
+                                  h1Gm_, dstBase + j);
+        }
+    }
+
+    __aicore__ inline void ComputeLayer2(uint32_t row)
+    {
+        // For each neuron j in H2: y2[row, j] = relu( dot(h1[row,:], w2[j,:]) + b2[j] )
+        const uint32_t srcBase = row * H1_;
+        const uint32_t dstBase = row * H2_;
+        for (uint32_t j = 0; j < H2_; ++j) {
+            const uint32_t wBase = w2off_ + j * H1_;
+            DotAddBiasStore(true,  h1Gm_, srcBase, H1_,
+                                  wGm_,  wBase,   H1_,
+                                  bGm_,  b2off_ + j,
+                                  h2Gm_, dstBase + j);
+        }
+    }
+
+    __aicore__ inline void ComputeLayer3(uint32_t row)
+    {
+        // For each neuron j in O_: y[row, j] = dot(h2[row,:], w3[j,:]) + b3[j]
+        const uint32_t srcBase = row * H2_;
+        const uint32_t dstBase = row * O_;
+        for (uint32_t j = 0; j < O_; ++j) {
+            const uint32_t wBase = w3off_ + j * H2_;
+            DotAddBiasStore(false, h2Gm_, srcBase, H2_,
+                                  wGm_,  wBase,   H2_,
+                                  bGm_,  b3off_ + j,
+                                  yGm_,  dstBase + j);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> bufQ_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> bGm_;
+    AscendC::GlobalTensor<float> yGm_;
+    AscendC::GlobalTensor<float> h1Gm_;
+    AscendC::GlobalTensor<float> h2Gm_;
+
+    uint32_t B_{0}, K_{0}, H1_{0}, H2_{0}, O_{0};
+    uint32_t B_, K_, H1_, H2_, O_;
+    uint32_t tileK_{0};
+
+    uint32_t w1off_{0}, w2off_{0}, w3off_{0};
+    uint32_t b1off_{0}, b2off_{0}, b3off_{0};
+};
+
+extern "C" __global__ __aicore__ void mlp_custom(GM_ADDR x, GM_ADDR w_packed, GM_ADDR b_packed, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMlpCustom op;
+    op.Init(x, w_packed, b_packed, y, workspace,
+            tiling_data.batch, tiling_data.inSize,
+            tiling_data.h1, tiling_data.h2, tiling_data.outSize,
+            tiling_data.tileK);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+static inline bool solve_dims_from_shapes(int64_t K, int64_t Lw, int64_t Lb,
+                                          int64_t &h1, int64_t &h2, int64_t &out)
+{
+    if (K <= 0 || Lb < 3) return false;
+    for (int64_t h2_try = 1; h2_try + 1 < Lb; ++h2_try) {
+        int64_t rhs = Lw - h2_try * (Lb - h2_try);
+        if (rhs <= 0) continue;
+        if (rhs % K != 0) continue;
+        int64_t h1_try = rhs / K;
+        if (h1_try <= 0) continue;
+        if (h1_try + h2_try >= Lb) continue;
+        int64_t out_try = Lb - h1_try - h2_try;
+        if (h1_try * K + h2_try * h1_try + out_try * h2_try == Lw) {
+            h1 = h1_try; h2 = h2_try; out = out_try;
+            return true;
+        }
+    }
+    return false;
+}
+
+at::Tensor mlp_impl_npu(const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& b_packed) {
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(w_packed.dim() == 1, "w_packed must be 1D");
+    TORCH_CHECK(b_packed.dim() == 1, "b_packed must be 1D");
+
+    const auto B = x.size(0);
+    const auto K = x.size(1);
+    const auto Lw = w_packed.numel();
+    const auto Lb = b_packed.numel();
+
+    int64_t h1=0, h2=0, out=0;
+    TORCH_CHECK(solve_dims_from_shapes(K, Lw, Lb, h1, h2, out),
+                "Failed to infer MLP dims from packed weights/biases.");
+
+    at::Tensor result = at::empty({B, out}, x.options());
+    EXEC_NPU_CMD(aclnnMlpCustom, x, w_packed, b_packed, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("mlp_custom", &mlp_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mlp_custom", &mlp_impl_npu, "Fused 3-layer MLP (MlpCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'mlp_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, input_size, layer_sizes, output_size):
+        super(ModelNew, self).__init__()
+        # Store for reference; inference dims are derived from packed tensors at runtime
+        self.input_size = input_size
+        self.layer_sizes = list(layer_sizes)
+        self.output_size = output_size
+
+    def forward(self, x, w_packed, b_packed):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, w_packed, b_packed)
+'''

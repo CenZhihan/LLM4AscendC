@@ -1,0 +1,450 @@
+project_json_src='''
+[
+  {
+    "op": "MatmulWithIrregularShapesCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "A",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "B",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "C",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": []
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(MatmulWithIrregularShapesCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, M);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, tileM);
+  TILING_DATA_FIELD_DEF(uint32_t, tileN);
+  TILING_DATA_FIELD_DEF(uint32_t, tileK);
+  TILING_DATA_FIELD_DEF(uint32_t, mTiles);
+  TILING_DATA_FIELD_DEF(uint32_t, nTiles);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulWithIrregularShapesCustom, MatmulWithIrregularShapesCustomTilingData)
+
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "matmul_with_irregular_shapes_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) {
+    return (x / a) * a;
+}
+static inline uint32_t AlignUp(uint32_t x, uint32_t a) {
+    return ((x + a - 1u) / a) * a;
+}
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (a + b - 1u) / b;
+}
+
+} // anonymous
+
+namespace optiling {
+
+// UB memory model (floats):
+//   A_tile:  tileM * tileK
+//   B_tile:  tileK * tileN
+//   C_tile:  tileM * tileN
+//   tmpVec:  tileN
+// Total floats: tileM*(tileK + tileN) + tileK*tileN + tileN
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024; // Conservative per-core UB
+static constexpr uint32_t BUDGET_FLOATS   = UB_BUDGET_BYTES / 4;
+static constexpr uint32_t ALIGN_ELEMS     = 16;
+static constexpr uint32_t MAX_TILE_M      = 128;
+static constexpr uint32_t MAX_TILE_N      = 256;
+static constexpr uint32_t MAX_TILE_K      = 64;
+static constexpr uint32_t MIN_BLOCKS      = 8;
+static constexpr uint32_t MAX_BLOCKS      = 24;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    MatmulWithIrregularShapesCustomTilingData tiling;
+
+    const gert::Shape *A_shape = context->GetInputShape(0);
+    const gert::Shape *B_shape = context->GetInputShape(1);
+
+    // Expect 2-D matrices
+    const auto &a_origin = A_shape->GetOriginShape();
+    const auto &b_origin = B_shape->GetOriginShape();
+
+    const uint32_t M = static_cast<uint32_t>(a_origin.GetDim(0));
+    const uint32_t K = static_cast<uint32_t>(a_origin.GetDim(1));
+    const uint32_t N = static_cast<uint32_t>(b_origin.GetDim(1));
+
+    // Initial heuristic tiles (aligned and clamped)
+    uint32_t tileK = (K >= MAX_TILE_K) ? MAX_TILE_K : AlignDown(K, ALIGN_ELEMS);
+    if (tileK == 0) tileK = K;
+    tileK = AlignDown(tileK, ALIGN_ELEMS) ? AlignDown(tileK, ALIGN_ELEMS) : tileK;
+
+    uint32_t tileN = (N >= MAX_TILE_N) ? MAX_TILE_N : AlignDown(N, ALIGN_ELEMS);
+    if (tileN == 0) tileN = N;
+    tileN = AlignDown(tileN, ALIGN_ELEMS) ? AlignDown(tileN, ALIGN_ELEMS) : tileN;
+
+    // Reduce tileN if too big for budget with minimum tileM=ALIGN_ELEMS
+    while (tileN > 0) {
+        // Remaining budget for tileM*(tileK + tileN)
+        int64_t rem = static_cast<int64_t>(BUDGET_FLOATS) - static_cast<int64_t>(tileK) * tileN - tileN;
+        if (rem <= 0) {
+            tileN = AlignDown(tileN - ALIGN_ELEMS, ALIGN_ELEMS);
+            continue;
+        }
+        // Maximum tileM that fits
+        uint32_t maxTileMByBudget = static_cast<uint32_t>(rem / (static_cast<int64_t>(tileK) + tileN));
+        uint32_t tileM = maxTileMByBudget;
+        if (tileM > MAX_TILE_M) tileM = MAX_TILE_M;
+        if (tileM > M) tileM = M;
+        tileM = AlignDown(tileM, ALIGN_ELEMS) ? AlignDown(tileM, ALIGN_ELEMS) : tileM;
+        if (tileM >= ALIGN_ELEMS || tileM == M) {
+            // Found feasible tileM with this tileN
+            tiling.set_tileM((tileM == 0) ? 1u : tileM);
+            tiling.set_tileN((tileN == 0) ? 1u : tileN);
+            tiling.set_tileK((tileK == 0) ? 1u : tileK);
+            break;
+        }
+        tileN = AlignDown(tileN - ALIGN_ELEMS, ALIGN_ELEMS);
+    }
+
+    if (tiling.tileM() == 0 || tiling.tileN() == 0 || tiling.tileK() == 0) {
+        // Fallback conservative tiny tiles to guarantee feasibility
+        uint32_t tK = (K >= ALIGN_ELEMS) ? ALIGN_ELEMS : K;
+        uint32_t tN = (N >= ALIGN_ELEMS) ? ALIGN_ELEMS : N;
+        uint32_t tM = (M >= ALIGN_ELEMS) ? ALIGN_ELEMS : M;
+        tiling.set_tileK(tK);
+        tiling.set_tileN(tN);
+        tiling.set_tileM(tM);
+    }
+
+    const uint32_t mTiles = CeilDiv(M, tiling.tileM());
+    const uint32_t nTiles = CeilDiv(N, tiling.tileN());
+    uint32_t totalTiles = mTiles * nTiles;
+
+    uint32_t blockDim = totalTiles;
+    if (blockDim < MIN_BLOCKS) blockDim = MIN_BLOCKS;
+    if (blockDim > MAX_BLOCKS) blockDim = MAX_BLOCKS;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_M(M);
+    tiling.set_N(N);
+    tiling.set_K(K);
+    tiling.set_mTiles(mTiles);
+    tiling.set_nTiles(nTiles);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspaces = context->GetWorkspaceSizes(1);
+    workspaces[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *A_shape = context->GetInputShape(0);
+    const gert::Shape *B_shape = context->GetInputShape(1);
+
+    const auto &a_origin = A_shape->GetOriginShape();
+    const auto &b_origin = B_shape->GetOriginShape();
+
+    gert::Shape *C_shape = context->GetOutputShape(0);
+
+    // C: [M, N] where M = A[0], N = B[1]
+    std::vector<int64_t> dims(2);
+    dims[0] = a_origin.GetDim(0);
+    dims[1] = b_origin.GetDim(1);
+    C_shape->SetOriginShape(dims);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    ge::DataType dtypeA = context->GetInputDataType(0);
+    ge::DataType dtypeB = context->GetInputDataType(1);
+    // Require same dtype; pass through
+    if (dtypeA != dtypeB) {
+        return GRAPH_FAILED;
+    }
+    context->SetOutputDataType(0, dtypeA);
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+
+class MatmulWithIrregularShapesCustom : public OpDef {
+public:
+    explicit MatmulWithIrregularShapesCustom(const char* name) : OpDef(name)
+    {
+        this->Input("A")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("B")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("C")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulWithIrregularShapesCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelMatmulWithIrregularShapesCustom {
+public:
+    __aicore__ inline KernelMatmulWithIrregularShapesCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR A, GM_ADDR B, GM_ADDR C,
+                                uint32_t M, uint32_t N, uint32_t K,
+                                uint32_t tileM, uint32_t tileN, uint32_t tileK,
+                                uint32_t mTiles, uint32_t nTiles)
+    {
+        M_ = M; N_ = N; K_ = K;
+        tileM_ = tileM; tileN_ = tileN; tileK_ = tileK;
+        mTiles_ = mTiles; nTiles_ = nTiles;
+
+        Agm_.SetGlobalBuffer((__gm__ float*)A, static_cast<uint32_t>(M_ * K_));
+        Bgm_.SetGlobalBuffer((__gm__ float*)B, static_cast<uint32_t>(K_ * N_));
+        Cgm_.SetGlobalBuffer((__gm__ float*)C, static_cast<uint32_t>(M_ * N_));
+
+        pipe_.InitBuffer(aBufQ_, BUFFER_NUM, tileM_ * tileK_ * sizeof(float));
+        pipe_.InitBuffer(bBufQ_, BUFFER_NUM, tileK_ * tileN_ * sizeof(float));
+        pipe_.InitBuffer(cBufQ_, BUFFER_NUM, tileM_ * tileN_ * sizeof(float));
+        pipe_.InitBuffer(tmpQ_,   BUFFER_NUM, tileN_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (M_ == 0 || N_ == 0 || K_ == 0) return;
+
+        const uint32_t totalTiles = mTiles_ * nTiles_;
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        for (uint32_t tileId = blockIdx; tileId < totalTiles; tileId += blockNum) {
+            const uint32_t mi = tileId / nTiles_;
+            const uint32_t ni = tileId % nTiles_;
+
+            const uint32_t mStart = mi * tileM_;
+            const uint32_t nStart = ni * tileN_;
+            const uint32_t curM = AscendC::min((uint32_t)tileM_, M_ - mStart);
+            const uint32_t curN = AscendC::min((uint32_t)tileN_, N_ - nStart);
+
+            ComputeTile(mStart, nStart, curM, curN);
+        }
+    }
+
+private:
+    __aicore__ inline void LoadATile(AscendC::LocalTensor<float>& aUb,
+                                     uint32_t mStart, uint32_t kStart,
+                                     uint32_t curM, uint32_t curK)
+    {
+        // Copy A[mStart : mStart+curM, kStart : kStart+curK] into aUb row-major
+        for (uint32_t r = 0; r < curM; ++r) {
+            const uint32_t gmOff = (mStart + r) * K_ + kStart;
+            AscendC::DataCopy(aUb[r * tileK_], Agm_[gmOff], curK);
+        }
+    }
+
+    __aicore__ inline void LoadBTile(AscendC::LocalTensor<float>& bUb,
+                                     uint32_t kStart, uint32_t nStart,
+                                     uint32_t curK, uint32_t curN)
+    {
+        // Copy B[kStart : kStart+curK, nStart : nStart+curN] into bUb row-major
+        for (uint32_t r = 0; r < curK; ++r) {
+            const uint32_t gmOff = (kStart + r) * N_ + nStart;
+            AscendC::DataCopy(bUb[r * tileN_], Bgm_[gmOff], curN);
+        }
+    }
+
+    __aicore__ inline void StoreCTile(const AscendC::LocalTensor<float>& cUb,
+                                      uint32_t mStart, uint32_t nStart,
+                                      uint32_t curM, uint32_t curN)
+    {
+        for (uint32_t r = 0; r < curM; ++r) {
+            const uint32_t gmOff = (mStart + r) * N_ + nStart;
+            AscendC::DataCopy(Cgm_[gmOff], cUb[r * tileN_], curN);
+        }
+    }
+
+    __aicore__ inline float ReadLocalScalar(const AscendC::LocalTensor<float>& t, uint32_t offset)
+    {
+        // Read a scalar from local tensor (device local memory)
+        // AscendC provides GetValue to read scalar from LocalTensor
+        return t.GetValue(offset);
+    }
+
+    __aicore__ inline void ComputeTile(uint32_t mStart, uint32_t nStart,
+                                       uint32_t curM, uint32_t curN)
+    {
+        // Allocate C tile and zero-init
+        AscendC::LocalTensor<float> cUb = cBufQ_.AllocTensor<float>();
+        const uint32_t cSize = curM * tileN_; // allocate with max stride tileN_
+        // Zero initialize only curM*curN region row by row
+        for (uint32_t r = 0; r < curM; ++r) {
+            AscendC::LocalTensor<float> cRow = cUb[r * tileN_];
+            // cRow = 0
+            AscendC::Muls(cRow, cRow, 0.0f, curN);
+        }
+
+        // Reduction over K dimension by tileK
+        for (uint32_t kStart = 0; kStart < K_; kStart += tileK_) {
+            const uint32_t curK = AscendC::min((uint32_t)tileK_, K_ - kStart);
+
+            AscendC::LocalTensor<float> aUb = aBufQ_.AllocTensor<float>();
+            AscendC::LocalTensor<float> bUb = bBufQ_.AllocTensor<float>();
+            LoadATile(aUb, mStart, kStart, curM, curK);
+            LoadBTile(bUb, kStart, nStart, curK, curN);
+
+            // Compute: C[m, :] += sum_k A[m, k] * B[k, :]
+            for (uint32_t r = 0; r < curM; ++r) {
+                AscendC::LocalTensor<float> cRow = cUb[r * tileN_];
+                for (uint32_t kk = 0; kk < curK; ++kk) {
+                    const float aVal = ReadLocalScalar(aUb, r * tileK_ + kk);
+                    AscendC::LocalTensor<float> bRow = bUb[kk * tileN_];
+                    AscendC::LocalTensor<float> tmp = tmpQ_.AllocTensor<float>();
+                    AscendC::Muls(tmp, bRow, aVal, curN);
+                    AscendC::Add(cRow, cRow, tmp, curN);
+                    tmpQ_.FreeTensor(tmp);
+                }
+            }
+
+            aBufQ_.FreeTensor(aUb);
+            bBufQ_.FreeTensor(bUb);
+        }
+
+        StoreCTile(cUb, mStart, nStart, curM, curN);
+        cBufQ_.FreeTensor(cUb);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> aBufQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> bBufQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> cBufQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQ_;
+
+    AscendC::GlobalTensor<float> Agm_;
+    AscendC::GlobalTensor<float> Bgm_;
+    AscendC::GlobalTensor<float> Cgm_;
+
+    uint32_t M_{0}, N_{0}, K_{0};
+    uint32_t tileM_{0}, tileN_{0}, tileK_{0};
+    uint32_t mTiles_{0}, nTiles_{0};
+};
+
+extern "C" __global__ __aicore__ void matmul_with_irregular_shapes_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulWithIrregularShapesCustom op;
+    op.Init(A, B, C,
+            tiling_data.M, tiling_data.N, tiling_data.K,
+            tiling_data.tileM, tiling_data.tileN, tiling_data.tileK,
+            tiling_data.mTiles, tiling_data.nTiles);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor matmul_with_irregular_shapes_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    auto M = A.size(-2);
+    auto K = A.size(-1);
+    TORCH_CHECK(B.size(-2) == K, \"Incompatible shapes for matmul\");
+    auto N = B.size(-1);
+    at::Tensor result = at::empty({M, N}, A.options());
+    EXEC_NPU_CMD(aclnnMatmulWithIrregularShapesCustom, A, B, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"matmul_with_irregular_shapes_custom\", &matmul_with_irregular_shapes_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"matmul_with_irregular_shapes_custom\", &matmul_with_irregular_shapes_custom_impl_npu,
+          \"Matmul (MatmulWithIrregularShapesCustom on NPU)\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'matmul_with_irregular_shapes_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''

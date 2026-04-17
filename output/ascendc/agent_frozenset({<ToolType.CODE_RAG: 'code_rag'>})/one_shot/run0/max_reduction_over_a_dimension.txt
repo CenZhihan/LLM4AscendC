@@ -1,0 +1,385 @@
+project_json_src='''
+[
+  {
+    "op": "MaxReductionOverADimensionCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "dim",
+        "param_type": "required",
+        "type": "int"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MaxReductionOverADimensionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, outer);
+  TILING_DATA_FIELD_DEF(uint32_t, reduceDim);
+  TILING_DATA_FIELD_DEF(uint32_t, inner);
+  TILING_DATA_FIELD_DEF(uint32_t, tileInner);
+  TILING_DATA_FIELD_DEF(uint32_t, tasksPerOuter);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(int32_t, axis);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MaxReductionOverADimensionCustom, MaxReductionOverADimensionCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+#include "max_reduction_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) {
+    return (a == 0u) ? x : (x / a) * a;
+}
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (b == 0u) ? 0u : (a + b - 1u) / b;
+}
+static inline uint32_t Clamp(uint32_t v, uint32_t lo, uint32_t hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+} // anonymous namespace
+
+namespace optiling {
+
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;   // conservative per-core share
+static constexpr uint32_t ALIGN_ELEMS = 2048;             // favor larger vector alignment
+static constexpr uint32_t MIN_ALIGN_ELEMS = 256;          // minimal alignment for tails
+static constexpr uint32_t HARD_CAP_ELEMS = 65536;         // avoid too-large per-iter latency
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    MaxReductionOverADimensionCustomTilingData tiling;
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t *dimPtr = attrs->GetAttrPointer<int32_t>(0);
+
+    const gert::Shape *in_shape = context->GetInputShape(0);
+    const auto &ori = in_shape->GetOriginShape();
+
+    const int32_t rank = static_cast<int32_t>(ori.GetDimNum());
+    if (rank <= 0) {
+        // Degenerate case: scalar -> output is scalar
+        context->SetBlockDim(1);
+        tiling.set_outer(1);
+        tiling.set_reduceDim(1);
+        tiling.set_inner(1);
+        tiling.set_tileInner(1);
+        tiling.set_tasksPerOuter(1);
+        tiling.set_blockDim(1);
+        tiling.set_axis(0);
+        tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                            context->GetRawTilingData()->GetCapacity());
+        context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+        size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+        currentWorkspace[0] = 0;
+        return ge::GRAPH_SUCCESS;
+    }
+
+    int32_t axis = *dimPtr;
+    if (axis < 0) axis += rank;
+    if (axis < 0) axis = 0;
+    if (axis >= rank) axis = rank - 1;
+
+    uint64_t outer64 = 1, reduceDim64 = 1, inner64 = 1;
+    for (int32_t i = 0; i < axis; ++i) {
+        outer64 *= static_cast<uint64_t>(ori.GetDim(i));
+    }
+    reduceDim64 = static_cast<uint64_t>(ori.GetDim(axis));
+    for (int32_t i = axis + 1; i < rank; ++i) {
+        inner64 *= static_cast<uint64_t>(ori.GetDim(i));
+    }
+
+    // Cast down with safety
+    uint32_t outer = static_cast<uint32_t>(outer64 > UINT32_MAX ? UINT32_MAX : outer64);
+    uint32_t reduceDim = static_cast<uint32_t>(reduceDim64 > UINT32_MAX ? UINT32_MAX : reduceDim64);
+    uint32_t inner = static_cast<uint32_t>(inner64 > UINT32_MAX ? UINT32_MAX : inner64);
+
+    // tileInner from UB budget: two local buffers (accumulator + current slice)
+    uint32_t maxTile = UB_BUDGET_BYTES / (2u * sizeof(float));
+    maxTile = (maxTile > HARD_CAP_ELEMS) ? HARD_CAP_ELEMS : maxTile;
+    if (maxTile >= ALIGN_ELEMS) {
+        maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    } else if (maxTile >= MIN_ALIGN_ELEMS) {
+        maxTile = AlignDown(maxTile, MIN_ALIGN_ELEMS);
+    } else if (maxTile == 0) {
+        maxTile = 1;
+    }
+
+    uint32_t tileInner = maxTile;
+    if (inner > 0 && inner < tileInner) {
+        // align down but ensure at least 1
+        uint32_t aligned = (inner >= MIN_ALIGN_ELEMS) ? AlignDown(inner, MIN_ALIGN_ELEMS) : inner;
+        tileInner = (aligned > 0) ? aligned : 1u;
+    }
+    if (tileInner == 0) tileInner = 1u;
+
+    uint32_t tasksPerOuter = (inner == 0) ? 1u : CeilDiv(inner, tileInner);
+    uint64_t totalTasks64 = static_cast<uint64_t>(outer) * static_cast<uint64_t>(tasksPerOuter);
+    uint32_t totalTasks = (totalTasks64 > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(totalTasks64);
+
+    uint32_t blockDim = Clamp(totalTasks, 1u, 24u);
+    if (blockDim < 8u && totalTasks >= 8u) blockDim = 8u;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_outer(outer);
+    tiling.set_reduceDim(reduceDim);
+    tiling.set_inner(inner);
+    tiling.set_tileInner(tileInner);
+    tiling.set_tasksPerOuter(tasksPerOuter);
+    tiling.set_blockDim(blockDim);
+    tiling.set_axis(axis);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const auto &ori = x_shape->GetOriginShape();
+
+    const ge::Shape *attr_shape_unused = nullptr;
+    (void)attr_shape_unused;
+
+    const int32_t rank = static_cast<int32_t>(ori.GetDimNum());
+    gert::Shape *y_shape = context->GetOutputShape(0);
+
+    if (rank <= 0) {
+        // Scalar: output is scalar
+        std::vector<int64_t> out_dims;
+        y_shape->SetDimNum(0);
+        return GRAPH_SUCCESS;
+    }
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t *dimPtr = attrs->GetAttrPointer<int32_t>(0);
+
+    int32_t axis = *dimPtr;
+    if (axis < 0) axis += rank;
+    if (axis < 0) axis = 0;
+    if (axis >= rank) axis = rank - 1;
+
+    std::vector<int64_t> out_dims;
+    out_dims.reserve(static_cast<size_t>(rank - 1));
+    for (int32_t i = 0; i < rank; ++i) {
+        if (i == axis) continue;
+        out_dims.push_back(static_cast<int64_t>(ori.GetDim(i)));
+    }
+
+    gert::Shape new_shape;
+    new_shape.SetDimNum(out_dims.size());
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        new_shape.SetDim(i, out_dims[i]);
+    }
+    *y_shape = new_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class MaxReductionOverADimensionCustom : public OpDef {
+public:
+    explicit MaxReductionOverADimensionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("dim").AttrType(REQUIRED).Int();
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MaxReductionOverADimensionCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+class KernelMaxReductionOverADimensionCustom {
+public:
+    __aicore__ inline KernelMaxReductionOverADimensionCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t outer, uint32_t reduceDim, uint32_t inner,
+                                uint32_t tileInner, uint32_t tasksPerOuter)
+    {
+        outer_ = outer;
+        reduceDim_ = reduceDim;
+        inner_ = inner;
+        tileInner_ = tileInner;
+        tasksPerOuter_ = tasksPerOuter;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint64_t>(outer_) * reduceDim_ * inner_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint64_t>(outer_) * inner_);
+
+        pipe_.InitBuffer(calcQ_, 2, tileInner_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (outer_ == 0 || inner_ == 0) {
+            return;
+        }
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        const uint64_t totalTasks = static_cast<uint64_t>(outer_) * static_cast<uint64_t>(tasksPerOuter_);
+
+        for (uint64_t task = blockIdx; task < totalTasks; task += blockNum) {
+            uint32_t outerIdx = static_cast<uint32_t>(task / tasksPerOuter_);
+            uint32_t innerTileIdx = static_cast<uint32_t>(task % tasksPerOuter_);
+
+            uint32_t innerStart = innerTileIdx * tileInner_;
+            if (innerStart >= inner_) continue;
+            uint32_t curLen = inner_ - innerStart;
+            if (curLen > tileInner_) curLen = tileInner_;
+
+            // Base offsets in GM for this outer row
+            uint64_t rowBase = static_cast<uint64_t>(outerIdx) * static_cast<uint64_t>(reduceDim_) * static_cast<uint64_t>(inner_);
+            uint64_t yBase = static_cast<uint64_t>(outerIdx) * static_cast<uint64_t>(inner_) + innerStart;
+
+            // Allocate accumulator and initialize with first slice (k=0)
+            AscendC::LocalTensor<float> yLocal = calcQ_.AllocTensor<float>();
+            {
+                uint64_t xOffset0 = rowBase + static_cast<uint64_t>(0) * static_cast<uint64_t>(inner_) + innerStart;
+                AscendC::DataCopy(yLocal, xGm_[xOffset0], curLen);
+            }
+
+            // Iterate remaining slices and compute max
+            for (uint32_t k = 1; k < reduceDim_; ++k) {
+                AscendC::LocalTensor<float> xLocal = calcQ_.AllocTensor<float>();
+                uint64_t xOffset = rowBase + static_cast<uint64_t>(k) * static_cast<uint64_t>(inner_) + innerStart;
+                AscendC::DataCopy(xLocal, xGm_[xOffset], curLen);
+                AscendC::Max(yLocal, yLocal, xLocal, curLen);
+                calcQ_.FreeTensor(xLocal);
+            }
+
+            // Write result to GM
+            AscendC::DataCopy(yGm_[yBase], yLocal, curLen);
+            calcQ_.FreeTensor(yLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 2> calcQ_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t outer_ {0};
+    uint32_t reduceDim_ {0};
+    uint32_t inner_ {0};
+    uint32_t tileInner_ {0};
+    uint32_t tasksPerOuter_ {0};
+};
+
+extern "C" __global__ __aicore__ void max_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMaxReductionOverADimensionCustom op;
+    op.Init(x, y,
+            tiling_data.outer,
+            tiling_data.reduceDim,
+            tiling_data.inner,
+            tiling_data.tileInner,
+            tiling_data.tasksPerOuter);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor max_reduction_over_a_dimension_impl_npu(const at::Tensor& self, int64_t dim) {
+    at::Tensor result = at::empty(self.sizes().vec().erase(self.sizes().vec().begin() + (dim < 0 ? (dim + self.dim()) : dim)), self.options());
+    // The custom ACLNN entry is expected to be generated from the operator registration.
+    // Signature: (input: Tensor, dim: int, output: Tensor)
+    EXEC_NPU_CMD(aclnnMaxReductionOverADimensionCustom, self, static_cast<int>(dim), result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("max_reduction_over_a_dimension_custom", &max_reduction_over_a_dimension_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("max_reduction_over_a_dimension_custom", &max_reduction_over_a_dimension_impl_npu,
+          "Max reduction along a specified dimension (MaxReductionOverADimensionCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'max_reduction_over_a_dimension_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, self.dim)
+'''

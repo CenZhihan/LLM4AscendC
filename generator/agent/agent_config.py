@@ -294,7 +294,7 @@ def get_llm_config_compatible() -> dict:
     if os.environ.get("USE_API_CONFIG", "").strip().lower() in ("1", "true"):
         import importlib.util
         _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        local_config_path = os.path.join(_project_root, "generation", "local_api_config.py")
+        local_config_path = os.path.join(_project_root, "generator", "local_api_config.py")
         if os.path.exists(local_config_path):
             try:
                 spec = importlib.util.spec_from_file_location("local_api_config", local_config_path)

@@ -14,21 +14,17 @@ from generator.agent import (
     generate_kernel_with_agent,
     KernelGenerationTask,
 )
-from generator.agent.agent_config import parse_tool_mode
+from generator.agent.agent_config import parse_tool_mode, AgentToolMode, has_code_rag
+from generator.agent.retrievers.code_retriever import CodeRetriever
 from generator.dataset import dataset
-from generator.rag import EmbeddingRetriever
 from generator.config import rag_index_path, rag_embedding_model
 
 
 def _load_code_retriever():
     """Pre-load Code RAG retriever for parallel generation."""
-    retriever = EmbeddingRetriever(
-        index_path=rag_index_path,
-        model_name=rag_embedding_model,
-        devices=['cpu']
-    )
-    if retriever.load_index():
-        print(f"[INFO] Code RAG index loaded: {len(retriever.index['chunks'])} chunks")
+    retriever = CodeRetriever(devices=['cpu'])
+    if retriever.is_available():
+        print(f"[INFO] Code RAG retriever loaded")
         return retriever
     else:
         print("[WARN] Failed to load Code RAG index")
@@ -40,7 +36,7 @@ def _generate_one_op(
     category: str,
     out_dir: str,
     tool_mode: AgentToolMode,
-    code_retriever: EmbeddingRetriever,
+    code_retriever: CodeRetriever,
     strategy: str,
 ):
     """Single operator generation task."""
@@ -149,7 +145,7 @@ def main():
     strategy = args.strategy
     workers = args.workers
 
-    print(f"[INFO] Tool mode: {tool_mode.value}")
+    print(f"[INFO] Tool mode: {', '.join(t.name for t in sorted(tool_mode, key=lambda t: t.name))}")
     print(f"[INFO] Strategy: {strategy}")
     print(f"[INFO] Workers: {workers}")
     print(f"[INFO] Categories: {args.categories}")
@@ -169,7 +165,7 @@ def main():
 
     # Pre-load Code RAG retriever if needed
     code_retriever = None
-    if tool_mode.has_code_rag():
+    if has_code_rag(tool_mode):
         print("[INFO] Loading Code RAG retriever...")
         code_retriever = _load_code_retriever()
 
@@ -186,7 +182,7 @@ def main():
         if args.output_dir:
             out_dir = args.output_dir
         else:
-            out_dir = f"output/ascendc/agent_{tool_mode.value}/{strategy}/run{run}"
+            out_dir = f"output/ascendc/agent_{str(tool_mode)}/{strategy}/run{run}"
 
         os.makedirs(out_dir, exist_ok=True)
         print(f"[INFO] Output directory: {out_dir}")

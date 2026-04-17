@@ -42,8 +42,8 @@ def get_default_model():
     """
     if os.environ.get('USE_API_CONFIG'):
         import importlib.util
-        # Try generation/local_api_config.py first
-        local_config_path = os.path.join(_generator_root, 'generation', 'local_api_config.py')
+        # Try generator/local_api_config.py first
+        local_config_path = os.path.join(_generator_root, 'generator', 'local_api_config.py')
         if os.path.exists(local_config_path):
             try:
                 spec = importlib.util.spec_from_file_location("local_api_config", local_config_path)

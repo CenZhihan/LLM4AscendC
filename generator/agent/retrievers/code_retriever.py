@@ -44,21 +44,36 @@ class CodeRetriever:
         """
         self.index_path = index_path or rag_index_path
         self.model_name = model_name or rag_embedding_model
+        # Ensure absolute paths (sentence_transformers may resolve relative to CWD)
+        if not os.path.isabs(self.model_name):
+            self.model_name = os.path.abspath(self.model_name)
+        if not os.path.isabs(self.index_path):
+            self.index_path = os.path.abspath(self.index_path)
         self.top_k = top_k or rag_top_k
         self.max_chars = max_chars or rag_max_chars
         self.devices = devices or ['cpu']  # Default to CPU to avoid NPU issues
 
         self._retriever: Optional[EmbeddingRetriever] = None
         self._loaded = False
+        self._lock = __import__('threading').Lock()
 
     def _ensure_retriever(self) -> EmbeddingRetriever:
         """Ensure EmbeddingRetriever is initialized and loaded."""
         if self._retriever is None:
-            self._retriever = EmbeddingRetriever(
-                index_path=self.index_path,
-                model_name=self.model_name,
-                devices=self.devices,
-            )
+            with self._lock:
+                if self._retriever is None:  # Double-check under lock
+                    # Defensive: ensure absolute paths
+                    model_path = self.model_name
+                    if not os.path.isabs(model_path):
+                        model_path = os.path.abspath(model_path)
+                    index_path = self.index_path
+                    if not os.path.isabs(index_path):
+                        index_path = os.path.abspath(index_path)
+                    self._retriever = EmbeddingRetriever(
+                        index_path=index_path,
+                        model_name=model_path,
+                        devices=self.devices,
+                    )
         if not self._loaded:
             self._loaded = self._retriever.load_index()
             if not self._loaded:

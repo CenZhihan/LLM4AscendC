@@ -1,0 +1,522 @@
+project_json_src='''
+[
+  {
+    "op": "Conv2dMinAddMultiplyCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["NCHW"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["NCHW"],
+        "type": ["float"]
+      },
+      {
+        "name": "conv_bias",
+        "param_type": "optional",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "post_bias",
+        "param_type": "required",
+        "format": ["NCHW", "ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "constant_value",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "scaling_factor",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["NCHW"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "has_bias",
+        "param_type": "optional",
+        "type": "bool",
+        "default_value": "false"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv2dMinAddMultiplyCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cin);
+  TILING_DATA_FIELD_DEF(uint32_t, cout);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, ho);
+  TILING_DATA_FIELD_DEF(uint32_t, wo);
+  TILING_DATA_FIELD_DEF(uint32_t, tileW);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint32_t, hasBiasFlag);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv2dMinAddMultiplyCustom, Conv2dMinAddMultiplyCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "conv2d_min_add_multiply_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // per-core conservative UB share
+static constexpr uint32_t ALIGN_ELEMS = 128;             // prefer 128-aligned lengths for DMA/vector
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return (x / a) * a;
+}
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (a + b - 1u) / b;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    Conv2dMinAddMultiplyCustomTilingData tiling;
+
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+
+    const uint32_t n = static_cast<uint32_t>(x_shape->GetDim(0));
+    const uint32_t cin = static_cast<uint32_t>(x_shape->GetDim(1));
+    const uint32_t h = static_cast<uint32_t>(x_shape->GetDim(2));
+    const uint32_t w = static_cast<uint32_t>(x_shape->GetDim(3));
+
+    const uint32_t cout = static_cast<uint32_t>(w_shape->GetDim(0));
+    const uint32_t kH = static_cast<uint32_t>(w_shape->GetDim(2));
+    const uint32_t kW = static_cast<uint32_t>(w_shape->GetDim(3));
+    // We assume square kernels with stride=1, dilation=1, padding=0
+    const uint32_t k = kH;  // == kW
+
+    const uint32_t ho = (h >= k) ? (h - k + 1) : 0;
+    const uint32_t wo = (w >= k) ? (w - k + 1) : 0;
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const bool *hasBiasPtr = attrs->GetAttrPointer<bool>(0);
+    const bool hasBias = (hasBiasPtr != nullptr) ? *hasBiasPtr : false;
+
+    // UB requirement per width tile: yBuf + xBuf + tmpBuf + wVec = 4 * tileW floats -> bytes = 16 * tileW
+    uint32_t maxTile = UB_BUDGET_BYTES / 16;
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t tileW = (wo == 0) ? ALIGN_ELEMS : maxTile;
+    if (wo < tileW) {
+        const uint32_t aligned = AlignDown(wo, ALIGN_ELEMS);
+        tileW = (aligned > 0) ? aligned : wo;
+    }
+
+    // Task parallelism across (n, cout, ho)
+    const uint32_t totalTasks = (ho == 0) ? 1u : (n * cout * ho);
+    uint32_t blockDim = totalTasks;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_n(n);
+    tiling.set_cin(cin);
+    tiling.set_cout(cout);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_k(k);
+    tiling.set_ho(ho);
+    tiling.set_wo(wo);
+    tiling.set_tileW(tileW);
+    tiling.set_blockDim(blockDim);
+    tiling.set_hasBiasFlag(hasBias ? 1u : 0u);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+
+    const int64_t N = x_shape->GetDim(0);
+    const int64_t Cin = x_shape->GetDim(1);
+    const int64_t H = x_shape->GetDim(2);
+    const int64_t W = x_shape->GetDim(3);
+
+    const int64_t Cout = w_shape->GetDim(0);
+    const int64_t K = w_shape->GetDim(2); // assume square kernels and stride=1, pad=0, dil=1
+
+    const int64_t Ho = (H >= K) ? (H - K + 1) : 0;
+    const int64_t Wo = (W >= K) ? (W - K + 1) : 0;
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(4);
+    y_shape->SetDim(0, N);
+    y_shape->SetDim(1, Cout);
+    y_shape->SetDim(2, Ho);
+    y_shape->SetDim(3, Wo);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class Conv2dMinAddMultiplyCustom : public OpDef {
+public:
+    explicit Conv2dMinAddMultiplyCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+
+        this->Input("conv_bias")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("post_bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("constant_value")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("scaling_factor")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+
+        this->Attr("has_bias").AttrType(OPTIONAL).Bool(false);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv2dMinAddMultiplyCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelConv2dMinAddMultiplyCustom {
+public:
+    __aicore__ inline KernelConv2dMinAddMultiplyCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR conv_bias,
+                                GM_ADDR post_bias, GM_ADDR constant_value,
+                                GM_ADDR scaling_factor, GM_ADDR y,
+                                uint32_t n, uint32_t cin, uint32_t cout,
+                                uint32_t h, uint32_t w, uint32_t k,
+                                uint32_t ho, uint32_t wo, uint32_t tileW,
+                                uint32_t hasBiasFlag)
+    {
+        n_ = n; cin_ = cin; cout_ = cout;
+        h_ = h; w_ = w; k_ = k;
+        ho_ = ho; wo_ = wo; tileW_ = tileW;
+        hasBias_ = (hasBiasFlag != 0u);
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, n_ * cin_ * h_ * w_);
+        wGm_.SetGlobalBuffer((__gm__ float*)weight, cout_ * cin_ * k_ * k_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, n_ * cout_ * ho_ * wo_);
+
+        if (hasBias_) {
+            bGm_.SetGlobalBuffer((__gm__ float*)conv_bias, cout_);
+        }
+        pbGm_.SetGlobalBuffer((__gm__ float*)post_bias, cout_ * 1 * 1);
+        cvGm_.SetGlobalBuffer((__gm__ float*)constant_value, 1);
+        sfGm_.SetGlobalBuffer((__gm__ float*)scaling_factor, 1);
+
+        pipe_.InitBuffer(bufIn_, BUFFER_NUM, tileW_ * sizeof(float));
+        pipe_.InitBuffer(bufTmp_, BUFFER_NUM, tileW_ * sizeof(float));
+        pipe_.InitBuffer(bufOut_, BUFFER_NUM, tileW_ * sizeof(float));
+        pipe_.InitBuffer(bufWvec_, 1, tileW_ * sizeof(float));
+        pipe_.InitBuffer(bufScalar_, 1, sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (ho_ == 0 || wo_ == 0 || tileW_ == 0) return;
+
+        float cv = LoadScalar(cvGm_, 0);
+        float sf = LoadScalar(sfGm_, 0);
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        const uint32_t totalTasks = n_ * cout_ * ho_;
+        for (uint32_t task = blockIdx; task < totalTasks; task += blockNum) {
+            const uint32_t nIdx = task / (cout_ * ho_);
+            const uint32_t rem1 = task % (cout_ * ho_);
+            const uint32_t co = rem1 / ho_;
+            const uint32_t hoIdx = rem1 % ho_;
+
+            const float bias = hasBias_ ? LoadScalar(bGm_, co) : 0.0f;
+            const float postb = LoadPostBias(co); // pb[co,1,1]
+
+            for (uint32_t wStart = 0; wStart < wo_; wStart += tileW_) {
+                uint32_t len = wo_ - wStart;
+                if (len > tileW_) len = tileW_;
+
+                AscendC::LocalTensor<float> yBuf = bufOut_.AllocTensor<float>();
+                bool firstAccum = true;
+
+                // Accumulate convolution
+                for (uint32_t ci = 0; ci < cin_; ++ci) {
+                    for (uint32_t ky = 0; ky < k_; ++ky) {
+                        for (uint32_t kx = 0; kx < k_; ++kx) {
+                            // Load x slice [len] contiguous along width
+                            AscendC::LocalTensor<float> xBuf = bufIn_.AllocTensor<float>();
+                            const uint32_t xBase = IndexX(nIdx, ci, hoIdx + ky, wStart + kx);
+                            AscendC::DataCopy(xBuf, xGm_[xBase], len);
+
+                            // Load weight scalar and duplicate to vector
+                            const uint32_t wBase = IndexW(co, ci, ky, kx);
+                            float wVal = LoadScalar(wGm_, wBase);
+                            AscendC::LocalTensor<float> wVec = bufWvec_.AllocTensor<float>();
+                            AscendC::Dup(wVec, wVal, len);
+
+                            // temp = xBuf * wVec
+                            AscendC::LocalTensor<float> tmp = bufTmp_.AllocTensor<float>();
+                            AscendC::Mul(tmp, xBuf, wVec, len);
+
+                            if (firstAccum) {
+                                AscendC::DataCopy(yBuf, tmp, len);
+                                firstAccum = false;
+                            } else {
+                                AscendC::Add(yBuf, yBuf, tmp, len);
+                            }
+
+                            bufTmp_.FreeTensor(tmp);
+                            bufWvec_.FreeTensor(wVec);
+                            bufIn_.FreeTensor(xBuf);
+                        }
+                    }
+                }
+
+                // Add conv bias if any
+                if (hasBias_ && bias != 0.0f) {
+                    AscendC::Adds(yBuf, yBuf, bias, len);
+                }
+
+                // Clip to constant_value
+                AscendC::Mins(yBuf, yBuf, cv, len);
+
+                // Add post_bias per output channel
+                if (postb != 0.0f) {
+                    AscendC::Adds(yBuf, yBuf, postb, len);
+                }
+
+                // Scale
+                AscendC::Muls(yBuf, yBuf, sf, len);
+
+                // Store back
+                const uint32_t yBase = IndexY(nIdx, co, hoIdx, wStart);
+                AscendC::DataCopy(yGm_[yBase], yBuf, len);
+                bufOut_.FreeTensor(yBuf);
+            }
+        }
+    }
+
+private:
+    __aicore__ inline uint32_t IndexX(uint32_t n, uint32_t c, uint32_t h, uint32_t w) const
+    {
+        return (((n * cin_ + c) * h_ + h) * w_ + w);
+    }
+
+    __aicore__ inline uint32_t IndexW(uint32_t co, uint32_t ci, uint32_t ky, uint32_t kx) const
+    {
+        return (((co * cin_ + ci) * k_ + ky) * k_ + kx);
+    }
+
+    __aicore__ inline uint32_t IndexY(uint32_t n, uint32_t c, uint32_t h, uint32_t w) const
+    {
+        return (((n * cout_ + c) * ho_ + h) * wo_ + w);
+    }
+
+    __aicore__ inline float LoadScalar(const AscendC::GlobalTensor<float>& gm, uint32_t idx)
+    {
+        AscendC::LocalTensor<float> t = bufScalar_.AllocTensor<float>();
+        AscendC::DataCopy(t, gm[idx], 1);
+        float v = t.GetValue(0);
+        bufScalar_.FreeTensor(t);
+        return v;
+    }
+
+    __aicore__ inline float LoadPostBias(uint32_t co)
+    {
+        // post_bias is [Cout,1,1] laid out as Cout elements
+        return LoadScalar(pbGm_, co);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> bufIn_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> bufTmp_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> bufOut_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> bufWvec_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> bufScalar_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> yGm_;
+    AscendC::GlobalTensor<float> bGm_;
+    AscendC::GlobalTensor<float> pbGm_;
+    AscendC::GlobalTensor<float> cvGm_;
+    AscendC::GlobalTensor<float> sfGm_;
+
+    uint32_t n_{0}, cin_{0}, cout_{0};
+    uint32_t h_{0}, w_{0}, k_{0};
+    uint32_t ho_{0}, wo_{0}, tileW_{0};
+    bool hasBias_{false};
+};
+
+extern "C" __global__ __aicore__ void conv2d_min_add_multiply_custom(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR conv_bias, GM_ADDR post_bias,
+    GM_ADDR constant_value, GM_ADDR scaling_factor, GM_ADDR y,
+    GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv2dMinAddMultiplyCustom op;
+    op.Init(x, weight, conv_bias, post_bias, constant_value, scaling_factor, y,
+            tiling_data.n, tiling_data.cin, tiling_data.cout,
+            tiling_data.h, tiling_data.w, tiling_data.k,
+            tiling_data.ho, tiling_data.wo, tiling_data.tileW,
+            tiling_data.hasBiasFlag);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor conv2d_min_add_multiply_impl_npu(const at::Tensor& x,
+                                            const at::Tensor& weight,
+                                            c10::optional<at::Tensor> conv_bias_opt,
+                                            const at::Tensor& post_bias,
+                                            const at::Tensor& constant_value,
+                                            const at::Tensor& scaling_factor) {
+    at::Tensor result;
+
+    // Infer output shape: N, Cout, H-K+1, W-K+1 (stride=1, pad=0, dil=1)
+    const auto N = x.size(0);
+    const auto Cin = x.size(1);
+    const auto H = x.size(2);
+    const auto W = x.size(3);
+    const auto Cout = weight.size(0);
+    const auto K = weight.size(2);
+    const auto Ho = H - K + 1;
+    const auto Wo = W - K + 1;
+
+    result = at::empty({N, Cout, Ho, Wo}, x.options());
+
+    const bool has_bias = conv_bias_opt.has_value();
+    at::Tensor conv_bias = has_bias ? conv_bias_opt.value() : at::Tensor();
+
+    EXEC_NPU_CMD(aclnnConv2dMinAddMultiplyCustom,
+                 x, weight, conv_bias, post_bias, constant_value, scaling_factor,
+                 has_bias, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv2d_min_add_multiply_custom", &conv2d_min_add_multiply_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv2d_min_add_multiply_custom", &conv2d_min_add_multiply_impl_npu,
+          "Conv2D -> Min(clip) -> Add post-bias -> Multiply scaling (Conv2dMinAddMultiplyCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'conv2d_min_add_multiply_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x, weight, conv_bias_opt, post_bias, constant_value, scaling_factor):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, weight, conv_bias_opt, post_bias, constant_value, scaling_factor)
+'''
