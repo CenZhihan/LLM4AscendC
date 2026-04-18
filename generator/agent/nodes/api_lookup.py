@@ -85,7 +85,12 @@ def api_lookup_node(
 
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "API_LOOKUP", "query": f"API: {api_name}", "response": display_text}
+    log_entry = {
+        "round": round_num,
+        "tool": "api_lookup",
+        "query": f"API: {api_name}",
+        "response": display_text,
+    }
 
     print(f"[Round {round_num}] 工具=API签名查询(API_LOOKUP), API=\"{api_name}\"")
 

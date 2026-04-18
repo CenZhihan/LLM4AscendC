@@ -83,7 +83,7 @@ def env_check_env_node(
     round_num = state.get("query_round_count", 0) + 1
     query = state.get("current_query", "check environment")
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "ENV_CHECK_ENV", "query": query, "response": display_text}
+    log_entry = {"round": round_num, "tool": "env_check_env", "query": query, "response": display_text}
 
     print(f"[Round {round_num}] 工具=环境检查(ENV_CHECK_ENV), 查询=\"{query[:100]}\"")
 
@@ -123,7 +123,7 @@ def env_check_npu_node(
     round_num = state.get("query_round_count", 0) + 1
     query = state.get("current_query", "query npu devices")
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "ENV_CHECK_NPU", "query": query, "response": display_text}
+    log_entry = {"round": round_num, "tool": "env_check_npu", "query": query, "response": display_text}
 
     print(f"[Round {round_num}] 工具=NPU查询(ENV_CHECK_NPU), 查询=\"{query[:100]}\"")
 
@@ -164,7 +164,12 @@ def env_check_api_node(
     result = env_retriever.check_api_exists(api_name)
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "ENV_CHECK_API", "query": f"API: {api_name}", "response": display_text}
+    log_entry = {
+        "round": round_num,
+        "tool": "env_check_api",
+        "query": f"API: {api_name}",
+        "response": display_text,
+    }
 
     print(f"[Round {round_num}] 工具=API检查(ENV_CHECK_API), API=\"{api_name}\"")
 

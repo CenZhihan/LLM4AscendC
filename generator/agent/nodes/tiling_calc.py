@@ -91,7 +91,7 @@ def tiling_calc_node(
 
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "TILING_CALC", "query": query, "response": display_text}
+    log_entry = {"round": round_num, "tool": "tiling_calc", "query": query, "response": display_text}
 
     print(f"[Round {round_num}] 工具=Tiling计算(TILING_CALC), params={params}")
 

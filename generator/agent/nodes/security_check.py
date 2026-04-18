@@ -76,7 +76,12 @@ def security_check_node(
 
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "SECURITY_CHECK", "query": query[:100], "response": display_text}
+    log_entry = {
+        "round": round_num,
+        "tool": "security_check",
+        "query": query[:100],
+        "response": display_text,
+    }
 
     print(f"[Round {round_num}] 工具=安全检查(SECURITY_CHECK), safe={result.safe}, issues={len(result.issues)}")
 

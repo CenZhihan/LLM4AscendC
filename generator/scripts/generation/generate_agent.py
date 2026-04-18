@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # 使用智能体生成算子 Kernel（支持 KB、Web、Code RAG 多源检索）
 import os
 import sys
@@ -14,7 +16,12 @@ from generator.agent import (
     generate_kernel_with_agent,
     KernelGenerationTask,
 )
-from generator.agent.agent_config import parse_tool_mode, AgentToolMode, has_code_rag, tool_mode_to_string
+from generator.agent.agent_config import (
+    parse_tool_mode,
+    AgentToolMode,
+    has_code_rag,
+    tool_mode_to_string,
+)
 from generator.agent.retrievers.code_retriever import CodeRetriever
 from generator.dataset import dataset
 from generator.config import rag_index_path, rag_embedding_model
@@ -93,9 +100,10 @@ def main():
         "--tool-mode",
         type=str,
         default="no_tool",
-        choices=["no_tool", "kb_only", "web_only", "code_rag_only",
-                 "kb_and_web", "kb_and_code_rag", "web_and_code_rag", "all"],
-        help="检索工具模式 (默认: no_tool)"
+        help=(
+            "检索工具模式：预置名 no_tool/kb_only/web_only/.../all，"
+            "或逗号分隔列表如 kb,web,code_rag 及已注册的插件名（如 kb,my_plugin）。"
+        ),
     )
     parser.add_argument(
         "--strategy",
@@ -141,11 +149,16 @@ def main():
 
     args = parser.parse_args()
 
-    tool_mode = parse_tool_mode(args.tool_mode)
+    try:
+        tool_mode = parse_tool_mode(args.tool_mode)
+    except ValueError as e:
+        print(f"[ERROR] Invalid --tool-mode: {e}")
+        raise SystemExit(2) from e
     strategy = args.strategy
     workers = args.workers
 
-    print(f"[INFO] Tool mode: {', '.join(t.name for t in sorted(tool_mode, key=lambda t: t.name))}")
+    tool_labels = [str(t) for t in sorted(tool_mode)]
+    print(f"[INFO] Tool mode: {', '.join(tool_labels)}")
     print(f"[INFO] Strategy: {strategy}")
     print(f"[INFO] Workers: {workers}")
     print(f"[INFO] Categories: {args.categories}")

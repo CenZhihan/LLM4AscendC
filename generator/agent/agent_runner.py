@@ -67,7 +67,7 @@ def _build_base_prompt(language: str, strategy_name: str, op: str) -> str:
         return strategy.generate(op)
 
     # Fallback: simple prompt
-    return f"请为 {op} 算子编写一个 {language} Kernel 实现。"
+    return f"Write a {language} kernel implementation for the `{op}` operator."
 
 
 def _add_kb_hint(prompt: str) -> str:
@@ -91,6 +91,21 @@ def _extract_final_answer(final_state: Dict[str, Any]) -> str:
 
 def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
     """Build detailed report from final state."""
+    parse_errors = final_state.get("tool_choice_error_log", [])
+
+    def _summarize_parse_entry(e: Dict[str, Any]) -> Dict[str, Any]:
+        raw = e.get("raw_model_output") or ""
+        if len(raw) > 2000:
+            raw = raw[:2000] + "...(truncated)"
+        return {
+            "kind": e.get("kind"),
+            "round": e.get("round"),
+            "error": e.get("error"),
+            "parsed_tool_field": e.get("parsed_tool_field"),
+            "raw_model_output": raw,
+            "ts": e.get("ts"),
+        }
+
     return {
         "reasoning_content": final_state.get("reasoning_content", ""),
         "answer": _extract_final_answer(final_state),
@@ -99,10 +114,13 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
                 "round": t.get("round"),
                 "tool": t.get("tool", ""),
                 "query": t.get("query", ""),
-                "response": t.get("response", "")[:500] + "..." if len(t.get("response", "")) > 500 else t.get("response", ""),
+                "response": t.get("response", "")[:500] + "..."
+                if len(t.get("response", "")) > 500
+                else t.get("response", ""),
             }
             for t in final_state.get("tool_calls_log", [])
         ],
+        "tool_choice_parse_errors": [_summarize_parse_entry(x) for x in parse_errors],
         "kb_results_count": len(final_state.get("kb_results", [])),
         "web_results_count": len(final_state.get("web_results", [])),
         "code_rag_results_count": len(final_state.get("code_rag_results", [])),
@@ -120,7 +138,7 @@ def generate_kernel_with_agent(
 
     Args:
         task: KernelGenerationTask with language, op, strategy_name, category
-        tool_mode: Tool mode (FrozenSet[ToolType] or string like "kb_only", "kb,web", "all")
+        tool_mode: Tool mode (``frozenset`` of tool keys or string like ``\"kb_only\"``, ``\"kb,web\"``, ``\"all\"``)
         retriever: Optional pre-loaded CodeRetriever for Code RAG
         llm_config: Optional LLM config (api_key, base_url, model)
 
@@ -197,7 +215,7 @@ def generate_ascendc_kernel(
         op: Operator name
         category: Operator category
         strategy: Prompt strategy
-        tool_mode: Tool mode (string like "kb_only", "kb,web", "all" or FrozenSet[ToolType])
+        tool_mode: Tool mode (string preset or comma list, or ``frozenset`` of tool keys)
 
     Returns:
         Generated kernel code

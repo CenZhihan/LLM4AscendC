@@ -54,24 +54,69 @@ def _openai_completion_stream(
 
 
 def _format_retrieved_content(state: GeneratorAgentState) -> str:
-    """Format all retrieved content for the prompt."""
+    """Format all retrieved content for the prompt (aligned with choose_tool summaries)."""
     kb_results = state.get("kb_results", [])
     web_results = state.get("web_results", [])
     code_rag_results = state.get("code_rag_results", [])
+    env_check_results = state.get("env_check_results", [])
+    kb_shell_results = state.get("kb_shell_search_results", [])
+    api_lookup_results = state.get("api_lookup_results", [])
+    api_constraint_results = state.get("api_constraint_results", [])
+    api_alternative_results = state.get("api_alternative_results", [])
+    tiling_calc_results = state.get("tiling_calc_results", [])
+    tiling_validate_results = state.get("tiling_validate_results", [])
+    npu_arch_results = state.get("npu_arch_results", [])
+    code_style_results = state.get("code_style_results", [])
+    security_check_results = state.get("security_check_results", [])
+    registered_tool_results = state.get("registered_tool_results", [])
 
     parts: list = []
 
     if kb_results:
-        kb_text = "\n\n".join(kb_results)
-        parts.append(f"【知识库检索结果（Ascend C API 文档）】\n{kb_text}")
+        kb_text = "\n\n".join(kb_results[:6])
+        parts.append(f"[KB retrieval — Ascend C API docs]\n{kb_text}")
 
     if web_results:
-        web_text = "\n\n".join(web_results)
-        parts.append(f"【网页搜索结果】\n{web_text}")
+        web_text = "\n\n".join(web_results[:6])
+        parts.append(f"[Web search results]\n{web_text}")
 
     if code_rag_results:
-        code_text = "\n\n".join(code_rag_results)
-        parts.append(f"【代码检索结果】\n{code_text}")
+        code_text = "\n\n".join(code_rag_results[:4])
+        parts.append(f"[Code RAG retrieval]\n{code_text}")
+
+    if env_check_results:
+        env_text = "\n\n".join(env_check_results[:4])
+        parts.append(f"[Environment checks]\n{env_text}")
+
+    if kb_shell_results:
+        parts.append("[KB shell search]\n" + "\n\n".join(kb_shell_results[:4]))
+
+    if api_lookup_results:
+        parts.append("[API signature lookup]\n" + "\n\n".join(api_lookup_results[:4]))
+
+    if api_constraint_results:
+        parts.append("[API constraint check]\n" + "\n\n".join(api_constraint_results[:4]))
+
+    if api_alternative_results:
+        parts.append("[API alternatives]\n" + "\n\n".join(api_alternative_results[:4]))
+
+    if tiling_calc_results:
+        parts.append("[Tiling calculation]\n" + "\n\n".join(tiling_calc_results[:4]))
+
+    if tiling_validate_results:
+        parts.append("[Tiling validation]\n" + "\n\n".join(tiling_validate_results[:4]))
+
+    if npu_arch_results:
+        parts.append("[NPU architecture]\n" + "\n\n".join(npu_arch_results[:4]))
+
+    if code_style_results:
+        parts.append("[Code style]\n" + "\n\n".join(code_style_results[:4]))
+
+    if security_check_results:
+        parts.append("[Security scan]\n" + "\n\n".join(security_check_results[:4]))
+
+    if registered_tool_results:
+        parts.append("[Registered tools]\n" + "\n\n".join(registered_tool_results[:6]))
 
     return "\n\n".join(parts) if parts else ""
 
@@ -104,17 +149,19 @@ def answer_node(
     # Build system prompt
     if ref_text:
         system_prompt = (
-            "你是一个 Ascend C 算子开发专家。下面是根据用户问题检索到的参考资料。\n"
-            "请基于这些内容，按照用户的要求生成完整的 Ascend C Kernel 代码。\n\n"
-            f"参考资料：\n{ref_text}\n\n"
-            f"用户原始要求：\n{base_prompt}\n\n"
-            "请生成符合要求的完整代码。"
+            "You are an expert Ascend C kernel engineer. The following blocks are retrieval results "
+            "and tool outputs gathered for the user task.\n"
+            "Use them faithfully and produce the full Ascend C kernel / host / project artifacts "
+            "the user asked for.\n\n"
+            f"Retrieved context:\n{ref_text}\n\n"
+            f"Original user instruction:\n{base_prompt}\n\n"
+            "Generate the complete solution as instructed (code only where the task demands code)."
         )
     else:
         system_prompt = (
-            "你是一个 Ascend C 算子开发专家。\n"
-            "请根据你的知识生成完整的 Ascend C Kernel 代码。\n\n"
-            f"用户要求：\n{base_prompt}"
+            "You are an expert Ascend C kernel engineer.\n"
+            "Generate the complete Ascend C artifacts requested below.\n\n"
+            f"User instruction:\n{base_prompt}"
         )
 
     # Call LLM with streaming
@@ -123,7 +170,7 @@ def answer_node(
         [{"role": "system", "content": system_prompt}]
     )
 
-    print(f"[answer] 生成完成，代码长度: {len(content)} 字符")
+    print(f"[answer] done, output length={len(content)} chars")
 
     return {
         "messages": [AIMessage(content=content)],

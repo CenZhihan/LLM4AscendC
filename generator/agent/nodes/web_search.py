@@ -20,13 +20,13 @@ def _generate_search_query(client, model: str, state: GeneratorAgentState) -> st
 
     if not existing_text:
         prompt = (
-            f"用户需求描述：\n{user_need}\n\n"
-            "请用一句话总结成一个适合在搜索引擎中查询的问题（只输出这句话，不要解释）。"
+            f"User goal:\n{user_need}\n\n"
+            "Summarize in one short line as a web search query. Output only that line, no explanation."
         )
     else:
         prompt = (
-            f"用户需求：\n{user_need}\n\n已搜到的信息：\n{existing_text[:500]}\n\n"
-            "请再提出一个不同的搜索问题来补充信息（一句话，只输出这句话）。"
+            f"User goal:\n{user_need}\n\nExisting search snippets:\n{existing_text[:500]}\n\n"
+            "Propose one different search query to fill gaps. Output only that line, no explanation."
         )
 
     resp = client.chat.completions.create(
@@ -71,14 +71,14 @@ def web_search_node(
         results = web_retriever.retrieve(query)
     else:
         print("[WARN] Web search not available (pip install ddgs)")
-        results = ["[网页搜索不可用，请安装 ddgs: pip install ddgs]"]
+        results = ["[Web search unavailable: pip install ddgs]"]
 
     # Update state
     round_num = state.get("query_round_count", 0) + 1
     response = "\n".join(results) if results else ""
-    log_entry = {"round": round_num, "tool": "WEB", "query": query, "response": response}
+    log_entry = {"round": round_num, "tool": "web", "query": query, "response": response}
 
-    print(f"[Round {round_num}] 工具=网页搜索(WEB), 查询=\"{query}\"")
+    print(f"[Round {round_num}] tool=web query={query!r}")
 
     return {
         "web_results": results,

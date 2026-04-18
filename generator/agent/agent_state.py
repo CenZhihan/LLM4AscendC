@@ -29,6 +29,13 @@ def _add_tool_calls(
     return (left or []) + (right or [])
 
 
+def _append_error_log(
+    left: List[Dict[str, Any]], right: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Reducer for tool-choice / parse error records."""
+    return (left or []) + (right or [])
+
+
 class GeneratorAgentState(MessagesState):
     """
     Unified state for generator agent with KB, WEB, and Code RAG retrieval.
@@ -44,7 +51,7 @@ class GeneratorAgentState(MessagesState):
         code_rag_results: Code RAG retrieval results
         tool_calls_log: Tool call history for debugging/reporting
         query_round_count: Current round number (0 to MAX_QUERY_ROUNDS)
-        next_action: Next tool action (KB, WEB, CODE_RAG, ANSWER)
+        next_action: Next tool action (lowercase tool key or ANSWER)
         current_query: Current query string for this round
         reasoning_content: LLM reasoning output (if supported)
         op_name: Operator name (e.g., "gelu")
@@ -68,6 +75,7 @@ class GeneratorAgentState(MessagesState):
     npu_arch_results: Annotated[List[str], _add_list]
     code_style_results: Annotated[List[str], _add_list]
     security_check_results: Annotated[List[str], _add_list]
+    registered_tool_results: Annotated[List[str], _add_list]
 
     # Structured env check results (for programmatic access)
     env_check_env_result: NotRequired[Dict[str, Any]]    # Environment overview
@@ -92,7 +100,11 @@ class GeneratorAgentState(MessagesState):
     query_round_count: NotRequired[int]      # Current round number
     next_action: NotRequired[str]            # Next tool: KB, WEB, CODE_RAG, ANSWER
     current_query: NotRequired[str]          # Current query string
+    tool_choice_json: NotRequired[Dict[str, Any]]  # Last parsed ToolChoiceV1 as dict (tool/query/args)
     reasoning_content: NotRequired[str]      # LLM reasoning output
+
+    tool_choice_parse_failed: NotRequired[bool]
+    tool_choice_error_log: Annotated[List[Dict[str, Any]], _append_error_log]
 
     # Task context fields
     op_name: NotRequired[str]                # Operator name (e.g., "gelu")
@@ -144,6 +156,7 @@ def create_initial_state(
         "npu_arch_results": [],
         "code_style_results": [],
         "security_check_results": [],
+        "registered_tool_results": [],
         "tool_calls_log": [],
         "query_round_count": 0,
     }

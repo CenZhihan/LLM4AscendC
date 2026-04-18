@@ -90,7 +90,12 @@ def api_alternative_node(
 
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "API_ALTERNATIVE", "query": f"API: {api_name}", "response": display_text}
+    log_entry = {
+        "round": round_num,
+        "tool": "api_alternative",
+        "query": f"API: {api_name}",
+        "response": display_text,
+    }
 
     print(f"[Round {round_num}] 工具=API替代方案(API_ALTERNATIVE), API=\"{api_name}\", reason=\"{reason}\"")
 
