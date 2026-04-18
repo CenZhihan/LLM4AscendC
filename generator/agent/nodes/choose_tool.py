@@ -153,17 +153,51 @@ def _build_tool_selection_prompt(
         for ex in (spec.examples or [])[:2]:
             examples.append(f"Example {example_idx} (tool={spec.name}):\n{ex}")
             example_idx += 1
-    examples.append('Example (finish retrieval, generate code):\n{"tool":"ANSWER","query":"","args":null}')
+    examples.append(
+        'Example (downstream may proceed without further retrieval — use null args only):\n'
+        '{"tool":"ANSWER","query":"","args":null}'
+    )
     few_shot = "\n\n".join(examples)
 
+    routing_instructions = (
+        "Your role here is **orchestration only**. You are **not** the model that writes the Ascend C "
+        "kernel or the six-string bundle. Another agent will read your JSON and either run a tool or "
+        "produce the final code.\n\n"
+        "**CANN / API context:** CANN releases and recommended usage patterns change quickly. Even when "
+        "the task looks familiar, **prefer using the enabled tools** so the downstream agent gets the "
+        "**latest** documentation and the **most canonical** Ascend C patterns. The tools available "
+        "in this session are **high-signal and very effective** at retrieving authoritative material; "
+        "lean on them rather than relying on static intuition alone.\n\n"
+        "**What you must decide:**\n"
+        "- Output **ANSWER** only when the task text **plus** the \"Already retrieved\" excerpts already "
+        "give the downstream agent enough **fresh, task-specific** evidence (not generic memory). If "
+        "that section is empty or thin, you should normally **call a tool first**.\n"
+        "- Otherwise choose **one** tool and a focused English `query`. Prefer a tool whenever there is "
+        "any doubt: retrieved material improves grounding, aligns with current CANN guidance, and "
+        "reduces hallucination risk for the downstream model. Treat proactive retrieval as your "
+        "responsibility to the pipeline.\n\n"
+        "**Strict output rules (avoid common failures):**\n"
+        "- Output **one** JSON object only. No markdown fences, no commentary before or after the object, "
+        "and no second JSON or trailing code.\n"
+        "- For **ANSWER**, you must use exactly: "
+        '`{"tool":"ANSWER","query":"","args":null}`. '
+        "**Never** put generated code, `project_json_src`, partial answers, or any narrative inside "
+        '`args`. Putting the solution in `args` breaks parsing (\"Extra data\" / invalid JSON) and '
+        "skips real tool use.\n"
+        '- For a normal tool call, use `"args": null` unless you are using a **plugin** tool whose docs '
+        "explicitly require a small parameter object.\n"
+        '- `"query"` is the natural-language request for the tool; use `""` when `tool` is ANSWER.\n\n'
+    )
+
     prompt = (
-        f"User task:\n{user_question}\n\n"
-        f"Available tools for this session (JSON field \"tool\" must be one of these keys or ANSWER):\n{tools_line}\n"
-        "You must output exactly one JSON object (no markdown fences, no prose before or after).\n"
+        f"Task specification (shared with the downstream code-generation agent):\n{user_question}\n\n"
+        f"{routing_instructions}"
+        f"Available tools for this session (field \"tool\" must be one of these keys or ANSWER):\n{tools_line}\n"
+        "You must output exactly one JSON object.\n"
         "JSON fields:\n"
-        '  "tool": string — a lowercase tool key from the list above, or ANSWER to stop retrieving;\n'
-        '  "query": string — natural-language query for that tool; empty when tool is ANSWER;\n'
-        '  "args": object or null — optional extra parameters (mainly for custom tools).\n'
+        '  "tool": string — lowercase tool key from the list above, or ANSWER;\n'
+        '  "query": string — English request for that tool; empty string when tool is ANSWER;\n'
+        '  "args": null or a small object only when a plugin documents structured parameters.\n'
     )
     if existing_results:
         prompt += f"\nAlready retrieved (may be empty):\n{existing_results}\n"

@@ -11,7 +11,6 @@ from langchain_core.messages import HumanMessage
 from .agent_config import (
     AgentToolMode,
     NO_TOOL,
-    has_kb,
     parse_tool_mode,
     tool_mode_to_string,
     get_llm_config_compatible,
@@ -68,16 +67,6 @@ def _build_base_prompt(language: str, strategy_name: str, op: str) -> str:
 
     # Fallback: simple prompt
     return f"Write a {language} kernel implementation for the `{op}` operator."
-
-
-def _add_kb_hint(prompt: str) -> str:
-    """Add KB hint to prompt when KB is enabled."""
-    return (
-        "[Note] You have access to a knowledge base that contains Huawei Ascend C API documentation. "
-        "This documentation is highly reliable; following it when writing kernels can greatly reduce the chance of inventing non-existent APIs. "
-        "You are strongly encouraged to consult the knowledge base before answering.\n\n"
-        + prompt
-    )
 
 
 def _extract_final_answer(final_state: Dict[str, Any]) -> str:
@@ -161,18 +150,14 @@ def generate_kernel_with_agent(
     # 1. Build base prompt using existing prompt_generators
     base_prompt = _build_base_prompt(task.language, task.strategy_name, task.op)
 
-    # 2. Add KB hint if KB is enabled
-    if has_kb(parsed_mode):
-        base_prompt = _add_kb_hint(base_prompt)
-
-    # 3. Build and invoke agent
+    # 2. Build and invoke agent
     app = build_agent_app(
         tool_mode=parsed_mode,
         llm_config=llm_config,
         code_retriever=retriever,
     )
 
-    # 4. Create initial state
+    # 3. Create initial state
     initial_state = create_initial_state(
         base_prompt=base_prompt,
         op_name=task.op,
@@ -181,12 +166,12 @@ def generate_kernel_with_agent(
         strategy_name=task.strategy_name,
     )
 
-    # 5. Invoke agent
+    # 4. Invoke agent
     mode_str = tool_mode_to_string(parsed_mode)
     print(f"[INFO] Starting agent for op={task.op}, tool_mode={mode_str}")
     final_state = app.invoke(initial_state)
 
-    # 6. Extract results
+    # 5. Extract results
     generated_code = _extract_final_answer(final_state)
     reasoning = final_state.get("reasoning_content")
     tool_calls = final_state.get("tool_calls_log", [])

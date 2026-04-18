@@ -21,6 +21,8 @@ from generator.agent.agent_config import (
     AgentToolMode,
     has_code_rag,
     tool_mode_to_string,
+    get_llm_config_compatible,
+    model_slug_for_path,
 )
 from generator.agent.retrievers.code_retriever import CodeRetriever
 from generator.dataset import dataset
@@ -45,6 +47,7 @@ def _generate_one_op(
     tool_mode: AgentToolMode,
     code_retriever: CodeRetriever,
     strategy: str,
+    llm_config: dict,
 ):
     """Single operator generation task."""
     out_path = os.path.join(out_dir, f"{op}.txt")
@@ -66,6 +69,7 @@ def _generate_one_op(
             task,
             tool_mode=tool_mode,
             retriever=code_retriever,
+            llm_config=llm_config,
         )
 
         # Write output
@@ -142,12 +146,28 @@ def main():
         help="自定义输出目录"
     )
     parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="覆盖配置文件中的模型名（优先级高于 generator/local_api_config.py 中的 XI_AI_MODEL）",
+    )
+    parser.add_argument(
         "--kernelbench102",
         action="store_true",
         help="只生成 kernelbench102 中的 102 个算子"
     )
 
     args = parser.parse_args()
+
+    try:
+        llm_config = get_llm_config_compatible(cli_model=args.model)
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        print(f"[ERROR] LLM 配置: {e}")
+        raise SystemExit(2) from e
+
+    resolved_model = llm_config["model"]
+    model_slug = model_slug_for_path(resolved_model)
+    print(f"[INFO] LLM model: {resolved_model} (output segment: {model_slug})")
 
     try:
         tool_mode = parse_tool_mode(args.tool_mode)
@@ -195,7 +215,10 @@ def main():
         if args.output_dir:
             out_dir = args.output_dir
         else:
-            out_dir = f"output/ascendc/agent_{tool_mode_to_string(tool_mode)}/{strategy}/run{run}"
+            out_dir = (
+                f"output/ascendc/{model_slug}/agent_{tool_mode_to_string(tool_mode)}"
+                f"/{strategy}/run{run}"
+            )
 
         os.makedirs(out_dir, exist_ok=True)
         print(f"[INFO] Output directory: {out_dir}")
@@ -210,7 +233,7 @@ def main():
             futures = {
                 executor.submit(
                     _generate_one_op, op, dataset[op]['category'],
-                    out_dir, tool_mode, code_retriever, strategy
+                    out_dir, tool_mode, code_retriever, strategy, llm_config
                 ): op
                 for op in ops_to_process
             }

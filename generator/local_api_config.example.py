@@ -1,10 +1,10 @@
 # 复制为 local_api_config.py 并填写（local_api_config.py 已加入 .gitignore，勿提交密钥）
 #
-# 使用方式：
-#   export USE_API_CONFIG=1
-#   python3 tools/generate_ascendc_operators.py ...
+# Agent 入口 ``generator/scripts/generation/generate_agent.py`` 仅从本文件读取
+# XI_AI_API_KEY / XI_AI_BASE_URL / XI_AI_MODEL（不再使用 USE_API_CONFIG 或 XI_* 环境变量）。
+# 命令行 ``--model`` 可覆盖本文件中的模型名。
 #
-# 未设置 USE_API_CONFIG=1 时，仍从环境变量 XI_AI_API_KEY / XI_AI_BASE_URL / XI_AI_MODEL 读取。
+# 其他脚本（如 tools/generate_ascendc_operators.py）若仍使用 generator/llm_config，请见其说明。
 
 # 推荐：与本仓库生成逻辑默认命名一致
 XI_AI_API_KEY = ""

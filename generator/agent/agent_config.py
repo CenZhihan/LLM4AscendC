@@ -282,46 +282,63 @@ def normalize_tool_choice_name(raw: str) -> Optional[str]:
 
 
 # ===== LLM Configuration =====
-def get_llm_config_from_env() -> dict:
-    api_key = os.getenv("XI_AI_API_KEY")
-    if not api_key or not api_key.strip():
-        return None
-    base_url = os.getenv("XI_AI_BASE_URL", "https://api-2.xi-ai.cn/v1")
-    model_name = os.getenv("XI_AI_MODEL", "gpt-5")
+def _load_llm_config_from_local_api_file() -> dict:
+    """仅从 ``generator/local_api_config.py`` 读取 api_key / base_url / model（不含环境变量）。"""
+    import importlib.util
+
+    _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    local_config_path = os.path.join(_project_root, "generator", "local_api_config.py")
+    if not os.path.exists(local_config_path):
+        raise FileNotFoundError(
+            "Agent 需要 LLM 配置：请创建 generator/local_api_config.py（可复制 "
+            "generator/local_api_config.example.py）。不再从环境变量读取。"
+        )
+    spec = importlib.util.spec_from_file_location("local_api_config", local_config_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载 LLM 配置文件: {local_config_path}")
+    lac = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lac)
+    key = (getattr(lac, "XI_AI_API_KEY", None) or getattr(lac, "OPENAI_API_KEY", None) or "").strip()
+    base = (getattr(lac, "XI_AI_BASE_URL", None) or getattr(lac, "OPENAI_API_BASE", None) or "").strip()
+    model = (getattr(lac, "XI_AI_MODEL", None) or getattr(lac, "MODEL", None) or "").strip()
+    if not key:
+        raise ValueError(
+            "generator/local_api_config.py 中未设置有效的 XI_AI_API_KEY 或 OPENAI_API_KEY。"
+        )
     return {
-        "api_key": api_key,
-        "base_url": base_url,
-        "model": model_name,
+        "api_key": key,
+        "base_url": base or "https://api-2.xi-ai.cn/v1",
+        "model": model,
     }
 
 
-def get_llm_config_compatible() -> dict:
-    if os.environ.get("USE_API_CONFIG", "").strip().lower() in ("1", "true"):
-        import importlib.util
+def get_llm_config_compatible(cli_model: Optional[str] = None) -> dict:
+    """
+    解析 Agent 使用的 LLM 配置。
 
-        _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        local_config_path = os.path.join(_project_root, "generator", "local_api_config.py")
-        if os.path.exists(local_config_path):
-            try:
-                spec = importlib.util.spec_from_file_location("local_api_config", local_config_path)
-                lac = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(lac)
-                key = (getattr(lac, "XI_AI_API_KEY", None) or getattr(lac, "OPENAI_API_KEY", None) or "").strip()
-                base = (getattr(lac, "XI_AI_BASE_URL", None) or getattr(lac, "OPENAI_API_BASE", None) or "").strip()
-                model = (getattr(lac, "XI_AI_MODEL", None) or getattr(lac, "MODEL", None) or "").strip()
-                if key:
-                    return {
-                        "api_key": key,
-                        "base_url": base or "https://api-2.xi-ai.cn/v1",
-                        "model": model or "gpt-5",
-                    }
-            except Exception:
-                pass
-    env_config = get_llm_config_from_env()
-    if env_config:
-        return env_config
-    return {
-        "api_key": "",
-        "base_url": "https://api.deepseek.com/v1",
-        "model": "deepseek-chat",
-    }
+    **model** 优先级（仅这两处，不再读环境变量）：
+    1. ``cli_model`` 非空时作为 ``model``；
+    2. 否则使用 ``local_api_config.py`` 中的 ``XI_AI_MODEL`` / ``MODEL``。
+
+    ``api_key``、``base_url`` 仅从 ``generator/local_api_config.py`` 读取。
+    """
+    cfg = _load_llm_config_from_local_api_file()
+    if cli_model is not None and str(cli_model).strip():
+        cfg = {**cfg, "model": str(cli_model).strip()}
+    if not (cfg.get("model") or "").strip():
+        raise ValueError(
+            "未设置 model：请在命令行传入 --model，或在 generator/local_api_config.py 中设置 "
+            "XI_AI_MODEL / MODEL。"
+        )
+    return cfg
+
+
+def model_slug_for_path(model: str) -> str:
+    """将 model 名转为安全的单段目录名（用于 ``output/ascendc/<slug>/...``）。"""
+    s = (model or "").strip() or "unknown"
+    for ch in r'/\:*?"<>| ':
+        s = s.replace(ch, "-")
+    while "--" in s:
+        s = s.replace("--", "-")
+    s = s.strip("-")
+    return s or "unknown"
