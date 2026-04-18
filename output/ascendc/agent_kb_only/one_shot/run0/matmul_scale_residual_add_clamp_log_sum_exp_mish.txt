@@ -1,0 +1,555 @@
+project_json_src='''
+[
+  {
+    "op": "MatmulScaleResidualAddClampLogSumExpMishCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "bias",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "scaling",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "clamp_min",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "clamp_max",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(MatmulScaleResidualAddClampLogSumExpMishCustomTiling)
+  TILING_DATA_FIELD_DEF(uint32_t, M);          // batch
+  TILING_DATA_FIELD_DEF(uint32_t, K);          // input_size
+  TILING_DATA_FIELD_DEF(uint32_t, N);          // hidden_size
+  TILING_DATA_FIELD_DEF(uint32_t, kTile);      // K tile for UB
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);   // launch blocks
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulScaleResidualAddClampLogSumExpMishCustom,
+                           MatmulScaleResidualAddClampLogSumExpMishCustomTiling)
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) {
+    return (x / a) * a;
+}
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (a + b - 1u) / b;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MatmulScaleResidualAddClampLogSumExpMishCustomTiling tiling;
+
+    // x: [M, K], weight: [N, K], bias: [N]
+    const auto* xShape = context->GetInputShape(0);
+    const auto* wShape = context->GetInputShape(1);
+    if (xShape == nullptr || wShape == nullptr) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    uint32_t M = static_cast<uint32_t>(xShape->GetOriginShape().GetDim(0));
+    uint32_t K = static_cast<uint32_t>(xShape->GetOriginShape().GetDim(1));
+    uint32_t N = static_cast<uint32_t>(wShape->GetOriginShape().GetDim(0));
+
+    // UB budgeting: we do scalar-accumulated GEMM with K-tiles. Need:
+    // xSeg: kTile floats
+    // wSeg: kTile floats (reused per column)
+    // mulTmp: kTile floats
+    // reduce work: kTile floats (conservative)
+    // softmax tmp later uses separate buffer on kernel side with sharedTmp
+    // total bytes per row-loop ≈ 4 * kTile * 4
+    uint64_t ubBytes = 0;
+    auto platformInfo = context->GetPlatformInfo();
+    platform_ascendc::PlatformAscendC plat(platformInfo);
+    plat.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubBytes);
+
+    const uint32_t bytesPerFloat = 4;
+    uint32_t kTile = AlignDown(static_cast<uint32_t>(ubBytes / (bytesPerFloat * 4)), 256U);
+    if (kTile == 0) kTile = 256;
+    if (kTile > K) kTile = AlignDown(K, 256U);
+    if (kTile == 0) kTile = K; // very small K
+
+    // blocks: grid-stride over rows
+    uint32_t blockDim = M;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_M(M);
+    tiling.set_K(K);
+    tiling.set_N(N);
+    tiling.set_kTile(kTile);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // No extra workspace requested at host tiling time.
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext* ctx)
+{
+    // Output y shape: [M, 1]
+    const gert::Shape* x = ctx->GetInputShape(0);
+    if (x == nullptr) return GRAPH_PARAM_INVALID;
+    gert::Shape* y = ctx->GetOutputShape(0);
+    std::vector<int64_t> out = {x->GetOriginShape().GetDim(0), 1};
+    y->SetDimNum(out.size());
+    for (size_t i = 0; i < out.size(); ++i) y->SetDim(i, out[i]);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* ctx)
+{
+    ge::DataType dt = ctx->GetInputDataType(0);
+    ctx->SetOutputDataType(0, dt);
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+"""
+
+host_operator_src="""
+#include "register/op_def_registry.h"
+#include "matmul_scale_residual_add_clamp_log_sum_exp_mish_custom_tiling.h"
+
+namespace ops {
+
+class MatmulScaleResidualAddClampLogSumExpMishCustom : public OpDef {
+public:
+    explicit MatmulScaleResidualAddClampLogSumExpMishCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("scaling")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("clamp_min")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("clamp_max")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulScaleResidualAddClampLogSumExpMishCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+// We'll implement a GEMM over rows with K-tiling and per-column accumulation.
+// Then apply y = clamp((1+s) * y, lo, hi).
+// Then compute z = logsumexp(y, dim=1, keepdim=True) using SoftmaxFlashV2 primitives.
+// Finally output: z * mish(z), where mish(z) = z * tanh(ln(1 + exp(z))).
+// Tiling data provides M, K, N and kTile for UB.
+
+using namespace AscendC;
+
+constexpr int32_t BUFFER_NUM = 1;
+
+namespace MatmulScaleResAddClampLSEMishCustom {
+
+struct TilingData {
+    uint32_t M;
+    uint32_t K;
+    uint32_t N;
+    uint32_t kTile;
+    uint32_t blockDim;
+};
+
+class KernelMatmulScaleResidualAddClampLogSumExpMishCustom {
+public:
+    __aicore__ inline KernelMatmulScaleResidualAddClampLogSumExpMishCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b,
+                                GM_ADDR scaling, GM_ADDR cmin, GM_ADDR cmax,
+                                GM_ADDR y, const TilingData& t)
+    {
+        M_ = t.M;
+        K_ = t.K;
+        N_ = t.N;
+        kTile_ = (t.kTile == 0) ? K_ : t.kTile;
+
+        xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(x), static_cast<uint32_t>(M_) * K_);
+        wGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(w), static_cast<uint32_t>(N_) * K_);
+        bGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(b), N_);
+        sGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(scaling), 1);
+        loGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(cmin), 1);
+        hiGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(cmax), 1);
+        yGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), static_cast<uint32_t>(M_) * 1);
+
+        // Queues/buffers
+        // For per-segment vectors on K: xSeg, wSeg, mulTmp, redWork
+        pipe_.InitBuffer(xSegQ_, BUFFER_NUM, kTile_ * sizeof(float));
+        pipe_.InitBuffer(wSegQ_, BUFFER_NUM, kTile_ * sizeof(float));
+        pipe_.InitBuffer(tmpQ_, BUFFER_NUM, kTile_ * sizeof(float));
+        pipe_.InitBuffer(redWorkQ_, BUFFER_NUM, kTile_ * sizeof(float)); // work buffer for ReduceSum
+
+        // Buffers for row-wise post ops
+        pipe_.InitBuffer(rowQ_, 1, N_ * sizeof(float));        // full row buffer for LSE
+        pipe_.InitBuffer(auxQ_, 1, N_ * sizeof(float));        // exp dst or aux
+        pipe_.InitBuffer(blockQ_, 1, 32u);                     // minimal scalar buffer
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (M_ == 0 || K_ == 0 || N_ == 0) return;
+
+        // Load scalars s, lo, hi
+        float scaleHost = 0.f, loHost = 0.f, hiHost = 0.f;
+        {
+            LocalTensor<float> oneS = blockQ_.AllocTensor<float>();
+            DataCopy(oneS, sGm_, 1);
+            PipeBarrier<PIPE_V>();
+            scaleHost = oneS.GetValue(0);
+            blockQ_.FreeTensor(oneS);
+        }
+        {
+            LocalTensor<float> oneLo = blockQ_.AllocTensor<float>();
+            DataCopy(oneLo, loGm_, 1);
+            PipeBarrier<PIPE_V>();
+            loHost = oneLo.GetValue(0);
+            blockQ_.FreeTensor(oneLo);
+        }
+        {
+            LocalTensor<float> oneHi = blockQ_.AllocTensor<float>();
+            DataCopy(oneHi, hiGm_, 1);
+            PipeBarrier<PIPE_V>();
+            hiHost = oneHi.GetValue(0);
+            blockQ_.FreeTensor(oneHi);
+        }
+        const float sAll = scaleHost + 1.0f;
+
+        const uint32_t blkNum = static_cast<uint32_t>(GetBlockNum());
+        const uint32_t blkIdx = static_cast<uint32_t>(GetBlockIdx());
+
+        for (uint32_t m = blkIdx; m < M_; m += blkNum) {
+            // Compute row m: y_row[n] = dot(x[m,:], w[n,:]) + b[n]
+            // We'll iterate columns sequentially for simplicity.
+            for (uint32_t n = 0; n < N_; ++n) {
+                float acc = 0.0f;
+                for (uint32_t kb = 0; kb < K_; kb += kTile_) {
+                    uint32_t cur = K_ - kb;
+                    if (cur > kTile_) cur = kTile_;
+
+                    // xSeg <- x[m, kb:kb+cur]
+                    LocalTensor<float> xSeg = xSegQ_.AllocTensor<float>();
+                    DataCopy(xSeg, xGm_[m * K_ + kb], cur);
+                    // wSeg <- w[n, kb:kb+cur]
+                    LocalTensor<float> wSeg = wSegQ_.AllocTensor<float>();
+                    DataCopy(wSeg, wGm_[n * K_ + kb], cur);
+                    // mulTmp = xSeg * wSeg
+                    LocalTensor<float> mulTmp = tmpQ_.AllocTensor<float>();
+                    Mul(mulTmp, xSeg, wSeg, cur);
+
+                    // Reduce sum over mulTmp
+                    LocalTensor<float> redWork = redWorkQ_.AllocTensor<float>();
+                    ReduceSum(mulTmp, mulTmp, redWork, cur);
+                    PipeBarrier<PIPE_V>();
+                    // Retrieve accumulation result
+                    float partial = GetAccVal<float>();
+                    acc += partial;
+
+                    // free
+                    redWorkQ_.FreeTensor(redWork);
+                    tmpQ_.FreeTensor(mulTmp);
+                    wSegQ_.FreeTensor(wSeg);
+                    xSegQ_.FreeTensor(xSeg);
+                }
+                // add bias
+                LocalTensor<float> btmp = blockQ_.AllocTensor<float>();
+                DataCopy(btmp, bGm_[n], 1);
+                PipeBarrier<PIPE_V>();
+                acc += btmp.GetValue(0);
+                blockQ_.FreeTensor(btmp);
+
+                // fused scale-residual: y = y * s + y = y * (1 + s)
+                acc *= sAll;
+
+                // clamp
+                if (acc < loHost) acc = loHost;
+                if (acc > hiHost) acc = hiHost;
+
+                // Store into row buffer (UB)
+                if (n == 0) {
+                    LocalTensor<float> row = rowQ_.AllocTensor<float>();
+                    // initialize row with zeros to avoid UB usage faults
+                    Muls(row, row, 0.0f, N_);
+                    row.SetValue(0, acc);
+                    rowQ_.EnQue(row);
+                } else {
+                    LocalTensor<float> row = rowQ_.DeQue<float>();
+                    row.SetValue(n, acc);
+                    rowQ_.EnQue(row);
+                }
+            }
+
+            // Copy UB row to itself for LSE input
+            LocalTensor<float> row = rowQ_.DeQue<float>();
+            // Compute per-row logsumexp via SoftmaxFlashV2 primitives
+            // Allocate buffers for outputs
+            LocalTensor<float> dstTmp = auxQ_.AllocTensor<float>();      // same length as row
+            LocalTensor<float> expSum = auxQ_.AllocTensor<float>();      // broadcast block
+            LocalTensor<float> maxVal = auxQ_.AllocTensor<float>();      // broadcast block
+            LocalTensor<uint8_t> tmpSpace = auxQ_.ReinterpretCast<uint8_t>(); // reuse for tmp
+
+            // Build shape info and tiling
+            SoftMaxShapeInfo shape;
+            shape.srcM = 1;
+            shape.srcK = N_;
+            shape.oriSrcM = 1;
+            shape.oriSrcK = N_;
+            // Reserve local workspace for tiling-dependent temp space
+            const uint32_t ty1 = sizeof(float);
+            const uint32_t ty2 = sizeof(float);
+            // use kernel tiling func to get tiling
+            auto sftTiling = SoftMaxFlashV2TilingFunc(shape, ty1, ty2, 0, false, false, false, false);
+
+            // Call SoftmaxFlashV2 (normal mode, not update)
+            SoftmaxFlashV2<float, false, false>(dstTmp, expSum, maxVal, row, dstTmp, expSum, maxVal, tmpSpace, sftTiling, {});
+
+            // expSum/maxVal are block-broadcasted. Take the first element.
+            float mVal = maxVal.GetValue(0);
+            float sVal = expSum.GetValue(0);
+
+            // z = mVal + ln(sVal)
+            float z = 0.0f;
+            {
+                LocalTensor<float> scalIn = blockQ_.AllocTensor<float>();
+                LocalTensor<float> scalOut = blockQ_.AllocTensor<float>();
+                scalIn.SetValue(0, sVal);
+                Ln(scalOut, scalIn, 1);
+                PipeBarrier<PIPE_V>();
+                float lnSum = scalOut.GetValue(0);
+                blockQ_.FreeTensor(scalOut);
+                blockQ_.FreeTensor(scalIn);
+                z = mVal + lnSum;
+            }
+
+            // mish(z) = z * tanh(ln(1 + exp(z)))
+            float mishZ = 0.0f;
+            {
+                LocalTensor<float> tin = blockQ_.AllocTensor<float>();
+                LocalTensor<float> tout = blockQ_.AllocTensor<float>();
+                LocalTensor<float> ttmp = blockQ_.AllocTensor<float>();
+
+                tin.SetValue(0, z);
+                // e = exp(z)
+                Exp(tout, tin, 1);
+                float e = tout.GetValue(0);
+                // sp = ln(1 + e)
+                ttmp.SetValue(0, e + 1.0f);
+                Ln(tout, ttmp, 1);
+                float sp = tout.GetValue(0);
+                // t = tanh(sp)
+                tin.SetValue(0, sp);
+                Tanh(tout, tin, 1);
+                float t = tout.GetValue(0);
+                mishZ = z * t; // z * tanh(softplus(z))
+
+                blockQ_.FreeTensor(ttmp);
+                blockQ_.FreeTensor(tout);
+                blockQ_.FreeTensor(tin);
+            }
+
+            float outVal = z * mishZ;
+
+            // Store to GM output y[m, 0]
+            LocalTensor<float> outScal = blockQ_.AllocTensor<float>();
+            outScal.SetValue(0, outVal);
+            DataCopy(yGm_[m * 1 + 0], outScal, 1);
+            blockQ_.FreeTensor(outScal);
+
+            // free row/aux buffers
+            auxQ_.FreeTensor(maxVal);
+            auxQ_.FreeTensor(expSum);
+            auxQ_.FreeTensor(dstTmp);
+            rowQ_.FreeTensor(row);
+        }
+    }
+
+private:
+    // Global tensors
+    GlobalTensor<float> xGm_;
+    GlobalTensor<float> wGm_;
+    GlobalTensor<float> bGm_;
+    GlobalTensor<float> sGm_;
+    GlobalTensor<float> loGm_;
+    GlobalTensor<float> hiGm_;
+    GlobalTensor<float> yGm_;
+
+    // Queues
+    TPipe pipe_;
+    TQue<QuePosition::VECIN, BUFFER_NUM> xSegQ_;
+    TQue<QuePosition::VECIN, BUFFER_NUM> wSegQ_;
+    TQue<QuePosition::VECCALC, BUFFER_NUM> tmpQ_;
+    TQue<QuePosition::VECCALC, BUFFER_NUM> redWorkQ_;
+    TQue<QuePosition::VECOUT, 1> rowQ_;
+    TQue<QuePosition::VECCALC, 1> auxQ_;
+    TQue<QuePosition::VECCALC, 1> blockQ_;
+
+    // Shape parameters
+    uint32_t M_{0}, K_{0}, N_{0}, kTile_{0};
+};
+
+} // namespace MatmulScaleResAddClampLSEMishCustom
+
+extern "C" __global__ __aicore__ void matmul_scale_residual_add_clamp_log_sum_exp_mish_custom(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR bias,
+    GM_ADDR scaling, GM_ADDR clamp_min, GM_ADDR clamp_max,
+    GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    if (ASCEND_IS_AIC) { return; }
+
+    MatmulScaleResAddClampLSEMishCustom::TilingData td;
+    CopyTiling(&td, tiling);
+
+    MatmulScaleResAddClampLSEMishCustom::KernelMatmulScaleResidualAddClampLogSumExpMishCustom op;
+    op.Init(x, weight, bias, scaling, clamp_min, clamp_max, y, td);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor matmul_scale_residual_add_clamp_log_sum_exp_mish_impl_npu(const at::Tensor& x,
+                                                                     const at::Tensor& weight,
+                                                                     const at::Tensor& bias,
+                                                                     const at::Tensor& scaling,
+                                                                     const at::Tensor& clamp_min,
+                                                                     const at::Tensor& clamp_max) {
+    // Output tensor: [M, 1]
+    TORCH_CHECK(x.dim() == 2, \"x must be 2D\");
+    at::Tensor y = at::empty({x.size(0), 1}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulScaleResidualAddClampLogSumExpMishCustom, x, weight, bias,
+                 scaling, clamp_min, clamp_max, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"matmul_scale_residual_add_clamp_log_sum_exp_mish_custom\",
+           &matmul_scale_residual_add_clamp_log_sum_exp_mish_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"matmul_scale_residual_add_clamp_log_sum_exp_mish_custom\",
+          &matmul_scale_residual_add_clamp_log_sum_exp_mish_impl_npu,
+          \"Fused Matmul+Scale+Residual+Clamp+LogSumExp+Mish (Custom AscendC)\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = "matmul_scale_residual_add_clamp_log_sum_exp_mish_custom"
+
+class ModelNew(torch.nn.Module):
+    """
+    Pybind: (x, weight, bias, scaling, clamp_min, clamp_max) — last three are length-1 float tensors.
+    """
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+        # init_inputs: input_size, hidden_size, scale_factor, clamp_min, clamp_max
+        self.input_size = int(init_inputs[0])
+        self.hidden_size = int(init_inputs[1])
+
+    def forward(self, *inputs):
+        # inputs: (x, weight, bias, scaling, clamp_min, clamp_max)
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''

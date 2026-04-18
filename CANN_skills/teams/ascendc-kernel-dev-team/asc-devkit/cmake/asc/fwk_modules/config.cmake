@@ -1,0 +1,118 @@
+# ----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ----------------------------------------------------------------------------------------------------------
+set(CMAKE_CXX_FLAGS_DEBUG "")
+set(CMAKE_CXX_FLAGS_RELEASE "")
+
+set(ASCENDC_CMAKE_SCRIPTS_PATH ${CMAKE_CURRENT_LIST_DIR} CACHE STRING "")
+
+if (NOT DEFINED vendor_name)
+    set(vendor_name customize CACHE STRING "")
+endif()
+if (NOT DEFINED CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "")
+endif()
+if (CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(ASCENDC_INSTALL_PREFIX "${CMAKE_CURRENT_BINARY_DIR}" CACHE PATH "" FORCE)
+else()
+    if (NOT ASCENDC_INSTALL_PREFIX)
+        set(ASCENDC_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}" CACHE PATH "" FORCE)
+    endif()
+endif()
+if (NOT DEFINED ENABLE_SOURCE_PACKAGE)
+    set(ENABLE_SOURCE_PACKAGE TRUE CACHE BOOL "")
+endif()
+if (NOT DEFINED ASCEND_SKIP_FAILED_COMPUTE_UNIT)
+    set(ASCEND_SKIP_FAILED_COMPUTE_UNIT FALSE CACHE BOOL "")
+endif()
+if (NOT DEFINED ENABLE_BINARY_PACKAGE)
+    set(ENABLE_BINARY_PACKAGE TRUE CACHE BOOL "")
+endif()
+if (DEFINED ASCEND_CANN_PACKAGE_PATH)
+    set(_ASCEND_CANN_PACKAGE_PATH ${ASCEND_CANN_PACKAGE_PATH} CACHE PATH "")
+elseif(DEFINED ENV{ASCEND_HOME_PATH})
+    set(_ASCEND_CANN_PACKAGE_PATH $ENV{ASCEND_HOME_PATH} CACHE PATH "")
+else()
+    if(IS_DIRECTORY $ENV{HOME}/Ascend/cann)
+        set(_ASCEND_CANN_PACKAGE_PATH $ENV{HOME}/Ascend/cann CACHE PATH "")
+    else()
+        set(_ASCEND_CANN_PACKAGE_PATH /usr/local/Ascend/cann CACHE PATH "")
+    endif()
+endif()
+set(ASCEND_CANN_PACKAGE_PATH ${_ASCEND_CANN_PACKAGE_PATH} CACHE PATH "")
+if (NOT DEFINED ASCEND_PYTHON_EXECUTABLE)
+    set(ASCEND_PYTHON_EXECUTABLE python3 CACHE STRING "")
+endif()
+
+
+set(ASCEND_CHECK_OPTYPE_DUPLICATE FALSE CACHE BOOL "")
+
+if (NOT DEFINED ASCEND_COMPUTE_UNIT)
+    set(ASCEND_COMPUTE_UNIT ascend910b CACHE STRING "")
+endif()
+
+set(ASC_VALID_SOC_LIST ascend310b ascend310p ascend610 ascend910 ascend910b ascend910_93 ascend950 bs9sx1a bs9sx2a ascend610lite mc61am21a mc62cm12a ascend910_96 kirinx90 kirin9030 mc32dm11a)
+
+foreach(soc_version ${ASCEND_COMPUTE_UNIT})
+    if(NOT soc_version IN_LIST ASC_VALID_SOC_LIST)
+        message(FATAL_ERROR "COMPUTE_UNIT ${soc_version} does not support, the support list is ${ASC_VALID_SOC_LIST}")
+    endif()
+endforeach()
+
+if (NOT DEFINED ENABLE_TEST)
+    set(ENABLE_TEST FALSE CACHE BOOL "")
+endif()
+if (NOT DEFINED ENABLE_CROSS_COMPILE)
+    set(ENABLE_CROSS_COMPILE  FALSE CACHE BOOL "")
+endif()
+if (NOT DEFINED CMAKE_CROSS_PLATFORM_COMPILER)
+    set(CMAKE_CROSS_PLATFORM_COMPILER "/your/cross/compiler/path" CACHE PATH "")
+endif()
+if (NOT DEFINED CMAKE_CROSS_LIBRARY_PATH)
+    set(CMAKE_CROSS_LIBRARY_PATH "" CACHE PATH "")
+endif()
+if (NOT DEFINED ASCEND_PACK_SHARED_LIBRARY)
+    set(ASCEND_PACK_SHARED_LIBRARY False CACHE BOOL "")
+endif()
+if (NOT DEFINED ENABLE_COPY_KERNEL_SRC_TO_ASCENDC)
+    set(ENABLE_COPY_KERNEL_SRC_TO_ASCENDC FALSE CACHE BOOL "")
+endif()
+
+set(ASCEND_AUTOGEN_PATH ${CMAKE_BINARY_DIR}/autogen)
+set(ASCEND_AUTOGEN_GROUPPROTO_PATH ${ASCEND_AUTOGEN_PATH}/group_proto)
+set(ASCEND_FRAMEWORK_TYPE tensorflow)
+file(MAKE_DIRECTORY ${ASCEND_AUTOGEN_PATH} ${ASCEND_AUTOGEN_GROUPPROTO_PATH})
+set(CUSTOM_COMPILE_OPTIONS "custom_compile_options.ini")
+set(CUSTOM_OPC_OPTIONS "custom_opc_options.ini")
+execute_process(COMMAND rm -rf ${ASCEND_AUTOGEN_PATH}/${CUSTOM_COMPILE_OPTIONS}
+                COMMAND rm -rf ${ASCEND_AUTOGEN_PATH}/${CUSTOM_OPC_OPTIONS}
+                COMMAND touch ${ASCEND_AUTOGEN_PATH}/${CUSTOM_COMPILE_OPTIONS}
+                COMMAND touch ${ASCEND_AUTOGEN_PATH}/${CUSTOM_OPC_OPTIONS}
+                )
+
+
+if(ENABLE_CROSS_COMPILE)
+    if(${CMAKE_SYSTEM_PROCESSOR} STREQUAL x86_64)
+        set(CROSS_COMPILE_PLATFORM aarch64)
+    else()
+        set(CROSS_COMPILE_PLATFORM x86_64)
+    endif()
+    set(PLATFORM ${CMAKE_SYSTEM_PROCESSOR})
+    set(ASCENDC_CMAKE_COMPILE_COMPILER_LIBRARY ${ASCEND_CANN_PACKAGE_PATH}/${PLATFORM}-linux/devlib/linux/${CROSS_COMPILE_PLATFORM}/)
+    set(ASCENDC_CMAKE_COMPILE_RUNTIME_LIBRARY ${ASCEND_CANN_PACKAGE_PATH}/${PLATFORM}-linux/devlib/${CROSS_COMPILE_PLATFORM}/)
+    if(CMAKE_CROSS_LIBRARY_PATH)
+        set(ASCENDC_CMAKE_COMPILE_COMPILER_LIBRARY ${CMAKE_CROSS_LIBRARY_PATH})
+        set(ASCENDC_CMAKE_COMPILE_RUNTIME_LIBRARY ${CMAKE_CROSS_LIBRARY_PATH})
+    endif()
+    set(CMAKE_SYSTEM_PROCESSOR ${CROSS_COMPILE_PLATFORM})
+    set(ASCENDC_CMAKE_COMPILER ${CMAKE_CXX_COMPILER})
+    set(CMAKE_CXX_COMPILER ${CMAKE_CROSS_PLATFORM_COMPILER})
+else()
+    set(ASCENDC_CMAKE_COMPILER ${CMAKE_CXX_COMPILER})
+endif()

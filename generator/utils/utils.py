@@ -12,11 +12,15 @@ from generator.config import ref_impl_base_path
 from generator.dataset import dataset
 
 def _load_file_api_config():
-    """加载 generation/local_api_config.py 配置。返回 (api_key, base_url, model) 或 None。"""
+    """加载本地 API 配置。优先 generator/local_api_config.py，其次兼容 generation/local_api_config.py。"""
     if os.environ.get("USE_API_CONFIG", "").strip().lower() not in ("1", "true"):
         return None
-    config_path = os.path.join(_project_root, "generation", "local_api_config.py")
-    if not os.path.exists(config_path):
+    candidates = [
+        os.path.join(_project_root, "generator", "local_api_config.py"),
+        os.path.join(_project_root, "generation", "local_api_config.py"),
+    ]
+    config_path = next((p for p in candidates if os.path.exists(p)), None)
+    if not config_path:
         return None
     try:
         spec = importlib.util.spec_from_file_location("local_api_config", config_path)
@@ -60,7 +64,7 @@ def get_client(model):
     """获取 OpenAI 兼容 API 客户端。
 
     配置优先级：
-    1. USE_API_CONFIG=1 + generation/local_api_config.py（统一 OpenAI 兼容端点）
+    1. USE_API_CONFIG=1 + generator/local_api_config.py（或兼容 generation/local_api_config.py）
     2. USE_API_CONFIG=1 + api_config.py（仅 gpt 模型）
     3. 模型前缀专用环境变量（DEEPSEEK_API_KEY / DASHSCOPE_API_KEY 等）
     """

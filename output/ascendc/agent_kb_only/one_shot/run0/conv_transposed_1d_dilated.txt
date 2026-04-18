@@ -1,0 +1,474 @@
+project_json_src='''
+[
+  {
+    "op": "ConvTransposed1dDilatedCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "stride",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "1"
+      },
+      {
+        "name": "padding",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "0"
+      },
+      {
+        "name": "dilation",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "1"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(ConvTransposed1dDilatedCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, B);
+  TILING_DATA_FIELD_DEF(uint32_t, Cin);
+  TILING_DATA_FIELD_DEF(uint32_t, Cout);
+  TILING_DATA_FIELD_DEF(uint32_t, Lin);
+  TILING_DATA_FIELD_DEF(uint32_t, Lout);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, stride);
+  TILING_DATA_FIELD_DEF(uint32_t, padding);
+  TILING_DATA_FIELD_DEF(uint32_t, dilation);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLen);
+  TILING_DATA_FIELD_DEF(uint32_t, coTile);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTransposed1dDilatedCustom, ConvTransposed1dDilatedCustomTilingData)
+
+} // namespace optiling
+"""
+
+host_operator_src="""
+#include "conv_transposed_1d_dilated_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return a ? (x / a) * a : x;
+}
+
+static inline uint32_t MinU(uint32_t a, uint32_t b) { return a < b ? a : b; }
+static inline uint32_t MaxU(uint32_t a, uint32_t b) { return a > b ? a : b; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
+static constexpr uint32_t ALIGN_ELEMS = 256;
+static constexpr uint32_t MAX_BLOCKS = 24;
+
+} // anonymous namespace
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    ConvTransposed1dDilatedCustomTilingData tiling;
+
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+
+    // Expect x: [B, Cin, Lin], weight: [Cin, Cout, K]
+    const uint32_t B = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    const uint32_t Cin = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    const uint32_t Lin = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(2));
+
+    const uint32_t W_Cin = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(0));
+    const uint32_t Cout = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(1));
+    const uint32_t K = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(2));
+
+    if (Cin != W_Cin) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t *stride_ptr = attrs->GetAttrPointer<int32_t>(0);
+    const int32_t *padding_ptr = attrs->GetAttrPointer<int32_t>(1);
+    const int32_t *dilation_ptr = attrs->GetAttrPointer<int32_t>(2);
+
+    const uint32_t stride = static_cast<uint32_t>(*stride_ptr);
+    const uint32_t padding = static_cast<uint32_t>(*padding_ptr);
+    const uint32_t dilation = static_cast<uint32_t>(*dilation_ptr);
+
+    // Only stride==1 is supported in this kernel
+    if (stride != 1u) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const uint32_t Lout = (Lin - 1u) * stride + 1u + dilation * (K - 1u) - 2u * padding;
+
+    // Choose coTile
+    uint32_t coTile = (Cout >= 32u) ? 32u : ((Cout >= 16u) ? 16u : Cout);
+    if (coTile == 0u) return ge::GRAPH_FAILED;
+
+    // UB budget: float bytes = 4
+    // Buffers: y_tile (coTile * tileLen) + xVec (tileLen) + tVec (tileLen) + w_sub (coTile)
+    // Total elems ~= coTile*tileLen + 2*tileLen + coTile
+    // bytes = 4 * (coTile * tileLen + 2 * tileLen + coTile)
+    uint32_t maxTile = 0;
+    if (4u * (coTile + 2u) > 0) {
+        maxTile = (UB_BUDGET_BYTES / 4u > coTile) ? (UB_BUDGET_BYTES / 4u - coTile) / (coTile + 2u) : 0u;
+    }
+    if (maxTile == 0u) maxTile = ALIGN_ELEMS;
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile == 0u) maxTile = ALIGN_ELEMS;
+
+    uint32_t tileLen = maxTile;
+    if (Lout < tileLen) {
+        const uint32_t aligned = AlignDown(Lout, ALIGN_ELEMS);
+        tileLen = (aligned > 0u) ? aligned : Lout;
+    }
+
+    const uint32_t numCoTiles = CeilDiv(Cout, coTile);
+    uint32_t blockDim = B * numCoTiles;
+    if (blockDim == 0u) blockDim = 1u;
+    if (blockDim > MAX_BLOCKS) blockDim = MAX_BLOCKS;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_B(B);
+    tiling.set_Cin(Cin);
+    tiling.set_Cout(Cout);
+    tiling.set_Lin(Lin);
+    tiling.set_Lout(Lout);
+    tiling.set_K(K);
+    tiling.set_stride(stride);
+    tiling.set_padding(padding);
+    tiling.set_dilation(dilation);
+    tiling.set_tileLen(tileLen);
+    tiling.set_coTile(coTile);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+
+    const uint32_t B = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    const uint32_t Cin = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    const uint32_t Lin = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(2));
+    const uint32_t W_Cin = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(0));
+    const uint32_t Cout = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(1));
+    const uint32_t K = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(2));
+
+    if (Cin != W_Cin) {
+        return GRAPH_FAILED;
+    }
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t *stride_ptr = attrs->GetAttrPointer<int32_t>(0);
+    const int32_t *padding_ptr = attrs->GetAttrPointer<int32_t>(1);
+    const int32_t *dilation_ptr = attrs->GetAttrPointer<int32_t>(2);
+
+    const uint32_t stride = static_cast<uint32_t>(*stride_ptr);
+    const uint32_t padding = static_cast<uint32_t>(*padding_ptr);
+    const uint32_t dilation = static_cast<uint32_t>(*dilation_ptr);
+
+    if (stride != 1u) {
+        return GRAPH_FAILED;
+    }
+
+    const uint32_t Lout = (Lin - 1u) * stride + 1u + dilation * (K - 1u) - 2u * padding;
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    gert::Shape out_shape;
+    out_shape.SetDimNum(3);
+    out_shape.SetDim(0, B);
+    out_shape.SetDim(1, Cout);
+    out_shape.SetDim(2, Lout);
+    *y_shape = out_shape;
+
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+class ConvTransposed1dDilatedCustom : public OpDef {
+public:
+    explicit ConvTransposed1dDilatedCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("stride").AttrType(OPTIONAL).Int(1);
+        this->Attr("padding").AttrType(OPTIONAL).Int(0);
+        this->Attr("dilation").AttrType(OPTIONAL).Int(1);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(ConvTransposed1dDilatedCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelConvTransposed1dDilatedCustom {
+public:
+    __aicore__ inline KernelConvTransposed1dDilatedCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                uint32_t B, uint32_t Cin, uint32_t Cout,
+                                uint32_t Lin, uint32_t Lout, uint32_t K,
+                                uint32_t stride, uint32_t padding, uint32_t dilation,
+                                uint32_t tileLen, uint32_t coTile)
+    {
+        B_ = B; Cin_ = Cin; Cout_ = Cout;
+        Lin_ = Lin; Lout_ = Lout; K_ = K;
+        stride_ = stride; padding_ = padding; dilation_ = dilation;
+        tileLen_ = tileLen; coTile_ = coTile;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, B_ * Cin_ * Lin_);
+        wGm_.SetGlobalBuffer((__gm__ float*)w, Cin_ * Cout_ * K_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, B_ * Cout_ * Lout_);
+
+        pipe_.InitBuffer(xQueue_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(yTileQueue_, BUFFER_NUM, coTile_ * tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpVecQueue_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(wQueue_, BUFFER_NUM, coTile_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (stride_ != 1u) return; // only stride=1 supported
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        const uint32_t numCoTiles = (Cout_ + coTile_ - 1u) / coTile_;
+        if (blockIdx >= B_ * numCoTiles) return;
+
+        const uint32_t b = blockIdx / numCoTiles;
+        const uint32_t coTileIdx = blockIdx % numCoTiles;
+        const uint32_t coBase = coTileIdx * coTile_;
+        const uint32_t curCo = (coBase + coTile_ <= Cout_) ? coTile_ : (Cout_ - coBase);
+
+        for (uint32_t t0 = 0; t0 < Lout_; t0 += tileLen_) {
+            uint32_t curTL = Lout_ - t0;
+            if (curTL > tileLen_) curTL = tileLen_;
+
+            AscendC::LocalTensor<float> yTile = yTileQueue_.AllocTensor<float>();
+            AscendC::Duplicate(yTile, 0.0f, curCo * curTL);
+
+            for (uint32_t ci = 0; ci < Cin_; ++ci) {
+                for (uint32_t k = 0; k < K_; ++k) {
+                    // valid out range where input index is in [0, Lin_-1]
+                    // i = out + padding - k*dilation
+                    int32_t leftBound = static_cast<int32_t>(-static_cast<int32_t>(padding_) + static_cast<int32_t>(k) * static_cast<int32_t>(dilation_));
+                    int32_t rightBound = static_cast<int32_t>(static_cast<int32_t>(Lin_) - 1 - static_cast<int32_t>(padding_) + static_cast<int32_t>(k) * static_cast<int32_t>(dilation_));
+
+                    int32_t out_lo = leftBound;
+                    int32_t out_hi = rightBound;
+                    if (out_lo < static_cast<int32_t>(t0)) out_lo = static_cast<int32_t>(t0);
+                    if (out_hi > static_cast<int32_t>(t0 + curTL - 1u)) out_hi = static_cast<int32_t>(t0 + curTL - 1u);
+                    if (out_lo > out_hi) {
+                        continue;
+                    }
+
+                    const uint32_t segStart = static_cast<uint32_t>(out_lo - static_cast<int32_t>(t0));
+                    const uint32_t segLen = static_cast<uint32_t>(out_hi - out_lo + 1);
+
+                    const uint32_t iStart = static_cast<uint32_t>(out_lo + static_cast<int32_t>(padding_) - static_cast<int32_t>(k) * static_cast<int32_t>(dilation_));
+
+                    // Load x segment: [segLen]
+                    AscendC::LocalTensor<float> xVec = xQueue_.AllocTensor<float>();
+                    {
+                        const uint64_t xOff = ((static_cast<uint64_t>(b) * Cin_ + ci) * Lin_) + iStart;
+                        AscendC::DataCopy(xVec, xGm_[xOff], segLen);
+                    }
+
+                    // Load weight sub-vector for current co tile and k
+                    AscendC::LocalTensor<float> wLocal = wQueue_.AllocTensor<float>();
+                    {
+                        const uint64_t wOff = ((static_cast<uint64_t>(ci) * Cout_ + coBase) * K_) + k;
+                        // weight layout: [Cin, Cout, K], contiguous in K
+                        // copy co tile scalars with stride K: we cannot DMA strided here simply,
+                        // therefore load one by one
+                        // Fallback: do multiple small copies of 1 element
+                        for (uint32_t coOff = 0; coOff < curCo; ++coOff) {
+                            AscendC::DataCopy(wLocal[coOff], wGm_[wOff + static_cast<uint64_t>(coOff) * K_], 1);
+                        }
+                    }
+
+                    // Accumulate: for each output channel in this tile, y_row += w * xVec
+                    for (uint32_t coOff = 0; coOff < curCo; ++coOff) {
+                        // y row offset in yTile: coOff * tileLen_ + segStart
+                        AscendC::LocalTensor<float> ySeg = yTile[coOff * tileLen_ + segStart];
+                        // Get scalar weight
+                        float wScalar = wLocal.GetValue(coOff);
+                        // ySeg = ySeg + wScalar * xVec
+                        AscendC::Axpy(ySeg, xVec, wScalar, segLen);
+                    }
+
+                    wQueue_.FreeTensor(wLocal);
+                    xQueue_.FreeTensor(xVec);
+                } // k
+            } // ci
+
+            // Write back yTile to GM: per co row copy contiguous segment
+            for (uint32_t coOff = 0; coOff < curCo; ++coOff) {
+                const uint64_t yOff = ((static_cast<uint64_t>(b) * Cout_ + (coBase + coOff)) * Lout_) + t0;
+                AscendC::LocalTensor<float> ySeg = yTile[coOff * tileLen_];
+                AscendC::DataCopy(yGm_[yOff], ySeg, curTL);
+            }
+
+            yTileQueue_.FreeTensor(yTile);
+        } // t0
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> xQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> yTileQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpVecQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> wQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t B_{0}, Cin_{0}, Cout_{0};
+    uint32_t Lin_{0}, Lout_{0}, K_{0};
+    uint32_t stride_{1}, padding_{0}, dilation_{1};
+    uint32_t tileLen_{0}, coTile_{0};
+};
+
+extern "C" __global__ __aicore__ void conv_transposed_1d_dilated_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(t, tiling);
+    KernelConvTransposed1dDilatedCustom op;
+    op.Init(x, weight, y,
+            t.B, t.Cin, t.Cout,
+            t.Lin, t.Lout, t.K,
+            t.stride, t.padding, t.dilation,
+            t.tileLen, t.coTile);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor conv_transposed_1d_dilated_impl_npu(const at::Tensor& x,
+                                               const at::Tensor& weight,
+                                               int64_t stride,
+                                               int64_t padding,
+                                               int64_t dilation) {
+    at::Tensor y = at::empty({x.size(0), weight.size(1),
+                              (x.size(2) - 1) * stride + 1 + dilation * (weight.size(2) - 1) - 2 * padding},
+                             x.options());
+    EXEC_NPU_CMD(aclnnConvTransposed1dDilatedCustom, x, weight, (int)stride, (int)padding, (int)dilation, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transposed_1d_dilated_custom", &conv_transposed_1d_dilated_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transposed_1d_dilated_custom", &conv_transposed_1d_dilated_impl_npu,
+          "Transposed 1D convolution with dilation (ConvTransposed1dDilatedCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'conv_transposed_1d_dilated_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+    def forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, weight, self.stride, self.padding, self.dilation)
+'''

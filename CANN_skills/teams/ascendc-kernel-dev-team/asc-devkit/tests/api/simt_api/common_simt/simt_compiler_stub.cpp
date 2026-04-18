@@ -1,0 +1,26 @@
+/**
+* Copyright (c) 2025 Huawei Technologies Co., Ltd.
+* This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+* CANN Open Software License Agreement Version 2.0 (the "License").
+* Please refer to the License for details. You may not use this file except in compliance with the License.
+* THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+* INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+* See LICENSE in the root of the software repository for the full text of the License.
+*/
+
+#include "simt_compiler_stub.h"
+#include "kernel_process_lock.h"
+#include "kernel_utils.h"
+#include "kernel_simt_cpu.h"
+#include "stub_def.h"
+#include <cmath>
+
+int32_t asc_get_block_idx()
+{
+    return block_idx;
+}
+
+int32_t asc_get_block_num()
+{
+    return block_num;
+}
