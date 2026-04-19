@@ -1,0 +1,421 @@
+project_json_src='''
+
+[
+  {
+    "op": "LayerNormCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "gamma",
+        "param_type": "optional",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "beta",
+        "param_type": "optional",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "eps",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "1e-5"
+      },
+      {
+        "name": "normalized_ndims",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "1"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(LayerNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, normSize);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(float, eps);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(LayerNormCustom, LayerNormCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "layer_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+} // namespace
+
+namespace optiling {
+
+// UB model for this kernel:
+//   inQueueX:     2 * tile
+//   outQueueY:    2 * tile
+//   tmpQueue:     1 * tile        (x*x, intermediates)
+//   inQueueGamma: 1 * tile
+//   inQueueBeta:  1 * tile
+// Total floats = 7 * tile => bytes = 28 * tile
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
+static constexpr uint32_t ALIGN_ELEMS = 1024;
+static constexpr uint32_t HARD_CAP_ELEMS = 65536;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    LayerNormCustomTilingData tiling;
+
+    const gert::Shape *inShape = context->GetInputShape(0);
+    const auto &originShape = inShape->GetOriginShape();
+    const uint32_t dimNum = static_cast<uint32_t>(originShape.GetDimNum());
+    const uint64_t totalLen64 = originShape.GetShapeSize();
+    const uint32_t totalLen = static_cast<uint32_t>(totalLen64);
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const float *eps = attrs->GetAttrPointer<float>(0);
+    const int64_t *normalizedNdimsPtr = attrs->GetAttrPointer<int64_t>(1);
+    uint32_t normalizedNdims = static_cast<uint32_t>(*normalizedNdimsPtr);
+    if (normalizedNdims == 0 || normalizedNdims > dimNum) {
+        normalizedNdims = dimNum > 0 ? 1u : 0u;
+    }
+
+    // Compute normSize = product of last normalizedNdims dims
+    uint32_t normSize = 1u;
+    for (uint32_t i = dimNum - normalizedNdims; i < dimNum; ++i) {
+        normSize *= static_cast<uint32_t>(originShape.GetDim(i));
+    }
+    if (normSize == 0) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    const uint32_t rows = (normSize == 0) ? 0u : (totalLen / normSize);
+
+    // Tile size constrained by UB budget
+    uint32_t maxTile = UB_BUDGET_BYTES / 28;  // elements
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t tileLen = maxTile;
+    if (normSize < tileLen) {
+        const uint32_t aligned = AlignDown(normSize, ALIGN_ELEMS);
+        tileLen = (aligned > 0) ? aligned : normSize;
+    }
+
+    // Block dim based on number of rows
+    uint32_t blockDim = (rows == 0) ? 1u : rows;
+    if (blockDim < 8u) blockDim = (rows > 0 && rows < 8u) ? rows : 8u;
+    if (blockDim > 24u) blockDim = 24u;
+    if (blockDim == 0u) blockDim = 1u;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_rows(rows);
+    tiling.set_normSize(normSize);
+    tiling.set_tileLength(tileLen);
+    tiling.set_blockDim(blockDim);
+    tiling.set_eps(*eps);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class LayerNormCustom : public OpDef {
+public:
+    explicit LayerNormCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("gamma")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("beta")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("eps").AttrType(OPTIONAL).Float(1e-5);
+        this->Attr("normalized_ndims").AttrType(OPTIONAL).Int(1);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(LayerNormCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+#include <cmath>
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelLayerNormCustom {
+public:
+    __aicore__ inline KernelLayerNormCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y,
+                                uint32_t rows, uint32_t normSize, uint32_t tileLength,
+                                float eps)
+    {
+        rows_ = rows;
+        normSize_ = normSize;
+        tileLen_ = tileLength;
+        eps_ = eps;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, (uint32_t)(rows_ * normSize_));
+        yGm_.SetGlobalBuffer((__gm__ float*)y, (uint32_t)(rows_ * normSize_));
+        hasGamma_ = (gamma != nullptr);
+        hasBeta_ = (beta != nullptr);
+        if (hasGamma_) {
+            gammaGm_.SetGlobalBuffer((__gm__ float*)gamma, normSize_);
+        }
+        if (hasBeta_) {
+            betaGm_.SetGlobalBuffer((__gm__ float*)beta, normSize_);
+        }
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueGamma_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueBeta_, 1, tileLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (rows_ == 0 || normSize_ == 0 || tileLen_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        for (uint32_t row = blockIdx; row < rows_; row += blockNum) {
+            DoRow(row);
+        }
+    }
+
+private:
+    __aicore__ inline void DoRow(uint32_t row)
+    {
+        const uint32_t rowBase = row * normSize_;
+        // Pass 1: compute mean and variance
+        float sum = 0.0f;
+        float sumsq = 0.0f;
+
+        for (uint32_t off = 0; off < normSize_; off += tileLen_) {
+            uint32_t len = normSize_ - off;
+            if (len > tileLen_) len = tileLen_;
+            AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            AscendC::DataCopy(xLocal, xGm_[rowBase + off], len);
+
+            // sum
+            float tileSum = AscendC::ReduceSum<float>(xLocal, len);
+            // sum of squares
+            AscendC::LocalTensor<float> tmpLocal = tmpQueue_.AllocTensor<float>();
+            AscendC::Mul(tmpLocal, xLocal, xLocal, len);
+            float tileSumSq = AscendC::ReduceSum<float>(tmpLocal, len);
+
+            tmpQueue_.FreeTensor(tmpLocal);
+            inQueueX_.FreeTensor(xLocal);
+
+            sum += tileSum;
+            sumsq += tileSumSq;
+        }
+
+        const float invN = 1.0f / static_cast<float>(normSize_);
+        const float mean = sum * invN;
+        float var = sumsq * invN - mean * mean;
+        if (var < 0.0f) var = 0.0f;
+        const float rstd = 1.0f / sqrtf(var + eps_);
+
+        // Pass 2: normalize and apply affine
+        for (uint32_t off = 0; off < normSize_; off += tileLen_) {
+            uint32_t len = normSize_ - off;
+            if (len > tileLen_) len = tileLen_;
+
+            AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            AscendC::DataCopy(xLocal, xGm_[rowBase + off], len);
+
+            AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+            AscendC::LocalTensor<float> tmpLocal = tmpQueue_.AllocTensor<float>();
+
+            // tmpLocal = x - mean
+            AscendC::Duplicate(yLocal, mean, len);
+            AscendC::Sub(tmpLocal, xLocal, yLocal, len);
+
+            // yLocal = (x - mean) * rstd
+            AscendC::Muls(yLocal, tmpLocal, rstd, len);
+
+            if (hasGamma_) {
+                AscendC::LocalTensor<float> gLocal = inQueueGamma_.AllocTensor<float>();
+                AscendC::DataCopy(gLocal, gammaGm_[off], len);
+                AscendC::Mul(yLocal, yLocal, gLocal, len);
+                inQueueGamma_.FreeTensor(gLocal);
+            }
+            if (hasBeta_) {
+                AscendC::LocalTensor<float> bLocal = inQueueBeta_.AllocTensor<float>();
+                AscendC::DataCopy(bLocal, betaGm_[off], len);
+                AscendC::Add(yLocal, yLocal, bLocal, len);
+                inQueueBeta_.FreeTensor(bLocal);
+            }
+
+            tmpQueue_.FreeTensor(tmpLocal);
+            outQueueY_.EnQue(yLocal);
+
+            AscendC::LocalTensor<float> yOut = outQueueY_.DeQue<float>();
+            AscendC::DataCopy(yGm_[rowBase + off], yOut, len);
+            outQueueY_.FreeTensor(yOut);
+
+            inQueueX_.FreeTensor(xLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueGamma_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueBeta_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+    AscendC::GlobalTensor<float> gammaGm_;
+    AscendC::GlobalTensor<float> betaGm_;
+
+    uint32_t rows_{0};
+    uint32_t normSize_{0};
+    uint32_t tileLen_{0};
+    float eps_{1e-5f};
+    bool hasGamma_{false};
+    bool hasBeta_{false};
+};
+
+extern "C" __global__ __aicore__ void layer_norm_custom(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta,
+                                                        GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelLayerNormCustom op;
+    op.Init(x, gamma, beta, y,
+            tiling_data.rows, tiling_data.normSize, tiling_data.tileLength,
+            tiling_data.eps);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor layer_norm_impl_npu(const at::Tensor& x,
+                               const at::Tensor& gamma,
+                               const at::Tensor& beta,
+                               double eps,
+                               int64_t normalized_ndims) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnLayerNormCustom, x, gamma, beta, static_cast<float>(eps), normalized_ndims, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("layer_norm_custom", &layer_norm_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("layer_norm_custom", &layer_norm_impl_npu, "LayerNorm (LayerNormCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'layer_norm_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, normalized_shape):
+        super(ModelNew, self).__init__()
+        # Learnable affine parameters, same as torch.nn.LayerNorm default
+        self.weight = torch.nn.Parameter(torch.ones(*normalized_shape))
+        self.bias = torch.nn.Parameter(torch.zeros(*normalized_shape))
+        self.eps = 1e-5
+        self.normalized_ndims = len(normalized_shape)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, self.weight, self.bias, self.eps, self.normalized_ndims)
+'''

@@ -61,6 +61,10 @@ def shell_prefix(cfg: EnvConfig) -> str:
     if cfg.conda_env:
         conda_sh = "/root/miniconda3/etc/profile.d/conda.sh"
         if os.path.exists(conda_sh):
-            pieces.append(f"source '{conda_sh}' && conda activate {cfg.conda_env}")
+            env_bin = f"/root/miniconda3/envs/{cfg.conda_env}/bin"
+            pieces.append(
+                f"source '{conda_sh}' && conda activate {cfg.conda_env} && "
+                f"export PATH=\"{env_bin}:$PATH\""
+            )
     return " && ".join(pieces)
 

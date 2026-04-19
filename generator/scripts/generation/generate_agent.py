@@ -14,7 +14,7 @@ from generator.agent import (
     generate_kernel_with_agent,
     KernelGenerationTask,
 )
-from generator.agent.agent_config import parse_tool_mode, AgentToolMode, has_code_rag
+from generator.agent.agent_config import parse_tool_mode, AgentToolMode, has_code_rag, tool_mode_to_string
 from generator.agent.retrievers.code_retriever import CodeRetriever
 from generator.dataset import dataset
 from generator.config import rag_index_path, rag_embedding_model
@@ -93,9 +93,9 @@ def main():
         "--tool-mode",
         type=str,
         default="no_tool",
-        choices=["no_tool", "kb_only", "web_only", "code_rag_only",
-                 "kb_and_web", "kb_and_code_rag", "web_and_code_rag", "all"],
-        help="检索工具模式 (默认: no_tool)"
+        help="检索工具模式。预定义: no_tool, kb_only, web_only, code_rag_only, "
+             "kb_and_web, kb_and_code_rag, web_and_code_rag, all。"
+             "也支持逗号分隔的自定义组合，如: code_rag,env_check_env,env_check_npu,env_check_api"
     )
     parser.add_argument(
         "--strategy",
@@ -182,7 +182,7 @@ def main():
         if args.output_dir:
             out_dir = args.output_dir
         else:
-            out_dir = f"output/ascendc/agent_{str(tool_mode)}/{strategy}/run{run}"
+            out_dir = f"output/ascendc/agent_{tool_mode_to_string(tool_mode)}/{strategy}/run{run}"
 
         os.makedirs(out_dir, exist_ok=True)
         print(f"[INFO] Output directory: {out_dir}")
