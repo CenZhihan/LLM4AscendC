@@ -48,7 +48,7 @@ def code_rag_node(
     # Update state
     round_num = state.get("query_round_count", 0) + 1
     response = "\n".join(results) if results else ""
-    log_entry = {"round": round_num, "tool": "CODE_RAG", "query": query, "response": response}
+    log_entry = {"round": round_num, "tool": "code_rag", "query": query, "response": response}
 
     print(f"[Round {round_num}] 工具=代码检索(CODE_RAG), 查询=\"{query[:100]}...\"")
 

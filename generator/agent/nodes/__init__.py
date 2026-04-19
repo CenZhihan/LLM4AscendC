@@ -34,6 +34,7 @@ from .api_alternative import api_alternative_node
 from .code_style_check import code_style_node
 from .security_check import security_check_node
 from .kb_shell_search import kb_shell_search_node
+from .registered_tool import registered_tool_dispatch_node, tool_dispatch_node
 from .answer import answer_node
 
 __all__ = [
@@ -53,5 +54,7 @@ __all__ = [
     'code_style_node',
     'security_check_node',
     'kb_shell_search_node',
+    'registered_tool_dispatch_node',
+    'tool_dispatch_node',
     'answer_node',
 ]

@@ -90,7 +90,12 @@ def tiling_validate_node(
 
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "TILING_VALIDATE", "query": query, "response": display_text}
+    log_entry = {
+        "round": round_num,
+        "tool": "tiling_validate",
+        "query": query,
+        "response": display_text,
+    }
 
     print(f"[Round {round_num}] 工具=Tiling验证(TILING_VALIDATE), params={params}")
 

@@ -11,7 +11,6 @@ from langchain_core.messages import HumanMessage
 from .agent_config import (
     AgentToolMode,
     NO_TOOL,
-    has_kb,
     parse_tool_mode,
     tool_mode_to_string,
     get_llm_config_compatible,
@@ -67,17 +66,7 @@ def _build_base_prompt(language: str, strategy_name: str, op: str) -> str:
         return strategy.generate(op)
 
     # Fallback: simple prompt
-    return f"请为 {op} 算子编写一个 {language} Kernel 实现。"
-
-
-def _add_kb_hint(prompt: str) -> str:
-    """Add KB hint to prompt when KB is enabled."""
-    return (
-        "[Note] You have access to a knowledge base that contains Huawei Ascend C API documentation. "
-        "This documentation is highly reliable; following it when writing kernels can greatly reduce the chance of inventing non-existent APIs. "
-        "You are strongly encouraged to consult the knowledge base before answering.\n\n"
-        + prompt
-    )
+    return f"Write a {language} kernel implementation for the `{op}` operator."
 
 
 def _extract_final_answer(final_state: Dict[str, Any]) -> str:
@@ -91,6 +80,21 @@ def _extract_final_answer(final_state: Dict[str, Any]) -> str:
 
 def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
     """Build detailed report from final state."""
+    parse_errors = final_state.get("tool_choice_error_log", [])
+
+    def _summarize_parse_entry(e: Dict[str, Any]) -> Dict[str, Any]:
+        raw = e.get("raw_model_output") or ""
+        if len(raw) > 2000:
+            raw = raw[:2000] + "...(truncated)"
+        return {
+            "kind": e.get("kind"),
+            "round": e.get("round"),
+            "error": e.get("error"),
+            "parsed_tool_field": e.get("parsed_tool_field"),
+            "raw_model_output": raw,
+            "ts": e.get("ts"),
+        }
+
     return {
         "reasoning_content": final_state.get("reasoning_content", ""),
         "answer": _extract_final_answer(final_state),
@@ -99,10 +103,13 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
                 "round": t.get("round"),
                 "tool": t.get("tool", ""),
                 "query": t.get("query", ""),
-                "response": t.get("response", "")[:500] + "..." if len(t.get("response", "")) > 500 else t.get("response", ""),
+                "response": t.get("response", "")[:500] + "..."
+                if len(t.get("response", "")) > 500
+                else t.get("response", ""),
             }
             for t in final_state.get("tool_calls_log", [])
         ],
+        "tool_choice_parse_errors": [_summarize_parse_entry(x) for x in parse_errors],
         "kb_results_count": len(final_state.get("kb_results", [])),
         "web_results_count": len(final_state.get("web_results", [])),
         "code_rag_results_count": len(final_state.get("code_rag_results", [])),
@@ -120,7 +127,7 @@ def generate_kernel_with_agent(
 
     Args:
         task: KernelGenerationTask with language, op, strategy_name, category
-        tool_mode: Tool mode (FrozenSet[ToolType] or string like "kb_only", "kb,web", "all")
+        tool_mode: Tool mode (``frozenset`` of tool keys or string like ``\"kb_only\"``, ``\"kb,web\"``, ``\"all\"``)
         retriever: Optional pre-loaded CodeRetriever for Code RAG
         llm_config: Optional LLM config (api_key, base_url, model)
 
@@ -143,18 +150,14 @@ def generate_kernel_with_agent(
     # 1. Build base prompt using existing prompt_generators
     base_prompt = _build_base_prompt(task.language, task.strategy_name, task.op)
 
-    # 2. Add KB hint if KB is enabled
-    if has_kb(parsed_mode):
-        base_prompt = _add_kb_hint(base_prompt)
-
-    # 3. Build and invoke agent
+    # 2. Build and invoke agent
     app = build_agent_app(
         tool_mode=parsed_mode,
         llm_config=llm_config,
         code_retriever=retriever,
     )
 
-    # 4. Create initial state
+    # 3. Create initial state
     initial_state = create_initial_state(
         base_prompt=base_prompt,
         op_name=task.op,
@@ -163,12 +166,12 @@ def generate_kernel_with_agent(
         strategy_name=task.strategy_name,
     )
 
-    # 5. Invoke agent
+    # 4. Invoke agent
     mode_str = tool_mode_to_string(parsed_mode)
     print(f"[INFO] Starting agent for op={task.op}, tool_mode={mode_str}")
     final_state = app.invoke(initial_state)
 
-    # 6. Extract results
+    # 5. Extract results
     generated_code = _extract_final_answer(final_state)
     reasoning = final_state.get("reasoning_content")
     tool_calls = final_state.get("tool_calls_log", [])
@@ -197,7 +200,7 @@ def generate_ascendc_kernel(
         op: Operator name
         category: Operator category
         strategy: Prompt strategy
-        tool_mode: Tool mode (string like "kb_only", "kb,web", "all" or FrozenSet[ToolType])
+        tool_mode: Tool mode (string preset or comma list, or ``frozenset`` of tool keys)
 
     Returns:
         Generated kernel code

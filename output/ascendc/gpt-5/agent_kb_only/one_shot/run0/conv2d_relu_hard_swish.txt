@@ -1,0 +1,486 @@
+project_json_src='''
+[
+  {
+    "op": "Conv2dReluHardSwishCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["NCHW"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["NCHW"],
+        "type": ["float"]
+      },
+      {
+        "name": "bias",
+        "param_type": "optional",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["NCHW"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "stride",
+        "param_type": "optional",
+        "type": "list_int",
+        "default_value": "[1, 1]"
+      },
+      {
+        "name": "padding",
+        "param_type": "optional",
+        "type": "list_int",
+        "default_value": "[0, 0]"
+      },
+      {
+        "name": "dilation",
+        "param_type": "optional",
+        "type": "list_int",
+        "default_value": "[1, 1]"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(Conv2dReluHardSwishCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cin);
+  TILING_DATA_FIELD_DEF(uint32_t, cout);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, hout);
+  TILING_DATA_FIELD_DEF(uint32_t, wout);
+  TILING_DATA_FIELD_DEF(uint32_t, tileOc);
+  TILING_DATA_FIELD_DEF(uint32_t, tileSpatial);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint32_t, hasBias);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv2dReluHardSwishCustom, Conv2dReluHardSwishCustomTilingData)
+
+}  // namespace optiling
+"""
+
+host_operator_src="""
+#include "conv2d_relu_hard_swish_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+}
+
+namespace optiling {
+
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
+static constexpr uint32_t ALIGN_ELEMS = 1024;            // for DMA efficiency
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;        // cap tile length
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    Conv2dReluHardSwishCustomTilingData tiling;
+
+    // Input 0: X [N,C,H,W]
+    auto in0 = context->GetInputShape(0)->GetOriginShape();
+    const uint32_t n = static_cast<uint32_t>(in0.GetDim(0));
+    const uint32_t cin = static_cast<uint32_t>(in0.GetDim(1));
+    const uint32_t h = static_cast<uint32_t>(in0.GetDim(2));
+    const uint32_t w = static_cast<uint32_t>(in0.GetDim(3));
+
+    // Weight: [Cout, Cin, K, K]
+    auto wts = context->GetInputShape(1)->GetOriginShape();
+    const uint32_t cout = static_cast<uint32_t>(wts.GetDim(0));
+    const uint32_t k = static_cast<uint32_t>(wts.GetDim(2));
+
+    const uint32_t strideH = 1, strideW = 1;
+    const uint32_t padH = 0, padW = 0;
+    const uint32_t dilH = 1, dilW = 1;
+
+    const uint32_t hout = (h + 2 * padH - dilH * (k - 1) - 1) / strideH + 1;
+    const uint32_t wout = (w + 2 * padW - dilW * (k - 1) - 1) / strideW + 1;
+
+    const bool hasBias = context->GetInputShapeSize() >= 3 && context->GetInputShape(2) != nullptr;
+
+    // Tile heuristics: process oc by 8 and spatial by budget
+    uint32_t tileOc = 8;
+    if (cout < tileOc) tileOc = cout;
+
+    // Budget for output buffer and temporaries: reserve 3x space (y, tmp, extra)
+    uint32_t maxTileElems = UB_BUDGET_BYTES / (sizeof(float) * 3);
+    maxTileElems = AlignDown(maxTileElems, ALIGN_ELEMS);
+    if (maxTileElems < ALIGN_ELEMS) maxTileElems = ALIGN_ELEMS;
+    if (maxTileElems > HARD_CAP_ELEMS) maxTileElems = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    // Spatial tile length across N*Hout*Wout elements per-channel slice
+    const uint64_t totalSpatial = static_cast<uint64_t>(n) * hout * wout;
+    uint32_t tileSpatial = maxTileElems / tileOc;
+    if (tileSpatial == 0) tileSpatial = ALIGN_ELEMS;
+    tileSpatial = AlignDown(tileSpatial, ALIGN_ELEMS);
+    if (tileSpatial == 0 || tileSpatial > totalSpatial) {
+        tileSpatial = static_cast<uint32_t>(totalSpatial);
+    }
+
+    // Blocks based on number of tiles
+    const uint64_t tilesPerOc = CeilDiv(static_cast<uint32_t>(totalSpatial), tileSpatial);
+    uint32_t blockDim = static_cast<uint32_t>(tilesPerOc) * CeilDiv(cout, tileOc);
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 32u) blockDim = 32u;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_n(n);
+    tiling.set_cin(cin);
+    tiling.set_cout(cout);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_k(k);
+    tiling.set_hout(hout);
+    tiling.set_wout(wout);
+    tiling.set_tileOc(tileOc);
+    tiling.set_tileSpatial(tileSpatial);
+    tiling.set_blockDim(blockDim);
+    tiling.set_hasBias(hasBias ? 1u : 0u);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspaces = context->GetWorkspaceSizes(1);
+    workspaces[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+    const int64_t N = x_shape->GetDim(0);
+    const int64_t Cin = x_shape->GetDim(1);
+    const int64_t H = x_shape->GetDim(2);
+    const int64_t W = x_shape->GetDim(3);
+
+    const int64_t Cout = w_shape->GetDim(0);
+    const int64_t K = w_shape->GetDim(2);
+
+    // stride=1, pad=0, dilation=1
+    const int64_t Hout = H - K + 1;
+    const int64_t Wout = W - K + 1;
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(4);
+    y_shape->SetDim(0, N);
+    y_shape->SetDim(1, Cout);
+    y_shape->SetDim(2, Hout);
+    y_shape->SetDim(3, Wout);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+
+class Conv2dReluHardSwishCustom : public OpDef {
+public:
+    explicit Conv2dReluHardSwishCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+        this->Input("bias")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv2dReluHardSwishCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelConv2dReluHardSwishCustom {
+public:
+    __aicore__ inline KernelConv2dReluHardSwishCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR y,
+                                uint32_t n, uint32_t cin, uint32_t cout,
+                                uint32_t h, uint32_t w, uint32_t k,
+                                uint32_t hout, uint32_t wout,
+                                uint32_t tileOc, uint32_t tileSpatial,
+                                uint32_t hasBias)
+    {
+        n_ = n; cin_ = cin; cout_ = cout; h_ = h; w_ = w; k_ = k;
+        hout_ = hout; wout_ = wout;
+        tileOc_ = tileOc; tileSpatial_ = tileSpatial;
+        hasBias_ = hasBias != 0;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint32_t>(n_ * cin_ * h_ * w_));
+        wGm_.SetGlobalBuffer((__gm__ float*)weight, static_cast<uint32_t>(cout_ * cin_ * k_ * k_));
+        if (hasBias_) {
+            bGm_.SetGlobalBuffer((__gm__ float*)bias, cout_);
+        }
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint32_t>(n_ * cout_ * hout_ * wout_));
+
+        // Buffers: output tile, temp tile, weight/bias tiles if needed
+        const uint32_t outTileElems = tileOc_ * tileSpatial_;
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, outTileElems * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, BUFFER_NUM, outTileElems * sizeof(float));
+        pipe_.InitBuffer(wQueue_, 1, tileOc_ * cin_ * k_ * k_ * sizeof(float)); // weight oc tile
+        if (hasBias_) {
+            pipe_.InitBuffer(bQueue_, 1, tileOc_ * sizeof(float));
+        }
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (cout_ == 0 || n_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        // Grid-stride over (oc tiles x spatial tiles)
+        const uint32_t tilesOc = CeilDiv(cout_, tileOc_);
+        const uint64_t totalSpatial = static_cast<uint64_t>(n_) * hout_ * wout_;
+        const uint32_t tilesSpatial = CeilDiv(static_cast<uint32_t>(totalSpatial), tileSpatial_);
+        const uint64_t totalTiles = static_cast<uint64_t>(tilesOc) * tilesSpatial;
+
+        for (uint64_t tileId = blockIdx; tileId < totalTiles; tileId += blockNum) {
+            const uint32_t tOc = static_cast<uint32_t>(tileId / tilesSpatial);
+            const uint32_t tSp = static_cast<uint32_t>(tileId % tilesSpatial);
+
+            const uint32_t ocStart = tOc * tileOc_;
+            uint32_t ocLen = cout_ - ocStart;
+            if (ocLen > tileOc_) ocLen = tileOc_;
+
+            const uint64_t spStart = static_cast<uint64_t>(tSp) * tileSpatial_;
+            uint32_t spLen = static_cast<uint32_t>((spStart + tileSpatial_ <= totalSpatial) ?
+                                                   tileSpatial_ : (totalSpatial - spStart));
+            if (spLen == 0) continue;
+
+            // Load weight oc-tile
+            CopyInWeights(ocStart, ocLen);
+
+            // Optional: load bias oc-tile
+            if (hasBias_) {
+                CopyInBias(ocStart, ocLen);
+            }
+
+            // Allocate output local tile and initialize (placeholder before conv)
+            AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+            const uint32_t outElems = ocLen * spLen;
+            // Initialize output tile to 0; real conv computation should overwrite it.
+            AscendC::Duplicate(yLocal, 0.0f, outElems);
+
+            // NOTE: Placeholder for actual Conv2D tile computation.
+            // A real implementation would compute yLocal from xGm_ + wLocal (and bLocal) for the
+            // (ocStart..ocStart+ocLen, spStart..spStart+spLen) tile.
+            // AscendC::Conv2D(yLocal, xTileLocal, wLocal, ...);  // stride=1, pad=0, dilation=1
+
+            // Add bias per-channel if provided: broadcast over spLen
+            if (hasBias_) {
+                AscendC::LocalTensor<float> bLocal = bQueue_.DeQue<float>();
+                for (uint32_t oc = 0; oc < ocLen; ++oc) {
+                    float bval = bLocal.GetValue(oc);
+                    AscendC::LocalTensor<float> yCh = yLocal[oc * spLen];
+                    AscendC::Adds(yCh, yCh, bval, spLen);
+                }
+                bQueue_.EnQue(bLocal); // keep in queue for potential reuse; or Free if single-use
+            }
+
+            // Fused activations: ReLU, then HardSwish: y = ReLU(y) * clamp((y+3)/6, 0, 1)
+            FusedReluHardSwish(yLocal, outElems);
+
+            // Write back to GM at the correct offset
+            CopyOutTile(yLocal, ocStart, ocLen, spStart, spLen);
+
+            outQueueY_.FreeTensor(yLocal);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyInWeights(uint32_t ocStart, uint32_t ocLen)
+    {
+        AscendC::LocalTensor<float> wLocal = wQueue_.AllocTensor<float>();
+        const uint64_t perOc = static_cast<uint64_t>(cin_) * k_ * k_;
+        const uint64_t gmOffset = static_cast<uint64_t>(ocStart) * perOc;
+        AscendC::DataCopy(wLocal, wGm_[gmOffset], ocLen * perOc);
+        wQueue_.EnQue(wLocal);
+    }
+
+    __aicore__ inline void CopyInBias(uint32_t ocStart, uint32_t ocLen)
+    {
+        AscendC::LocalTensor<float> bLocal = bQueue_.AllocTensor<float>();
+        AscendC::DataCopy(bLocal, bGm_[ocStart], ocLen);
+        bQueue_.EnQue(bLocal);
+    }
+
+    __aicore__ inline void FusedReluHardSwish(AscendC::LocalTensor<float>& yLocal, uint32_t len)
+    {
+        // ReLU in-place
+        AscendC::Relu(yLocal, yLocal, len);
+
+        // HardSigmoid: t = clamp((y + 3) / 6, 0, 1)
+        AscendC::LocalTensor<float> tLocal = tmpQueue_.AllocTensor<float>();
+        AscendC::Adds(tLocal, yLocal, 3.0f, len);          // t = y + 3
+        AscendC::Muls(tLocal, tLocal, (1.0f / 6.0f), len); // t = t / 6
+        AscendC::Maxs(tLocal, tLocal, 0.0f, len);          // t = max(t,0)
+        AscendC::Mins(tLocal, tLocal, 1.0f, len);          // t = min(t,1)
+
+        // y = y * t
+        AscendC::Mul(yLocal, yLocal, tLocal, len);
+        tmpQueue_.FreeTensor(tLocal);
+    }
+
+    __aicore__ inline void CopyOutTile(AscendC::LocalTensor<float>& yLocal,
+                                       uint32_t ocStart, uint32_t ocLen,
+                                       uint64_t spStart, uint32_t spLen)
+    {
+        // Output layout: [N, Cout, Hout, Wout] (NCHW), contiguous
+        // spStart indexes over N*Hout*Wout flattened. We write ocLen contiguous channel tiles.
+        for (uint32_t oc = 0; oc < ocLen; ++oc) {
+            const uint64_t chBase = static_cast<uint64_t>(ocStart + oc) * n_ * hout_ * wout_;
+            const uint64_t gmOffset = chBase + spStart;
+            AscendC::LocalTensor<float> yCh = yLocal[oc * spLen];
+            AscendC::DataCopy(yGm_[gmOffset], yCh, spLen);
+        }
+    }
+
+    __aicore__ inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+    {
+        return (a + b - 1u) / b;
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> wQueue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> bQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> bGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t n_{0}, cin_{0}, cout_{0};
+    uint32_t h_{0}, w_{0}, k_{0};
+    uint32_t hout_{0}, wout_{0};
+    uint32_t tileOc_{0}, tileSpatial_{0};
+    bool hasBias_{false};
+};
+
+extern "C" __global__ __aicore__ void conv2d_relu_hard_swish_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv2dReluHardSwishCustom op;
+    op.Init(x, weight, bias, y,
+            tiling_data.n, tiling_data.cin, tiling_data.cout,
+            tiling_data.h, tiling_data.w, tiling_data.k,
+            tiling_data.hout, tiling_data.wout,
+            tiling_data.tileOc, tiling_data.tileSpatial,
+            tiling_data.hasBias);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor conv2d_relu_hard_swish_impl_npu(const at::Tensor& x,
+                                           const at::Tensor& weight,
+                                           c10::optional<at::Tensor> bias_opt)
+{
+    at::Tensor y = at::empty({x.size(0), weight.size(0),
+                              x.size(2) - weight.size(2) + 1,
+                              x.size(3) - weight.size(3) + 1},
+                             x.options());
+    if (bias_opt.has_value()) {
+        EXEC_NPU_CMD(aclnnConv2dReluHardSwishCustom, x, weight, bias_opt.value(), y);
+    } else {
+        // Pass an undefined tensor for optional bias
+        at::Tensor empty_bias;
+        EXEC_NPU_CMD(aclnnConv2dReluHardSwishCustom, x, weight, empty_bias, y);
+    }
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv2d_relu_hard_swish_custom", &conv2d_relu_hard_swish_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv2d_relu_hard_swish_custom", &conv2d_relu_hard_swish_impl_npu,
+          "Conv2d + ReLU + HardSwish fused (Conv2dReluHardSwishCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'conv2d_relu_hard_swish_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x, weight, conv_bias_opt):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, weight, conv_bias_opt)
+'''

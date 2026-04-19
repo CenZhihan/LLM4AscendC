@@ -210,37 +210,44 @@ python3 generator/scripts/generation/generate_agent.py \
 # Agent + KB + Code RAG 组合
 python3 generator/scripts/generation/generate_agent.py \
   --tool-mode kb_and_code_rag --strategy add_shot --categories activation --workers 4
+
+# 指定模型（覆盖 local_api_config 中的 XI_AI_MODEL），仅 KB，activation ∩ kernelbench102
+python3 generator/scripts/generation/generate_agent.py \
+  --model gpt-4o --tool-mode kb_only --strategy one_shot \
+  --categories activation --kernelbench102 --workers 4 --runs 1
 ```
 
 **Agent 专用参数**
 
 | 参数 | 默认值 | 含义 |
 |------|--------|------|
-| `--tool-mode` | `no_tool` | 工具模式：`no_tool` / `kb_only` / `web_only` / `code_rag_only` / `kb_and_web` / `kb_and_code_rag` / `web_and_code_rag` / `all` |
+| `--tool-mode` | `no_tool` | 工具模式：上列预置名，或 **逗号分隔** 的小写工具键（如 `kb,code_rag,env_check_env`）及已注册插件名；由 `parse_tool_mode` 解析 |
 | `--strategy` | `add_shot` | Prompt 策略名称，由 `prompt_generators/` 注册表提供 |
 | `--kernelbench102` | — | 只生成 `generator/kernelbench102_ops.py` 中登记的 102 个已验证算子 |
 | `--categories` | `all` | 算子类别列表 |
 | `--workers` | `4` | 并行 worker 数量 |
 | `--start-from` | — | 从指定算子开始生成（断点续传） |
 | `--runs` | `1` | 运行轮数 |
+| `--model` | — | 仅覆盖模型名；**优先级高于** `generator/local_api_config.py` 中的 `XI_AI_MODEL` / `MODEL` |
+| `--output-dir` | — | 自定义输出根目录；不设则按解析后的模型名自动分目录（见下节「默认输出」） |
 
-> **注意**：Agent 方式需要提前构建 RAG 索引（同 `tools/generate_operator.py --build-index`），且 LLM 配置需通过环境变量 `XI_AI_API_KEY` / `XI_AI_BASE_URL` / `XI_AI_MODEL` 或 `api_config.py` 提供。
+> **注意**：若 `--tool-mode` 包含 `code_rag`，需提前构建 RAG 索引（同 `tools/generate_operator.py --build-index`）。**Agent 的 LLM** 仅从 `generator/local_api_config.py` 读取密钥与 Base URL（见 §3.5.5），**不再**使用 `USE_API_CONFIG` 或 `XI_AI_*` 环境变量作为 Agent 入口的配置来源。
 
 #### （3）Python API — 自定义工具组合
 
-除了 CLI 预定义的模式，还可以通过 `frozenset` 自由组合任意 `ToolType`，实现更精细的工具控制：
+除 CLI 预置名外，可用 **`frozenset[str]`**（`AgentToolMode`）列出要启用的工具键；键名一律为 **小写 snake_case**，与 LLM 输出的 JSON `tool` 字段一致。
 
 ```python
 from generator.agent import (
     generate_kernel_with_agent,
     KernelGenerationTask,
-    ToolType,
     parse_tool_mode,
 )
 
-# 使用 frozenset 自定义工具组合
 from generator.agent.agent_config import KB_ONLY, CODE_RAG_ONLY
-custom_mode = frozenset({ToolType.KB, ToolType.CODE_RAG, ToolType.ENV_CHECK_ENV})
+
+# 使用 frozenset 自定义工具组合（字符串键）
+custom_mode = frozenset({"kb", "code_rag", "env_check_env"})
 
 task = KernelGenerationTask(
     language="ascendc",
@@ -252,35 +259,32 @@ result = generate_kernel_with_agent(task, custom_mode)
 print(result.generated_code)
 ```
 
-也支持直接传入字符串，内部自动解析：
+也支持直接传入字符串，内部由 `parse_tool_mode` 解析（可包含已在 `tool_registry` 注册的插件名）：
 
 ```python
-# 字符串自动解析
 result = generate_kernel_with_agent(task, "kb,code_rag,env_check_env")
-
-# 等价于
 result = generate_kernel_with_agent(task, parse_tool_mode("kb,code_rag,env_check_env"))
 ```
 
-可用 `ToolType` 完整列表：
+内置工具键一览（与 `generator/agent/agent_config.py` 中 `BUILTIN_TOOL_NAMES` 一致）：
 
-| ToolType | 说明 |
-|----------|------|
-| `KB` | 知识库查询（ChromaDB Ascend C API 文档） |
-| `WEB` | 网页搜索（DuckDuckGo） |
-| `CODE_RAG` | 代码检索（`generator/rag/` 索引中的相似实现） |
-| `ENV_CHECK_ENV` | 环境概览检查（CANN 版本、工具链状态） |
-| `ENV_CHECK_NPU` | NPU 设备查询（状态、显存、温度、功耗） |
-| `ENV_CHECK_API` | API 兼容性检查（搜索 CANN 头文件中的 API） |
-| `KB_SHELL_SEARCH` | 基于 shell 命令的知识库搜索 |
-| `API_LOOKUP` | API 文档查找 |
-| `API_CONSTRAINT` | API 约束检查 |
-| `API_ALTERNATIVE` | API 替代方案查找 |
-| `TILING_CALC` | Tiling 计算 |
-| `TILING_VALIDATE` | Tiling 验证 |
-| `NPU_ARCH` | NPU 架构查询 |
-| `CODE_STYLE` | 代码风格检查 |
-| `SECURITY_CHECK` | 安全模式检查 |
+| 键 (`tool`) | 说明 |
+|-------------|------|
+| `kb` | 知识库查询（ChromaDB Ascend C API 文档） |
+| `web` | 网页搜索（DuckDuckGo / `ddgs`） |
+| `code_rag` | 代码检索（`generator/rag/` 索引） |
+| `env_check_env` | 环境概览（CANN、工具链） |
+| `env_check_npu` | NPU 设备查询 |
+| `env_check_api` | API 头文件存在性检查 |
+| `kb_shell_search` | 知识库内 shell/grep 式搜索 |
+| `api_lookup` | API 签名与文档查询 |
+| `api_constraint` | API 参数与平台约束检查 |
+| `api_alternative` | API 替代方案 |
+| `tiling_calc` | Tiling 参数计算 |
+| `tiling_validate` | Tiling 参数校验 |
+| `npu_arch` | NPU 架构 / UB 容量等 |
+| `code_style` | Ascend C 代码风格检查 |
+| `security_check` | 不安全模式扫描 |
 
 ### 3.3 提示策略（`generator/prompt_generators/`）
 
@@ -300,83 +304,77 @@ RAG 模块负责将外部代码库（C++ 头文件与实现）索引为向量数
 
 ### 3.5 LangGraph Agent（`generator/agent/`）
 
-Agent 是一个基于 LangGraph StateGraph 的多轮工作流，LLM 在每轮自主决定下一步动作：查询知识库、搜索网页、检索代码库、检查环境兼容性，或直接生成答案。
+Agent 基于 LangGraph `StateGraph`：在 `build_agent_app` 入口会 **`get_tool_registry().clear()`**，再为本图的 `tool_mode` **仅注册**出现的内置工具（`RegisteredToolSpec` + 薄 `handler` 包装现有节点）以及快照恢复的插件；拓扑为 **`entry` → `choose_tool` → (`answer` | `tool_dispatch` → `choose_tool`)**。
 
-#### 3.5.1 工具类型
+**与 `eval_operator.py` 的关系**：Agent 与脚本生成路径将算子 `.txt` 写到 `output/`（或 `--output-dir`）；评测仍用 `tools/eval_operator.py --txt …` / `--txt-dir …` 指向这些文件，二者只通过产物路径衔接，无代码耦合。
 
-| 工具 | 标识 | 数据源 | 说明 |
-|------|------|--------|------|
-| 知识库查询 | `KB` | ChromaDB 中的 Ascend C API 文档 | 查询本地索引的昇腾 API 文档片段 |
-| 网页搜索 | `WEB` | DuckDuckGo（`ddgs` 包） | 搜索技术文档、博客与教程 |
-| 代码检索 | `CODE_RAG` | `generator/rag/` 索引 | 检索代码库中的相似实现 |
-| 环境检查 | `ENV_CHECK_ENV` | CANN 头文件与运行时环境 | 检查 CANN 版本、工具链状态 |
-| NPU 查询 | `ENV_CHECK_NPU` | `npu-smi` | 查询设备状态、显存、温度、功耗 |
-| API 兼容 | `ENV_CHECK_API` | CANN 头文件 | 检查 API 是否在 CANN 头文件中存在 |
-| KB Shell 搜索 | `KB_SHELL_SEARCH` | 本地知识库 | 通过 shell 命令搜索知识库 |
-| API 查找 | `API_LOOKUP` | CANN API 文档 | 查找特定 API 的详细文档 |
-| API 约束 | `API_CONSTRAINT` | CANN API 文档 | 检查 API 的参数约束与限制 |
-| API 替代 | `API_ALTERNATIVE` | CANN API 文档 | 查找 API 的替代方案 |
-| Tiling 计算 | `TILING_CALC` | 算子参数推导 | 根据输入 shape 计算 Tiling 参数 |
-| Tiling 验证 | `TILING_VALIDATE` | 算子参数推导 | 验证 Tiling 参数的合法性 |
-| NPU 架构 | `NPU_ARCH` | 架构知识库 | 查询 NPU 芯片型号与架构特性 |
-| 代码风格 | `CODE_STYLE` | 代码规范 | 检查代码风格是否符合 Ascend C 规范 |
-| 安全检查 | `SECURITY_CHECK` | 安全规范 | 检查代码中的安全模式问题 |
+#### 3.5.1 工具类型与数据源
 
-每种工具均以 Retriever 类封装，提供 `is_available()` 与 `retrieve(query)` 两个标准方法，便于在节点中统一调用。
+| 工具 | JSON `tool` 键 | 数据源 | 说明 |
+|------|----------------|--------|------|
+| 知识库查询 | `kb` | ChromaDB Ascend C API 文档 | 本地 API 文档片段；每次调用由 `kb_query_node` 取 **top_k=3** 条片段写入状态 |
+| 网页搜索 | `web` | DuckDuckGo（`ddgs`） | 技术文档与博客 |
+| 代码检索 | `code_rag` | `generator/rag/` | 相似内核实现 |
+| 环境概览 | `env_check_env` | CANN / 运行时 | 工具链与版本 |
+| NPU 查询 | `env_check_npu` | `npu-smi` 等 | 设备状态 |
+| API 头文件检查 | `env_check_api` | CANN 头文件 | 符号是否存在 |
+| KB Shell 搜索 | `kb_shell_search` | 打包知识库目录 | grep/find 式搜索 |
+| API 查找 | `api_lookup` | 结构化 API 文档 | 签名与限制 |
+| API 约束 | `api_constraint` | 同上 | 对齐、repeatTimes 等 |
+| API 替代 | `api_alternative` | 同上 | 备选 API |
+| Tiling 计算 | `tiling_calc` | 推导规则 | 分块参数 |
+| Tiling 验证 | `tiling_validate` | 推导规则 | 合法性检查 |
+| NPU 架构 | `npu_arch` | 内置芯片表 | UB、宏、特性 |
+| 代码风格 | `code_style` | 规则集 | 风格问题 |
+| 安全检查 | `security_check` | 规则集 | 危险模式 |
+
+底层仍以各 **Retriever** 实现为主；**`tool_dispatch`** 节点根据 `state["next_action"]`（小写键或 `ANSWER`）在 **同一 Registry** 上查找并调用 `handler`。
+
+实现落点简述：**`generator/agent/nodes/`** 中各节点负责一次工具调用的编排（读状态、调 retriever、写回结果）；**`generator/agent/retrievers/`** 承担具体检索与环境探测逻辑。**`builtin_tools.py`** 为内置工具组装注册表元数据并把 `handler` 指到上述节点。选工具、写答案、KB 英译子请求等 **凡进入 LLM API 的文案当前为英文**。
 
 #### 3.5.2 Agent 模式
 
-通过 `ToolType` 的冻结集合（`AgentToolMode`）指定启用的工具。常用模式：
+`AgentToolMode` 即 `frozenset[str]`（小写工具键，外加可选插件键）。常用 **字符串** 预置名由 `parse_tool_mode` 解析：
 
 | 模式字符串 | 含义 |
 |------------|------|
-| `no_tool` | 不使用工具，LLM 直接回答 |
-| `kb_only` | 仅使用知识库 |
-| `web_only` | 仅使用网页搜索 |
-| `code_rag_only` | 仅使用代码检索 |
-| `kb_and_web` | 知识库 + 网页搜索 |
-| `kb_and_code_rag` | 知识库 + 代码检索 |
-| `web_and_code_rag` | 网页搜索 + 代码检索 |
-| `all` | 启用全部三种工具（KB、WEB、CODE_RAG） |
+| `no_tool` | 不使用工具，直接 `answer` |
+| `kb_only` / `web_only` / `code_rag_only` | 单工具 |
+| `kb_and_web` / `kb_and_code_rag` / `web_and_code_rag` | 两两组合 |
+| `all` | 预置子集（`kb` + `web` + `code_rag` + 三个 `env_check_*`） |
 
-可通过 `frozenset` 自由组合，例如同时启用所有工具和 `ENV_CHECK`：
+任意扩展组合示例：
 
 ```python
-from generator.agent.agent_config import ALL, ToolType
-mode = frozenset({*ALL, ToolType.ENV_CHECK})
+from generator.agent.agent_config import ALL
+
+mode = frozenset({*ALL, "kb_shell_search", "api_lookup"})
 ```
 
-#### 3.5.3 Agent 工作流
+#### 3.5.3 Agent 工作流（统一调度）
 
 ```
 entry
   │
-  ├─ (无工具时) → answer → END
-  └─ (有工具时) → choose_tool
+  ├─ (no_tool) ──────────────────────────────→ answer → END
+  └─ (有工具) → choose_tool
                     │
-                    ├─ KB ──→ kb_query ──→ choose_tool (循环)
-                    ├─ WEB ──→ web_search ──→ choose_tool (循环)
-                    ├─ CODE_RAG ──→ code_rag ──→ choose_tool (循环)
-                    ├─ ENV_CHECK_ENV ──→ env_check_env ──→ choose_tool (循环)
-                    ├─ ENV_CHECK_NPU ──→ env_check_npu ──→ choose_tool (循环)
-                    ├─ ENV_CHECK_API ──→ env_check_api ──→ choose_tool (循环)
-                    ├─ KB_SHELL_SEARCH ──→ kb_shell_search ──→ choose_tool (循环)
-                    ├─ API_LOOKUP ──→ api_lookup ──→ choose_tool (循环)
-                    ├─ API_CONSTRAINT ──→ api_constraint ──→ choose_tool (循环)
-                    ├─ API_ALTERNATIVE ──→ api_alternative ──→ choose_tool (循环)
-                    ├─ TILING_CALC ──→ tiling_calc ──→ choose_tool (循环)
-                    ├─ TILING_VALIDATE ──→ tiling_validate ──→ choose_tool (循环)
-                    ├─ NPU_ARCH ──→ npu_arch ──→ choose_tool (循环)
-                    ├─ CODE_STYLE ──→ code_style ──→ choose_tool (循环)
-                    ├─ SECURITY_CHECK ──→ security_check ──→ choose_tool (循环)
-                    └─ ANSWER ──→ answer → END
+                    ├─ (query_round_count ≥ MAX_QUERY_ROUNDS) → answer → END
+                    ├─ (JSON 解析失败或 tool 不在本图 tool_mode) → choose_tool（自环，burn 一轮）
+                    ├─ tool = ANSWER ─────────────────────────→ answer → END
+                    └─ 否则 → tool_dispatch（Registry handler）→ choose_tool
 ```
 
-- **`entry`**：入口节点，根据是否启用工具决定走向。
-- **`choose_tool`**：LLM 根据当前已有信息选择下一步动作。每轮输出一行动作标识和一行英文查询。
-- **检索节点**：执行对应工具的 `retrieve(query)`，将结果追加到 Agent 状态中。
-- **`answer`**：综合所有检索结果，由 LLM 生成最终算子代码。
-- 最大查询轮数由 `agent_max_query_rounds` 控制（默认 3 轮），达到上限后强制进入 `answer`。
+- **`choose_tool`**：向 LLM 发送 **全英文** 说明与 few-shot（含 CANN / API 快速迭代、**优先用已启用工具**获取最新与最规范用法、工具检索有效的编排指引）；模型必须只输出一个 JSON 对象（见下节）。不再发起「二次 JSON 修复」模型调用。
+- **`tool_dispatch`**：按 Registry 调用对应 `handler`（内部仍为各 `*_node`），写回各 `*_results` / `tool_calls_log`；`query_round_count` 由各工具节点与 `choose_tool` 的 burn 逻辑按原语义更新。
+- **`answer`**：根据 `messages` 与聚合检索结果生成最终代码。
+- 最大轮数：`generator/agent/agent_state.py` 中 **`MAX_QUERY_ROUNDS`**（默认 3）；达到上限后 **`choose_tool` 侧** 也会强制要求输出 `ANSWER`。
+
+#### 3.5.3.1 JSON 工具选择与解析失败（ToolChoiceV1）
+
+- 字段：`"tool"`（**小写**内置键、已注册插件键、或 **`ANSWER`**）、`"query"`（字符串）、`"args"`（对象或 `null`）。
+- 若 **无法解析 JSON** 或 **`tool` 不在当前 `tool_mode`**：`query_round_count += 1`（与跑完一次工具等价 burn），`tool_choice_parse_failed=True`，向 **`tool_choice_error_log`** 追加一条（含 `raw_model_output`、错误说明、时间戳等），路由 **回到 `choose_tool`**；**不会**立刻进入 `ANSWER`。
+- 批跑报告：`generate_kernel_with_agent` 返回的 `report` / 落盘的 `{op}_report.json` 中含 **`tool_choice_parse_errors`**（对 `tool_choice_error_log` 的摘要，含截断后的原始输出）。
 
 #### 3.5.4 使用示例
 
@@ -389,17 +387,17 @@ python3 generator/scripts/generation/generate_agent.py \
   --categories activation --workers 4
 ```
 
+**默认输出目录**（未传 `--output-dir` 时）：`output/ascendc/<model_slug>/agent_<tool_mode_string>/<strategy>/run<N>/`。其中 `<model_slug>` 由最终采用的模型名经路径安全化得到（与 `--model` 或配置文件中的 `XI_AI_MODEL` 一致，例如 `gpt-4o`）；`<tool_mode_string>` 为 `tool_mode_to_string` 的结果（如 `kb_only`、`kb,code_rag`）。传 `--output-dir` 则完全使用该路径，不再自动插入 `<model_slug>` 等分段。
+
 **Python API 方式**（适合脚本调用）：
 
 ```python
 from generator.agent import (
     generate_kernel_with_agent,
     KernelGenerationTask,
-    ToolType,
     parse_tool_mode,
 )
 
-# 使用字符串（自动解析）
 task = KernelGenerationTask(
     language="ascendc",
     op="gelu",
@@ -409,26 +407,25 @@ task = KernelGenerationTask(
 result = generate_kernel_with_agent(task, "code_rag_only")
 print(result.generated_code)
 
-# 使用 frozenset 自定义组合
-custom_mode = frozenset({ToolType.KB, ToolType.CODE_RAG, ToolType.ENV_CHECK_ENV})
+custom_mode = frozenset({"kb", "code_rag", "env_check_env"})
 result = generate_kernel_with_agent(task, custom_mode)
 ```
 
 #### 3.5.5 Agent LLM 配置
 
-Agent 使用独立于生成器的 LLM 配置，优先级为：
+**`generate_agent.py` CLI** 与 **`generate_kernel_with_agent(..., llm_config=None)`** 解析配置的方式如下（与 `tools/generate_operator.py` 使用的 `generator/llm_config.py` **相互独立**）：
 
-1. `USE_API_CONFIG=1` + `generation/local_api_config.py`（最高优先级）
-2. 环境变量 `XI_AI_API_KEY` + `XI_AI_BASE_URL` + `XI_AI_MODEL`
-3. `api_config.py` 或 `generator/utils/api_config.py` 中的配置
-4. 默认回退到 `deepseek-chat`（`https://api.deepseek.com/v1`）
+1. **命令行** `--model`：若传入非空字符串，则仅 **覆盖模型名** `model` 字段。
+2. **`generator/local_api_config.py`**（须自行从 `generator/local_api_config.example.py` 复制并填写）：读取 `XI_AI_API_KEY` 或 `OPENAI_API_KEY`、`XI_AI_BASE_URL` 或 `OPENAI_API_BASE`（未填则回退为 `https://api-2.xi-ai.cn/v1`，见 `generator/agent/agent_config.py`）、`XI_AI_MODEL` 或 `MODEL`。`api_key` 缺失，或未传 `--model` 且配置里也没有模型名时，会报错退出；**不再**通过 `USE_API_CONFIG`、`XI_AI_*` 环境变量或 DeepSeek 默认兜底为 Agent 提供密钥。
+
+在代码中传入 **`llm_config=dict`** 时，将 **直接使用** 该字典（需自行包含 `api_key`、`base_url`、`model`），不再读取上述文件。
 
 ### 3.6 配置与依赖
 
 | 文件 | 作用 |
 |------|------|
 | `generator/config.py` | 生成器与 Agent 的配置（模型路径、RAG 参数、Agent 参数等） |
-| `generator/agent/agent_config.py` | Agent 工具类型、ToolType 枚举、parse_tool_mode、LLM 配置 |
+| `generator/agent/agent_config.py` | `AgentToolMode`（`frozenset[str]`）、`parse_tool_mode`、预置模式常量、LLM 配置 |
 | `generator/kernelbench102_ops.py` | 预定义的 102 个通过数值正确性验证的算子列表 |
 | `api_config.py`（可选） | LLM API 密钥、基地址、模型名称 |
 | `tools/common/env.py` | CANN/NPU 环境配置（与评测流水线共享） |
@@ -443,8 +440,13 @@ Agent 使用独立于生成器的 LLM 配置，优先级为：
 | `tools/eval_operator.py` | 统一评测入口 |
 | `tools/generate_operator.py` | LLM 算子生成入口（RAG 策略） |
 | `generator/scripts/generation/generate_agent.py` | Agent 生成入口（LangGraph 多轮工作流） |
-| `generator/agent/` | LangGraph 智能 Agent（15+ ToolType） |
-| `generator/agent/agent_config.py` | ToolType 枚举、parse_tool_mode、AgentToolMode、LLM 配置 |
+| `generator/agent/` | LangGraph Agent（Registry + `tool_dispatch` 单调度） |
+| `generator/agent/builtin_tools.py` | 按 `tool_mode` 注册内置 `RegisteredToolSpec` |
+| `generator/agent/tool_registry.py` | 进程内工具注册表（内置 + `register_tool` 插件） |
+| `generator/agent/nodes/` | 各工具节点（编排层，调用 `retrievers/`） |
+| `generator/agent/retrievers/` | KB / Web / Code RAG / 环境检查等具体检索与探测实现 |
+| `generator/agent/agent_config.py` | 工具键常量、`parse_tool_mode`、`tool_mode_to_string`、Agent LLM 本地文件加载 |
+| `generator/agent/_example_prompts_relu_kb/` | `choose_tool` / `answer` 侧提示样例快照（与线上一致时宜同步更新） |
 | `generator/rag/` | RAG 代码索引与嵌入检索（ChromaDB + BGE-M3） |
 | `generator/prompt_generators/` | 提示策略实现（rag、add_shot、selected_shot 等） |
 | `generator/kernelbench102_ops.py` | 102 个通过数值验证的算子列表 |

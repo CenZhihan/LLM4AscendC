@@ -1,75 +1,65 @@
 """
 Agent configuration for LangGraph-based kernel generation agent.
 
-Uses FrozenSet-based tool mode design for extensibility.
-Adding new tools only requires adding a ToolType enum value, no need to define all combinations.
+Tool modes are frozensets of canonical tool keys (lowercase snake_case).
+All tools (retrieval, checks, plugins) register the same way via tool_registry.
 """
 import os
 from enum import Enum
-from typing import FrozenSet, Set, Union, Optional
+from typing import FrozenSet, Iterable, List, Set, Union, Optional
 
 
-class ToolType(str, Enum):
-    """
-    Individual tool type for retrieval.
+# Every built-in tool key the graph may register (subset selected by AgentToolMode).
+BUILTIN_TOOL_NAMES: FrozenSet[str] = frozenset(
+    {
+        "kb",
+        "web",
+        "code_rag",
+        "env_check_env",
+        "env_check_npu",
+        "env_check_api",
+        "kb_shell_search",
+        "api_lookup",
+        "api_constraint",
+        "api_alternative",
+        "tiling_calc",
+        "tiling_validate",
+        "npu_arch",
+        "code_style",
+        "security_check",
+    }
+)
 
-    Each tool represents a retrieval source:
-    - KB: Knowledge base (API documentation)
-    - WEB: Web search (technical blogs, tutorials)
-    - CODE_RAG: Code RAG (similar implementations from code library)
-    - ENV_CHECK_ENV: Environment overview check (CANN version, tools, OPP packages)
-    - ENV_CHECK_NPU: NPU device query (npu-smi info/list/memory/temp/power/usages)
-    - ENV_CHECK_API: API compatibility check (search API in CANN headers)
-
-    Future tools can be easily added:
-    - DOC_RAG: Documentation RAG
-    - API_SEARCH: API search engine
-    - STACKOVERFLOW: Stack Overflow search
-    """
-    KB = "kb"
-    WEB = "web"
-    CODE_RAG = "code_rag"
-    ENV_CHECK_ENV = "env_check_env"
-    ENV_CHECK_NPU = "env_check_npu"
-    ENV_CHECK_API = "env_check_api"
-    KB_SHELL_SEARCH = "kb_shell_search"
-    API_LOOKUP = "api_lookup"
-    API_CONSTRAINT = "api_constraint"
-    API_ALTERNATIVE = "api_alternative"
-    TILING_CALC = "tiling_calc"
-    TILING_VALIDATE = "tiling_validate"
-    NPU_ARCH = "npu_arch"
-    CODE_STYLE = "code_style"
-    SECURITY_CHECK = "security_check"
+AgentToolMode = FrozenSet[str]
 
 
-# Type alias for tool mode (FrozenSet for immutability and dict key usage)
-AgentToolMode = FrozenSet[ToolType]
-
-
-# ===== Enum-based AgentToolMode for CLI script compatibility =====
-# The CLI script (tools/generate_ascendc_operators.py) expects AgentToolMode as an Enum.
-# This Enum mirrors the FrozenSet-based modes above for argparse integration.
 class AgentToolModeEnum(str, Enum):
+    """Enum for tools/generate_ascendc_operators.py argparse only."""
+
     NO_TOOL = "no_tool"
     KB_ONLY = "kb_only"
     WEB_ONLY = "web_only"
     KB_AND_WEB = "kb_and_web"
 
 
-# ===== Predefined common modes (for backward compatibility and convenience) =====
 NO_TOOL: AgentToolMode = frozenset()
-KB_ONLY: AgentToolMode = frozenset({ToolType.KB})
-WEB_ONLY: AgentToolMode = frozenset({ToolType.WEB})
-CODE_RAG_ONLY: AgentToolMode = frozenset({ToolType.CODE_RAG})
-KB_AND_WEB: AgentToolMode = frozenset({ToolType.KB, ToolType.WEB})
-KB_AND_CODE_RAG: AgentToolMode = frozenset({ToolType.KB, ToolType.CODE_RAG})
-WEB_AND_CODE_RAG: AgentToolMode = frozenset({ToolType.WEB, ToolType.CODE_RAG})
-ALL: AgentToolMode = frozenset({ToolType.KB, ToolType.WEB, ToolType.CODE_RAG,
-                                ToolType.ENV_CHECK_ENV, ToolType.ENV_CHECK_NPU, ToolType.ENV_CHECK_API})
+KB_ONLY: AgentToolMode = frozenset({"kb"})
+WEB_ONLY: AgentToolMode = frozenset({"web"})
+CODE_RAG_ONLY: AgentToolMode = frozenset({"code_rag"})
+KB_AND_WEB: AgentToolMode = frozenset({"kb", "web"})
+KB_AND_CODE_RAG: AgentToolMode = frozenset({"kb", "code_rag"})
+WEB_AND_CODE_RAG: AgentToolMode = frozenset({"web", "code_rag"})
+ALL: AgentToolMode = frozenset(
+    {
+        "kb",
+        "web",
+        "code_rag",
+        "env_check_env",
+        "env_check_npu",
+        "env_check_api",
+    }
+)
 
-
-# Map from Enum string values to FrozenSet-based AgentToolMode (for script compatibility)
 AGENT_TOOL_MODE_MAP = {
     AgentToolModeEnum.NO_TOOL: NO_TOOL,
     AgentToolModeEnum.KB_ONLY: KB_ONLY,
@@ -78,141 +68,126 @@ AGENT_TOOL_MODE_MAP = {
 }
 
 
-# ===== Helper functions =====
-def has_tool(mode: AgentToolMode, tool: ToolType) -> bool:
-    """Check if a specific tool is enabled in the mode."""
-    return tool in mode
+def has_tool(mode: AgentToolMode, tool: str) -> bool:
+    return tool.strip().lower() in mode
 
 
 def has_kb(mode: AgentToolMode) -> bool:
-    """Check if KB knowledge base is enabled."""
-    return has_tool(mode, ToolType.KB)
+    return "kb" in mode
 
 
 def has_web(mode: AgentToolMode) -> bool:
-    """Check if Web search is enabled."""
-    return has_tool(mode, ToolType.WEB)
+    return "web" in mode
 
 
 def has_code_rag(mode: AgentToolMode) -> bool:
-    """Check if Code RAG is enabled."""
-    return has_tool(mode, ToolType.CODE_RAG)
+    return "code_rag" in mode
 
 
 def has_env_check_env(mode: AgentToolMode) -> bool:
-    """Check if Environment Check (env overview) is enabled."""
-    return has_tool(mode, ToolType.ENV_CHECK_ENV)
+    return "env_check_env" in mode
 
 
 def has_env_check_npu(mode: AgentToolMode) -> bool:
-    """Check if NPU Device Query is enabled."""
-    return has_tool(mode, ToolType.ENV_CHECK_NPU)
+    return "env_check_npu" in mode
 
 
 def has_env_check_api(mode: AgentToolMode) -> bool:
-    """Check if API Compatibility Check is enabled."""
-    return has_tool(mode, ToolType.ENV_CHECK_API)
+    return "env_check_api" in mode
 
 
 def has_kb_shell_search(mode: AgentToolMode) -> bool:
-    """Check if KB Shell Search is enabled."""
-    return has_tool(mode, ToolType.KB_SHELL_SEARCH)
+    return "kb_shell_search" in mode
 
 
 def has_api_lookup(mode: AgentToolMode) -> bool:
-    """Check if API Lookup is enabled."""
-    return has_tool(mode, ToolType.API_LOOKUP)
+    return "api_lookup" in mode
 
 
 def has_api_constraint(mode: AgentToolMode) -> bool:
-    """Check if API Constraint Check is enabled."""
-    return has_tool(mode, ToolType.API_CONSTRAINT)
+    return "api_constraint" in mode
 
 
 def has_api_alternative(mode: AgentToolMode) -> bool:
-    """Check if API Alternative Finder is enabled."""
-    return has_tool(mode, ToolType.API_ALTERNATIVE)
+    return "api_alternative" in mode
 
 
 def has_tiling_calc(mode: AgentToolMode) -> bool:
-    """Check if Tiling Calculator is enabled."""
-    return has_tool(mode, ToolType.TILING_CALC)
+    return "tiling_calc" in mode
 
 
 def has_tiling_validate(mode: AgentToolMode) -> bool:
-    """Check if Tiling Validator is enabled."""
-    return has_tool(mode, ToolType.TILING_VALIDATE)
+    return "tiling_validate" in mode
 
 
 def has_npu_arch(mode: AgentToolMode) -> bool:
-    """Check if NPU Architecture Query is enabled."""
-    return has_tool(mode, ToolType.NPU_ARCH)
+    return "npu_arch" in mode
 
 
 def has_code_style(mode: AgentToolMode) -> bool:
-    """Check if Code Style Check is enabled."""
-    return has_tool(mode, ToolType.CODE_STYLE)
+    return "code_style" in mode
 
 
 def has_security_check(mode: AgentToolMode) -> bool:
-    """Check if Security Pattern Check is enabled."""
-    return has_tool(mode, ToolType.SECURITY_CHECK)
+    return "security_check" in mode
 
 
-def _parse_tool_type(tool_str: str) -> Optional[ToolType]:
-    """Parse a single tool string to ToolType."""
-    tool_str = tool_str.lower().strip()
-    # Try by value first (kb, web, code_rag)
-    try:
-        return ToolType(tool_str)
-    except ValueError:
-        pass
-    # Try by name (KB, WEB, CODE_RAG)
-    try:
-        return ToolType[tool_str.upper()]
-    except KeyError:
-        pass
-    return None
+def iter_tools(mode: AgentToolMode) -> Iterable[str]:
+    """Yield enabled tool keys (same as iterating the mode)."""
+    return iter(sorted(mode))
+
+
+def iter_plugin_tools(mode: AgentToolMode) -> List[str]:
+    """Return plugin tool keys present in ``mode`` (not built-in names)."""
+    return sorted(t for t in mode if t not in BUILTIN_TOOL_NAMES)
+
+
+def has_plugin(mode: AgentToolMode, raw_key: str) -> bool:
+    """True if ``raw_key`` refers to a non-builtin tool key that is enabled in ``mode``."""
+    x = normalize_tool_choice_name(raw_key or "")
+    if x is None or x == "answer":
+        return False
+    return x in mode and x not in BUILTIN_TOOL_NAMES
+
+
+def _normalize_tool_token(tok: str) -> str:
+    return tok.strip().lower()
+
+
+def _resolve_mode_token(tok: str) -> str:
+    t = _normalize_tool_token(tok)
+    if not t:
+        raise ValueError("empty tool token")
+    if t in BUILTIN_TOOL_NAMES:
+        return t
+    from .tool_registry import get_tool_registry
+
+    if get_tool_registry().is_registered(t):
+        return t
+    raise ValueError(
+        f"unknown tool {tok!r}; use a built-in key (e.g. kb, web) or register a plugin before parse_tool_mode"
+    )
 
 
 def parse_tool_mode(mode_str: Union[str, Set[str], FrozenSet[str], AgentToolMode]) -> AgentToolMode:
-    """
-    Parse tool mode from various input formats.
-
-    Args:
-        mode_str: Can be:
-            - AgentToolMode (FrozenSet[ToolType]): returned directly
-            - str: comma-separated tool names (e.g., "kb,web" or "all")
-            - Set[str]: set of tool name strings
-            - FrozenSet[str]: frozen set of tool name strings
-
-    Returns:
-        AgentToolMode (FrozenSet[ToolType])
-
-    Examples:
-        parse_tool_mode("kb") -> KB_ONLY
-        parse_tool_mode("kb,web") -> KB_AND_WEB
-        parse_tool_mode("all") -> ALL
-        parse_tool_mode({"kb", "web"}) -> KB_AND_WEB
-        parse_tool_mode(ALL) -> ALL (direct return)
-    """
-    # Already an AgentToolMode
     if isinstance(mode_str, frozenset):
-        # Check if it's already ToolType elements
-        if all(isinstance(t, ToolType) for t in mode_str):
-            return mode_str
-        # Convert string elements to ToolType
-        return frozenset({_parse_tool_type(t) for t in mode_str if _parse_tool_type(t) is not None})
+        if not mode_str:
+            return NO_TOOL
+        out: List[str] = []
+        for t in mode_str:
+            if isinstance(t, str):
+                out.append(_resolve_mode_token(t))
+            else:
+                raise TypeError(f"Invalid tool mode element type: {type(t)}")
+        return frozenset(out)
 
-    # Set of strings
     if isinstance(mode_str, set):
-        return frozenset({_parse_tool_type(t) for t in mode_str if _parse_tool_type(t) is not None})
+        if not mode_str:
+            return NO_TOOL
+        return frozenset(_resolve_mode_token(str(x)) for x in mode_str)
 
-    # String input
     if isinstance(mode_str, str):
         mode_str_lower = mode_str.lower().strip()
-
-        # Handle predefined mode names
         predefined_modes = {
             "no_tool": NO_TOOL,
             "kb_only": KB_ONLY,
@@ -225,21 +200,17 @@ def parse_tool_mode(mode_str: Union[str, Set[str], FrozenSet[str], AgentToolMode
         }
         if mode_str_lower in predefined_modes:
             return predefined_modes[mode_str_lower]
-
-        # Handle comma-separated tools
         tools = [t.strip() for t in mode_str.split(",") if t.strip()]
-        return frozenset({_parse_tool_type(t) for t in tools if _parse_tool_type(t) is not None})
+        if not tools:
+            return NO_TOOL
+        return frozenset(_resolve_mode_token(t) for t in tools)
 
-    # Fallback
     return NO_TOOL
 
 
 def tool_mode_to_string(mode: AgentToolMode) -> str:
-    """Convert AgentToolMode to string representation."""
     if not mode:
         return "no_tool"
-
-    # Check predefined modes first
     predefined_map = {
         NO_TOOL: "no_tool",
         KB_ONLY: "kb_only",
@@ -252,74 +223,122 @@ def tool_mode_to_string(mode: AgentToolMode) -> str:
     }
     if mode in predefined_map:
         return predefined_map[mode]
+    return ",".join(sorted(mode))
 
-    # Custom combination
-    return ",".join(sorted(t.value for t in mode))
+
+def normalize_tool_choice_name(raw: str) -> Optional[str]:
+    """
+    Map model output for ``tool`` field to canonical key or 'answer'.
+
+    Accepts kb, KB, legacy ENV_CHECK_ENV, etc.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.upper() == "ANSWER":
+        return "answer"
+    key = s.lower().replace("-", "_")
+    # Legacy uppercase enum-style names -> lowercase keys
+    legacy = {
+        "kb": "kb",
+        "web": "web",
+        "code_rag": "code_rag",
+        "env_check_env": "env_check_env",
+        "env_check_npu": "env_check_npu",
+        "env_check_api": "env_check_api",
+        "kb_shell_search": "kb_shell_search",
+        "api_lookup": "api_lookup",
+        "api_constraint": "api_constraint",
+        "api_alternative": "api_alternative",
+        "tiling_calc": "tiling_calc",
+        "tiling_validate": "tiling_validate",
+        "npu_arch": "npu_arch",
+        "code_style": "code_style",
+        "security_check": "security_check",
+    }
+    u = s.upper()
+    legacy_upper = {
+        "KB": "kb",
+        "WEB": "web",
+        "CODE_RAG": "code_rag",
+        "ENV_CHECK_ENV": "env_check_env",
+        "ENV_CHECK_NPU": "env_check_npu",
+        "ENV_CHECK_API": "env_check_api",
+        "KB_SHELL_SEARCH": "kb_shell_search",
+        "API_LOOKUP": "api_lookup",
+        "API_CONSTRAINT": "api_constraint",
+        "API_ALTERNATIVE": "api_alternative",
+        "TILING_CALC": "tiling_calc",
+        "TILING_VALIDATE": "tiling_validate",
+        "NPU_ARCH": "npu_arch",
+        "CODE_STYLE": "code_style",
+        "SECURITY_CHECK": "security_check",
+    }
+    if u in legacy_upper:
+        return legacy_upper[u]
+    if key in legacy:
+        return legacy[key]
+    return key
 
 
 # ===== LLM Configuration =====
-def get_llm_config_from_env() -> dict:
-    """
-    Get LLM configuration from environment variables (Agent_kernel style).
+def _load_llm_config_from_local_api_file() -> dict:
+    """仅从 ``generator/local_api_config.py`` 读取 api_key / base_url / model（不含环境变量）。"""
+    import importlib.util
 
-    Returns dict with api_key, base_url, model.
-    Raises SystemExit if XI_AI_API_KEY is not set.
-    """
-    api_key = os.getenv("XI_AI_API_KEY")
-    if not api_key or not api_key.strip():
-        # Don't raise error here, allow fallback to generator config
-        return None
-
-    base_url = os.getenv("XI_AI_BASE_URL", "https://api-2.xi-ai.cn/v1")
-    model_name = os.getenv("XI_AI_MODEL", "gpt-5")
+    _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    local_config_path = os.path.join(_project_root, "generator", "local_api_config.py")
+    if not os.path.exists(local_config_path):
+        raise FileNotFoundError(
+            "Agent 需要 LLM 配置：请创建 generator/local_api_config.py（可复制 "
+            "generator/local_api_config.example.py）。不再从环境变量读取。"
+        )
+    spec = importlib.util.spec_from_file_location("local_api_config", local_config_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载 LLM 配置文件: {local_config_path}")
+    lac = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lac)
+    key = (getattr(lac, "XI_AI_API_KEY", None) or getattr(lac, "OPENAI_API_KEY", None) or "").strip()
+    base = (getattr(lac, "XI_AI_BASE_URL", None) or getattr(lac, "OPENAI_API_BASE", None) or "").strip()
+    model = (getattr(lac, "XI_AI_MODEL", None) or getattr(lac, "MODEL", None) or "").strip()
+    if not key:
+        raise ValueError(
+            "generator/local_api_config.py 中未设置有效的 XI_AI_API_KEY 或 OPENAI_API_KEY。"
+        )
     return {
-        "api_key": api_key,
-        "base_url": base_url,
-        "model": model_name,
+        "api_key": key,
+        "base_url": base or "https://api-2.xi-ai.cn/v1",
+        "model": model,
     }
 
 
-def get_llm_config_compatible() -> dict:
+def get_llm_config_compatible(cli_model: Optional[str] = None) -> dict:
     """
-    Get LLM configuration with fallback support.
+    解析 Agent 使用的 LLM 配置。
 
-    Priority:
-    1. USE_API_CONFIG=1 + generation/local_api_config.py
-    2. XI_AI_API_KEY environment variable (Agent_kernel style)
-    3. Fallback: deepseek-chat default
+    **model** 优先级（仅这两处，不再读环境变量）：
+    1. ``cli_model`` 非空时作为 ``model``；
+    2. 否则使用 ``local_api_config.py`` 中的 ``XI_AI_MODEL`` / ``MODEL``。
 
-    Returns dict with api_key, base_url, model.
+    ``api_key``、``base_url`` 仅从 ``generator/local_api_config.py`` 读取。
     """
-    # Priority 1: generation/local_api_config.py
-    if os.environ.get("USE_API_CONFIG", "").strip().lower() in ("1", "true"):
-        import importlib.util
-        _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        local_config_path = os.path.join(_project_root, "generator", "local_api_config.py")
-        if os.path.exists(local_config_path):
-            try:
-                spec = importlib.util.spec_from_file_location("local_api_config", local_config_path)
-                lac = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(lac)
-                key = (getattr(lac, "XI_AI_API_KEY", None) or getattr(lac, "OPENAI_API_KEY", None) or "").strip()
-                base = (getattr(lac, "XI_AI_BASE_URL", None) or getattr(lac, "OPENAI_API_BASE", None) or "").strip()
-                model = (getattr(lac, "XI_AI_MODEL", None) or getattr(lac, "MODEL", None) or "").strip()
-                if key:
-                    return {
-                        "api_key": key,
-                        "base_url": base or "https://api-2.xi-ai.cn/v1",
-                        "model": model or "gpt-5",
-                    }
-            except Exception:
-                pass
+    cfg = _load_llm_config_from_local_api_file()
+    if cli_model is not None and str(cli_model).strip():
+        cfg = {**cfg, "model": str(cli_model).strip()}
+    if not (cfg.get("model") or "").strip():
+        raise ValueError(
+            "未设置 model：请在命令行传入 --model，或在 generator/local_api_config.py 中设置 "
+            "XI_AI_MODEL / MODEL。"
+        )
+    return cfg
 
-    # Priority 2: XI_AI_API_KEY environment variable
-    env_config = get_llm_config_from_env()
-    if env_config:
-        return env_config
 
-    # Priority 3: Final fallback
-    return {
-        "api_key": "",
-        "base_url": "https://api.deepseek.com/v1",
-        "model": "deepseek-chat",
-    }
+def model_slug_for_path(model: str) -> str:
+    """将 model 名转为安全的单段目录名（用于 ``output/ascendc/<slug>/...``）。"""
+    s = (model or "").strip() or "unknown"
+    for ch in r'/\:*?"<>| ':
+        s = s.replace(ch, "-")
+    while "--" in s:
+        s = s.replace("--", "-")
+    s = s.strip("-")
+    return s or "unknown"

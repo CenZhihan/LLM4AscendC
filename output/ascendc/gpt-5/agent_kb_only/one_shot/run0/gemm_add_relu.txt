@@ -1,0 +1,441 @@
+project_json_src='''
+[
+  {
+    "op": "GemmAddReluCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "w",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "bias",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": []
+  }
+]
+'''
+
+host_tiling_src="""
+#include <cstring>
+#include "register/tilingdata_base.h"
+#include "external/register/op_tiling.h"
+#include "graph/utils/type_utils.h"
+#include "register/op_def_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/matmul_tiling.h"
+
+namespace {
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+}
+
+namespace optiling {
+
+// We pack our tiling buffer as:
+// [0..3]   : M (uint32_t)
+// [4..7]   : N (uint32_t)
+// [8..11]  : K (uint32_t)
+// [12..]   : raw bytes of optiling::TCubeTiling produced by MatmulApiTiling
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    const auto *x_shape = context->GetInputShape(0);
+    const auto *w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Expect shapes:
+    //   x: [M, K]
+    //   w: [N, K] (PyTorch Linear uses weight [N, K], we will transpose logically in kernel)
+    const uint32_t M = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    const uint32_t K = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    const uint32_t N = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(0));
+
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    matmul_tiling::MatmulApiTiling mmTiling(ascendcPlatform);
+
+    // A/B/C/Bias types: GM, ND, float32
+    mmTiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                      matmul_tiling::DataType::DT_FLOAT);
+    mmTiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                      matmul_tiling::DataType::DT_FLOAT);
+    mmTiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                      matmul_tiling::DataType::DT_FLOAT);
+    mmTiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                         matmul_tiling::DataType::DT_FLOAT);
+
+    // Normal layout with bias
+    mmTiling.SetShape(M, N, K);
+    mmTiling.SetOrgShape(M, N, K);
+    mmTiling.EnableBias(true);
+    // Auto buffer space
+    mmTiling.SetBufferSpace(-1, -1, -1);
+
+    optiling::TCubeTiling cubeTiling;
+    if (mmTiling.GetTiling(cubeTiling) != 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Conservative blockDim: distribute along M tiles
+    uint32_t blockDim = 16u;
+    const uint64_t totalTiles = static_cast<uint64_t>(CeilDiv(M, 64u)) * static_cast<uint64_t>(CeilDiv(N, 64u));
+    if (totalTiles < 8u) blockDim = 8u;
+    if (totalTiles > 32u) blockDim = 24u;
+    context->SetBlockDim(blockDim);
+
+    // Save to raw tiling buffer: [M,N,K] + cubeTiling binary
+    auto *raw = context->GetRawTilingData();
+    uint8_t *buf = reinterpret_cast<uint8_t*>(raw->GetData());
+    const uint32_t headerSize = 3u * sizeof(uint32_t);
+    const uint32_t cubeSize = static_cast<uint32_t>(sizeof(optiling::TCubeTiling));
+    if (raw->GetCapacity() < headerSize + cubeSize) {
+        return ge::GRAPH_FAILED;
+    }
+    // Write M,N,K
+    std::memcpy(buf + 0, &M, sizeof(uint32_t));
+    std::memcpy(buf + 4, &N, sizeof(uint32_t));
+    std::memcpy(buf + 8, &K, sizeof(uint32_t));
+    // Write cube tiling payload
+    std::memcpy(buf + headerSize, &cubeTiling, cubeSize);
+    raw->SetDataSize(headerSize + cubeSize);
+
+    // No workspace required at host
+    size_t *ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return GRAPH_FAILED;
+    }
+    // y: [M, N]
+    const int64_t M = x_shape->GetShape().GetDim(0);
+    const int64_t N = w_shape->GetShape().GetDim(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, M);
+    y_shape->SetDim(1, N);
+    return GRAPH_SUCCESS;
+}
+
+static graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    // All inputs and outputs are float32
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class GemmAddReluCustom : public OpDef {
+public:
+    explicit GemmAddReluCustom(const char *name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmAddReluCustom);
+} // namespace ops
+"""
+
+host_operator_src="""
+#include "register/op_def_registry.h"
+#include "register/op_tiling_registry.h"
+#include "optiling/tiling.h"
+
+extern ge::graphStatus InferShape(gert::InferShapeContext *context);
+extern ge::graphStatus InferDataType(gert::InferDataTypeContext *context);
+
+namespace ops {
+extern class GemmAddReluCustom;
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+using AscendC::GlobalTensor;
+
+constexpr int32_t RELU_BUFFER_NUM = 2;
+
+// Global pipe pointer used by matmul Cube
+extern AscendC::TPipe* g_cubeTPipePtr;
+
+class KernelGemmAddReluCustom {
+public:
+    __aicore__ inline KernelGemmAddReluCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR bias, GM_ADDR y,
+                                GM_ADDR tiling)
+    {
+        // Parse tiling payload: [M, N, K] + TCubeTiling
+        __gm__ uint32_t *tPtr = reinterpret_cast<__gm__ uint32_t*>(tiling);
+        M_ = tPtr[0];
+        N_ = tPtr[1];
+        K_ = tPtr[2];
+
+        // Copy TCubeTiling that starts after 12 bytes header
+        __gm__ uint8_t *raw = reinterpret_cast<__gm__ uint8_t*>(tiling);
+        const uint32_t headerSize = 3u * sizeof(uint32_t);
+        __gm__ uint8_t *cubePtr = raw + headerSize;
+
+        // Load TCubeTiling bytes into local TCubeTiling object
+        uint32_t *dst = reinterpret_cast<uint32_t*>(&mmTiling_);
+        __gm__ uint32_t *src = reinterpret_cast<__gm__ uint32_t*>(cubePtr);
+        for (uint32_t i = 0; i < sizeof(optiling::TCubeTiling) / sizeof(uint32_t); ++i) {
+            dst[i] = src[i];
+        }
+
+        aLen_ = M_ * K_;
+        bLen_ = N_ * K_; // B provided as [N, K]
+        cLen_ = M_ * N_;
+
+        aGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(x), aLen_);
+        bGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(w), bLen_);
+        biasGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(bias), N_);
+        cGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), cLen_);
+
+        // UB tiling for ReLU post-pass
+        // Two queues in/out, each tileLen floats -> UB usage ~ 8 * tileLen bytes (in+out),
+        // keep conservative margin for runtime
+        const uint32_t UB_BUDGET_BYTES = 192 * 1024;
+        uint32_t maxTile = UB_BUDGET_BYTES / 8; // elements
+        const uint32_t ALIGN_ELEMS = 2048;
+        maxTile = (maxTile / ALIGN_ELEMS) * ALIGN_ELEMS;
+        if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+        const uint32_t HARD_CAP_ELEMS = 32768;
+        if (maxTile > HARD_CAP_ELEMS) maxTile = (HARD_CAP_ELEMS / ALIGN_ELEMS) * ALIGN_ELEMS;
+        tileLen_ = maxTile;
+        if (tileLen_ > cLen_) {
+            uint32_t aligned = (cLen_ / ALIGN_ELEMS) * ALIGN_ELEMS;
+            tileLen_ = (aligned > 0) ? aligned : cLen_;
+        }
+
+        vpipe_.InitBuffer(inQ_, RELU_BUFFER_NUM, tileLen_ * sizeof(float));
+        vpipe_.InitBuffer(outQ_, RELU_BUFFER_NUM, tileLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void RunMatmulWithBias(GM_ADDR workspace)
+    {
+        // Matmul types: NORMAL layout, B transpose enabled at runtime
+        typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> aType;
+        typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, true,  LayoutMode::NORMAL> bType;
+        typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> cType;
+        typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float> biasType;
+
+        set_atomic_none();
+
+        matmul::Matmul<aType, bType, cType, biasType> mm;
+        AscendC::TPipe cubePipe;
+        g_cubeTPipePtr = &cubePipe;
+        REGIST_MATMUL_OBJ(&cubePipe, GetSysWorkSpacePtr(), mm);
+        mm.Init(&mmTiling_);
+
+        // Bind tensors
+        AscendC::GlobalTensor<float> gm_a;
+        gm_a.SetGlobalBuffer(const_cast<__gm__ float*>(aGm_.GetPhyAddr()), aLen_);
+        AscendC::GlobalTensor<float> gm_b;
+        gm_b.SetGlobalBuffer(const_cast<__gm__ float*>(bGm_.GetPhyAddr()), bLen_);
+        AscendC::GlobalTensor<float> gm_c;
+        gm_c.SetGlobalBuffer(const_cast<__gm__ float*>(cGm_.GetPhyAddr()), cLen_);
+        AscendC::GlobalTensor<float> gm_bias;
+        gm_bias.SetGlobalBuffer(const_cast<__gm__ float*>(biasGm_.GetPhyAddr()), N_);
+
+        // Set tensors; B is logically transposed (w: [N,K] => [K,N])
+        mm.SetTensorA(gm_a[0], 0);
+        mm.SetTensorB(gm_b[0], 1);
+        // Some versions may not require SetTensorC explicitly. Call it if available.
+        mm.SetTensorC(gm_c[0]);
+        mm.SetWorkspace(workspace, 0);
+        mm.SetBias(gm_bias[0]);
+
+        // Execute single-batch GEMM
+        const uint32_t for_extent = 1u;
+        mm.IterateNBatch(for_extent, 1, 1, true);
+    }
+
+    __aicore__ inline void ReluPostProcess()
+    {
+        if (cLen_ == 0 || tileLen_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        const uint32_t strideElems = blockNum * tileLen_;
+        uint32_t base = blockIdx * tileLen_;
+        if (base >= cLen_) return;
+
+        // Prefetch
+        uint32_t curLen = cLen_ - base;
+        if (curLen > tileLen_) curLen = tileLen_;
+        CopyIn(base, curLen);
+
+        while (true) {
+            const uint32_t nextBase = base + strideElems;
+            uint32_t nextLen = 0;
+            if (nextBase < cLen_) {
+                nextLen = cLen_ - nextBase;
+                if (nextLen > tileLen_) nextLen = tileLen_;
+                CopyIn(nextBase, nextLen);
+            }
+
+            Compute(curLen);
+            CopyOut(base, curLen);
+
+            if (nextLen == 0) break;
+            base = nextBase;
+            curLen = nextLen;
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> inLocal = inQ_.AllocTensor<float>();
+        AscendC::DataCopy(inLocal, cGm_[gmOffset], len);
+        inQ_.EnQue(inLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t len)
+    {
+        AscendC::LocalTensor<float> inLocal = inQ_.DeQue<float>();
+        AscendC::LocalTensor<float> outLocal = outQ_.AllocTensor<float>();
+        // ReLU: out = max(in, 0)
+        AscendC::Maxs(outLocal, inLocal, 0.0f, len);
+        outQ_.EnQue(outLocal);
+        inQ_.FreeTensor(inLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> outLocal = outQ_.DeQue<float>();
+        AscendC::DataCopy(cGm_[gmOffset], outLocal, len);
+        outQ_.FreeTensor(outLocal);
+    }
+
+private:
+    // Matmul tiling and tensors
+    optiling::TCubeTiling mmTiling_;
+    GlobalTensor<float> aGm_;
+    GlobalTensor<float> bGm_;
+    GlobalTensor<float> biasGm_;
+    GlobalTensor<float> cGm_;
+
+    uint32_t M_{0}, N_{0}, K_{0};
+    uint32_t aLen_{0}, bLen_{0}, cLen_{0};
+
+    // ReLU vector pipeline
+    AscendC::TPipe vpipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, RELU_BUFFER_NUM> inQ_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, RELU_BUFFER_NUM> outQ_;
+    uint32_t tileLen_{0};
+};
+
+extern "C" __global__ __aicore__ void gemm_add_relu_custom(GM_ADDR xGM, GM_ADDR wGM, GM_ADDR biasGM,
+                                                            GM_ADDR yGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+{
+    KernelGemmAddReluCustom op;
+    op.Init(xGM, wGM, biasGM, yGM, tilingGM);
+    op.RunMatmulWithBias(workspaceGM);
+    op.ReluPostProcess();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor gemm_add_relu_impl_npu(const at::Tensor& x,
+                                  const at::Tensor& w,
+                                  const at::Tensor& bias) {
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [M, K]");
+    TORCH_CHECK(w.dim() == 2, "w must be 2D [N, K]");
+    TORCH_CHECK(bias.dim() == 1, "bias must be 1D [N]");
+    at::Tensor y = at::empty({x.size(0), w.size(0)}, x.options());
+    EXEC_NPU_CMD(aclnnGemmAddReluCustom, x, w, bias, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_add_relu_custom", &gemm_add_relu_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_add_relu_custom", &gemm_add_relu_impl_npu, "GEMM + Bias + ReLU (GemmAddReluCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'gemm_add_relu_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x, w, bias):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, w, bias)
+'''

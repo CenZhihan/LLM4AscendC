@@ -14,8 +14,8 @@ from ..retrievers.kb_retriever import KBRetriever
 def _ensure_english_for_kb(client, model: str, user_question: str) -> str:
     """Translate Chinese query to English for KB (KB requires English)."""
     prompt = (
-        "将下面用户问题转成一句英文查询（用于知识库检索），"
-        "只输出这句英文，不要解释、不要引号。\n\n"
+        "Convert the following user text into a single English sentence suitable for "
+        "knowledge-base search. Output only that English sentence, no quotes or explanation.\n\n"
         f"{user_question}"
     )
     content, _ = _call_llm(client, model, prompt)
@@ -74,14 +74,14 @@ def kb_query_node(
         chunks = kb_retriever.retrieve(query, top_k=3)
     else:
         print("[WARN] KB not available, returning empty results")
-        chunks = ["[知识库不可用，请检查 chroma_db 路径]"]
+        chunks = ["[KB unavailable: check chroma_db path configuration]"]
 
     # Update state
     round_num = state.get("query_round_count", 0) + 1
     response = "\n".join(chunks) if chunks else ""
-    log_entry = {"round": round_num, "tool": "KB", "query": query, "response": response}
+    log_entry = {"round": round_num, "tool": "kb", "query": query, "response": response}
 
-    print(f"[Round {round_num}] 工具=知识库(KB), 查询=\"{query}\"")
+    print(f"[Round {round_num}] tool=kb query={query!r}")
 
     return {
         "kb_results": chunks,

@@ -102,7 +102,12 @@ def api_constraint_node(
 
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "API_CONSTRAINT", "query": f"API: {api_name}", "response": display_text}
+    log_entry = {
+        "round": round_num,
+        "tool": "api_constraint",
+        "query": f"API: {api_name}",
+        "response": display_text,
+    }
 
     print(f"[Round {round_num}] 工具=API约束检查(API_CONSTRAINT), API=\"{api_name}\"")
 

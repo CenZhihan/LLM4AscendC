@@ -77,7 +77,7 @@ def npu_arch_node(
 
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "NPU_ARCH", "query": query, "response": display_text}
+    log_entry = {"round": round_num, "tool": "npu_arch", "query": query, "response": display_text}
 
     print(f"[Round {round_num}] 工具=NPU架构查询(NPU_ARCH), chip=\"{chip_name}\"")
 

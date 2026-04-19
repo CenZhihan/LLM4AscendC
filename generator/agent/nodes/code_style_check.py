@@ -69,7 +69,12 @@ def code_style_node(
 
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "CODE_STYLE", "query": query[:100], "response": display_text}
+    log_entry = {
+        "round": round_num,
+        "tool": "code_style",
+        "query": query[:100],
+        "response": display_text,
+    }
 
     print(f"[Round {round_num}] 工具=代码风格检查(CODE_STYLE), issues={len(result.issues)}, score={result.score}")
 

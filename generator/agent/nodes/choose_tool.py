@@ -1,33 +1,23 @@
 """
 Tool selection node for generator agent.
 
-Let LLM choose the next action: KB, WEB, CODE_RAG, or ANSWER.
+LLM outputs a single JSON object (ToolChoiceV1) selecting the next action.
 """
-from typing import Dict, Any, Tuple
+from __future__ import annotations
+
+import time
+from typing import Any, Dict, List, Tuple
 
 from langchain_core.messages import HumanMessage
 
 from ..agent_state import GeneratorAgentState, MAX_QUERY_ROUNDS
 from ..agent_config import (
     AgentToolMode,
-    ToolType,
     NO_TOOL,
-    has_kb,
-    has_web,
-    has_code_rag,
-    has_env_check_env,
-    has_env_check_npu,
-    has_env_check_api,
-    has_kb_shell_search,
-    has_api_lookup,
-    has_api_constraint,
-    has_api_alternative,
-    has_tiling_calc,
-    has_tiling_validate,
-    has_npu_arch,
-    has_code_style,
-    has_security_check,
+    normalize_tool_choice_name,
 )
+from ..tool_choice import ToolChoiceV1, parse_tool_choice_json
+from ..tool_registry import get_tool_registry
 
 
 def _openai_completion(
@@ -36,18 +26,6 @@ def _openai_completion(
     messages: list,
     stream: bool = False,
 ) -> Tuple[str, str]:
-    """
-    Call OpenAI-compatible API for completion.
-
-    Args:
-        client: OpenAI client instance
-        model: Model name
-        messages: Message list
-        stream: Whether to stream
-
-    Returns:
-        Tuple of (content, reasoning)
-    """
     if not stream:
         resp = client.chat.completions.create(
             model=model,
@@ -65,7 +43,6 @@ def _openai_completion(
             reasoning = ""
         return content, (reasoning if isinstance(reasoning, str) else "")
 
-    # Stream mode
     stream_resp = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -89,13 +66,11 @@ def _openai_completion(
 
 
 def _extract_user_question(state: GeneratorAgentState) -> str:
-    """Extract user question from messages."""
     user_msgs = [m for m in state["messages"] if isinstance(m, HumanMessage)]
     return user_msgs[0].content if user_msgs else state["messages"][-1].content
 
 
 def _summarize_existing_results(state: GeneratorAgentState) -> str:
-    """Summarize existing retrieval results."""
     kb_results = state.get("kb_results", [])
     web_results = state.get("web_results", [])
     code_rag_results = state.get("code_rag_results", [])
@@ -109,35 +84,48 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
     npu_arch_results = state.get("npu_arch_results", [])
     code_style_results = state.get("code_style_results", [])
     security_check_results = state.get("security_check_results", [])
+    reg_results = state.get("registered_tool_results", [])
 
     existing = ""
     if kb_results:
-        existing += "已查知识库结果（节选）：\n" + "\n".join(kb_results[:2]) + "\n\n"
+        existing += "KB results (excerpt):\n" + "\n".join(kb_results[:2]) + "\n\n"
     if web_results:
-        existing += "已搜网页结果（节选）：\n" + "\n".join(web_results[:2]) + "\n\n"
+        existing += "Web results (excerpt):\n" + "\n".join(web_results[:2]) + "\n\n"
     if code_rag_results:
-        existing += "已检索代码结果（节选）：\n" + "\n".join(code_rag_results[:1]) + "\n\n"
+        existing += "Code RAG results (excerpt):\n" + "\n".join(code_rag_results[:1]) + "\n\n"
     if env_check_results:
-        existing += "环境检查结果（节选）：\n" + "\n".join(env_check_results[:1]) + "\n\n"
+        existing += "Environment check (excerpt):\n" + "\n".join(env_check_results[:1]) + "\n\n"
     if kb_shell_results:
-        existing += "知识库搜索结果（节选）：\n" + "\n".join(kb_shell_results[:1]) + "\n\n"
+        existing += "KB shell search (excerpt):\n" + "\n".join(kb_shell_results[:1]) + "\n\n"
     if api_lookup_results:
-        existing += "API 签名查询结果（节选）：\n" + "\n".join(api_lookup_results[:1]) + "\n\n"
+        existing += "API lookup (excerpt):\n" + "\n".join(api_lookup_results[:1]) + "\n\n"
     if api_constraint_results:
-        existing += "API 约束检查结果（节选）：\n" + "\n".join(api_constraint_results[:1]) + "\n\n"
+        existing += "API constraint (excerpt):\n" + "\n".join(api_constraint_results[:1]) + "\n\n"
     if api_alternative_results:
-        existing += "API 替代方案结果（节选）：\n" + "\n".join(api_alternative_results[:1]) + "\n\n"
+        existing += "API alternative (excerpt):\n" + "\n".join(api_alternative_results[:1]) + "\n\n"
     if tiling_calc_results:
-        existing += "Tiling 计算结果（节选）：\n" + "\n".join(tiling_calc_results[:1]) + "\n\n"
+        existing += "Tiling calc (excerpt):\n" + "\n".join(tiling_calc_results[:1]) + "\n\n"
     if tiling_validate_results:
-        existing += "Tiling 验证结果（节选）：\n" + "\n".join(tiling_validate_results[:1]) + "\n\n"
+        existing += "Tiling validate (excerpt):\n" + "\n".join(tiling_validate_results[:1]) + "\n\n"
     if npu_arch_results:
-        existing += "NPU 架构查询结果（节选）：\n" + "\n".join(npu_arch_results[:1]) + "\n\n"
+        existing += "NPU arch (excerpt):\n" + "\n".join(npu_arch_results[:1]) + "\n\n"
     if code_style_results:
-        existing += "代码风格检查结果（节选）：\n" + "\n".join(code_style_results[:1]) + "\n\n"
+        existing += "Code style (excerpt):\n" + "\n".join(code_style_results[:1]) + "\n\n"
     if security_check_results:
-        existing += "安全检查结果（节选）：\n" + "\n".join(security_check_results[:1]) + "\n\n"
+        existing += "Security check (excerpt):\n" + "\n".join(security_check_results[:1]) + "\n\n"
+    if reg_results:
+        existing += "Registered tool results (excerpt):\n" + "\n".join(reg_results[:2]) + "\n\n"
     return existing
+
+
+def _registry_tools_for_prompt(tool_mode: AgentToolMode) -> List[Any]:
+    reg = get_tool_registry()
+    out: List[Any] = []
+    for key in sorted(tool_mode):
+        spec = reg.get(key)
+        if spec is not None:
+            out.append(spec)
+    return out
 
 
 def _build_tool_selection_prompt(
@@ -146,111 +134,122 @@ def _build_tool_selection_prompt(
     tool_mode: AgentToolMode,
     round_count: int,
 ) -> str:
-    """Build prompt for tool selection."""
-
-    # Build tools description dynamically
-    tools_desc: list = []
-    if has_kb(tool_mode):
-        tools_desc.append("知识库查询（KB）- 查询华为 Ascend C API 文档")
-    if has_web(tool_mode):
-        tools_desc.append("网页搜索（WEB）- 搜索相关技术文档和博客")
-    if has_code_rag(tool_mode):
-        tools_desc.append("代码检索（CODE_RAG）- 检索 Ascend C 代码库中的相似实现")
-    if has_env_check_env(tool_mode):
-        tools_desc.append("环境检查（ENV_CHECK_ENV）- 检查 CANN 环境配置及 API 兼容性")
-    if has_env_check_npu(tool_mode):
-        tools_desc.append("NPU查询（ENV_CHECK_NPU）- 查询 NPU 设备状态和资源使用")
-    if has_env_check_api(tool_mode):
-        tools_desc.append("API检查（ENV_CHECK_API）- 验证 Ascend C API 是否在头文件中存在")
-    if has_kb_shell_search(tool_mode):
-        tools_desc.append("知识库搜索（KB_SHELL_SEARCH）- 使用 grep/find 在知识库文档中搜索")
-    if has_api_lookup(tool_mode):
-        tools_desc.append("API签名查询（API_LOOKUP）- 查询 API 签名、支持的数据类型、repeatTimes 限制")
-    if has_api_constraint(tool_mode):
-        tools_desc.append("API约束检查（API_CONSTRAINT）- 检查 API 的对齐要求、blockCount 限制等平台约束")
-    if has_api_alternative(tool_mode):
-        tools_desc.append("API替代方案（API_ALTERNATIVE）- 当目标 API 不可用时查找等价替代方案")
-    if has_tiling_calc(tool_mode):
-        tools_desc.append("Tiling计算（TILING_CALC）- 根据算子类型和数据量自动计算最优 Tiling 参数")
-    if has_tiling_validate(tool_mode):
-        tools_desc.append("Tiling验证（TILING_VALIDATE）- 验证 Tiling 参数是否满足硬件约束")
-    if has_npu_arch(tool_mode):
-        tools_desc.append("NPU架构查询（NPU_ARCH）- 查询目标芯片的关键硬件参数")
-    if has_code_style(tool_mode):
-        tools_desc.append("代码风格检查（CODE_STYLE）- 检查代码是否符合 Ascend C 编码规范")
-    if has_security_check(tool_mode):
-        tools_desc.append("安全检查（SECURITY_CHECK）- 检查代码中的安全隐患（内存泄漏、越界等）")
-
+    specs = _registry_tools_for_prompt(tool_mode)
+    tools_desc: List[str] = []
+    for spec in specs:
+        desc = (spec.description or "").rstrip(".")
+        tools_desc.append(
+            f"{spec.name} ({spec.display_name}): {desc}. Parameters: {spec.parameter_docs}"
+        )
     if not tools_desc:
-        return ""  # No tools, will return ANSWER
+        return ""
 
-    tools_line = "、".join(tools_desc)
+    tools_line = "\n".join(f"- {t}" for t in tools_desc)
     at_max = round_count >= MAX_QUERY_ROUNDS
 
-    # Build few-shot examples dynamically (order matches tools_desc)
-    examples: list = []
+    examples: List[str] = []
     example_idx = 1
-    for tool_type in [ToolType.KB, ToolType.WEB, ToolType.CODE_RAG,
-                      ToolType.ENV_CHECK_ENV, ToolType.ENV_CHECK_NPU, ToolType.ENV_CHECK_API,
-                      ToolType.KB_SHELL_SEARCH, ToolType.API_LOOKUP, ToolType.API_CONSTRAINT,
-                      ToolType.API_ALTERNATIVE, ToolType.TILING_CALC, ToolType.TILING_VALIDATE,
-                      ToolType.NPU_ARCH, ToolType.CODE_STYLE, ToolType.SECURITY_CHECK]:
-        if tool_type in tool_mode:
-            tool_name = tool_type.value.upper()
-            if tool_type == ToolType.KB:
-                examples.append(f"示例{example_idx}（查知识库）：\nKB\nAscend C GELU kernel implementation")
-            elif tool_type == ToolType.WEB:
-                examples.append(f"示例{example_idx}（网页搜索）：\nWEB\nAscend C custom operator tutorial")
-            elif tool_type == ToolType.CODE_RAG:
-                examples.append(f"示例{example_idx}（代码检索）：\nCODE_RAG\nAscend C softmax kernel example")
-            elif tool_type == ToolType.ENV_CHECK_ENV:
-                examples.append(f"示例{example_idx}（环境检查）：\nENV_CHECK_ENV\ncheck CANN environment")
-            elif tool_type == ToolType.ENV_CHECK_NPU:
-                examples.append(f"示例{example_idx}（NPU查询）：\nENV_CHECK_NPU\nquery npu device status")
-            elif tool_type == ToolType.ENV_CHECK_API:
-                examples.append(f"示例{example_idx}（API检查）：\nENV_CHECK_API\ncheck if AscendC::DataCopy exists")
-            elif tool_type == ToolType.KB_SHELL_SEARCH:
-                examples.append(f"示例{example_idx}（知识库搜索）：\nKB_SHELL_SEARCH\nsearch DataCopy API in Knowledge/api/")
-            elif tool_type == ToolType.API_LOOKUP:
-                examples.append(f"示例{example_idx}（API签名查询）：\nAPI_LOOKUP\nlookup AscendC::DataCopy signature")
-            elif tool_type == ToolType.API_CONSTRAINT:
-                examples.append(f"示例{example_idx}（API约束检查）：\nAPI_CONSTRAINT\ncheck DataCopy constraints with count=512 dtype=half")
-            elif tool_type == ToolType.API_ALTERNATIVE:
-                examples.append(f"示例{example_idx}（API替代方案）：\nAPI_ALTERNATIVE\nfind alternative for GlobalTensor::SetValue")
-            elif tool_type == ToolType.TILING_CALC:
-                examples.append(f"示例{example_idx}（Tiling计算）：\nTILING_CALC\ncalculate tiling for 1024 float elements elementwise")
-            elif tool_type == ToolType.TILING_VALIDATE:
-                examples.append(f"示例{example_idx}（Tiling验证）：\nTILING_VALIDATE\nvalidate tiling params with chip=DAV_2201")
-            elif tool_type == ToolType.NPU_ARCH:
-                examples.append(f"示例{example_idx}（NPU架构查询）：\nNPU_ARCH\nquery Ascend910B2 chip specs")
-            elif tool_type == ToolType.CODE_STYLE:
-                examples.append(f"示例{example_idx}（代码风格检查）：\nCODE_STYLE\ncheck code style for kernel implementation")
-            elif tool_type == ToolType.SECURITY_CHECK:
-                examples.append(f"示例{example_idx}（安全检查）：\nSECURITY_CHECK\ncheck security patterns in elementwise kernel")
+    for spec in specs:
+        for ex in (spec.examples or [])[:2]:
+            examples.append(f"Example {example_idx} (tool={spec.name}):\n{ex}")
             example_idx += 1
-    examples.append("示例（直接回答）：\nANSWER")
+    examples.append(
+        'Example (downstream may proceed without further retrieval — use null args only):\n'
+        '{"tool":"ANSWER","query":"","args":null}'
+    )
     few_shot = "\n\n".join(examples)
 
-    # Build prompt
-    prompt = (
-        f"用户问题：\n{user_question}\n\n"
-        f"当前可选工具：{tools_line}，或直接回答（ANSWER）。根据需要选择合适的工具。\n"
-        "规则：只输出两行。第一行为动作（KB/WEB/CODE_RAG/ENV_CHECK_ENV/ENV_CHECK_NPU/ENV_CHECK_API/"
-        "KB_SHELL_SEARCH/API_LOOKUP/API_CONSTRAINT/API_ALTERNATIVE/TILING_CALC/TILING_VALIDATE/"
-        "NPU_ARCH/CODE_STYLE/SECURITY_CHECK/ANSWER）；"
-        "若选任何工具或ANSWER，第二行必须是一句完整的英文查询。\n"
+    routing_instructions = (
+        "Your role here is **orchestration only**. You are **not** the model that writes the Ascend C "
+        "kernel or the six-string bundle. Another agent will read your JSON and either run a tool or "
+        "produce the final code.\n\n"
+        "**CANN / API context:** CANN releases and recommended usage patterns change quickly. Even when "
+        "the task looks familiar, **prefer using the enabled tools** so the downstream agent gets the "
+        "**latest** documentation and the **most canonical** Ascend C patterns. The tools available "
+        "in this session are **high-signal and very effective** at retrieving authoritative material; "
+        "lean on them rather than relying on static intuition alone.\n\n"
+        "**What you must decide:**\n"
+        "- Output **ANSWER** only when the task text **plus** the \"Already retrieved\" excerpts already "
+        "give the downstream agent enough **fresh, task-specific** evidence (not generic memory). If "
+        "that section is empty or thin, you should normally **call a tool first**.\n"
+        "- Otherwise choose **one** tool and a focused English `query`. Prefer a tool whenever there is "
+        "any doubt: retrieved material improves grounding, aligns with current CANN guidance, and "
+        "reduces hallucination risk for the downstream model. Treat proactive retrieval as your "
+        "responsibility to the pipeline.\n\n"
+        "**Strict output rules (avoid common failures):**\n"
+        "- Output **one** JSON object only. No markdown fences, no commentary before or after the object, "
+        "and no second JSON or trailing code.\n"
+        "- For **ANSWER**, you must use exactly: "
+        '`{"tool":"ANSWER","query":"","args":null}`. '
+        "**Never** put generated code, `project_json_src`, partial answers, or any narrative inside "
+        '`args`. Putting the solution in `args` breaks parsing (\"Extra data\" / invalid JSON) and '
+        "skips real tool use.\n"
+        '- For a normal tool call, use `"args": null` unless you are using a **plugin** tool whose docs '
+        "explicitly require a small parameter object.\n"
+        '- `"query"` is the natural-language request for the tool; use `""` when `tool` is ANSWER.\n\n'
     )
 
+    prompt = (
+        f"Task specification (shared with the downstream code-generation agent):\n{user_question}\n\n"
+        f"{routing_instructions}"
+        f"Available tools for this session (field \"tool\" must be one of these keys or ANSWER):\n{tools_line}\n"
+        "You must output exactly one JSON object.\n"
+        "JSON fields:\n"
+        '  "tool": string — lowercase tool key from the list above, or ANSWER;\n'
+        '  "query": string — English request for that tool; empty string when tool is ANSWER;\n'
+        '  "args": null or a small object only when a plugin documents structured parameters.\n'
+    )
     if existing_results:
-        prompt += f"\n已有检索内容：\n{existing_results}\n"
-
+        prompt += f"\nAlready retrieved (may be empty):\n{existing_results}\n"
     if at_max:
-        prompt += f"\n已达最大查询轮数（{MAX_QUERY_ROUNDS}），本回合只能选 ANSWER。\n"
-
-    prompt += f"\n格式参考：\n{few_shot}\n\n"
-    prompt += "请按上述格式输出（第一行动作，第二行查询）："
-
+        prompt += (
+            f"\nYou have reached the maximum number of query rounds ({MAX_QUERY_ROUNDS}). "
+            'You must output exactly: {"tool":"ANSWER","query":"","args":null}\n'
+        )
+    prompt += f"\nFormat reference:\n{few_shot}\n\n"
+    prompt += "Output JSON only:"
     return prompt
+
+
+def _resolve_json_choice(
+    choice: ToolChoiceV1,
+    tool_mode: AgentToolMode,
+    user_question: str,
+) -> Tuple[str, str, Dict[str, Any]]:
+    """Map validated ToolChoiceV1 to next_action, current_query, and tool_choice_json dict."""
+    canon = normalize_tool_choice_name(choice.tool.strip())
+    q = (choice.query or "").strip() or user_question.strip()
+    if canon == "answer":
+        return "ANSWER", "", {"tool": "ANSWER", "query": "", "args": None}
+    if canon is None or canon not in tool_mode:
+        raise RuntimeError("invalid tool for _resolve_json_choice (caller must validate)")
+    return canon, q, {"tool": canon, "query": choice.query or "", "args": choice.args}
+
+
+def _semantic_tool_error_payload(
+    choice: ToolChoiceV1,
+    message: str,
+    raw_model_output: str,
+    round_after_burn: int,
+) -> Dict[str, Any]:
+    return {
+        "kind": "tool_choice_semantic_error",
+        "ts": time.time(),
+        "round": round_after_burn,
+        "error": message,
+        "parsed_tool_field": choice.tool,
+        "raw_model_output": (raw_model_output or "")[:8000],
+    }
+
+
+def _parse_error_payload(err: str, raw_model_output: str, round_after_burn: int) -> Dict[str, Any]:
+    return {
+        "kind": "tool_choice_parse_error",
+        "ts": time.time(),
+        "round": round_after_burn,
+        "error": err or "unknown",
+        "raw_model_output": (raw_model_output or "")[:8000],
+    }
 
 
 def choose_tool_node(
@@ -259,126 +258,79 @@ def choose_tool_node(
     model: str,
     tool_mode: AgentToolMode,
 ) -> Dict[str, Any]:
-    """
-    Tool selection node: let LLM choose next action.
-
-    Args:
-        state: Current agent state
-        client: OpenAI client
-        model: Model name
-        tool_mode: Enabled tool mode (FrozenSet[ToolType])
-
-    Returns:
-        Dict with next_action and current_query
-    """
     user_question = _extract_user_question(state)
     existing_results = _summarize_existing_results(state)
     round_count = state.get("query_round_count", 0)
 
-    # No tools enabled -> direct answer
-    if tool_mode == NO_TOOL:
-        return {"next_action": "ANSWER", "current_query": ""}
+    base_patch: Dict[str, Any] = {}
+    if state.get("tool_choice_parse_failed"):
+        base_patch["tool_choice_parse_failed"] = False
 
-    # Build and call LLM
+    if tool_mode == NO_TOOL:
+        return {
+            **base_patch,
+            "next_action": "ANSWER",
+            "current_query": "",
+            "tool_choice_json": {"tool": "ANSWER", "query": "", "args": None},
+        }
+
     prompt = _build_tool_selection_prompt(user_question, existing_results, tool_mode, round_count)
     if not prompt:
-        return {"next_action": "ANSWER", "current_query": ""}
+        return {
+            **base_patch,
+            "next_action": "ANSWER",
+            "current_query": "",
+            "tool_choice_json": {"tool": "ANSWER", "query": "", "args": None},
+        }
 
-    raw_response, _ = _openai_completion(client, model, [{"role": "user", "content": prompt}], stream=False)
-
-    # Parse response
-    lines = [ln.strip() for ln in raw_response.splitlines() if ln.strip()]
-    first = (lines[0].upper() if lines else "") or "ANSWER"
-    query_line = lines[1] if len(lines) > 1 else ""
-
-    # Determine next action
     at_max = round_count >= MAX_QUERY_ROUNDS
     if at_max:
-        next_action = "ANSWER"
-        current_query = ""
-    elif "ANSWER" in first or first == "ANSWER":
-        next_action = "ANSWER"
-        current_query = ""
-    elif "CODE_RAG" in first and has_code_rag(tool_mode):
-        next_action = "CODE_RAG"
-        current_query = query_line or user_question
-    elif "ENV_CHECK_API" in first and has_env_check_api(tool_mode):
-        next_action = "ENV_CHECK_API"
-        current_query = query_line or user_question
-    elif "ENV_CHECK_NPU" in first and has_env_check_npu(tool_mode):
-        next_action = "ENV_CHECK_NPU"
-        current_query = query_line or user_question
-    elif "ENV_CHECK_ENV" in first and has_env_check_env(tool_mode):
-        next_action = "ENV_CHECK_ENV"
-        current_query = query_line or user_question
-    elif "KB_SHELL_SEARCH" in first and has_kb_shell_search(tool_mode):
-        next_action = "KB_SHELL_SEARCH"
-        current_query = query_line or user_question
-    elif "API_LOOKUP" in first and has_api_lookup(tool_mode):
-        next_action = "API_LOOKUP"
-        current_query = query_line or user_question
-    elif "API_CONSTRAINT" in first and has_api_constraint(tool_mode):
-        next_action = "API_CONSTRAINT"
-        current_query = query_line or user_question
-    elif "API_ALTERNATIVE" in first and has_api_alternative(tool_mode):
-        next_action = "API_ALTERNATIVE"
-        current_query = query_line or user_question
-    elif "TILING_CALC" in first and has_tiling_calc(tool_mode):
-        next_action = "TILING_CALC"
-        current_query = query_line or user_question
-    elif "TILING_VALIDATE" in first and has_tiling_validate(tool_mode):
-        next_action = "TILING_VALIDATE"
-        current_query = query_line or user_question
-    elif "NPU_ARCH" in first and has_npu_arch(tool_mode):
-        next_action = "NPU_ARCH"
-        current_query = query_line or user_question
-    elif "CODE_STYLE" in first and has_code_style(tool_mode):
-        next_action = "CODE_STYLE"
-        current_query = query_line or user_question
-    elif "SECURITY_CHECK" in first and has_security_check(tool_mode):
-        next_action = "SECURITY_CHECK"
-        current_query = query_line or user_question
-    elif "KB" in first and has_kb(tool_mode):
-        next_action = "KB"
-        current_query = query_line or user_question
-    elif "WEB" in first and has_web(tool_mode):
-        next_action = "WEB"
-        current_query = query_line or user_question
-    else:
-        # Fallback: choose first available tool
-        if has_kb(tool_mode):
-            next_action = "KB"
-        elif has_web(tool_mode):
-            next_action = "WEB"
-        elif has_code_rag(tool_mode):
-            next_action = "CODE_RAG"
-        elif has_env_check_env(tool_mode):
-            next_action = "ENV_CHECK_ENV"
-        elif has_env_check_npu(tool_mode):
-            next_action = "ENV_CHECK_NPU"
-        elif has_env_check_api(tool_mode):
-            next_action = "ENV_CHECK_API"
-        elif has_kb_shell_search(tool_mode):
-            next_action = "KB_SHELL_SEARCH"
-        elif has_api_lookup(tool_mode):
-            next_action = "API_LOOKUP"
-        elif has_api_constraint(tool_mode):
-            next_action = "API_CONSTRAINT"
-        elif has_api_alternative(tool_mode):
-            next_action = "API_ALTERNATIVE"
-        elif has_tiling_calc(tool_mode):
-            next_action = "TILING_CALC"
-        elif has_tiling_validate(tool_mode):
-            next_action = "TILING_VALIDATE"
-        elif has_npu_arch(tool_mode):
-            next_action = "NPU_ARCH"
-        elif has_code_style(tool_mode):
-            next_action = "CODE_STYLE"
-        elif has_security_check(tool_mode):
-            next_action = "SECURITY_CHECK"
-        else:
-            next_action = "ANSWER"
-        current_query = query_line or user_question
+        return {
+            **base_patch,
+            "next_action": "ANSWER",
+            "current_query": "",
+            "tool_choice_json": {"tool": "ANSWER", "query": "", "args": None},
+        }
 
-    print(f"[choose_tool] 模型回复: {raw_response[:100]!r} -> next_action={next_action}")
-    return {"next_action": next_action, "current_query": current_query}
+    raw_response, _ = _openai_completion(
+        client, model, [{"role": "user", "content": prompt}], stream=False
+    )
+    choice, err = parse_tool_choice_json(raw_response)
+    if choice is None:
+        new_round = round_count + 1
+        entry = _parse_error_payload(err or "unknown", raw_response, new_round)
+        print(f"[choose_tool] JSON parse failed: {err!r}")
+        return {
+            **base_patch,
+            "tool_choice_parse_failed": True,
+            "query_round_count": new_round,
+            "tool_choice_error_log": [entry],
+            "next_action": "",
+            "current_query": "",
+            "tool_choice_json": {},
+        }
+
+    canon = normalize_tool_choice_name(choice.tool)
+    if canon != "answer" and canon is not None and canon not in tool_mode:
+        new_round = round_count + 1
+        msg = f"tool {choice.tool!r} resolved to {canon!r} which is not enabled in this session"
+        entry = _semantic_tool_error_payload(choice, msg, raw_response, new_round)
+        print(f"[choose_tool] {msg}")
+        return {
+            **base_patch,
+            "tool_choice_parse_failed": True,
+            "query_round_count": new_round,
+            "tool_choice_error_log": [entry],
+            "next_action": "",
+            "current_query": "",
+            "tool_choice_json": {},
+        }
+
+    next_action, current_query, tjson = _resolve_json_choice(choice, tool_mode, user_question)
+    print(f"[choose_tool] model reply: {raw_response[:120]!r} -> next_action={next_action}")
+    return {
+        **base_patch,
+        "next_action": next_action,
+        "current_query": current_query,
+        "tool_choice_json": tjson,
+    }
