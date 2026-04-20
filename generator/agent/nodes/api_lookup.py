@@ -1,36 +1,10 @@
-"""
-API signature lookup node for generator agent.
-
-Queries API signatures, supported dtypes, and repeatTimes limits.
-"""
-import re
+"""API signature lookup node for generator agent."""
 import dataclasses
 from typing import Dict, Any
 
-from langchain_core.messages import HumanMessage
-
 from ..agent_state import GeneratorAgentState
+from ..query_utils import extract_api_name, get_tool_args
 from ..retrievers.api_doc_retriever import ApiDocRetriever
-
-
-def _extract_api_name(query: str) -> str:
-    """Extract API name from query string."""
-    # Pattern: "lookup XXX" / "API: XXX" / "signature of XXX"
-    match = re.search(r"(?:lookup|API[:：]?\s*|signature\s+(?:of|for)\s+)([A-Za-z_]\w*)", query, re.IGNORECASE)
-    if match:
-        return match.group(1)
-
-    # Check for known API patterns (e.g., AscendC::DataCopy)
-    match = re.search(r"(AscendC::[A-Za-z_]\w*)", query)
-    if match:
-        return match.group(1)
-
-    # Single identifier
-    match = re.search(r"\b([A-Z][A-Za-z_]\w{2,})\b", query)
-    if match:
-        return match.group(1)
-
-    return "unknown"
 
 
 def _format_for_display(result) -> str:
@@ -80,7 +54,8 @@ def api_lookup_node(
         }
 
     query = state.get("current_query", "")
-    api_name = _extract_api_name(query)
+    args = get_tool_args(state)
+    api_name = extract_api_name(query, args=args, known_names=api_retriever.known_api_names())
     result = api_retriever.lookup_signature(api_name)
 
     round_num = state.get("query_round_count", 0) + 1
@@ -88,7 +63,7 @@ def api_lookup_node(
     log_entry = {
         "round": round_num,
         "tool": "api_lookup",
-        "query": f"API: {api_name}",
+        "query": query or f"API: {api_name}",
         "response": display_text,
     }
 

@@ -13,24 +13,8 @@ from typing import Dict, Any
 from langchain_core.messages import HumanMessage
 
 from ..agent_state import GeneratorAgentState
+from ..query_utils import extract_api_name, extract_npu_query_params, get_tool_args
 from ..retrievers.env_checker import EnvCheckRetriever
-
-
-def _extract_api_name(query: str) -> str:
-    """Extract API name from a query string."""
-    # Pattern: "check API: XXX" / "check if XXX exists" / "API XXX"
-    match = re.search(r"(?:检查\s*api[:：]?\s*|check\s*(?:if\s*)?(?:api\s*)?[:：]?\s*|is\s+)(\w+)", query, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    match = re.search(r"(\w+)\s*(?:api|函数|function|算子)", query, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    # If query looks like a single identifier, treat it as API name
-    if re.match(r"^[A-Za-z_]\w{2,}$", query.strip()):
-        return query.strip()
-    # Fallback: use first word
-    parts = query.strip().split()
-    return parts[0] if parts else "unknown"
 
 
 def _format_for_display(result) -> str:
@@ -119,9 +103,11 @@ def env_check_npu_node(
             "tool_calls_log": [],
         }
 
-    result = env_retriever.query_npu_devices()
-    round_num = state.get("query_round_count", 0) + 1
+    args = get_tool_args(state)
     query = state.get("current_query", "query npu devices")
+    query_type, device_id = extract_npu_query_params(query, args=args)
+    result = env_retriever.query_npu_devices(device_id=device_id, query_type=query_type)
+    round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
     log_entry = {"round": round_num, "tool": "env_check_npu", "query": query, "response": display_text}
 
@@ -160,7 +146,8 @@ def env_check_api_node(
         }
 
     query = state.get("current_query", "")
-    api_name = _extract_api_name(query)
+    args = get_tool_args(state)
+    api_name = extract_api_name(query, args=args)
     result = env_retriever.check_api_exists(api_name)
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
