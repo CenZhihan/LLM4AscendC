@@ -420,6 +420,36 @@ result = generate_kernel_with_agent(task, custom_mode)
 
 在代码中传入 **`llm_config=dict`** 时，将 **直接使用** 该字典（需自行包含 `api_key`、`base_url`、`model`），不再读取上述文件。
 
+#### 3.5.6 在线文档检索工具试跑（未接入 Agent 路由）
+
+为便于先观察在线文档检索返回结构，仓库提供了两类 retriever 与一个合并测试脚本：
+
+- `generator/agent/retrievers/ascend_docs_search_retriever.py`：在线文档搜索（hiascend）
+- `generator/agent/retrievers/ascend_docs_fetch_retriever.py`：按 URL 抓取并结构化提取正文/API/代码/表格
+- `tools/test_ascend_docs_tools.py`：`search` / `fetch` / `chain` 三模式本地试跑
+
+示例：
+
+```bash
+# 只搜索（推荐中文关键词）
+python3 tools/test_ascend_docs_tools.py \
+  --mode search --keyword "AscendC::DataCopy 对齐限制" \
+  --doc_type API --page_size 5 --version 8.5.0
+
+# 只抓取
+python3 tools/test_ascend_docs_tools.py \
+  --mode fetch --url "https://www.hiascend.com/document/detail/zh/..." \
+  --extract_code --extract_tables --max_content_chars 8000
+
+# 链式：先搜索再抓 top2，并保存 JSON
+python3 tools/test_ascend_docs_tools.py \
+  --mode chain --keyword "Ascend C 临时内存申请" \
+  --fetch_topk 2 --extract_code --print_json \
+  --save_json /tmp/ascend_docs_chain.json
+```
+
+依赖：`requirements-generation.txt` 中已列出 `requests` 与 `beautifulsoup4`。
+
 ### 3.6 配置与依赖
 
 | 文件 | 作用 |
@@ -445,8 +475,11 @@ result = generate_kernel_with_agent(task, custom_mode)
 | `generator/agent/tool_registry.py` | 进程内工具注册表（内置 + `register_tool` 插件） |
 | `generator/agent/nodes/` | 各工具节点（编排层，调用 `retrievers/`） |
 | `generator/agent/retrievers/` | KB / Web / Code RAG / 环境检查等具体检索与探测实现 |
+| `generator/agent/retrievers/ascend_docs_search_retriever.py` | 在线 Ascend 文档搜索 retriever（hiascend） |
+| `generator/agent/retrievers/ascend_docs_fetch_retriever.py` | 在线 Ascend 文档详情抓取与结构化解析 retriever |
 | `generator/agent/agent_config.py` | 工具键常量、`parse_tool_mode`、`tool_mode_to_string`、Agent LLM 本地文件加载 |
 | `generator/agent/_example_prompts_relu_kb/` | `choose_tool` / `answer` 侧提示样例快照（与线上一致时宜同步更新） |
+| `tools/test_ascend_docs_tools.py` | 在线文档工具本地试跑脚本（search/fetch/chain） |
 | `generator/rag/` | RAG 代码索引与嵌入检索（ChromaDB + BGE-M3） |
 | `generator/prompt_generators/` | 提示策略实现（rag、add_shot、selected_shot 等） |
 | `generator/kernelbench102_ops.py` | 102 个通过数值验证的算子列表 |

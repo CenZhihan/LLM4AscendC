@@ -42,6 +42,8 @@ from .kb_shell_search import (
     KBShellSearchResult,
     search_kb,
 )
+from .ascend_docs_search_retriever import AscendDocsSearchRetriever
+from .ascend_docs_fetch_retriever import AscendDocsFetchRetriever
 
 __all__ = [
     'KBRetriever', 'query_knowledge',
@@ -62,4 +64,5 @@ __all__ = [
     'CodeQualityRetriever', 'CodingStyleResult', 'SecurityCheckResult',
     'check_coding_style', 'check_security_patterns',
     'KBShellSearchRetriever', 'KBShellSearchResult', 'search_kb',
+    'AscendDocsSearchRetriever', 'AscendDocsFetchRetriever',
 ]
