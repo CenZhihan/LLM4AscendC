@@ -1,0 +1,417 @@
+The user wants me to write a custom AscendC kernel that replaces the PyTorch operations in the given Model class. The operations being performed are:
+
+1. `F.linear(x, w, b)` - matrix multiplication + bias
+2. `torch.sum(x, dim=1, keepdim=True)` - sum along dim 1
+3. `torch.max(x, dim=1, keepdim=True)[0]` - max along dim 1
+4. `torch.mean(x, dim=1, keepdim=True)` - mean along dim 1
+5. `torch.logsumexp(x, dim=1, keepdim=True)` - log-sum-exp along dim 1
+6. `torch.logsumexp(x, dim=1, keepdim=True)` - log-sum-exp along dim 1 again
+
+So it's essentially: linear -> sum -> max -> mean -> logsumexp -> logsumexp
+
+Let me create a fused kernel that does all of this. The kernel name is `matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_custom`.
+
+Actually, looking more carefully:
+- `F.linear(x, w, b)` = `x @ w.T + b` (if x is [batch, in_features] and w is [out_features, in_features])
+- So output after linear is [batch_size, out_features]
+- Then sum over dim=1: [batch_size, 1]
+- Then max over dim=1: [batch_size, 1]
+- Then mean over dim=1: [batch_size, 1]
+- Then logsumexp over dim=1: [batch_size, 1]
+- Then logsumexp over dim=1: [batch_size, 1]
+
+So the final output is [batch_size, 1].
+
+For the fused kernel, I need to:
+
+
+1. Load x, w, b
+2. Compute matmul: for each batch element, compute out[j] = sum_i(x[i] * w[j][i]) + b[j]
+3. Sum over j (dim=1): sum_j(out[j])
+4. Max over j (dim=1): max_j(out[j])
+5. Mean over j (dim=1): mean_j(out[j]) = sum_j(out[j]) / out_features
+6. LogSumExp over j (dim=1): log(sum_j(exp(out[j])))
+7. LogSumExp over j (dim=1): log(sum_j(exp(out[j]))) again
+
+I need to think about how to structure this as a custom kernel that can handle the full fused sequence efficiently.
+
+The operations break down into two stages: a matmul followed by a sequence of reductions. For the matmul, I need to handle the computation where x is [batch_size, in_features], w is [out_features, in_features], and b is [out_features], producing [batch_size, out_features]. Then I apply the reductions sequentially along the feature dimension.
+
+The challenge is that steps 3-7 all operate on the same dimension, so I could potentially compute the matmul once and then perform multiple reductions on the result. However, with batch_size=1024 and out_features=8192, I need to be strategic about memory and compute efficiency.
+
+Looking at the problem differently, if I focus on the math: after linear, I get [batch, out_features]. The sum gives total_out, the max gives max_out, and the mean gives total_out/out_features. The first logsumexp computes log(sum(exp(out))) which equals log(sum_exp) = logsumexp_1. The second logsumexp then applies the same operation again to the scalar result, which just returns log(exp(logsumexp_1)) = logsumexp_1.
+
+So the output is a scalar per batch element. The key challenge is efficiently handling the matmul followed by these reductions without recomputing intermediate values unnecessarily.
+
+I need to build a custom kernel with proper tiling for the matrix multiplication and reduction phases. The matmul computes out[j] = sum_i(x[i] * w[j][i]) + b[j], then I apply the sum, max, mean, and logsumexp operations sequentially on the resulting vector. For tiling, I should break down the problem into manageable blocks that fit in Unified Buffer memory while maintaining parallelism across the batch dimension. tile4 for w: [tile, in_features]
+- Tile the output: [batch_size, tile4] -> process in chunks
+
+I'll structure the kernel to first handle the matmul with proper tiling across the output dimension, then apply the reduction operations on each chunk before combining results. The key is breaking the computation into manageable pieces that fit in memory while maintaining the correct reduction semantics across the full output dimension. For the tiled approach, each block handles one batch element, processing out_features in chunks of tileSize. Within each tile, I compute the partial matmul result, then accumulate it across tiles to get the full output before applying reductions.
+
+Let me reconsider the problem structure. The kernel needs to fuse: matmul(x, w) + b, then apply sum, max, mean, and two logsumexp operations across the output dimension. Each batch element requires computing the full matmul result first, then reducing across the feature dimension.
+
+For tiling strategy, I should partition the out_features dimension into tiles. Each block computes its tile's contribution to the matmul, accumulating across input features. After processing all tiles, each block has the complete matmul output for its batch element, then applies the reduction operations to get the final scalar result.
+
+With batch_size=1024 and out_features=8192, I have 1024 blocks available. I can assign one block per batch element to simplify the reduction phase, then tile the feature dimension into chunks of ~1024 elements each. This gives each block roughly 8 tiles to process sequentially, avoiding the complexity of cross-block coordination for the matmul itself.
+
+For memory efficiency, I need to account for the Unified Buffer constraints. Each block loads one batch of x (8192 elements), a tile of w (1024×8192), and the bias (8192), while also managing workspace for the matmul computation.
+
+The key is overlapping computation with data transfer through double buffering—while computing on tile i, I'm simultaneously loading tile i+1. Each block processes tiles sequentially: computing out[j] = x[i]*w_tile[i][j] for all j, then adding the bias once all tiles are accumulated. After the matmul completes, the reduction operations (sum, max, mean, logsumexp) run on the final output.
+
+For the tiling strategy, I need to account for the UB budget of 192KB per core. With float32 at 4 bytes per element, a tile of 8192 elements consumes 32KB, leaving room for multiple tiles and temporary buffers in the unified buffer space.
+
+The main constraints are that w (32MB) exceeds available GMEM per block, and the output vector (~32KB) fits comfortably. I'll assign each block to handle one batch element, processing the weight matrix in 8 tiles of 1024 elements each, with careful overlap between computation and data movement to keep the pipeline saturated.
+
+For the reduction phase, I'll use tree-structured operations across the 8 blocks to compute the final scalar. Though actually, since each block already has the complete output vector after the matmul, I can perform all reductions locally without needing to communicate between blocks. This simplifies things significantly—the matmul produces the full [1, 8192] output per block, and then I apply sum, max, mean, and logsumexp directly on that local result. I need to reconsider the reduction strategy. The matmul is the dominant cost here, and while I could use a two-phase approach with temporary results, computing everything in a single pass is simpler and avoids memory overhead. I'll stick with the straightforward approach where each block processes one batch element independently.
+
+For the implementation, I need to structure the tiling data to capture the problem dimensions, define the operator with input and output specifications, and then write the kernel logic to handle the matrix multiplication and subsequent reductions in one cohesive process. "y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulSumMaxAvgPoolLogSumExpLogSumExpCustom);
+} // namespace ops
+"""
+
+kernel_src = """
+#include "kernel_operator.h"
+
+class KernelMatmulSumMaxAvgPoolLogSumExpLogSumExp {
+public:
+    __aicore__ inline KernelMatmulSumMaxAvgPoolLogSumExpLogSumExp() {}
+
+    __aicore__ inline void Init(int32_t batch, int32_t m, int32_t k, int32_t n, float slope)
+    {
+        batchSize = batch;
+        M = m;
+        K = k;
+        N = n;
+        negSlope = slope - 1.0f;
+    }
+
+    __aicore__ inline void SetBuffers(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y)
+    {
+        xGm.SetGlobalBuffer((__gm__ float*)x, batchSize * M * K);
+        wGm.SetGlobalBuffer((__gm__ float*)w, M * K);
+        bGm.SetGlobalBuffer((__gm__ float*)b, M);
+        yGm.SetGlobalBuffer((__gm__ float*)y, batchSize * M);
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (int b = 0; b < batchSize; ++b) {
+            for (int m = 0; m < M; ++m) {
+                float maxVal = -3.402823466e+38f;
+                float expSum = 0.0f;
+                
+                for (int k = 0; k < K; ++k) {
+                    float prod = xGm[b * M * K + m * K + k] * wGm[m * K + k];
+                    float val = prod + bGm[m];
+                    maxVal = val > maxVal ? val : maxVal;
+                    expSum += expf(val - maxVal);
+                }
+                
+                yGm[b * M + m] = negSlope * maxVal + logf(expSum);
+            }
+        }
+    }
+
+private:
+    int32_t batchSize, M, K, N;
+    float negSlope;
+    AscendC::GlobalTensor<float> xGm, wGm, bGm, yGm;
+};
+
+extern "C" __global__ __aicore__ void matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_custom(
+    GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulSumMaxAvgPoolLogSumExpLogSumExp op;
+    op.Init(tiling_data.batchSize, tiling_data.M, tiling_data.K, tiling_data.N, tiling_data.negativeSlope);
+    op.SetBuffers(x, w, b, y);
+    op.Process();
+}
+"""
+
+python_bind_src = """
+#include <torch/
+
+library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_impl_npu(
+    const at::Tensor& x,
+    const at::Tensor& w,
+    const at::Tensor& b)
+{
+    TORCH_CHECK(x.dim() == 2, "Expected 2D input");
+    TORCH_CHECK(w.dim() == 2, "Expected 2D weight");
+    TORCH_CHECK(b.dim() == 1, "Expected 1D bias");
+    
+    int64_t batch = x.size(0);
+    int64_t M = x.size(1);
+    int64_t K = w.size(1);
+    int64_t N = w.size(0);
+    
+    at::Tensor y = at::empty({batch, N}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulSumMaxAvgPoolLogSumExpLogSumExpCustom, x, w, b, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(matmul_ops, PrivateUse1, m) {
+    m.impl("matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_custom", 
+          &matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_custom",
+          &matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_impl_npu,
+          "Fused matmul with sum, max, avg pool, and log-sum-exp operations");
+}
+"""
+
+model_src = '''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
+
+I need to reconsider the problem more carefully. The architecture chains several operations: F.linear (matmul + bias), sum reduction, max reduction, mean reduction, and two logsumexp operations. Looking at the semantics, after the matmul produces [batch_size, out_features], the subsequent reductions collapse the out_features dimension to 1, so the final output is [batch_size, 1]. I should write a fused kernel that combines the matmul with all the reduction operations to avoid materializing intermediate tensors. The output is a scalar per batch element, which I can derive from the matmul computation. For each batch and output feature, I compute the weighted sum across input features, add the bias, then track the maximum value and accumulate the exponential sum. The final result applies the negative slope to the max and adds the log of the accumulated exponentials.
+
+For implementation, I need to tile the matrix dimensions efficiently—processing the output features in chunks of 1024 to balance memory usage with computational throughput, while each block handles a single batch element. x: [tile, in_features] from w[i*tile:(i+1)*tile, :]
+
+For each tile, I multiply x against the corresponding rows of w, accumulating partial results into out[tile_ids]. After processing all tiles, I add the bias terms and then compute the reduction operations (sum, max, mean, logsumexp) on the final output vector.
+
+For memory management, I need to ensure all required data fits in the unified buffer simultaneously. xLocal uses tile*in_features elements, wLocal needs the same, outLocal requires tile elements, and the temporary vectors need space for the maximum value and exponential sum across all output features.
+
+Since outLocal is the bottleneck at tile elements and xLocal/wLocal take tile*in_features combined, the total footprint is roughly 2*tile*in_features + 3*tile elements. With in_features=8192 and tile=1024, this approaches 17 million elements, which is problematic for UB capacity.
+
+I should process in stages instead—load xLocal once, then stream through w tiles sequentially. This means loading wTile[i], computing partials, accumulating into outPartial, then moving to the next w tile until completion. However, this creates a data dependency issue since xLocal must be preserved across all w tile iterations.
+
+A ping-pong buffer strategy with two xLocal buffers could overlap computation and loading, though x changes only per batch element. The real bottleneck is that w dimensions (8192 × 8192) exceed available global memory per block, so I need to stream w tiles from global memory rather than caching them all. The matmul is fundamentally limited by available memory bandwidth—each batch element requires reading the full weight matrix. For the reduction phase, outLocal (size 8192) fits in unified buffer, but accumulating partial results demands careful management of the exponential sum to prevent overflow.
+
+A two-pass approach handles this: first compute the maximum value across all elements, then calculate the sum of exponentials relative to that maximum. This avoids numerical overflow while keeping memory usage manageable.
+
+The implementation uses a temporary buffer to store the computed values, then applies the LeakyReLU-like operation with the pre-computed negative slope correction. I'll load x as a local tensor and stream through w in tiles to compute each batch element's output. For each tile, I calculate the partial results and accumulate them. After processing all tiles, I add the bias terms and begin the reduction phase by finding the maximum value across the output. // Add bias and compute leaky_relu
+            yLocal[i] = xVal + negCorr_ * std::min(xVal, 0.0f);
+            expSum += std::exp(yLocal[i] - maxVal);
+        }
+        
+        outQueueY_.EnQue(yLocal);
+    }
+
+For the reduction phase, I'm dequeueing the output tensor and initializing variables to track the sum and maximum value across all elements. Then I iterate through the tensor to find the maximum and accumulate the exponential sum after applying the leaky_relu transformation. // LogSumExp 2: log(exp(logsumexp1)) = logsumexp1
+yFinal = logsumexp1;
+
+I need to write this final value back to global memory and free the temporary buffer. The kernel completes by returning the computed result.
+
+Looking at the reduction logic more carefully, I realize I don't actually need a separate temporary queue for the values—I can reuse the input queue or allocate a smaller temporary buffer. For the matmul computation, I'm iterating through tiles of the weight matrix, multiplying input features by their corresponding weights and accumulating the partial results. After processing all tiles, I apply the bias and then compute the sum reduction by iterating through the output elements to find the maximum value. (outQueueY_.DeQue<float>());
+    }
+    
+    // Copy to output
+    for (uint32_t i = 0; i < N; i++) {
+        yGm[base + i] = yLocal[i];
+    }
+    outQueueY_.FreeTensor(yLocal);
+}
+
+The core strategy uses double buffering with a single output queue to overlap computation and data movement. I allocate ping-pong buffers for the input and output tensors, then stream through tiles of the weight matrix while the processing unit handles the computation on the previous tile's data. After the matmul completes, I apply the reduction operations to find the maximum value, compute the exponential sum, and write the final scalar result to global memory.
+
+However, the implementation has a critical constraint: the entire output vector of 8192 elements must fit in unified buffer memory, which may exceed the available capacity. Additionally, the input data (32KB for x, 32MB for w, 32KB for bias) likely cannot all reside in UB simultaneously, so I'll need to tile the weight matrix across multiple passes while keeping the output vector and input vector in fast memory. matmul, I:
+1. Load tile i of w
+2. Compute partial matmul
+3. Accumulate to out
+4. Repeat for all tiles
+
+For the reduction:
+1. Compute max of out
+2. Compute expSum using out
+
+The key is that out needs to persist across tiles. Since out is 8192 floats (32KB), it might fit in UB.
+
+Actually, I just realized: the AscendC TQue is designed for this! We can keep tensors in UB using the que.
+
+Let me revise:
+
+__aicore__ inline void Process()
+{
+    uint32_t batchIdx = GetBlockIdx();
+    uint32_t base = batchIdx * N;
+
+I stream tiles of w from GMEM while accumulating results into a persistent output buffer. The queuing system keeps tensors resident in UB, allowing me to compute partial matmul results across multiple passes without reloading the full output. After all tiles are processed, I perform the reduction directly on the accumulated output vector. For the sum, I'm using a reduction pattern to accumulate all elements, then dividing by N to get the mean. After that, I apply the LeakyReLU-like operation using the precomputed negative correction factor, calculating expSum as the sum of exponentials of the modified values. Then I compute the first log-sum-exp result from the original values before moving to the next stage.
+
+For the second log-sum-exp, I need to reconsider the math: applying logsumexp to a scalar just returns that scalar, so logsumexp2 should equal logsumexp1. However, I should verify whether there's a dimension mismatch—if the matmul produces a [batch, 8192] tensor, then applying reductions along dim=1 would collapse that dimension.
+
+The math checks out: after sum, max, and mean operations on dim=1, each produces [batch, 1]. The logsumexp operations then apply to these scalars, yielding the same shape. So the final result is indeed [batch, 1], and my implementation correctly outputs yFinal as a scalar value for each batch element.
+
+For the tiling strategy, I need to balance tile size against unified buffer capacity. With x as [1, 8192], w_tile as [tile, 8192], and output as [1, 8192], the matmul produces output elements that accumulate across k dimensions. The output vector can be kept in UB as a temporary, allowing me to process tiles of w sequentially while maintaining the accumulated result.
+
+For the tiling parameters, with UB budget around 192KB, I can set TILE = 512 to fit within constraints. This gives a tile of 512×8192 floats (16MB) plus overhead, which stays within the 32KB-64KB target per tile. I'm adjusting to 512 elements per tile to balance memory usage and computational efficiency.
+
+Now I'll implement the kernel using this configuration. Each block will process one batch element by loading x and w in tiles, computing partial results, then accumulating and reducing to produce the final scalar output. out += xLocal[k] * wLocal[tileId * K + k];
+                    }
+                }
+            }
+            
+            // Add bias
+            out += bGm[blockIdx * N + tileId];
+        }
+    }
+    
+    // Reduction
+    float maxVal = -3.402823466e+38f;
+    for (uint32_t i = 0; i < N; i++) {
+        if (out[i] > maxVal) maxVal = out[i];
+    }
+    
+    float expSum = 0.0f;
+    for (uint32_t i = 0; i < N; i++) {
+        float val = out[i] + negCorr_ * std::min(out[i], 0.0f);
+        expSum += std::exp(val - maxVal);
+    }
+
+I'm accumulating the weighted sum across input features for each output tile, then adding the bias term. After the matrix multiplication completes, I find the maximum value across all outputs and compute the exponential sum needed for the final softmax normalization. d = 1;
+    curLen = (totalLen < tileLen) ? totalLen : tileLen;
+    CopyIn(xGm, curLen);
+
+    for (uint32_t i = 1; i < numTiles; ++i) {
+        CopyIn(xGm + i * tileLen, tileLen);
+        Compute(curLen);
+        CopyOut(yGm + (i-1) * tileLen, curLen);
+        curLen = tileLen;
+    }
+    
+    Compute(curLen);
+    CopyOut(yGm + (numTiles-1) * tileLen, curLen);
+}
+
+Now I need to apply this same tiling pattern to the matmul_sum_max kernel, processing input tiles across the computation while managing data movement efficiently.
+
+In the matmul phase, I'll load the input vector and iterate through weight matrix tiles. For each tile, I compute the partial output by multiplying corresponding elements, then accumulate these contributions. After processing all tiles, I add the bias and move to the reduction phase where I'll compute the sum, max, and leakyrelu operations. Finally, I write the scalar result back to global memory. - maxVal);
+    }
+    float logsumexp1 = std::log(expSum) + maxVal;
+    float yFinal = logsumexp1;
+    yGm[batchIdx] = yFinal;
+}
+```
+
+I need to be careful with the scope of variables like tileLen and tileN—they're defined in Init() so they're accessible throughout the class. For the matmul computation, the nested loop structure handles the tile-based multiplication correctly, and I'm using a flat indexing approach where each block computes one output element per batch. The bias addition happens after accumulating all tile contributions.
+
+For the bias indexing, when blockIdx corresponds to a particular output element within a batch, the formula batchIdx * N + tileId correctly maps to the right bias value since the bias array is broadcast across all batches.
+
+Each block independently computes its assigned output element, so there's no race condition—the bias access is always valid for the specific output index that block is responsible for. The final result yFinal gets stored at the appropriate location in the output tensor.
+
+Now I need to finalize the implementation details. The tiling configuration should include batch_size, in_features, out_features, and the negative slope parameter. For memory management, I need to ensure out can be reused as a temporary buffer for the matmul accumulation. With UB budget around 192KB and tile sizes of 512, the memory layout should fit comfortably: x occupies 2KB, w takes 4MB, and out needs roughly 32KB plus some overhead for the reduction phase.
+
+I should also account for the fact that the matmul output is [batch_size, out_features], which means the subsequent operations—sum, max, mean, and logsumexp—need to operate across the feature dimension for each batch element independently. I need to be careful about floating point precision when computing logsumexp. Using logspace subtraction helps avoid overflow—calculating exp(x - maxVal) before taking the log prevents numerical instability that could occur with direct exponentiation.
+
+For the final kernel implementation, I'm structuring it with proper initialization that captures input dimensions and the negative slope parameter, then sets up global memory buffers for the input tensor, weight matrix, bias, and output. The negative slope gets adjusted to negativeSlope - 1 for use in the leaky ReLU computation.
+
+The main processing loop iterates through each batch element, computing the full matmul between the input and weight matrix by tiling the computation. For each output element, it accumulates the dot product across all input features, then adds the bias term. After the matmul completes for all elements in a batch, it performs the reduction operations.
+
+For the reduction phase, I first find the maximum value across all computed outputs to use for numerical stability in the exponential calculation. Then I apply the leaky ReLU activation with the precomputed negative slope, accumulating the exponential of each shifted value. Finally, I compute the log-sum-exp of the original outputs and store the result.
+
+Looking at the full operation sequence—linear transformation, sum reduction, max pooling, mean pooling, and two consecutive log-sum-exp operations—I'm wondering if these form a specific known pattern or if I should implement each step independently.
+
+Let me trace through the dimensions more carefully. The matmul produces [batch, out_features], and the subsequent reductions all operate along dim=1, collapsing that dimension to 1. So the output ends up as [batch, 1] after each operation, meaning logsumexp2 is indeed computing logsumexp on a scalar, which just returns that scalar value.
+
+For the kernel naming, I should use underscores in the C++ function since that's the standard convention in the codebase. I'll also structure the project configuration to define the operator interface with its input and output specifications.
+
+Now I'm setting up the tiling infrastructure. The tiling data structure will hold parameters like the negative slope, block dimensions, and feature sizes that the kernel needs to operate efficiently across the hardware. Then I need to implement the tiling function that determines how to partition the computation. The operator definition establishes the input and output interfaces for the matmul operation, specifying that both x and y are float tensors in ND format, with negative_slope as an optional float attribute defaulting to 0.01. The tiling function is registered to handle the computational tiling, and the implementation targets the ascend910b architecture. b"), "Output");
+
+Setting up the output tensor with float32 data type and ND format, keeping the same unknown shape format as the input. Then configuring the negative slope parameter as an optional float attribute that defaults to 0.01. The shape and data type inference functions are registered, along with a tiling function for the AI core. The operator is added to the registry with "MatmulSumMaxAvgPoolLogSumExpLogSumExpCustom" as its identifier.
+
+Moving to the kernel implementation, I'm defining a kernel class that handles the fused matmul with max pooling, average pooling, and log-sum-exp operations. The class includes an inline constructor and an initialization method that sets up the global memory buffers for the input matrix, weight matrix, bias vector, and output tensor. It also stores the negative slope parameter and computes a correction value by subtracting 1.0 from it.
+
+The initialization continues by configuring the queue buffers in the processing pipe—allocating space for the input matrix in the input queue, the weight matrix in the temporary queue, and the output tensor in the output queue. The method then begins preparing to process each batch element by calculating the number of tiles needed based on the feature dimension and a predefined tile size. .32, tileLength * sizeof(float));
+
+    pipe2.InitBuffer(tmpQueueMax, 1, N * sizeof(float));
+    pipe2.InitBuffer(tmpQueueExp, 1, N * sizeof(float));
+
+For the reduction phase, I need additional temporary buffers. The max queue holds N floats to track the maximum value across all elements, while the exp queue stores the exponential values needed for the logsumexp computation. After initializing these buffers, I can proceed with the main processing loop that iterates through each batch element. out += xLocal[k] * wLocal[i * K + k];
+                    }
+                }
+            }
+            
+            // Add bias
+            out += bGm[batchIdx * N + i];
+        }
+    }
+
+For the reduction phase, I need to find the maximum value across the output. I allocate a temporary tensor and initialize all elements to a very small number, then use the ReducesMax operation to compute the maximum across all N elements. Finally, I dequeue the temporary tensor to continue with the next steps. maxVal);
+        expsumQueue.FreeTensor(expLocal);
+    }
+
+I'm completing the exponential sum calculation by dequeuing the temporary tensor and performing the reduction. Then I compute the first log-sum-exp value using the accumulated maximum and exponential sum, apply the negative slope to the max for the leaky relu component, and store the final scalar result back to global memory before freeing all remaining tensors.
+
+The kernel function signature takes pointers to the input matrix, weight matrix, bias vector, and output along with workspace and tiling data. It extracts the tiling parameters and initializes the operator before calling Process().
+
+Now I need to implement the Python bindings using the NPU helper library to expose this custom operation.
+
+```cpp
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_impl_npu(
+    const at::Tensor& x, 
+    const at::Tensor& w, 
+    const at::Tensor& b,
+    double negative_slope) {
+    
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(w.dim() == 2, "w must be 2D");
+    TORCH_CHECK(b.dim() == 1, "b must be 1D");
+    
+    at::Tensor result = at::empty({x.size(0), 1}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulSumMaxAvgPoolLogSumExpLogSumExpCustom, 
+                 x, w, b, negative_slope, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_custom", 
+          &matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_custom",
+          &matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_impl_npu,
+          "Matmul with Sum, Max, AvgPool, LogSumExp, LogSumExp fusion");
+}
+```
+
+The PyTorch binding layer registers the custom NPU operation and exposes it through both the torch.library interface and pybind11, allowing the fused kernel to be called from Python with automatic tensor management and shape validation. ```python
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+```
+
+The implementation completes the model wrapper by extracting the custom operation function dynamically and executing it with the provided inputs. This approach keeps the model class minimal while delegating the actual computation to the registered custom operator.

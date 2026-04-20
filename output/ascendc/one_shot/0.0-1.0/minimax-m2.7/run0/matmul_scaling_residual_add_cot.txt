@@ -1,0 +1,714 @@
+The user wants me to transform a PyTorch model that performs a matmul with scaling and residual add into a custom AscendC kernel implementation.
+
+Let me analyze the original model:
+1. It takes inputs: x (batch_size, in_features), w (out_features, in_features), b (out_features), scaling (scalar)
+2. It performs: y = F.linear(x, w, b) which is: y = x @ w.T + b
+3. Then: result = y * s + y = y * (s + 1)
+
+So the kernel should:
+1. Perform matrix multiplication: y = x @ w.T + b
+2. Scale the result by (scaling + 1)
+3. The scaling is a scalar tensor
+
+For the AscendC kernel, I need to create:
+1. project_json_src - Op definition in JSON
+2. host_tiling_src - Tiling data definition
+3. host_operator_src - Tiling function and op registration
+4. kernel_src - The actual kernel implementation
+5. python_bind_src - PyTorch binding
+6. model_src - The ModelNew class that uses the custom op
+
+Let me think about the implementation:
+
+For the matmul: y = x @ w.T + b
+- x shape: [batch_size, in_features] = [B, K]
+- w shape: [out_features, in_features] = [N, K]
+- y shape: [batch_size, out_features] = [B, N]
+
+For the AscendC Matmul kernel on NPU, we typically use the MatmulAscend operator.
+
+Then scaling: result = y * (scaling + 1)
+
+Let me create the kernel. The kernel name is `matmul_scaling_residual_add_custom`.
+
+
+I'll structure the six components for the custom kernel. The op needs to handle matrix multiplication with a bias term, then apply scaling to the result. The project JSON defines the input and output specifications with x, w, b, and scaling as required parameters, producing output y. The host code will set up tiling information and register the operator, while the actual compute kernel performs the matrix multiplication and scaling operations. For the scaling computation, I need to figure out how to efficiently handle the multiplication and addition without requiring additional memory. The scaling factor is derived from the input parameter, so I can precompute it once rather than recomputing it for each element.
+
+The computation can be restructured to avoid the extra buffer by combining operations: result = y * (scaling + 1) can be rewritten as result = y * alpha where alpha = scaling + 1. This eliminates the need for a separate temporary buffer to store intermediate values.
+
+However, the Matmul operation is the primary computational bottleneck here, so the optimization strategy should focus on efficient tiling and memory management for that part. The scaling and addition can be fused into a single multiply-add operation to minimize overhead. The critical factor is ensuring the scaling tensor is accessible in the kernel so it can be applied during or after the matrix multiplication.
+
+Looking at the example pattern with leaky_relu_custom, the kernel extracts parameters directly from the tiling data structure. For matmul_scaling_residual_add_custom, I need to handle the scaling factor similarly—either storing it in the tiling data or passing it as a kernel argument. The kernel signature requires x, w, b, scaling as inputs, along with workspace and tiling parameters.
+
+The scaling value is a scalar that gets added to 1.0 internally, so I can compute this during initialization and store alpha = scaling + 1.0 in the tiling data. This avoids redundant calculations on the device side.
+
+The tiling strategy needs to account for both the matrix multiplication and the element-wise scaling. I'll divide the output elements across blocks, where each block handles a portion of the result matrix. For a batch size of 16384 and output features of 4096, that's roughly 67 million total elements to process across the available compute units.
+
+A practical approach is to have each block manage multiple rows, with the total rows divided by the block count. For the Matmul operation itself, I'll leverage the AscendC Matmul operator which handles tiling internally, then apply the scaling factor to each element of the output. shape: [N, K]
+- b shape: [N]
+- y shape: [B, N]
+- scaling shape: scalar
+
+The kernel needs to compute y = x @ w.T + b, then apply result = y * (scaling + 1).
+
+The core operation here is a matrix multiplication followed by a bias addition and scaling. For the implementation, I'll tile along the batch dimension since this typically offers better parallelism. Each tile processes a batch of rows from x, performs the matmul with w, adds the bias, scales by (scaling + 1), and writes the result. The tiling logic will need to determine the batch size per tile and ensure proper alignment with the matrix dimensions. dth); i += totalWidth) {
+    int currentWidth = min(tileWidth, totalWidth - i);
+    
+    // Load tile of weights [tileWidth, K]
+    LocalTensor<float> wTile = wQueue.DeQue<float>();
+    mmOp.SetShape(xTile, wTile);
+    mmOp.Detach();
+    
+    // Compute local result [tileHeight, tileWidth]
+    LocalTensor<float> localResult = mmOp(xTile, wTile);
+    
+    // Apply bias and scaling to this portion
+    LocalTensor<float> biasedResult = biasQueue.AllocTensor<float>();
+    LocalTensor<float> scaledResult = outQueue.AllocTensor<float>();
+    Add(biasedResult, localResult, biasTensor, currentWidth);
+    Muls(scaledResult, biasedResult, scaleFactor, tileHeight * currentWidth);
+    
+    // Copy output and cleanup
+    DataCopy(outputGm[outOffset], scaledResult, tileHeight * currentWidth);
+    outQueue.EnQue(scaledResult);
+    biasQueue.FreeTensor(biasedResult);
+    
+    wQueue.FreeTensor(wTile);
+}
+
+I'm implementing a tiling strategy where each block handles a subset of the output by loading a tile of weights, performing matrix multiplication with the corresponding input tile, then applying the bias and scale transformations before writing results back to global memory.
+
+The matmul operation itself should leverage the NPU's built-in MatmulAscend operator rather than manual loops, which is the standard approach for efficient tensor processing on this architecture.
+
+For the tiling strategy, I'll split the problem along the batch dimension with each block processing a subset of rows. The kernel will load the weight matrix once and broadcast it across all blocks, then handle the bias addition and scaling as element-wise operations. The implementation needs to define the kernel class with initialization for all required parameters and set up the processing pipeline for the tiled computation. .GetShapeSize();
+
+    // Use block-level tiling: each block processes totalLength/blockDim elements
+    const uint32_t blockDim = context->GetBlockDim();
+    const uint32_t perBlockLength = CeilDiv(totalLength, blockDim);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_perBlockLength(perBlockLength);
+    tiling.set_scaleFactor(*scaleFactor);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+
+The tiling function divides the flattened tensor across available blocks, computing how many elements each block should handle. It stores the total length, per-block length, and scale factor in the tiling data structure, then saves it to the buffer for the kernel to access during execution.
+
+For shape inference, the output tensor mirrors the input shape since the operation preserves dimensions. Data type inference ensures the output matches the input dtype, which must be float32 for the matmul to work correctly.
+
+The LeakyReluCustom operator defines its input as x with required parameter type, float data type, and ND format. The output y follows the same specifications, while negative_slope is an optional float attribute defaulting to 0.01. The infer functions are registered to handle shape and data type propagation during graph compilation.
+
+For MatmulScalingResidualAddCustom, the input descriptors include x (required, float32, ND format), w (required, float32, ND format), and b (required, float32, ND format). The scaling parameter is defined as an optional float attribute with a default value of 0.5. The implementation requires handling matrix multiplication with weight tensor w, adding bias b, and applying a scaling factor to the result.
+
+The output y maintains the same shape constraints and data type as the input x. For the kernel execution, I'll structure it with a Matmul operator to handle the core computation, then layer bias addition and element-wise scaling on top. The tiling strategy splits the batch dimension across available blocks, with each block handling a subset of rows from the input batch and computing their corresponding output rows through the matmul operation.
+
+Each block loads its assigned input rows and the full weight matrix, performs the matrix multiplication, applies the bias, scales the results, and writes them back. The bias gets broadcast across all rows in the tile. I'll use double buffering with local tensors to overlap data movement and computation.
+
+The kernel takes input tensor x, weight matrix w, and bias vector b from global memory, along with tiling parameters. It initializes the kernel object with these addresses and the tiling configuration, then invokes the Process method to execute the tiled matmul operation. The kernel extracts the tiling data from the parameter buffer using the GET_TILING_DATA macro.
+
+The Process method first checks if there's any work to do by verifying totalLength and tileLength aren't zero. It determines its block position using GetBlockNum and GetBlockIdx to calculate the offset into the input data, then returns early if this block has no elements assigned to it. The offset calculation divides the total elements among available blocks to distribute the workload evenly.
+
+Next, it calculates the tile dimensions based on available buffer space. The UB buffer can hold approximately 4.9 million floats, so it constrains tileLength to stay within this limit while maintaining alignment. It also enforces minimum and maximum tile sizes to ensure efficient processing across the NPU architecture.
+
+For memory management, it sets up three queues: one for the input matrix, one for weights, and one for output results, each double-buffered to overlap computation with data transfer. The tiling data stores the per-block length, tile dimensions, scale factor, and problem size (B, N, K) so each processing block knows its workload assignment. void MatmulTile()
+{
+    AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+    AscendC::LocalTensor<float> wLocal = wQueue_.AllocTensor<float>();
+    AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+
+    AscendC::DataCopy(xLocal, xGm_[offset_], tileLength_);
+    AscendC::DataCopy(wLocal, wGm_, k_);
+
+    mmOp_.SetMatmulParam(ASCEND_MATMUL_MODE_ND, k_, n_, k_, k_, n_);
+    mmOp_.(xLocal, wLocal, yLocal);
+
+    inQueueX_.FreeTensor(xLocal);
+    wQueue_.FreeTensor(wLocal);
+    outQueueY_.EnQue(yLocal);
+}
+
+The CopyOut method dequeues the output tensor and transfers it to global memory starting at the calculated offset, freeing the local tensor afterward.
+
+For bias and scaling operations, I allocate a temporary tensor, broadcast the bias across all columns using replicate operations, then apply scaling by multiplying each element with the scale factor before enqueuing the result.
+
+Once all tiles are processed, I copy the final output to global memory and clean up the queue. The kernel uses a TPipe for management and TQue objects for double-buffered input/output operations.
+
+For the matmul operation, I need to verify the correct API usage on the NPU. The Matmul operator should be instantiated with a specific position parameter, and the SetMatmulParam call configures it for ND array mode with the appropriate dimensions—K for the reduction dimension, N for the output width, and the stride parameters all set to K for row-major layout.
+
+Looking at the example patterns, I'll structure the kernel following their conventions: a KernelClass with Init and Process methods, where Init sets up buffers and Process handles the computation loop. The core matmul will use the MatmulAscend operator, and I'll append the scaling and residual addition as separate vector operations. I should also ensure the alignment and tiling considerations match the reference implementation for consistency. LocalTensor<float> yLocal = mmOp_(xLocal, wLocal);
+outQueueY_.EnQue(yLocal);
+```
+
+The MatmulAscend operator appears to be the built-in matmul implementation on AscendC. For the tiling strategy, I should account for the UB budget constraints—with a 192KB limit per core, that's roughly 48K elements available for the matmul tiles.
+
+Each matmul tile requires space for the input activation (tileN * K), weight matrix (tileN * K), and output (tileB * tileN), totaling approximately 3 * tileB * tileN in UB memory.
+
+The weight matrix W is a constant that I can broadcast across all blocks, so each block loads the same W. With a 192KB UB budget and 4 bytes per float, I have 48K floats available. If the output dimension is 4096, that leaves about 12 elements per block for the actual computation—which seems too constrained.
+
+I need to reconsider the strategy. Rather than trying to fit everything in UB simultaneously, I should process in tiles along the K dimension. The weight matrix stays in global memory and gets loaded incrementally in chunks, allowing each block to work through the computation iteratively without requiring the entire matrix to fit in local memory at once.
+
+For each tile along K, I load a portion of the input (B × tileK) and corresponding weights (N × tileK), multiply them to produce an intermediate result (B × N), accumulate across all K tiles, then apply bias and scaling. The double buffering approach would load the next tile's data while computing on the current one.
+
+I can optimize this by having all blocks share the weight matrix—each block computes its assigned rows of x multiplied by the complete weight matrix, then broadcasts results across blocks. This way, the weight matrix is loaded once per iteration and reused, reducing memory bandwidth while keeping the computation parallelized across the batch dimension. k (M), weight is k×n (N), output is m×n (P). The kernel operates on row vectors of x, processing each independently against the full weight matrix to produce a row of output.
+
+Given the NPU architecture, each block handles a tile of rows from x. For each block, I load tileB rows from x and the entire weight matrix (N × K), compute tileB × N results, then apply bias and scaling to get the final tileB × N output. This approach ensures complete coverage of the output while efficiently utilizing the available memory bandwidth. .32 MB
+Total UB: ~200KB to 400KB
+Matmul part: ~2.1 MB (doesn't fit!)
+
+I need to handle large K dimensions by processing in tiles. I'll break the computation into smaller chunks along K, accumulating partial results in output buffers before applying bias and scaling.
+
+```cpp
+__aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                            uint32_t B, uint32_t N, uint32_t K,
+                            uint32_t perBlockRows, uint32_t tileK,
+                            float scaleFactor)
+{
+    B_ = B;
+    N_ = N;
+    K_ = K;
+    perBlockRows_ = perBlockRows;
+    tileK_ = tileK;
+    scaleFactor_ = scaleFactor;
+    scaleCorr_ = scaleFactor_ - 1.0f;
+    
+    xGm_.SetGlobalBuffer((__gm__ float*)x, B * K);
+    wGm_.SetGlobalBuffer((__gm__ float*)w, N * K);
+    bGm_.SetGlobalBuffer((__gm__ float*)b, N);
+    yGm_.SetGlobalBuffer((__gm__ float*)y, B * N);
+    
+    const uint32_t UB_SIZE = 196608;
+    const uint32_t ELEMS_PER_ROW = N_;
+    const uint32_t tileB = min(perBlockRows_, UB_SIZE / (2 * ELEMS_PER_ROW + ELEMS_PER_ROW));
+    const uint32_t maxKBuf = UB_SIZE / (tileB * sizeof(float));
+    
+    pipe_.InitBuffer(inQueueX_, 2, tileB * tileK_ * sizeof(float));
+    pipe_.InitBuffer(wQueue_, 2, N_ * tileK_ * sizeof(float));
+    pipe_.InitBuffer(outQueueY_, 2, tileB * N_ * sizeof(float));
+    pipe_.InitBuffer(tmpQueue_, 1, tileB * N_ * sizeof(float));
+}
+```
+
+I'm calculating the maximum tile size that fits in unified buffer by dividing available space by memory requirements per element, then initializing double buffers for input activation, weights, output, and temporary storage. Each queue gets allocated based on the computed tile dimensions to enable overlapping computation and data movement. The core loop iterates through K in tileK_ increments. For each iteration, I calculate the current tile size for K, ensuring it doesn't exceed the remaining elements. I copy the x tile from global memory to the input queue, then copy the weight tile to the weight queue. After dequeuing both tensors, I set up the matrix multiply parameters—configuring the operation as a row-vector-to-matrix multiplication where the input vector has length tileK and the weight matrix has tileK rows and N_ columns, with the output producing tileB vectors of length N_.
+
+Once the matrix multiply completes with the x and weight tiles, I add the result to the accumulated output using the corresponding output queue. After processing all K tiles, the final accumulated result gets scaled by multiplying each element by the scale factor.
+
+The bias application first subtracts 1.0 from each accumulated value, then broadcasts the bias vector across all rows before adding it back. Finally, the scaled output is copied back to global memory and the temporary queue is freed. The compute-intensive operation here is the matrix multiplication, which needs careful optimization. The tiling strategy should account for the matmul's requirements along with the element-wise operations that follow.
+
+The matmul operation consumes the most UB space—roughly tileB × K for the input activations, tileN × K for weights, and tileB × tileN for output. Element-wise operations like bias addition and scaling are more memory-bound and fit within the matmul's UB footprint. To keep the implementation manageable, I can tile along the batch dimension for the matmul, where each block handles a subset of rows while processing the full K dimension against the entire weight matrix.
+
+The tiling logic calculates how many rows each block processes based on the total length and available blocks. For UB allocation, I'm dividing the 192KB budget across three buffers: input activations, weights, and output. The actual bytes per row depends on the data size and alignment requirements.
+
+If N equals 4096, each row needs about 16KB, which limits me to roughly 12 rows per block—too restrictive. I should instead tile along the K dimension for the matmul. The weight matrix stays fixed at N×K, but I can process it in chunks: load a tileK slice of weights and the corresponding x input, perform the matmul, and accumulate the results across all tiles.
+
+With the weight matrix staying in global memory across iterations, each tile only needs space for tileB×tileK activations plus tileB×N output. A more practical approach might be processing all rows in smaller batches—say tileB rows at a time—keeping a subset of weights in UB while iterating through K, then accumulating the partial results.
+
+The weight matrix itself is substantial at roughly 64MB, which exceeds what fits in L1/L2 cache, so it'll need to come from global memory repeatedly. Since the weight is identical across all blocks, I could have each block load it independently rather than duplicating across blocks, then each processes its assigned rows. Alternatively, I could distribute the weight matrix across blocks and aggregate partial outputs—a more involved strategy but potentially more bandwidth-efficient.
+
+For simplicity, I'll go with the first approach: each block loads the full weight matrix and computes its portion of the output independently. The matmul portion needs careful UB budgeting—with a 192KB limit and 4-byte floats, that's roughly 49,152 elements. The memory splits between input activations (tileB × K), weights (N × K), and output (tileB × N), where N is 4096 and K is 4096.
+
+The constraint becomes tileB × K + N × K + tileB × N ≤ 49,152. Rearranging: tileB × (K + N) ≤ 49,152 - K × N. With K = N = 4096, the right side turns negative, which means this approach won't work with the current UB budget.
+
+I need to take a different approach—instead of fitting everything in UB, I should stream the weight matrix from GM for each tile along K.
+
+I'll allocate UB buffers for the activations and partial outputs, then process the matrix multiplication iteratively. Each block loads its activation tile from xGm_, while the weight matrix streams through wQueue_ in chunks. The matmul operation computes tileB × tileK × N operations per iteration, accumulating results across all K tiles. After the matrix multiplication completes, I apply bias and scaling to finalize the output before writing back to yGm_. // Copy bias to UB and scale output
+    AscendC::LocalTensor<float> biasLocal = tmpQueue_.AllocTensor<float>();
+    AscendC::DataCopy(biasLocal, bGm_, N_);
+    
+    // Broadcast bias across all rows and add to output
+    AscendC::Adds(yLocal, yLocal, 0.0f, tileB_ * N_);
+    for (uint32_t i = 0; i < tileB_; ++i) {
+        AscendC::Add(yLocal[i * N_], yLocal[i * N_], biasLocal, N_);
+    }
+    
+    // Apply scaling: y = y * scaleFactor
+    AscendC::Muls(yLocal, yLocal, scaleFactor_, tileB_ * N_);
+    
+    // Copy output to global memory
+    AscendC::DataCopy(yGm_[offset_], yLocal, tileB_ * N_);
+    
+    // Free temporary tensors
+    tmpQueue_.FreeTensor(biasLocal);
+    outQueueY_.FreeTensor(yLocal);
+
+I'm allocating a temporary tensor for the bias, copying it from global memory, then adding it to each row of the output tensor. After scaling by the factor, I write the final result back to global memory and clean up the allocated tensors.
+
+The Process method sets up the block indices and calculates the offset within the matrix. If the block index exceeds the valid range, it returns early. The block dimensions are computed from the total number of elements and the tile size.
+
+The tiling function calculates how to distribute the computation across blocks. It retrieves the total lengths for each input tensor (x, w, b) and validates that they're compatible. The function then determines the per-block length by dividing the total length by the block dimension, and extracts the scale factor from the operation attributes to configure the tiling data for the kernel. shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+The shape inference simply passes through the input shape to the output. For data type inference, I'm extracting the input data type and applying it to the output. Then I'm registering these inference functions along with the operator definition, which specifies the input and output tensors with their required parameter types, data types as float, and format as ND.
+
+The attribute for scale_factor is optional with a default value of 0.5, and I'm binding the shape and data type inference functions to the operator. The tiling function is set for the AI core configuration targeting the ascend910b architecture.
+
+Now I need to reconsider the kernel implementation, particularly around the Matmul operator usage in AscendC.
+
+The MatmulAscend operator accepts input tensors x and w with configurable parameters. Looking at how this is typically structured, the SetMatmulParam call specifies the matrix dimensions and memory layout—in this case treating x as a row vector of length K and w as a K×N matrix. The actual computation then proceeds with the queued tensors, and the result flows through the output queue for subsequent operations.
+
+I need to be more deliberate about the buffer management strategy. The UB allocation for the weight matrix should match the tile size I'm using, and I need to ensure the matmul receives properly formatted inputs that align with how SetMatmulParam expects the data to be arranged in memory.
+
+For the matmul operation itself, the x tensor represents a batch of row vectors while w is a full weight matrix. The parameters should specify that each row has K elements, the matrix has K rows and N columns, and the output should have N columns per vector in the batch.
+
+The stride calculations matter for proper data layout. Since x contains tileB consecutive row vectors each with K elements, the stride between consecutive vectors is K. The weight matrix w has N columns per row, so the stride is N. The output y follows the same row-major layout as x, with stride N between rows. These parameters configure the memory access pattern for the multiplication. N)
+- mmOp_(xTile, wTile, yTile) → yTile[m * N + n]
+
+This suggests the MatmulAscend operator uses row-major layout by default. With xTile having shape (tileB, K) and wTile having shape (K, N), the output yTile would be (tileB, N).
+
+I need to determine the correct parameter values. For SetMatmulParam with a row-vector input:
+- xLocal is tileB×K, wLocal is K×N
+- For row-vector matmul, the parameters should specify the dimensions appropriately
+
+Looking at typical AscendC examples, the SetMatmulParam arguments are (mode, M, K, N, StrideA, StrideB, StrideC) where M is the batch dimension for x, K is the column dimension for x (also row dimension for w), and N is the column dimension for w.
+
+For this case: M = tileB (number of row vectors), K = K (vector length), N = N (weight columns). The strides would be K for x (distance between row vectors), N for w (distance between weight rows), and N for y (distance between output rows).
+
+Now I need to build the complete implementation with proper headers and kernel structure.
+
+The kernel class will initialize global memory buffers for the input matrices, weight, bias, and output. It sets up three queues: one for input tiles, one for weight tiles, and one for output tiles, all with double buffering. The pipe manages these buffers with sizes calculated based on tile dimensions and data types.
+
+The Process method first retrieves the block configuration and calculates the offset for this particular block's portion of the output. It returns early if the block index exceeds the valid range. Then it determines how many rows this block will process by checking if the remaining elements fit within the tile length, clamping to the total length if needed.
+
+The main loop iterates through the matrix in chunks along the K dimension, processing tileK elements at a time. For each iteration, it calculates the current tile size (either the full tileK or the remaining elements if we're near the end), then initiates the matrix multiplication for that tile before moving to the next chunk.
+
+Once all K tiles are processed, the accumulated result in the output queue is retrieved. The bias vector is loaded from global memory into a temporary local tensor, then broadcast across all rows of the output using a replication operation to add the bias term to each row.
+
+After broadcasting the bias, the output is scaled by multiplying each element with the scale factor. Finally, the scaled result is written back to global memory, and all temporary tensors are freed to clean up resources.
+
+The kernel entry point extracts tiling data from the parameter buffer and initializes the kernel object with the input and output buffer addresses along with tiling parameters, then invokes the processing method.
+
+For the Python bindings, I need to set up a torch library implementation that wraps the custom NPU operation, along with pybind11 module definitions for the leakyrelu activation and matmul scaling residual add kernels.
+
+Looking at the matmul_scaling_residual_add operation, it takes four inputs: two tensors for the linear layer weights and bias, a scaling factor, and the input tensor itself. The NPU helper function calls the corresponding custom operation and returns the result with the same tensor properties as the input.
+
+I notice the scaling parameter should be detachable from the computation graph since it's used as a runtime constant rather than a learnable parameter. For the ModelNew class, I need to define a forward method that unpacks the inputs and applies the custom operation through the library. The class stores the operation name as an internal attribute and retrieves it dynamically during the forward pass.
+
+Now I should finalize the implementation by incorporating the scaling computation directly into the kernel logic. The scaleFactor gets passed through from the Python bindings, where the scaling value is extracted as a float before being converted to a tensor. The kernel will then apply this factor during the matmul and residual addition operations.
+
+For the tile-based processing, I'm setting up the initialization to handle the input tensors (x, w, b, y), their dimensions (B, N, K), the per-block row count, tile size for K, and the scale factor. The memory layout allocates buffers for input activations, weights, and outputs, with the tile dimensions controlling how data flows through the compute pipeline. For (uint32_t k = 0; k < K_; k += tileK_) {
+        uint32_t curK = tileK_;
+        if (k + tileK_ > K_) {
+            curK = K_ - k;
+        }
+        
+        // Load weight tile from global to local memory
+        AscendC::LocalTensor<float> wLocal = wQueue_.AllocTensor<float>();
+        AscendC::DataCopy(wLocal, wGm_[k], curK * N_);
+        wQueue_.EnQue(wLocal);
+        
+        // Compute partial result: xTile @ wTile^T
+        AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+        AscendC::LocalTensor<float> wTile = wQueue_.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+        
+        // Perform matrix multiply
+        mmOp_.SetMatmulParam(AscendC::MatmulMode::ROW
+
+I'm iterating through the K dimension in tiles, loading weight chunks from global memory into local storage. For each tile, I dequeue the input activation and weight tile, allocate output space, and prepare to execute the matrix multiplication operation.
+
+Then I configure the matmul parameters—setting row vector mode with dimensions for the current tile, and enabling transpose on the weight matrix before computing the result. The operation processes the input against the transposed weights, stores the partial output, and frees the temporary tensors.
+
+After completing all K iterations, I retrieve the accumulated result from the output queue. I load the bias vector from global memory into a temporary local tensor, then apply it to each row of the output by adding the bias value to every element in each row.
+
+Next, I scale the output by multiplying each element with the scale factor. Finally, I copy the scaled result back to global memory and free the temporary tensor. The kernel then calculates its block index and offset within the total computation to determine which portion of the data it should process. __aicore__ void matmul_scaling_residual_add_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulScalingResidualAddCustom op;
+    op.Init(x, w, b, y, tiling_data.B, tiling_data.N, tiling_data.K,
+            tiling_data.perBlockRows, tiling_data.tileK, tiling_data.scaleFactor);
+    op.Process();
+}
+'''
+
+python_bind_src = '''
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor matmul_scaling_residual_add_impl_npu(const at::Tensor& x, const at::Tensor& w, const at::Tensor& b, float scale_factor) {
+    at::Tensor result = at::empty({x.size(0), w.size(1)}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulScalingResidualAddCustom, x, w, b, scale_factor, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_scaling_residual_add_custom", &matmul_scaling_residual_add_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_scaling_residual_add_custom", &matmul_scaling_residual_add_impl_npu,
+          "MatMul with scaling and residual addition (MatmulScalingResidualAddCustom on NPU)");
+}
+'''
+
+model_src = '''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+        self.in_features = init_inputs[0]
+        self.out_features = init_inputs[1]
+        self.scaling_factor = init_inputs[2]
+
+    def forward(self, x, w, b):
+        scale_factor = float(self.scaling_factor)
+        fn = getattr(custom_ops_lib, 'matmul_scaling_residual_add_custom')
+        return fn(x, w, b, scale_factor)
+'''
+
+I need to verify the kernel structure aligns with the provided example. The kernel name should match the specified identifier, and both the project configuration and operator registration need to follow PascalCase conventions for the operator definition. The project JSON defines the op as "MatmulScalingResidualAddCustom" in PascalCase, while the kernel function uses snake_case `matmul_scaling_residual_add_custom`. I need to ensure the operator registration in the host code also uses the PascalCase name `MatmulScalingResidualAddCustom` to maintain consistency across all three components.
+
+The project structure looks solid with the tiling data properly defined and the tiling function calculating the total length from the input shape. I should verify that the operator registration in host_operator_src matches this naming convention throughout.
+
+The tiling function extracts attributes like scaleFactor and computes the per-block length and tileK values. It also determines the block dimension by dividing totalLength by perBlockLength, then sets these values in the context and saves the tiling data to a buffer for later retrieval.
+
+The shape inference simply copies the input shape to the output, while the data type inference propagates the input dtype to the output. For the operator definition, the MatmulScalingResidualAddCustom class initializes with the operation name and configures input and weight tensors with required parameter types, float32 data type, and ND format. (attrs->GetAttrPointer<float>(0));
+    context->SetBlockDim(blockDim);
+    tiling.set_perBlockRows(perBlockRows);
+    tiling.set_tileK(tileK);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+The tiling function saves the computed parameters to a buffer and returns success. Then the shape inference simply copies the input shape to the output, and the data type inference propagates the input dtype to the output.
+
+For the operator definition, I'm setting up the input and output tensors with their parameter types, data types, and formats. The input tensor takes a float32 ND format, and the output follows the same specification.
+
+The `attr_alpha` attribute is marked as optional with a default value of 0.5. I'm attaching the shape and data type inference functions, then configuring the AI core with a custom tiling implementation using the TilingFunc defined earlier. The operator is registered with the "ascend910b" architecture configuration.
+
+I notice the tiling function needs to be wrapped in the `optiling` namespace, and I should verify the complete namespace structure for the shape and data type inference functions, as well as the overall operator registration. I'm completing the tiling function by saving the computed tiling parameters to the buffer and calculating workspace size. Then I'm setting up the shape inference function to pass through the input shape, and the data type inference to propagate the input data type to the output. Finally, I'm defining the LeakyReluCustom operator class with its input and output specifications.
+
+I need to verify the shape and data type inference functions are properly referenced in the namespace and that the tiling data is being saved correctly to the context. The inference functions should be static within the `ge` namespace, and the tiling function should be accessible when registered with the AI core configuration. // UB model:
+// inQueueX: 2 * tileB * tileK
+// wQueue: 2 * tileK * N
+// outQueueY: 2 * tileB * N
+// tmpQueue: 1 * tileB * N
+// Total bytes ≈ 4 * (tileB * tileK + tileK * N + tileB * N) * 4
+
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
+static constexpr uint32_t ALIGN_ELEMS = 128;
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (a + b - 1) / b;
+}
+
+I'm calculating the unified buffer usage by setting aside 192KB and ensuring proper alignment. The helper function computes ceiling division to determine how many blocks are needed for the tiling strategy, which will distribute the matrix multiplication across available compute resources. The tiling structure stores the computed dimensions—batch size, feature sizes, rows per block, and tile sizes—along with the scale factor. These values are serialized into the tiling buffer for the kernel to access during execution.
+
+After saving the tiling data, the workspace requirements are set to zero since no additional memory is needed beyond what's already allocated. The shape and data type inference functions are straightforward pass-throughs that propagate the input tensor's properties to the output.
+
+The operator definition sets up input and output ports for the matrix multiplication operation, specifying that inputs x, w, and b are required parameters with float32 data type and ND format.
+
+The `attr_alpha` attribute is defined as optional with a default value of 0.5. The operator implementation includes shape and data type inference functions, along with a tiling function for the AI core that targets the ascend910b architecture.
+
+Now examining the kernel implementation more carefully, particularly the Matmul operator usage. The SetMatmulParam method takes parameters including mode, M, K, N, and stride values that control how the matrix multiplication is performed.
+
+For this use case, xLocal represents a batch of row vectors with shape [tileB, tileK], while wLocal is the transposed weight matrix with shape [tileK, N_]. The parameters should be configured as M = tileB for the batch dimension, K = tileK for the vector length (which must match the weight matrix rows), and N = N_ for the output width. The stride parameters need to align with the actual memory layout of these tensors. I need to determine the stride values based on the memory layout. For xLocal with shape (tileB, tileK), the stride between consecutive row vectors is tileK. For wLocal with shape (tileK, N_), the stride between consecutive rows is N_. The output yLocal has shape (tileB, N_) with stride N_ between rows.
+
+When transposing wLocal, the stride between consecutive columns becomes 1, while the stride between rows stays at N_. For the output yLocal with shape (tileB, N_), the stride between rows is N_, and there's no inter-vector stride since it's row-major.
+
+Setting the matmul parameters with M=tileB, K=tileK, N=N_, StrideA=tileK, StrideB=N_, StrideC=N_ ensures the transpose operation works correctly with the actual memory layout. The kernel implementation should properly handle this configuration.
+
+One concern is handling edge cases when K isn't evenly divisible by tileK_. In those scenarios, the current implementation sets curK to the remaining elements if k + tileK exceeds K, which should work correctly. I also need to verify that the UB budget calculation is sufficient—the input queue allocation for xLocal uses tileB * tileK * sizeof(float), and I should double-check this against the actual memory requirements for the matmul operation. - weight: 2 * tileK * N * 4 = 32768 bytes (8KB)
+- output: 2 * tileB * N * 4 = 65536 bytes (16KB)
+- tmp: 1 * tileB * N * 4 = 32768 bytes (16KB)
+Total: 147456 bytes ≈ 144KB, which fits comfortably within the 192KB budget. This tile size is feasible.
+
+I need to verify the actual UB capacity on the target device since available memory can vary across configurations. The kernel should adapt to different hardware specs. I'm also considering whether each block loading the full weight matrix (N_ * K_ floats) creates a memory bottleneck, though the weight is read-only and can be cached.
+
+With the current parameters, the weight matrix requires 64MB per block—clearly unsustainable if replicated across all blocks. A better approach would be distributing the weight matrix across blocks, where each handles a column partition of size N_/blockDim, or streaming it from global memory iteratively along the K dimension.
+
+The kernel implementation tiles the computation along K, processing chunks of weight tiles while reusing the same xTile. This approach limits weight loading to roughly 16KB per iteration, which is more manageable. However, there's a constraint: if K_ is significantly larger than tileK_, we'd need to reload the same xTile multiple times, which could become inefficient. With the current configuration where K equals 4096 and tileK is also 4096, the entire weight matrix fits in a single tile, making this approach viable for this specific case.
+
+To optimize further, I should design the kernel to first determine the optimal tile size based on available UB budget and matrix dimensions, then process each tile sequentially. If the weight matrix is too large to fit in UB, it can be streamed in chunks. The kernel interface should accept the total input size and tiling parameters.
+
+Now I'm constructing the final kernel implementation with the initialization logic that sets up the global memory buffers for inputs and weights, configures the pipe with double buffering for each queue, and establishes the computation parameters. The tile dimensions are computed based on the UB budget allocation, with each tile needing space for the activation, weight, and output tensors plus temporary storage.
+
+During processing, the kernel determines which rows to handle based on the block index and total length, then iterates through the K dimension in tiles. For each tile, it copies the input data from global to local memory and begins the compute phase.
+
+Once the input tile is in local memory, I load the corresponding weight tile and prepare the output buffer. The matrix multiplication parameters are configured for row-vector mode, then executed to produce the partial result. After the operation completes, I free the temporary tensors and continue processing the remaining tiles.
+
+When all K tiles are processed, I retrieve the final accumulated result and apply the bias by loading it from global memory and adding it across each row. The scale factor is then multiplied across the entire output. Finally, I copy the result back to global memory and clean up the temporary buffer. The kernel entry point extracts the tiling parameters and initializes the operation.
+
+The function calculates its block index and offset within the total data, determining how many rows this block will process. It checks if the block is within valid bounds, then iterates through the K dimension in tiles to perform the matrix multiplication with scaling.
+
+For each tile iteration, it loads the corresponding weight slice from global memory, dequeues the activation tile, and allocates space for the output. The matrix multiplication is configured with row-vector mode enabled, using the tile dimensions to set the M, K, and N parameters appropriately. k_) {
+        uint32_t curK = tileK_;
+        if (k + tileK_ > K_) {
+            curK = K_ - k;
+        }
+        
+        // Load x tile from global memory
+        AscendC::LocalTensor<float> xTile = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xTile, xGm_[blockRowOffset_ * K_ + k], tileB_ * curK);
+        inQueueX_.EnQue(xTile);
+        
+        // Load w tile from global memory
+        AscendC::LocalTensor<float> wTile = wQueue_.AllocTensor<float>();
+        AscendC::DataCopy(wTile, wGm_[k * N_], curK * N_);
+        wQueue_.EnQue(wTile);
+
+The inner loop handles the final iteration when fewer than tileK_ elements remain. It allocates local tensors for both the activation and weight tiles, copying data from global memory using the appropriate offsets and sizes.
+
+        // Get tiles from queues
+        AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+        AscendC::LocalTensor<float> wLocal = wQueue_.DeQue<float>();
+        
+        // Allocate output tile
+        AscendC::LocalTensor<float> yTile = outQueueY_.AllocTensor<float>();
+        
+        // Perform matrix multiplication with transposed weight
+        mmOp_.SetMatmulParam(AscendC::MatmulMode::ROW_VEC, tileB_, curK, N_, 
+                            curK, N_, N_);
+        mmOp_(xLocal, wLocal, yTile);
+        
+        // Clean up temporary buffers
+        inQueueX_.FreeTensor(xLocal);
+        wQueue_.FreeTensor(wLocal);
+        outQueueY_.EnQue(yTile);
+    }
+    
+    // Finalize: apply bias and scaling
+    AscendC::LocalTensor<float> yLocal = outQueueY_.DeQue<float>();
+    AscendC::LocalTensor<float> biasLocal = tmpQueue_.AllocTensor<float>();
+    AscendC::DataCopy(biasLocal, bGm_, N_);
+    
+    // Add bias to each row
+    for (uint32_t i = 0; i < tileB_; ++i) {
+        AscendC::Add(yLocal[i * N_], yLocal[i * N_], biasLocal, N_);
+    }
+    
+    // Scale the output
+    AscendC::Muls(yLocal, yLocal, scaleFactor_, tileB_ * N_);
+    
+    // Write final result to global memory
+    AscendC::DataCopy(yGm_[blockRowOffset_ * N_], yLocal, tileB_ * N_);
+    
+    // Release temporary storage
+    tmpQueue_.FreeTensor(biasLocal);
+    outQueueY_.FreeTensor(yLocal);
+
+I notice the kernel uses offset_ to track the position, but this isn't initialized anywhere. The Init method doesn't set this field, so there's a mismatch between what the Process method expects and what's actually stored. I need to either add offset_ to the initialization or compute the position differently based on blockRowOffset_ and the dimensions.
+
+Looking at the tiling strategy, each block should process rows based on its index: blockIdx * perBlockRows gives the starting row. So offset_ should be calculated as blockIdx * perBlockRows * N_, representing the byte offset in the output buffer. I'll add this calculation to Init so it's available during processing. I see the tiling function calculates perBlockRows by dividing the total length by the block dimension, which gives the number of elements per block. The GetBlockIdx() method returns the block's position in the grid, so multiplying these together yields the starting offset for that block's data.
+
+However, there's a mismatch between how totalLength is computed and what the kernel expects. The tiling uses totalLength as B * N (treating it as a flat array), but the kernel's Init function receives B, N, and K separately, then calculates offset_ as blockRowOffset * N. This suggests the offset calculation should account for the actual matrix dimensions rather than assuming a flattened representation. So offset = blockIdx * perBlockRows * N_. With B=16384 and N_=4096, that's roughly 67 million elements total.
+
+The tiling strategy calculates perBlockRows by dividing totalLength by the block count. If I use 8 blocks, that's about 8.4 million elements per block, which translates to around 32MB of data to process per block.
+
+Given the UB constraint of 192KB, I need to fit the weight tile (tileK_ * N_), input tile (tileB_ * tileK_), output tile (tileB_ * N_), and a temporary buffer (tileB_ * N_) into memory. This gives me tileB_ = 12 rows with a 128KB budget for weights and I/O combined.
+
+For the full kernel, I'm setting up the initialization with input and output buffers, configuring the pipe with double buffering for the queues, and determining the tile dimensions based on the UB budget and alignment requirements. The tileK_ parameter controls how much of the weight matrix gets processed at once, while tileB_ defines the batch size per tile. The offset for each block is calculated based on its index and the number of rows per block.
+
+During processing, each block determines which rows it handles by checking if its offset falls within the total length, then calculates the actual number of rows to process by comparing against the remaining data.
+
+If no rows need processing, the function returns early. Otherwise, it enters the main loop to process tiles along the K dimension. The tile size is adjusted if it would exceed the available data, then input and weight tiles are loaded from global memory into the compute queues for the matrix multiplication operation.
+
+The matrix multiplication is configured with row-vector mode, using the current tile dimensions for M, K, and N parameters. The operation executes and produces output that gets queued. After all K tiles are processed, the accumulated result is retrieved from the output queue, bias is loaded from global memory, and the bias values are applied to each row of the output.
+
+The bias is broadcast across all rows by replicating the bias vector, then added to each output row. Finally, the result is scaled by a factor and written back to global memory, with temporary storage freed afterward.
+
+The kernel entry point extracts tiling data from the parameter buffer and initializes the custom operator with the input and output addresses along with the computed tiling parameters for batch size, dimensions, and parallelism settings. ModelMatmulScalingResidualAdd {
+public:
+    __aicore__ inline ModelMatmulScalingResidualAdd() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                uint32_t B, uint32_t N, uint32_t K,
+                                uint32_t perBlockRows, uint32_t tileK,
+                                float scaleFactor)
+    {
+        B_ = B;
+        N_ = N;
+        K_ = K;
+        perBlockRows_ = perBlockRows;
+        tileK_ = tileK;
+        scaleFactor_ = scaleFactor;
+        
+        xGm_.SetGlobalBuffer((__gm__ float*)x, B * K);
+        wGm_.SetGlobalBuffer((__gm__ float*)w, K * N);
+        bGm_.SetGlobalBuffer((__gm__ float*)b, N);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, B * N);
+        
+        // UB allocation strategy: split UB between weight tile, activation tile, output, and bias
+        const uint32_t UB_BUDGET = 192 * 1024 / sizeof(float);  // elements
+        const uint32_t biasSize = N_;
+        const uint32_t tileNK = tileK * N_;
+        const uint32_t tileBK = tileB * tileK;
+        
+        uint32_t xSize = (tileB * tileK) * sizeof(float);
+        uint32_t wSize = (tileK * N_) * sizeof(float);
+        uint32_t ySize = (tileB * N_) * sizeof(float);
+
+I'm calculating the buffer sizes needed for the matrix multiplication, converting from element counts to bytes by multiplying by the size of a float. The initialization sets up global memory buffers for all four matrices and determines how much on-chip memory (UB) is available for tiling. For (uint32_t k = 0; k < K_; k += tileK_) {
+        uint32_t curK = tileK_;
+        if (k + tileK_ > K_) {
+            curK = K_ - k;
+        }
+        
+        // Load x tile from global memory
+        AscendC::LocalTensor<float> xTile = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xTile, xGm_[blockRowOffset_ * K_ + k], tileB_ * curK);
+        inQueueX_.EnQue(xTile);
+        
+        // Load w tile from global memory
+        AscendC::LocalTensor<float> wTile = wQueue_.AllocTensor<float>();
+        AscendC::DataCopy(wTile, wGm_[k * N_], curK * N_);
+        wQueue_.EnQue(wTile);
+
+        // Get tiles from queues
+        AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+        AscendC::LocalTensor<float> wLocal = wQueue_.DeQue<float>();
+        
+        // Allocate output tile
+        AscendC::LocalTensor<float> yTile = outQueueY_.AllocTensor<float>();
+        
+        // Perform matrix multiplication with transposed weight
+        mmOp_.SetMatmulParam(AscendC::MatmulMode::ROW_VEC, tileB_, curK, N_, 
+                            curK, N_, N_);
+        mmOp_(xLocal, wLocal, yTile);
+        
+        // Clean up temporary buffers
+        inQueueX_.FreeTensor(xLocal);
+        wQueue_.FreeTensor(wLocal);
+        outQueueY_.EnQue(yTile);
+    }
+    
+    // Finalize: apply bias and scaling
+    AscendC::LocalTensor<float> yLocal = outQueueY_.DeQue<float>();
+    AscendC::LocalTensor<float> biasLocal = tmpQueue_.AllocTensor<float>();
+    AscendC::DataCopy(biasLocal, bGm_, N_);
+    
+    // Add bias to each row
+    for (uint32_t i = 0; i < tileB_; ++i) {
+        AscendC::Add(yLocal[i * N_], yLocal[i * N_], biasLocal, N_);
+    }
+    
+    // Scale the output
+    AscendC::Muls(yLocal, yLocal, scaleFactor_, tileB_ * N_);
+    
+    // Write final result to global memory
+    AscendC::DataCopy(yGm_[blockRowOffset_ * N_], yLocal, tileB_ * N_);
+    
+    // Release temporary storage
+    tmpQueue_.FreeTensor(biasLocal);
+    outQueueY_.FreeTensor(yLocal);
+
+I'm loading tiles of the input and weight matrices from global memory, then performing a matrix multiplication operation with the row vector mode enabled. After computing the result, I apply the bias by broadcasting it across rows and scale the output before writing back to global memory.
+
+The kernel entry point extracts tiling data and initializes the custom operation with the required parameters for batch size, dimensions, and parallelism settings.
+
+I need to complete the tiling data structure with additional fields for the block configuration and scaling parameter. Then I'll save the computed tiling information to the buffer and return success.
+
+The shape inference simply copies the input shape to the output, while the data type inference propagates the input data type to the output. The operator definition sets up input and weight tensors with required parameter types, float32 data type, and ND format specifications.
+
+The bias input follows the same configuration as the other tensors. An optional alpha attribute is defined with a default value of 0.5. Shape and data type inference functions are registered, along with the tiling function for the AI core targeting the ascend910b architecture.
+
+Now I need to implement the kernel using the MatmulAscend operator properly. I'm setting up a kernel class that initializes global memory buffers for the input tensor, weight matrix, bias vector, and output tensor, each with their respective sizes. The initialization also sets up double buffering queues for efficient data movement between global and local memory. I need to reconsider the UB allocation strategy. The total UB budget is constrained by device capabilities—typically 192KB on this architecture. With tileB_ at 12 and N_ at 4096, the tile dimensions become fixed, which means I can calculate the required buffer sizes directly. The memory footprint includes activation tiles, weight tiles, output buffers, and bias storage, all scaled by the element count and data type size. ub = UB / 4;
+tileB_ = maxTileB;
+tileK_ = min(K_, maxKBuf);
+
+pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileB_ * tileK_ * sizeof(float));
+pipe_.InitBuffer(wQueue_, BUFFER_NUM, tileK_ * N_ * sizeof(float));
+pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileB_ * N_ * sizeof(float));
+pipe_.InitBuffer(tmpQueue_, 1, tileB_ * N_ * sizeof(float));
+
+I'm setting up double buffering for the input and weight queues, each with 2 buffers. The output queue also uses double buffering, while the temporary queue holds a single buffer. Memory allocation for each queue is calculated based on tile dimensions and data type size.
+
+The Init method stores the input and weight matrices as global buffers, then configures the pipe with the calculated buffer sizes for each queue.
+
+During Process, I'm extracting the block index and calculating which rows this block should handle based on its position and the total number of rows per block. The offset into the output is computed as the block's starting row times the width, and I verify the block is within bounds before proceeding.
+
+The block determines its tile size by checking if the remaining rows exceed the maximum allowed tile, otherwise using what's left. Then it enters a loop to process tiles along the K dimension, adjusting the current tile size if it would exceed the available data.
+
+Within each iteration, it allocates local tensors for the input activation tile and weight tile, copying data from global memory—the activation tile from the input matrix and the weight tile from the transposed weight matrix—then enqueues them for processing. Que<float>();
+    AscendC::LocalTensor<float> yTile = outQueueY_.AllocTensor<float>();
+    
+    mmOp_.SetMatmulParam(AscendC::MatmulMode::ROW_VEC, tileB_, curK, N_, curK, N_, N_);
+    mmOp_(xLocal, wLocal, yTile);
+    
+    inQueueX_.FreeTensor(xLocal);
+    wQueue_.FreeTensor(wLocal);
+    outQueueY_.EnQue(yTile);
+}
+
+AscendC::LocalTensor<float> yLocal = outQueueY_.DeQue<float>();
+AscendC::LocalTensor<float> biasLocal = tmpQueue_.AllocTensor<float>();
+
+The matrix multiplication processes the local tiles and produces output that's queued. Once all tiles complete, I retrieve the final result and prepare to apply the bias term.
+
+I copy the bias vector from global memory, then broadcast it across all rows by replicating it across the batch dimension before adding it to the output. The scaled result gets copied back to global memory, and I free the temporary buffers.
+
+The kernel entry point extracts the tiling data from the parameter block and initializes the operation with the required buffers and dimensions. It then invokes the Process method to execute the computation.
+
+I'm working through a critical issue with how the tiling function computes the block dimension and per-block length. The function calculates totalLength as B times N, but the kernel actually expects the B, N, and K dimensions separately. I need to pass these individual dimensions through the tiling structure so the kernel receives the correct parameters for initialization. The tiling function retrieves the scale factor from operation attributes and calculates per-block rows by dividing total elements by block count, then determines the tile size for the K dimension. It packs these values into the tiling structure—batch size, feature dimensions, rows per block, tile size, and scale factor—saves them to the context's raw tiling buffer, and sets the appropriate data size for the kernel to access during execution.
+
+Now I need to implement the complete kernel structure. The kernel will process input data with matrix multiplication, applying a scaling factor to the result. I'll set up the compute kernel with the necessary parameters for the operation. I need to complete the initialization by setting up the remaining member variables like perBlockRows_, tileK_, and scaleFactor_, then initialize the global memory buffers for all four tensors with their respective sizes. After that, I calculate the tile dimensions based on the available unified buffer budget, determining how many rows can fit per block and how many elements per tile while respecting alignment constraints.
+
+The pipe initialization sets up double buffering queues for the input activation tiles, weight tiles, and output tiles, with each queue allocated to hold two tiles worth of data at the specified dimensions.
+
+During processing, the kernel determines which rows this block should handle by calculating an offset based on its block index, then proceeds to process the assigned rows. block rows to process
+    if (blockRows > tileB_) {
+        blockRows = tileB_;
+    }
+    
+    // Process all K tiles
+    for (uint32_t k = 0; k < K_; k += tileK_) {
+        uint32_t curK = tileK_;
+        if (k + tileK_ > K_) {
+            curK = K_ - k;
+        }
+        
+        // Load x tile: [tileB, curK]
+        AscendC::LocalTensor<float> xTile = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xTile, xGm_[offset_ + k], tileB_ * curK);
+        inQueueX_.EnQue(xTile);
+        
+        // Load w tile: [curK,
+
+For each iteration, I calculate the current tile size and load the corresponding x and w tiles from global memory into the queues for processing. M, tileB_, curK, N_, curK, N_, N_);
+        mmOp_(xLocal, wLocal, yTile);
+        
+        inQueueX_.FreeTensor(xLocal);
+        wQueue_.FreeTensor(wLocal);
+        outQueueY_.EnQue(yTile);
+    }
+    
+    // Apply bias and scaling
+    AscendC::LocalTensor<float> yLocal = outQueueY_.DeQue<float>();
+    
+    // Broadcast bias: add bias to each row of yLocal
+    for (uint32_t i = 0; i < tileB_; ++i) {
+        AscendC::Add(yLocal[i * N_], yLocal[i * N_], biasLocal, N_);
+    }
+    
+    // Scale output: yLocal = yLocal * scaleFactor
+    AscendC::M
+
+The matrix multiplication processes the activation and weight tiles, then the result is dequeued and bias is applied by broadcasting it across each row. Finally, the output is scaled by the activation factor.
+
+s(yLocal, yLocal, scaleFactor_, tileB_ * N_);
+    
+    // Copy result to global memory
+    AscendC::DataCopy(yGm_[offset_], yLocal, tileB_ * N_);
+    
+    outQueueY_.FreeTensor(yLocal);
+}
+
+The scaled result is written back to global memory at the calculated offset, and the local tensor is freed to release resources.
+
+A matmul operator is instantiated as a member variable, along with several queues for managing input activations, weights, and outputs during computation.
+
+The kernel function signature takes pointers to the input matrices x and w, bias vector b, output matrix y, workspace memory, and tiling parameters. It retrieves the tiling data structure and initializes the custom operation with the necessary dimensions and parameters before calling Process() to execute the computation.
+
+Now I need to construct the complete project structure with six embedded Python strings for project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, and model_src. These will be organized as a Python project containing the project configuration, C++ header files for tiling data and operator registration, the kernel implementation, PyTorch bindings, and the model definition.

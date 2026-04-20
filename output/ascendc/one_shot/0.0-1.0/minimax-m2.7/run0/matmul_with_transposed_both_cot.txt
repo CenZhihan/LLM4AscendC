@@ -1,0 +1,132 @@
+The user wants me to transform a PyTorch matmul operation into a custom AscendC kernel. Let me analyze the requirements:
+
+1. The original operation is `torch.matmul(A.T, B.T)` where:
+   - A has shape (K, M), A.T has shape (M, K)
+   - B has shape (N, K), B.T has shape (K, N)
+   - Result is (M, N)
+
+2. So it's a matrix multiplication: C = A^T @ B^T, which is equivalent to (B @ A)^T, but for the kernel, we're computing:
+   - C[M,N] = sum over K of A^T[M,K] * B^T[K,N] = sum over K of A[K,M] * B[N,K]
+
+3. I need to create six Python strings:
+   - project_json_src: JSON for the operator definition
+   - host_tiling_src: Tiling data structure and functions
+   - host_operator_src: Operator definition and tiling function
+   - kernel_src: The actual AscendC kernel implementation
+   - python_bind_src: PyTorch binding
+   - model_src: The new Model class using the custom kernel
+
+Let me write this step by step:
+
+### project_json_src
+```json
+[
+  {
+    "op": "MatmulWithTransposedBothCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "output",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": []
+  }
+]
+```
+
+### host_tiling_src
+For matmul, the tiling strategy needs to partition the M, N, and K dimensions appropriately for the AscendC architecture. I'll set up the tiling data structure with fields for total length, tile dimensions across all three matmul dimensions, block configuration, and alignment parameters.
+
+```cpp
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulWithTransposedBothTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, mSize);
+  TILING_DATA_FIELD_DEF(uint32_t, kSize);
+  TILING_DATA_FIELD_DEF(uint32_t, nSize);
+  TILING_DATA_FIELD_DEF(uint32_t, mTile);
+  TILING_DATA_FIELD_DEF(uint32_t, kTile);
+  TILING_DATA_FIELD_DEF(uint32_t, nTile);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint32_t, mBlocks);
+  TILING_DATA_FIELD_DEF(uint32_t, nBlocks);
+  TILING_DATA_FIELD_DEF(uint32_t, kBlocks);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulWithTransposedBoth, MatmulWithTransposedBothTilingData)
+}  // namespace optiling
+```
+
+Now I need to implement the operator definition and tiling function in host_operator_src. The matmul operation with both inputs transposed performs C = A^T @ B^T, which computes C[m,n] = sum over k of A[k,m] * B[n,k]. The tiling strategy needs to handle the 3D nature of the computation efficiently on the NPU architecture.
+
+The host code will define the operator interface with two input tensors and one output tensor, both float32 in ND format. The tiling function will partition the M, K, and N dimensions across available compute units, with UB memory budget constraints guiding the tile size decisions.
+
+The tiling strategy uses a 192KB budget with 32KB alignment for optimal DMA efficiency. M and N dimensions are capped at 32KB, while K is limited to 16KB. The grid dimensions (mBlocks, nBlocks, kBlocks) determine how work is distributed across the architecture.
+
+The block count calculation scales based on available tiles, with a minimum of 8 blocks and maximum of 24 to ensure efficient resource utilization. Once the grid is established, tiling parameters are persisted to the context buffer for the kernel to access during execution.
+
+The shape inference function simply propagates the input dimensions through to the output, maintaining the matrix multiplication semantics. Similarly, the data type inference copies the input tensor's dtype to the output. The operator definition then registers these inference functions and initializes the AICore configuration.
+
+The operator registers itself as a concrete implementation. The kernel module includes the necessary headers and defines a kernel operator class to handle the actual matmul computation on the device. The tiling logic calculates appropriate block dimensions based on the input sizes—determining how many blocks are needed for each dimension while respecting the tile size constraints, then sets the block configuration accordingly. The tiling parameters are then stored in the kernel context for use during execution.
+
+For the actual kernel implementation, I need to define a class that manages the matrix multiplication with transposed inputs. The class initializes global memory buffers for both input tensors and the output, sets up three internal queues—one for each input matrix and one for the output—each with a buffer size determined by the tile dimensions, and prepares the processing pipeline for the subsequent computation stages.
+
+The processing logic distributes work across available compute units by calculating stride-based offsets. Each block determines its starting position using its global index multiplied by the tile length, then validates that the starting position falls within the valid range before beginning the tile processing workflow.
+
+For each iteration, I calculate the next tile's position by advancing by the total stride, then determine how many elements to process in the current tile. The input matrices A and B are copied into local storage for computation, followed by the actual matrix multiplication operation on the current tile segment.
+
+After computing, I copy the result back to global memory and check if there are more tiles to process. The copying logic uses device-specific APIs to transfer data between global and local memory with appropriate alignment.
+
+The compute method is where the actual matmul happens with the transposed inputs. I need to handle the transposition by swapping the row and column indices when accessing A and B matrices. For each output element, I'm summing the products of corresponding elements from the transposed matrices across the K dimension. This requires nested loops to iterate through the M and N dimensions, then accumulating the products for each output position. (m, k) = A_mat[k][m] and B(n, k) = B_mat[k][n], so the element at position (n, k) in the flattened buffer is B_mat[k * N + n]. To access B(k, n), I need B_mat[k * N + n] from the buffer.
+
+This gives me a straightforward indexing scheme where yLocal[m * N + n] accumulates through yLocal[m * N + n] += A_mat[k * M + m] * B_mat[k * N + n]. Now I need to consider whether this straightforward approach is actually efficient for the hardware constraints I'm working with.
+
+Given the dimensions—M = 2048, K = 8192, N = 4096—I should implement a tiling strategy that breaks the computation into blocks to better utilize the available memory bandwidth and compute units. The kernel structure will need to handle the three-dimensional nature of the problem while accounting for the specific hardware capabilities. The matmul operation computes C = A.T @ B.T, where each output element is the sum of products across the K dimension: C[m,n] = Σ A.T[m,k] * B.T[k,n]. For efficiency, I need to tile the K dimension while streaming through M and N. The tiling strategy involves partitioning K into blocks, loading A and B tiles for each block, and accumulating partial results. Memory constraints for the A buffer require M * kBlock elements, while the B buffer needs kBlock * N elements.
+
+Given the total bytes needed (M + N) * kBlock * 4 plus overhead, I can set kBlock = 512 for the current problem sizes, allowing up to 2KB for M and 4KB for N. Rather than optimizing for all cases, I'll use a simpler kernel design that handles the specific dimensions: M = 2048, K = 8192, N = 4096.
+
+The kernel computes C = A^T @ B^T, which means each output element C[m,n] equals the sum over k of A^T[m,k] * B^T[k,n]. Since A is stored as (K, M) and B as (N, K), I access A[k,m] and B[n,k] directly. For efficiency, I'll tile across the K dimension while processing all of M and N in a vectorized manner.
+
+I'll allocate buffers for A_tile (M × kTile), B_tile (kTile × N), and C_accum (M × N) in the Ub memory, where kTile is chosen based on the UB budget. The tiling function will determine optimal kTile sizes given the UB budget constraints.
+
+The kernel will iterate through K in blocks, loading each tile of A and B, then computing their contribution to C. For each block, I'll multiply the A_tile across all rows with corresponding columns of B_tile and accumulate the results.
+
+The tiling function calculates optimal block dimensions for the matrix multiplication, determining how many tiles fit in each dimension based on the total sizes of M, K, and N, then sets the block count accordingly. For K tiles, with a budget of 98304 bytes and needing 12 bytes per element, I get a maximum of 8192 elements, though I need to account for the actual memory layout where each element uses 4 bytes and I'm allocating M × kBlock + N × kBlock bytes total.
+
+Let me adjust the budget to 160KB, which gives me 40960 bytes to work with. This means kBlock can be at most 40960 / ((M + N) × 4). With M = 2048 and N = 4096, that's 24576 bytes needed, so kBlock would be 40960 / 24576 = 1.66, which rounds down to 1. This is too restrictive, so I should reconsider the calculation approach.
+
+The UB buffer allocation breaks down to M × kBlock floats for the first input, kBlock × N floats for the second, and M × N floats for the output, totaling (M + N) × kBlock + M × N elements or ((M + N) × kBlock + M × N) × 4 bytes. I need to work with practical values like M = 2048, K = 8192, N = 4096, and kBlock = 512, where the A_tile alone requires 2048 × 512 × 4 = 4MB, which exceeds available memory. The computation is C = A.T @ B.T, and I'll need a more conservative tiling strategy.
+
+With a 192KB UB budget, I can allocate 64KB each for A_tile and B_tile, and 64KB for C_tile. This constrains kBlock to 8 for the A_tile dimension while still accommodating N in the B_tile. The approach is to divide M and N into smaller blocks while streaming through K in chunks of kBlock elements.
+
+For each block, I iterate over the K dimension in kBlock-sized tiles. Within each tile, I load a chunk of A (size M × kBlock) and B (size N × kBlock), multiply them together to produce an M × N partial result, and accumulate it into C. After processing all K blocks, C holds the final result. The multiplication itself uses a vectorized approach where each element of C_mat gets updated through the inner product of corresponding A and B rows.
+
+The tiling strategy divides the workload across available blocks by partitioning M and N dimensions. Each block computes a portion of the output matrix, with blockDim determining how many blocks handle the M dimension. The tiling function receives the full matrix dimensions and redistributes work by setting an appropriate block count and computing corresponding tile sizes. The maximum kTile calculation needs adjustment for actual UB usage. Each iteration allocates M * kBlock + kBlock * N + M * N elements across three buffers. The enqueued tensors don't persist simultaneously, so the peak memory is actually M * kBlock + kBlock * N + M * N, not their sum. For my test case with M = 2048 and N = 4096, this gives me 24576 + 32768 + 4096 elements per iteration. With a 196608 byte budget, kTile works out to around 3.2, so I'll use 2 to be safe.
+
+Actually, kTile = 2 is too small for efficient computation. Let me reconsider the UB allocation. I can reserve space for A (M * kBlock elements), B (kBlock * N elements), and C (M * N elements), which totals 24576 + 32768 + 4096 = 61440 floats or 245760 bytes. The remaining UB budget after accounting for queue overhead and other structures gives me room to work with a larger kBlock value. (M + N) * kBlock + M * N = 24576 + 4096 = 28672 floats, using 114688 bytes of memory. The kTile can be set to kBlock.
+
+For the tiling logic, I'm calculating how many blocks are needed based on the matrix dimensions. With mTile at 512 and kTile at 1024, the block count becomes 4, ensuring efficient utilization of available memory while maintaining alignment with the UB constraints.
+
+Setting the block dimension and storing the tiling parameters—mSize, kSize, nSize, mTile, kTile, nTile, and the calculated mBlocks and kBlocks—into the buffer for the kernel to access during execution.
+
+The tiling data is then serialized and passed to the kernel through context parameters, with workspace size set to zero. The shape inference simply copies the input tensor shape to the output, while data type inference propagates the float32 type. The operator definition establishes the computational kernel that will handle the actual matrix multiplication logic.
+
+For the PyTorch binding, I need to register this custom operator so it can be called directly from Python. The binding uses the NPU command executor to invoke the matmul operation with transposed inputs, returning the result tensor. The library implementation follows the same pattern as the leaky_relu example, setting up the operator registry and defining the binding function that bridges Python tensor operations to the underlying custom kernel.

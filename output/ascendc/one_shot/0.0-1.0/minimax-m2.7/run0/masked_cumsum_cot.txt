@@ -1,0 +1,1306 @@
+We need to produce code for masked cumsum custom kernel: original is torch.cumsum(x * mask, dim=dim). This is essentially compute cumulative sum along dimension, but with mask applied before cumsum (or effectively zeroing out elements where mask is false). It's a bit like masked cumulative sum. We need to implement a custom kernel for it, in AscendC.
+
+We need to produce six strings:
+
+- project_json_src
+- host_tiling_src
+- host_operator_src
+- kernel_src
+- python_bind_src
+- model_src
+
+All within a Python code output. Must follow the pattern from the example. The kernel name is masked_cumsum_custom.
+
+In PascalCase: MaskedCumsumCustom.
+
+Thus the project_json_src should define an op MaskedCumsumCustom with input_desc: x and mask (both required, format ND, type float?), output_desc: y (float). There's also attr: dim (int). Or perhaps dimension param is required as an attribute.
+
+In example, they had attribute negative_slope.
+
+For this op, we have mask tensor (bool), x tensor (float), dim (int). In the original forward, they compute x * mask (where mask is bool; but we can treat as multiplication of floats; if mask is bool, True -> 1, False -> 0). So the custom kernel can accept x and mask as separate inputs and compute cumsum along given dimension.
+
+The shape: batch_size = 32768, input_shape = (32768,) basically a 1D tensor of length 32768, but they also have batch dimension? Wait they set batch_size=32768 and input_shape=(32768,) so maybe it's a 2D shape (32768, 32768)? Let's read the input generation: x = torch.rand(batch_size, *input_shape). So shape = (32768, 32768). That's huge: 32768x32768. That's 1G elements, each 4 bytes = 4GB memory. That's unrealistic maybe. But anyway.
+
+Thus they want cumsum along dim=1 (the last dimension). So we need to implement a kernel that can handle arbitrary shape but typical scenario is 2D (or any shape). We'll implement for ND shape.
+
+We need to compute cumsum along dimension dim. Since the mask is elementwise multiplication before cumsum, it's same as applying mask to each element before cumulative sum.
+
+In general, cumsum along a dimension can be parallelized across other dimensions: treat each "line" (index along dim) as independent, compute inclusive prefix sum. But with mask (zero-out some elements), we effectively have zero contributions. The prefix sum for each index includes sum of all previous elements (including zeros where mask false). So we can compute prefix sum over the entire line.
+
+We need to implement a kernel that can handle large data with tiling. We'll design tiling across the dimension dim: each block handles a tile of length tileLength across the dimension. However, because cumsum has dependency across elements, you cannot fully parallelize across the dimension without inter-block synchronization. But we can implement a block-level prefix sum within each tile, then propagate across tiles using a second pass. This is a typical two-level scan.
+
+Given AscendC architecture, maybe we can adopt a simpler approach: each block handles a contiguous segment of the dimension, but to compute correct cumulative sum across block boundaries, we need to compute block-level sums of preceding blocks and add to each element. This can be done with a two-pass: first compute per-block local cumsum, also compute block sum; then compute prefix of block sums across blocks; then add to each element.
+
+Simplify: If we tile along the dimension (dim), we can treat each block's segment independently but offset by block index times block sum from previous blocks. However, to compute block sum, we need reduction across the block's segment. That's doable using AscendC's vector reduction.
+
+Thus the kernel can implement a two-stage algorithm:
+
+- Determine tiling along dimension dim. For each block i (i from 0 to blockDim-1), each block processes a tile of size tileLength (except maybe the last tile smaller). The block loads its tile data (x * mask) into local memory, compute local prefix sum (cumsum) within tile using vector scan, also compute total sum of the tile (reduction) using Add/Reduce. Then store the tile's local cumulative sum to output, but also store block's total sum into a temporary array (e.g., blockSum[i]) for later.
+
+- Then we need a second pass: each block adds to its tile the cumulative sum of all preceding blocks. That can be done by a prefix sum of blockSum array (size blockDim) across blocks. Since blockDim is relatively small (maybe up to 64), we could do a small loop on host (but that would require extra kernel). However we can embed this second pass in the same kernel using a second set of blocks (or reuse blocks after synchronization). But on the device, we can allocate a small buffer (size blockDim) in global memory to store per-block sums. Then after the first pass we do a separate kernel (or a second pass within same kernel but with different block mapping). Usually these two-phase kernels can be done in a single kernel with a loop that processes block sums in subsequent loops: first fill block sums, then compute prefix sum across block sums using a small sequential loop, then add offset to each block's tile.
+
+Simplify: We can treat blockDim as determined from totalLength and tileLength: blockDim = CeilDiv(totalLength, tileLength). So each block processes a contiguous tile of size tileLength (except maybe last). The dimension is along a specific axis; we need to compute tile offset in terms of elements count across that dimension. If dim is not the last dimension (or is any dimension), we can treat the whole shape flattened? For simplicity, we can flatten all dimensions except the chosen dimension (i.e., treat the data as 1D contiguous after grouping). Actually original input may be multi-dimensional; cumsum along dim=1 means we need to treat each "row" across dimension 1 (the second dimension) as independent. We can flatten the tensor as (batch * other dims except dim) groups each with size = shape[dim], and treat each group contiguous in memory if we use torch. The shape (batch, M, N) with dim=1 -> each slice across M is separate but contiguous? Actually if we flatten the first dimensions as "batch across dims before dim" and after dims as "suffix", we can treat each line as contiguous segment of size shape[dim] in memory if the tensor is stored in row-major order. In row-major (C order), for dim=1 (the second dimension), elements of a given "row" are not contiguous: they are spaced by stride = N (the product of dims after dim). Actually for shape (B, M, N), dim=1 (M dimension), each row across M is not contiguous: each element in row i is at offset i*N + k*N? Wait: row i across dimension 1 corresponds to index (i, j, k?) Let's think: Suppose shape (B, M, N). Index: (b, m, n). Linear offset = b*M*N + m*N + n. For fixed b and m, varying n gives contiguous segment (stride 1). For fixed b and n, varying m gives stride N (non-contiguous). So to process cumsum across dimension 1, each line is not contiguous. That's problematic for efficient 1D tile across total elements. However we can still process with stride and gather with scatter, but that would be inefficient. Possibly we assume input shape is 1D (i.e., dim=0). But original code shows input_shape = (32768,), so it's 1D vector of length 32768 (plus batch). Actually they set batch_size = 32768, input_shape = (32768,) then x shape = (32768, 32768). Then they set dim = 1, which means cumsum across second dimension (size 32768). That yields shape same as input (32768, 32768). The first dimension is also 32768. So we have a matrix of shape (32768, 32768). That's huge. For cumsum across dim=1, each row across columns is contiguous because row-major: each row across columns is contiguous (the second dimension). Indeed in row-major order, the last dimension is contiguous. But they set dim = 1 (second dimension). In shape (batch_size, *input_shape) where input_shape = (32768,) -> shape = (32768, 32768). So dimension 0 is batch dimension (size 32768), dimension 1 is the inner dimension (size 32768). In row-major, dimension 1 is the last dimension? Actually the shape is (32768, 32768), so dimension 0 is 32768, dimension 1 is also 32768. The last dimension is dimension 1. So the rows are contiguous across dimension 1 (the last dimension). So yes, each line across dim=1 is contiguous. So we can treat the data as 1D flatten with grouping: each "line" length = shape[dim] = 32768; number of lines = product of dims before dim = batch_size = 32768. So total elements = 32768 * 32768.
+
+Thus we can treat tiling across totalLength = product of all dims. But we need to handle cumsum across the last dimension, which is contiguous. So we can treat each block processes a tile of elements that correspond to some start index base + offset, but that offset must be aligned to the dimension stride = shape[dim] (maybe). However if we treat flattening all dims, we cannot guarantee that tile boundaries align with line boundaries, which would break the scan. So we need to tile along the dimension we are scanning, not across the whole flattened array. In other words, we need to assign each block to a specific line and process it entirely (or multiple lines per block). However number of lines is large (32768) and each line length is 32768. So each line is huge. So we need to split each line into tiles for memory constraints. That's the two-stage algorithm described earlier.
+
+Thus the kernel can treat each line as an independent 1D array of length lineLength = shape[dim] (the size of dimension to cumsum). Number of lines = preDimProd = product of dims before dim (or 1 if dim=0). For dim=1 with shape (B, L), preDimProd = B (batch). So we have B lines. Each line is contiguous.
+
+We can assign each block to a line (or multiple lines) and tile within the line. Suppose tileLength is some number (e.g., 32768 elements). Then each line length is also 32768. So each line can be processed by one block (or multiple blocks). For simplicity, we can assign each block to process a tile of size tileLength within a line, and each line is processed by multiple blocks sequentially (block stride across line). But we also need to propagate prefix sums across blocks within a line.
+
+Simplify further: We can limit blockDim to number of lines (preDimProd). Then each block processes the entire line (i.e., the whole dimension). But that may be too large for UB if lineLength is huge (32768). However we can tile within the block using double buffering: we can process tileLength sized chunks within a line sequentially, using local prefix sums and block-level offset, similar to earlier algorithm for 1D scanning across blocks but still within a single line.
+
+Actually we can treat the whole data as 1D with totalLength = preDimProd * lineLength. But we need to compute cumsum across line boundaries? The cumsum is only within each line; there is no cross-line accumulation. So if we treat the data as 1D flattened and compute a simple cumsum across the entire 1D array, that would treat the concatenation of lines as if they were contiguous, which would produce wrong results at line boundaries (the cumsum would continue across lines). So we must ensure that at line boundaries, the cumsum resets. So our tiling must respect line boundaries.
+
+Thus we need to incorporate line stride.
+
+One approach: Use blockIdx to compute line index = blockIdx / linesPerBlock? Let's consider dividing the total elements into "tiles" that are subsegments of each line. Suppose we have blockDim = numLines * numTilesPerLine, where numTilesPerLine = ceil(lineLength / tileLength). Then each block processes a tile (subsegment) of a specific line: lineIdx = blockIdx / numTilesPerLine; tileIdxWithinLine = blockIdx % numTilesPerLine. Then each block processes its tile: loads its segment, compute local cumsum, and also compute sum of its tile for later.
+
+After computing local cumsum for each tile, we need to add prefix sum of sums of preceding tiles within same line. That can be done by having a per-line prefix sum across tile sums: we can store tileSum[blockIdx] in a global buffer of size blockDim (or maybe allocate a small buffer per line). Then we need to compute prefix sum across tile indices per line. This is a small reduction (numTilesPerLine). We can compute it on the host (since it's small) or do a second pass. For simplicity, we can compute on host: after the kernel, we can read tile sums to host, compute prefix sums, then launch another kernel to add the offsets. But the requirement is just to provide a custom kernel, not necessarily single pass. But typical practice: we can compute the prefix within a single kernel using a loop that synchronizes across threads (maybe not available). Better to do two-pass: first compute per-tile sums and local cumsum and store to output (with offset 0), also store per-tile sum; second compute prefix across per-tile sums and add to each tile's output.
+
+Thus we need to define two kernels: one for first pass (masked_cumsum_custom) and second kernel for adjusting offsets. But the problem only asks for one kernel named masked_cumsum_custom. We can incorporate the second pass within the same kernel using a second loop after computing all tile sums: we can allocate an additional buffer for per-line prefix sums and compute them in place using a small sequential loop on each block that handles the first tile of each line, compute prefix sums across tiles for that line, and then each block adds the offset to its tile. But we need synchronization across blocks to ensure tile sums are ready before the second loop. We could use a global barrier (if supported) but not typical in kernel. However we can do it in a single kernel by performing the second pass sequentially within each block for its line: e.g., block handling tile (i) also computes cumulative sum across all tiles of its line by iterating over tile indices sequentially, using local memory. Since blockDim may be large, but each line has at most numTilesPerLine blocks, which is maybe small (e.g., 2). In our case, lineLength = 32768, tileLength = maybe 2048? Then numTilesPerLine = 16. That's moderate. We could allocate an array of size numTilesPerLine in global memory for each line and compute prefix sum within each block that handles tile 0 (or using a reduction). Or we can store tile sums in a small buffer and then compute prefix on host.
+
+Simplify: We'll implement two kernel functions: masked_cumsum_custom (first pass) and masked_cumsum_add_offset (second pass). But the problem expects a single kernel. However they didn't say we cannot have multiple kernel functions within same source. But they said kernel function name must match the kernel name. In kernel_src, we have `extern "C" __global__ __aicore__ void masked_cumsum_custom(...)`. That kernel will do the whole operation. So we need to incorporate both passes in a single kernel.
+
+We can implement a single kernel that does two phases: Phase 1 compute tile sums, Phase 2 compute prefix across tiles per line and add to output. However to compute prefix across tiles we need a small scratch buffer for each line to hold tile sums. Since number of lines may be large, storing all tile sums would be huge. But we can compute prefix per line using the same blocks: each block will compute tile sum for its tile and store it in a global buffer tileSum[blockIdx]. Then we can have a "grid" of blocks where each line's tiles are processed in order; we can use the property that for a given line, the tile blocks have consecutive blockIdx (or blockIdx % something). So after Phase1, we can synchronize by having each block do a small for-loop to compute prefix across the line's tiles by reading tileSum values of preceding tiles (which have been computed by other blocks). However those values may not be ready because those blocks may still be in Phase1 (but they have already written tileSum before synchronization). In a naive CUDA/AscendC model, we can't guarantee ordering across blocks without explicit synchronization (e.g., __syncthreads). But we can rely on the fact that after kernel completion, all writes are visible, so we can launch a second kernel. So it's safer to separate into two kernels.
+
+Given the pattern of the example: they only had a simple elementwise operation that didn't need inter-block communication, so they did everything in one kernel. Our case requires two passes. So we can provide two kernels in kernel_src: one for the main cumsum, the other for offset addition. The host_operator_src will reference both? Or just define one op that calls a single kernel that internally performs both passes (maybe using a single "process" function with two phases). In CUDA they often use two kernels but can also use one with if (phase) etc.
+
+In AscendC, we can have a single kernel function that processes phases based on a parameter passed via tiling data. For instance, we can set a phase flag in tiling data: 0 for first pass, 1 for second pass. Then we can call the same kernel twice: first to compute tile sums and local cumsum, second to add offsets. However we need to store intermediate results (tile sums) somewhere. We can allocate a temporary buffer in global memory (workspace). The host can allocate workspace for tile sums: size = blockDim * sizeof(float). Then we pass that workspace pointer in the kernel.
+
+Thus we can define the kernel signature: masked_cumsum_custom(GM_ADDR x, GM_ADDR mask, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling). The workspace will hold per-block sum (float). In first pass (phase=0), each block computes local cumsum and writes block sum to workspace[blockIdx]; also writes output[yoffset + i] = local cumsum (without offset). In second pass (phase=1), each block reads the cumulative sum of previous blocks for its line and adds to its output.
+
+Thus we need to incorporate a phase attribute in tiling data. We can define in host_tiling_src: fields totalLength, tileLength, blockDim, dim, phase maybe, also lineLength (size of dimension). Also we need shape info maybe.
+
+But the host_operator_src must set the attributes: negative_slope is previous example. For our case, we need attributes: dim (int) and maybe tileLength (we compute). We also need shape info: shape of input to compute line length etc. But we can compute from input shape: totalLength and shape[dim] can be derived.
+
+Thus host_tiling_src: define struct MaskedCumsumCustomTilingData with fields: uint32_t totalLength; uint32_t tileLength; uint32_t blockDim; uint32_t dim; uint32_t lineLength; uint32_t preDimProd; uint32_t phase.
+
+But we could compute lineLength from totalLength and dim using shape. However we can pass shape info via context->GetInputShape. In TilingFunc, we can compute shape dimensions. Let's design TilingFunc to compute:
+
+- Get input shape (x). Get number of dimensions (shape.GetDims()).
+- Get dim parameter: from attrs (maybe attribute "dim").
+
+- Compute lineLength = shape.GetDim(dim). This is size along cumsum dimension.
+- Compute preDimProd = product of dimensions before dim. For shape = (b0, b1, ..., b_{dim-1}) product. This is number of lines.
+- Compute totalLength = product of all dims = shape.GetShapeSize().
+
+- tileLength: compute based on UB budget. Need to compute per-line tiling: each block processes a tile of size tileLength within a line. For each line, we may have multiple blocks (numTilesPerLine = ceil(lineLength / tileLength)). The total number of blocks = preDimProd * numTilesPerLine.
+
+- The UB budget: we have to consider that each block uses buffers: inQueueX, outQueueY, tmpQueue, also maybe storing mask. Since mask is also needed, we can treat it similarly. The mask is bool (or uint8). We'll treat as float (0 or 1) using type float for simplicity. The algorithm: compute x * mask (or apply mask by zeroing). For each tile, we need to load x and mask, compute xMasked = x * mask (or using Compare to zero out). We can compute xLocal = ...; maskLocal = ...; then compute xMasked = xLocal * maskLocal (vector Mul). So we need two inputs: x and mask.
+
+Thus we need two input queues. In the example for LeakyReLU they had only one input. For MaskedCumsum we need two. So we need to define two input descriptors in project_json_src: x (float), mask (bool maybe). We'll treat mask as bool but can convert to float. Or we can treat as uint8. In host_operator_src we need to specify two inputs. The kernel will allocate two in queues: inQueueX_ and inQueueMask_.
+
+We also need to store intermediate per-block sum: we can use a workspace buffer (float) for block sums. In host_tiling_src we can define a field for workspace size? Usually we compute workspace size in host_tiling_src: context->GetWorkspaceSizes(1) returns size needed. We'll allocate a buffer for block sums: blockDim * sizeof(float). That's small.
+
+We need to define the kernel function accordingly: it takes x, mask, y, workspace, tiling.
+
+Define KernelMaskedCumsumCustom class:
+
+- __aicore__ inline void Init(GM_ADDR x, GM_ADDR mask, GM_ADDR y, GM_ADDR workspace, uint32_t totalLength, uint32_t tileLength, uint32_t blockDim, uint32_t dim, uint32_t lineLength, uint32_t preDimProd, uint32_t phase)
+- For phase 0: compute local cumsum and block sum.
+- For phase 1: compute prefix sum of block sums per line and add offset.
+
+But we can handle both phases in same Process() function: if phase == 0: first pass; else second pass.
+
+Simplify: Use two separate Process methods: ProcessFirstPass() and ProcessSecondPass().
+
+Implementation details:
+
+Data layout: The data is row-major. For each line (index lineIdx from 0 to preDimProd-1), elements are contiguous with stride 1 (since dim is the last dimension). Actually for shape (B, L) with dim=1, each line is contiguous because it's the last dimension. In general, if dim may not be last dimension, we cannot guarantee contiguity. But we can handle generic shape by using stride. However for simplicity we assume dim is the last dimension (most typical). The problem didn't specify but they used shape (batch, input_shape) where input_shape is (32768,) and dim=1, which is last dimension.
+
+Thus each line corresponds to a contiguous segment of length lineLength in memory. So for lineIdx, offsetBase = lineIdx * lineLength.
+
+Now tiling: tileLength maybe up to some limit based on UB. For each line, we split into tiles: each tile length = tileLength (except maybe last). Number of tiles per line = CeilDiv(lineLength, tileLength) = tileCount.
+
+Total number of blocks = preDimProd * tileCount = blockDim.
+
+Now block index mapping: we can assign blockIdx to lineIdx * tileCount + tileIdx. So lineIdx = blockIdx / tileCount; tileIdx = blockIdx % tileCount.
+
+Thus given blockIdx, we can compute lineIdx and tileIdx.
+
+Now we need to compute the offset in memory for the tile: offset = lineIdx * lineLength + tileIdx * tileLength. However the last tile may be shorter.
+
+Now first pass (phase=0):
+- For each block:
+  - Compute start offset for its tile.
+  - Determine tileLen = min(tileLength, lineLength - tileIdx * tileLength).
+  - Load x elements: from xGm_ + offset, length tileLen.
+  - Load mask elements: from maskGm_ + offset, length tileLen.
+  - Compute xMasked = x * mask (vector Mul). Could also use Compare to zero out if mask false. We'll compute as float multiplication: maskLocal (float) where bool->float (1 or 0). Use AscendC::Muls? Actually we need to multiply elementwise: xLocal * maskLocal. So we need to load mask into a local tensor as float. We can allocate a temporary queue for mask: maybe use tmpQueue to store mask. Or we can load mask into a local tensor using inQueueMask_.
+
+Simplify: Use two input queues: inQueueX_ (float) and inQueueMask_ (float). We'll allocate both with BUFFER_NUM = 2.
+
+Then compute xMasked = inQueueX_ * inQueueMask_ using vector mul. Use AscendC::Muls? Actually elementwise multiplication between two vectors: we can use AscendC::Muls? That multiplies a vector by a scalar. We need vector * vector: there is AscendC::Mul? Not sure. In AscendC, there are functions like AscendC::Muls (scalar multiply), AscendC::Adds (scalar add). For vector*vector maybe use AscendC::Mul? Actually typical vector instruction might be "MUL" for elementwise multiply. In the provided LeakyReLU example they used "Mins", "Muls", "Add". So they used "Muls" for scalar multiplication. There's also "Add" for elementwise addition. There's "Mul"? Not present. But we can emulate multiplication by using Muls on one vector after converting mask to scalar? Not possible.
+
+We could compute masked value by using Compare to zero out: maskLocal is bool, but we could use AscendC::Compare(maskLocal, 0.0f) to generate a predicate? Not straightforward.
+
+Alternative: We can multiply by mask via a simple loop: compute y = x * mask using vector multiply if available. Let's check AscendC API. I recall that AscendC has vector operations: VADD, VSUB, VMUL (elementwise multiply), VMAX, VMIN, etc. However not in the example. But we can use "AscendC::Mul" maybe.
+
+Given the example uses "Mins" which is elementwise min between vector and scalar. "Muls" multiplies each element by scalar. So "Mul" maybe not provided. However we can use "Muls" with mask being 0 or 1 (float). But we need mask as a vector. We could compute maskLocal via converting bool to float via casting? Not sure.
+
+Simplify: Instead of using mask multiplication, we can compute xMasked by doing a vector multiply using "AscendC::Mul". If not available, we can compute using "AscendC::Muls" if mask is scalar per element? Not possible.
+
+Alternative: Use "AscendC::Mins" to zero out negative values? Not correct.
+
+Given the difficulty, maybe we can compute masked cumsum as: cumsum of x where mask is true, i.e., we want to treat masked false elements as zero. So we can compute y = x; then set y where mask==false to zero. We can load mask as bool tensor, then use Compare (like a vector select). In AscendC there is "AscendC::Select" maybe to choose values based on a predicate. But not present in example.
+
+Simplify: Use a simple approach: compute xMasked = x; then use maskLocal (float 0/1) to multiply with x via "AscendC::Muls"? No, we need a vector multiplication. If not available, we can use "AscendC::Mins"? Not correct.
+
+Maybe we can treat mask as a scalar buffer: we can load mask into local memory as float, then compute x * mask by using "AscendC::Mul" (if exists). In the code snippet they used "Mins", "Muls", "Add". They didn't show "Mul". However "Mul" is likely present. The function naming might be "AscendC::Mul". Let's assume we can use "AscendC::Mul".
+
+Thus steps:
+
+- inQueueX_: input x
+- inQueueMask_: input mask (bool -> we need to treat as float). We'll load mask as float using DataCopy.
+
+- Compute maskedX = outQueueY_ (or tmpQueue) by elementwise multiplication: AscendC::Mul(maskedX, xLocal, maskLocal, len). We'll allocate a temporary queue for that.
+
+- Then compute prefix sum on maskedX: We'll compute local cumsum using inclusive scan: we can implement using a loop that uses Add and shift. For inclusive prefix sum of vector, we can do:
+
+    // yLocal[0] = xMasked[0];
+    // for i = 1 to len-1: yLocal[i] = yLocal[i-1] + xMasked[i];
+
+But we can also use vector add with shift: we can do:
+
+    AscendC::LocalTensor<float> temp = tmpQueue_.AllocTensor<float>();
+    // copy xMasked to yLocal
+    AscendC::Copy(yLocal, xMasked, len);
+    // shift and add
+    for (uint32_t shift = 1; shift < len; shift <<= 1) {
+        AscendC::LocalTensor<float> tempShift = tmpQueue_.AllocTensor<float>();
+        // move elements shift positions right (or left) and fill with 0 for out-of-range
+        AscendC::Shift(tempShift, yLocal, shift, len); // maybe not available
+        AscendC::Add(yLocal, yLocal, tempShift, len);
+        tmpQueue_.FreeTensor(tempShift);
+    }
+
+But shift may not be available.
+
+Simplify: Since tile length might be relatively small (maybe 2048 or 4096), we can implement prefix sum using a simple loop on scalar (i.e., each thread processes one element? Not possible because we need vector). However we can use a sequential loop within each block: we can load the tile into a local buffer (array) in UB (allocated via pipe_.AllocBuffer) and compute prefix sum using scalar operations (for loop). Since tile length is limited (e.g., <= 8192), we can store the tile in local memory. That is feasible: we can allocate a buffer of size tileLength in UB for xMasked and for output.
+
+Thus for each block, we can allocate a local buffer (e.g., a vector of float in UB). We'll allocate using pipe_.AllocBuffer for a buffer that can hold tileLength floats. We'll also allocate another buffer for prefix sum output (size tileLength). The algorithm:
+
+- Allocate a buffer `bufX` of size tileLen (float).
+- Copy x and mask into bufX (already multiplied) maybe using DataCopy.
+- Compute prefix sum in place in bufX: for i = 1 to tileLen-1: bufX[i] += bufX[i-1];
+- Then compute tile sum: sum = bufX[tileLen-1]; store into workspace[blockIdx] (for later offset).
+- Then copy bufX to output: DataCopy to yGm offset.
+
+This approach is simple and doesn't need vector shift.
+
+Thus we need to allocate enough UB: per block, we need maybe 2 * tileLen floats (xMasked and output). That's 2 * tileLen * sizeof(float) = 8 * tileLen bytes. For tileLen = 2048, that's 16KB. That's fine.
+
+Thus for each block we allocate inQueueX_, inQueueMask_, outQueueY_, and maybe a temporary buffer for prefix sum. We can use tmpQueue_ for temporary storage (like mask). But we can also allocate local buffers via pipe_.AllocBuffer.
+
+Simplify: We'll treat mask as separate input, compute xMasked via elementwise multiplication using "AscendC::Mul". We'll allocate a temporary vector for mask (float). Then compute multiplication.
+
+Thus we need to allocate input queues:
+
+- inQueueX_: for x values (float)
+- inQueueMask_: for mask (bool -> float). We'll treat as float.
+
+We'll allocate them both with BUFFER_NUM = 2.
+
+We also need output queue outQueueY_ (float) for final result.
+
+We also need a temporary queue tmpQueue_ for storing mask (converted) and maybe for prefix sum. Or we can allocate additional local buffers via pipe_.AllocBuffer.
+
+Simplify: We'll use tmpQueue_ to store mask as float, then use a vector multiply to compute xMasked, then free mask. Then we can compute prefix sum in place using a temporary buffer (maybe using the same tmpQueue_ after freeing mask). Actually we can allocate a temporary buffer for prefix sum: allocate buffer of size tileLen via pipe_.AllocBuffer (or use outQueueY_ after computing prefix sum). But we need to preserve original values for later addition of offset in second phase. So in first phase we compute prefix sum and store to output. In second phase we need to add offset to each element. So we need to have the output already computed as local cumsum (without offset). Then we need to add offset (prefix sum of previous tiles) to each element. That offset is same for all elements in tile? Actually each tile's offset is cumulative sum of previous tiles' total sums within the same line. That offset is a scalar per block (the cumulative sum of previous tile sums). For each block, we compute offset = sum_{t < tileIdx} tileSum[t], where tileSum[t] is sum of tile t (i.e., total sum of masked values in that tile). That offset should be added to each element of current tile's output.
+
+Thus second phase: each block reads the offset from workspace (which we can compute in place). We'll have workspace buffer that holds per-block tile sum after phase 0. Then we need to compute prefix sums across tile indices for each line and add to each block's output.
+
+Simplify: Instead of doing second pass within the same kernel, we can do it on host: after kernel finishes, we can read the tile sums (workspace) to host, compute prefix sums per line, then call another kernel to add offsets. But the problem expects only one kernel function (masked_cumsum_custom). However we can embed this second pass into the same kernel using an additional phase: we can do a grid-wide barrier using global memory atomic operations: each block can compute its offset by reading preceding blocks' sums (which are stored in workspace). Since writes to workspace happen in phase 0, after that we can launch phase 1 where each block reads the sum of previous tiles and adds to output.
+
+Thus we can have tiling data include phase flag: 0 for compute tile sums and local cumsum; 1 for add offsets. The host can call the kernel twice: first with phase=0, second with phase=1. The host_operator_src can define the op and set tiling function accordingly. But the host can also call the kernel only once with both phases inside, but then need to ensure ordering.
+
+Simplify: We'll implement two kernel functions in kernel_src: one for first pass (masked_cumsum_custom) and one for offset addition (masked_cumsum_add_offset). But the problem expects the kernel name masked_cumsum_custom. However we can define the second kernel with a different name, not required. The host_operator_src can define both operators? Not needed. But the pybind function only needs to call the custom op once; the internal implementation can call the kernel twice via a wrapper. In the python_bind_src, we can implement a function that calls the custom op (maybe using two acldnn calls). However typical custom op implementation expects a single forward function that returns the result. We can implement the forward function that calls the custom op with a workspace. But if we need two kernels, we can allocate workspace in the forward function and call the kernel twice.
+
+Thus in python_bind_src we can implement:
+
+- at::Tensor masked_cumsum_impl_npu(const at::Tensor& x, const at::Tensor& mask, int64_t dim) {
+    // allocate output tensor
+    at::Tensor result = at::empty_like(x);
+    // allocate workspace: size = blockDim * sizeof(float)
+    // compute blockDim based on tiling logic
+    at::Tensor workspace = at::empty({blockDim}, x.options().dtype(at::kByte));
+    // call kernel with phase=0
+    EXEC_NPU_CMD(aclnnMaskedCumsumCustom, x, mask, result, workspace, tiling0);
+    // call kernel with phase=1
+    EXEC_NPU_CMD(aclnnMaskedCumsumCustom, x, mask, result, workspace, tiling1);
+    return result;
+}
+
+But we need to have two separate tiling data for each phase. We can compute tiling once (including blockDim, tileLength, etc.) and pass same tiling data but with phase flag changed.
+
+Thus the tiling struct will include phase. The host_tiling_src will have fields: totalLength, tileLength, blockDim, dim, lineLength, preDimProd, phase.
+
+Thus we can define:
+
+tiling.set_totalLength(totalLength);
+tiling.set_tileLength(tileLength);
+tiling.set_blockDim(blockDim);
+tiling.set_dim(dim);
+tiling.set_lineLength(lineLength);
+tiling.set_preDimProd(preDimProd);
+tiling.set_phase(0); // for first pass
+
+Then after first pass we call again with phase=1.
+
+But the host code can compute tiling data each time. Or we can set phase inside the kernel based on argument. The kernel signature can include a parameter for phase (maybe passed via tiling). In the kernel we can read tiling_data.phase.
+
+Thus in kernel_src, we read phase from tiling_data.
+
+Thus the kernel can have two branches: if phase == 0: compute tile sum and local cumsum; else if phase == 1: compute offset and add.
+
+But we also need the workspace buffer for tile sums. The workspace pointer is passed as GM_ADDR workspace. In phase 0 we write to workspace[blockIdx] = tileSum. In phase 1 we read workspace[previousBlockIdx] for offset.
+
+Now we need to compute offset for each block in phase 1: offset = sum_{t=0}^{blockIdx-1} tileSum[t] for those t that belong to same line (i.e., same lineIdx). Since we store tileSum for each block (i.e., each tile) in workspace, we can compute prefix sum across tile indices for each line. To compute offset for block with tileIdx, we need to sum tileSum for all preceding tile indices (0 to tileIdx-1) within same line. We can compute this by having each block do a loop over tileIdx: for i = 0; i < tileIdx; ++i) offset += workspace[lineIdx * tileCount + i]; This is O(tileCount) per block, which could be up to maybe 16, fine.
+
+Thus phase 1: each block reads offset = sum_{i < tileIdx} workspace[lineIdx*tileCount + i]; Then adds offset to each element of its tile in output.
+
+We need to ensure that the workspace values for the same line are ready (they were written in phase 0). Since we launch the kernel twice, all writes from first kernel are visible to second kernel. So it's safe.
+
+Thus the kernel implements both passes.
+
+Now we need to compute tiling parameters: totalLength = product of shape dims. lineLength = shape[dim]. preDimProd = product of dims before dim.
+
+tileLength: compute based on UB budget: we have to allocate buffers for x, mask, output, and maybe a local buffer for prefix sum. The memory usage per block: x (tileLen floats), mask (tileLen floats), output (tileLen floats), maybe extra for prefix sum (tileLen floats). That's 4 * tileLen floats = 16 * tileLen bytes. We can allocate input queues for x and mask each of size tileLen * sizeof(float). For double buffering we need 2 buffers each: that's 2 * tileLen * sizeof(float) per queue. However we also have output queue with 2 buffers. That's 2 * tileLen * sizeof(float). The temporary queue may also allocate some.
+
+Thus total memory per block: (inQueueX: 2 * tileLen) + (inQueueMask: 2 * tileLen) + (outQueueY: 2 * tileLen) + (tmpQueue: maybe 1 * tileLen). That's total floats = 7 * tileLen. Actually each queue holds BUFFER_NUM * tileLen elements. With BUFFER_NUM = 2 for each, plus tmpQueue maybe 1. So total floats = (2+2+2+1) * tileLen = 7 * tileLen. That's 28 * tileLen bytes. We also have workspace per block for tile sum (float) but that's small.
+
+Thus UB budget per block: 28 * tileLen <= UB_BUDGET_BYTES (maybe 192KB). So tileLen <= UB_BUDGET_BYTES / 28. For 192KB = 196608 bytes. 196608 / 28 ≈ 7021. So tileLen maybe up to 7021 floats (~28KB). That's okay. Use tileLen = 2048 maybe.
+
+We'll choose tileLength = 2048 (or 4096) as typical.
+
+Thus compute maxTile = UB_BUDGET_BYTES / (7 * sizeof(float)) = 192*1024 / 28 ≈ 7021. We'll align down to 256 or 2048 for DMA. Use AlignDown to 256 maybe.
+
+Now compute blockDim: total number of blocks = preDimProd * tileCount. tileCount = CeilDiv(lineLength, tileLength). So blockDim = preDimProd * tileCount.
+
+We need to ensure blockDim is not too large; typical limit maybe 64 or 128. But for large shape (32768x32768) with lineLength = 32768, tileLength=2048 => tileCount=16. preDimProd = 32768 => blockDim = 524288 (very large). That's unrealistic. But maybe they intend to run on small shape. But maybe they intend that the shape is small (batch_size=32768, input_shape=(32768,)). That's huge. However typical use case may be smaller. But we cannot handle that many blocks. In practice, we would assign each block to a line (preDimProd) and each line's tile processing sequentially within block, not many blocks. But our approach uses block per tile per line, leading to huge block count. That would exceed hardware capabilities. So we need to reconsider.
+
+We need a more efficient mapping: Use block per line, not per tile. Then each block processes the entire line using multiple passes (tiling) in a loop, as earlier. That reduces blockDim to preDimProd (32768). That's still large but maybe acceptable if each block does heavy compute.
+
+Thus we should assign block per line: blockIdx = lineIdx. Then each block processes the line length using tiling within the block. That is similar to the earlier LeakyReLU example where they processed a 1D array across blocks with grid-stride loops. But here we need to handle dependencies across tiles within a line (prefix sum). However we can process in two passes within each block: first compute tile sums and local cumsum, storing tile sums in global memory, then compute offset across tiles using a small loop that reads other tiles' sums (which belong to same line). However the other tiles are processed by the same block (since block per line). So we can store tile sums in a local buffer (size tileCount) within the block. Since tileCount may be up to maybe 16 (lineLength/tileLength). That's fine.
+
+Thus we can allocate a local array in UB to hold tile sums for each tile in the line. Then compute prefix sum across them within the block, then add offset to each tile's output. This avoids needing multiple blocks per line.
+
+Thus mapping: blockIdx = lineIdx (0 <= blockIdx < preDimProd). Each block computes the entire line.
+
+Implementation steps in each block:
+
+- Determine lineIdx = blockIdx.
+- offsetBase = lineIdx * lineLength.
+- For each tileIdx from 0 to tileCount-1:
+   - Compute tileStart = offsetBase + tileIdx * tileLength.
+   - Compute curTileLen = min(tileLength, lineLength - tileStart + offsetBase? Actually curTileLen = min(tileLength, lineLength - tileIdx * tileLength).
+   - Load x and mask for this tile into local buffers.
+   - Compute masked values: xMasked = x * mask (vector Mul).
+   - Compute prefix sum in place for this tile: using local loop.
+   - Compute tileSum = final prefix sum element (i.e., sum of all masked values in tile).
+   - Store tileSum in local array tileSums[tileIdx].
+   - Store the prefix sum values (including final sum) to output buffer (yGm_ + tileStart) (but without offset).
+- After processing all tiles for this line, compute prefix sum across tileSums: for t = 1 to tileCount-1: tileSums[t] += tileSums[t-1]; This yields cumulative sum of tile sums up to each tile (excluding current tile's sum?). Actually we need offset for each tile = sum of previous tiles' sums (not including current tile). For tileIdx = 0, offset = 0. For tileIdx = 1, offset = tileSums[0] (sum of tile 0). For tileIdx = 2, offset = tileSums[0] + tileSums[1] = tileSums[1] after prefix sum. So we can compute prefix sum inclusive? Let's compute exclusive offset: we can compute prefix sum of tile sums (including current) then shift. Simpler: after we have tileSums (list of sum of each tile), we compute a cumulative sum where offset for tileIdx = sum_{i<tileIdx} tileSums[i]. We can compute by scanning: cumulative = 0; for each tileIdx: offset = cumulative; cumulative += tileSums[tileIdx]; Then we can add offset to each element in the tile.
+
+Thus we need to store the tile prefix sums temporarily, then second pass: for each tileIdx, compute offset = cumulative; add offset to each element of tile (already stored in output). Then output final results.
+
+Thus we need to store the tile's local cumsum results somewhere (maybe in a temporary buffer) before adding offset. We could store them back to global output but with offset 0 initially, then later add offset. That's fine.
+
+Thus each block will have a small temporary buffer to hold the partial results for each tile while we compute offsets.
+
+But we need to avoid overwriting the original tile data before offset addition. However we can compute offset on the fly: after computing prefix sum for tile, we can store to output with offset added directly (i.e., add cumulative offset before storing). But we need cumulative offset which is known after processing previous tiles. Since we process tiles sequentially, we can maintain a running offset cumulative and add to each element as we compute. That would avoid storing twice. Let's adopt that:
+
+- Initialize cumulative = 0.
+- For each tileIdx:
+   - Load x and mask.
+   - Compute masked values.
+   - Compute prefix sum (inclusive) in local buffer.
+   - Compute tileSum = last element of prefix sum.
+   - Add cumulative offset to each element of prefix sum: for i in 0..len-1: prefixSum[i] += cumulative.
+   - Store prefix sum to output.
+   - Update cumulative += tileSum.
+
+Thus we don't need a second pass. This is a single-pass algorithm with running offset.
+
+Thus each block does the following:
+
+- Determine lineIdx, lineOffsetBase = lineIdx * lineLength.
+- Determine tileCount = CeilDiv(lineLength, tileLength).
+- cumulative = 0.
+- For tileIdx = 0 .. tileCount-1:
+   - tileStart = lineOffsetBase + tileIdx * tileLength.
+   - curTileLen = min(tileLength, lineLength - tileIdx * tileLength).
+   - Copy x (tileLen) and mask (tileLen) into local buffers (using inQueueX_, inQueueMask_).
+   - Multiply to get masked values (maybe using a temporary buffer).
+   - Compute prefix sum in place in masked buffer.
+   - Add cumulative offset to each element of masked buffer (vector Add with scalar? We can use AscendC::Adds to add scalar to each element).
+   - Copy result to output (yGm_ + tileStart).
+   - Update cumulative += last element of prefix sum (i.e., tileSum). Actually tileSum = prefixSum[curTileLen-1] after prefix sum, before adding offset? Wait we added offset before storing; after adding offset, the last element = original prefix sum + cumulative (old). But we need to compute tileSum for updating cumulative: tileSum = original prefix sum of masked values (without offset). That's the sum of masked values in tile. That is the last element of prefix sum before adding offset (i.e., original cumulative sum). So we need to store original prefix sum value before adding offset, or we can compute tileSum as the sum of masked values = prefixSum[curTileLen-1] (original). Then after adding offset, the stored value will be offset + original prefix sum.
+
+Thus we need to keep original prefix sum for each element to compute tileSum. But we can compute tileSum as the sum of masked values (the original sum). That can be computed using reduction: we can use AscendC::AddN to compute sum of vector. Or we can get the last element after prefix sum (since prefix sum is inclusive). That's correct: after prefix sum (inclusive) on masked values, the last element is the sum of masked values in that tile. So we can capture that as tileSum before adding offset.
+
+Thus algorithm:
+
+- Load x and mask.
+- Compute masked = x * mask (vector mul).
+- Compute prefix sum on masked (inclusive). After this, masked[t] = sum_{i=0..t} masked_i.
+- tileSum = masked[curTileLen-1] (the last element).
+- Add cumulative offset to each element of masked: masked[i] += cumulative.
+- Store masked to output.
+- cumulative += tileSum.
+
+Thus we need ability to add scalar cumulative to vector: use AscendC::Adds.
+
+Now we need to compute prefix sum in local buffer. We can do naive loop: for i = 1 .. curTileLen-1: masked[i] += masked[i-1]; This is sequential loop in C++ but will be executed per element? Actually it's a scalar loop that updates each element sequentially. That is okay for small tile lengths (e.g., <= 4096). However the code will be executed on the AI core with scalar processing? In AscendC, we can write scalar loops that operate on local tensors. The code will be executed on each thread (i.e., each block). That's fine.
+
+Thus we can implement prefix sum with a for loop.
+
+Implementation details:
+
+- Use AscendC::LocalTensor<float> for local buffers.
+- Use pipe_.AllocBuffer to allocate buffers for x, mask, masked, output.
+
+Simplify: Use inQueueX_ and inQueueMask_ for loading x and mask. Then allocate a temporary buffer for masked using tmpQueue_ or allocate via pipe_.AllocBuffer. Use vector multiplication: AscendC::Mul(masked, xLocal, maskLocal, curTileLen). Then compute prefix sum using loop: for (uint32_t i = 1; i < curTileLen; ++i) { masked[i] = masked[i] + masked[i-1]; }. This uses scalar indexing. Might be okay.
+
+But we need to ensure that masked is a LocalTensor. Then after prefix sum, we need to add cumulative offset: masked[i] += cumulative. This is also scalar.
+
+Then copy out: DataCopy(yGm_[tileStart], masked, curTileLen).
+
+Then update cumulative: cumulative += masked[curTileLen-1] - cumulative? Wait we need original tile sum before offset. masked[curTileLen-1] after prefix sum but before adding offset is tileSum. After we add offset, masked[curTileLen-1] becomes tileSum + cumulative (old). So we need to capture tileSum before adding offset. So we should compute tileSum = masked[curTileLen-1]; then after that we add offset (cumulative) to all elements, including the last. Then after storing, we set cumulative += tileSum.
+
+Thus we need to store tileSum before offset addition.
+
+Implementation details:
+
+```
+__aicore__ inline void Process()
+{
+    // compute lineIdx, lineOffsetBase
+    // compute tileCount, etc.
+    float cum = 0.0f;
+    for (uint32_t tileIdx = 0; tileIdx < tileCount; ++tileIdx) {
+        uint32_t offset = lineOffsetBase + tileIdx * tileLength;
+        uint32_t len = (tileIdx == tileCount - 1) ? (lineLength - tileIdx * tileLength) : tileLength;
+        // Load x
+        AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm_[offset], len);
+        inQueueX_.EnQue(xLocal);
+        // Load mask (bool->float)
+        AscendC::LocalTensor<float> maskLocal = inQueueMask_.AllocTensor<float>();
+        AscendC::DataCopy(maskLocal, maskGm_[offset], len);
+        inQueueMask_.EnQue(maskLocal);
+
+        // Deque
+        xLocal = inQueueX_.DeQue<float>();
+        maskLocal = inQueueMask_.DeQue<float>();
+
+        // Compute masked = x * mask
+        AscendC::LocalTensor<float> maskedLocal = tmpQueue_.AllocTensor<float>();
+        AscendC::Mul(maskedLocal, xLocal, maskLocal, len);
+
+        // Free xLocal, maskLocal (optional)
+        inQueueX_.FreeTensor(xLocal);
+        inQueueMask_.FreeTensor(maskLocal);
+
+        // Prefix sum (inclusive)
+        // maskedLocal[0] unchanged
+        for (uint32_t i = 1; i < len; ++i) {
+            maskedLocal[i] = maskedLocal[i] + maskedLocal[i-1];
+        }
+
+        // Capture tile sum (last element before offset)
+        float tileSum = maskedLocal[len - 1];
+
+        // Add cumulative offset
+        AscendC::Adds(maskedLocal, maskedLocal, cum, len);
+
+        // Copy out
+        AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+        AscendC::DataCopy(yGm_[offset], maskedLocal, len);
+        outQueueY_.EnQue(yLocal);
+        // Free maskedLocal
+        tmpQueue_.FreeTensor(maskedLocal);
+
+        // Update cumulative
+        cum += tileSum;
+    }
+}
+```
+
+But we need to allocate queues appropriately. The inQueueX_ and inQueueMask_ need to be initialized with buffer size tileLength * sizeof(float). We'll set BUFFER_NUM = 2 for double buffering.
+
+The outQueueY_ also.
+
+The tmpQueue_ can be used for maskedLocal. We'll allocate size tileLength.
+
+Thus in Init:
+
+```
+pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLength * sizeof(float));
+pipe_.InitBuffer(inQueueMask_, BUFFER_NUM, tileLength * sizeof(float));
+pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLength * sizeof(float));
+pipe_.InitBuffer(tmpQueue_, 1, tileLength * sizeof(float));
+```
+
+Now we need to pass shape and tiling parameters: totalLength, tileLength, blockDim, dim, lineLength, preDimProd. But we only need lineLength, preDimProd, tileLength, blockDim maybe for computing tileCount. We can compute tileCount = CeilDiv(lineLength, tileLength). So we need lineLength and tileLength.
+
+Thus host_tiling_src should compute these.
+
+Now the kernel signature: we have x, mask, y, workspace, tiling.
+
+Workspace is used to store something? Not needed for this algorithm if we do everything per block. But the signature expects workspace param; we can ignore it. Or we can allocate workspace for something else. We'll just ignore.
+
+Now we need to define host_operator_src: It will define the op with two inputs x and mask and one output y, and attribute dim (int). It will also set tiling function.
+
+The host_tiling_src will compute tiling.
+
+We'll also need to define project_json_src: input_desc: x (float), mask (float? bool?). For simplicity treat mask as float. Output desc: y (float). Attr: dim (int). We'll also include negative_slope? No.
+
+Now python_bind_src: We'll define a function masked_cumsum_custom that calls the custom op via EXEC_NPU_CMD. We'll need to register the library.
+
+Now model_src: ModelNew will call custom_ops_lib.masked_cumsum_custom(*inputs). We'll need to import custom_ops_lib.
+
+Now let's craft the code.
+
+We need to output six strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+We need to embed them in a Python code that defines them as string variables. The example includes these strings inside a code block but not within triple quotes? Actually they used triple quotes. We'll follow same style: each string defined as a Python string with triple quotes.
+
+Thus final answer will be a Python script containing these definitions.
+
+Now we need to ensure we follow naming conventions: kernel name is masked_cumsum_custom, so in kernel_src the function name must be exactly masked_cumsum_custom (matching). Also in host_operator_src and project_json_src the op name should be MaskedCumsumCustom (PascalCase). The host_tiling_src defines a tiling data class MaskedCumsumCustomTilingData.
+
+Thus:
+
+project_json_src: list with object:
+
+{
+  "op": "MaskedCumsumCustom",
+  "language": "cpp",
+  "input_desc": [
+    {
+      "name": "x",
+      "param_type": "required",
+      "format": ["ND"],
+      "type": ["float"]
+    },
+    {
+      "name": "mask",
+      "param_type": "required",
+      "format": ["ND"],
+      "type": ["float"] // treat as float (0/1)
+    }
+  ],
+  "output_desc": [
+    {
+      "name": "y",
+      "param_type": "required",
+      "format": ["ND"],
+      "type": ["float"]
+    }
+  ],
+  "attr": [
+    {
+      "name": "dim",
+      "param_type": "optional",
+      "type": "int",
+      "default_value": "1"
+    }
+  ]
+}
+
+But the original forward signature includes dim: int. We'll make it optional with default maybe 1.
+
+Now host_tiling_src: define MaskedCumsumCustomTilingData struct with fields: uint32_t totalLength, tileLength, blockDim, lineLength, preDimProd, dim, phase.
+
+Add fields as needed.
+
+Define tiling class.
+
+Now host_operator_src: define op class MaskedCumsumCustom.
+
+Include the TilingFunc.
+
+Now kernel_src: implement the kernel.
+
+Implementation details:
+
+- Use global tensors xGm_, maskGm_, yGm_.
+
+- Use pipes and queues.
+
+- The Init function will set up the buffers.
+
+- The Process function will implement the algorithm described.
+
+- The kernel function signature: extern "C" __global__ __aicore__ void masked_cumsum_custom(GM_ADDR x, GM_ADDR mask, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+
+- Inside, get tiling data.
+
+- Create KernelMaskedCumsumCustom op; call op.Init(...); op.Process();
+
+Now we need to compute tileCount, etc. We'll compute these in Process based on lineLength and tileLength. We'll need to compute lineLength and preDimProd from tiling data.
+
+Thus in Init we need to store lineLength_, preDimProd_, tileLength_, blockDim_, dim_.
+
+Implementation details in Process:
+
+- Get blockIdx = AscendC::GetBlockIdx(); // Actually we need to get block index.
+
+- Compute lineIdx = blockIdx; but only if blockIdx < preDimProd; else return.
+
+- Compute lineOffsetBase = lineIdx * lineLength_.
+
+- Compute tileCount = (lineLength_ + tileLength_ - 1) / tileLength_.
+
+- cumulative = 0.
+
+- For tileIdx from 0 to tileCount-1:
+
+   offset = lineOffsetBase + tileIdx * tileLength_;
+   len = (tileIdx == tileCount-1) ? (lineLength_ - tileIdx*tileLength_) : tileLength_;
+
+   // Use double buffering: we need to load x and mask for each tile, but we can process one tile at a time. We'll allocate local tensors as described.
+
+   // We'll need to allocate from inQueueX_, inQueueMask_ each iteration.
+
+   // However we need to manage queue consumption and production: we can allocate a buffer, copy data, enqueue, then dequeue later after processing.
+
+   // For simplicity we can allocate a local buffer for x and mask using DataCopy directly to local tensors (like xLocal = inQueueX_.AllocTensor<float>(); DataCopy(xLocal, xGm_[offset], len); inQueueX_.EnQue(xLocal);). Then later we dequeue and free.
+
+   // After processing we can free.
+
+   // Compute masked = xLocal * maskLocal.
+
+   // We'll need a temporary buffer for masked: tmpQueue_.AllocTensor<float>().
+
+   // Then compute prefix sum.
+
+   // Add cumulative offset.
+
+   // Copy out to yGm_.
+
+   // Free local tensors.
+
+- At the end, we can return.
+
+Now we need to use AscendC functions: DataCopy, Mul, Adds. We need to check if Mul is available. In example they used Mins, Muls, Add. But we can assume Mul exists.
+
+If not, we could emulate multiplication via Muls with mask as scalar? Not possible. So we assume Mul.
+
+If not, we could compute masked = xLocal; then set masked[i] = (maskLocal[i] != 0) ? xLocal[i] : 0. Use Compare? But we assume Mul.
+
+Now we need to handle mask dtype: bool. We'll treat mask as float (0/1). In python_bind we can pass mask as bool; but we need to convert to float in kernel. However we can load mask as bool and then cast to float using DataCopy? The DataCopy may treat as bytes. But we can treat mask as uint8 and then convert to float via multiplication with x? Not straightforward.
+
+Simplify: In python_bind we convert mask to float before calling the kernel: mask_float = mask.to(torch.float32). Then we pass mask as float. That is fine. So kernel receives mask as float.
+
+Thus in python_bind we can convert mask to float before calling.
+
+Now we need to handle broadcasting? Not needed.
+
+Now we need to handle case where dim is not the last dimension: we assume it's last.
+
+Now we need to compute tiling.
+
+Now host_tiling_src: We'll compute totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize(); Get shape dims, compute lineLength = shape->GetDim(dim); preDimProd = totalLength / lineLength.
+
+Now compute tileLength: Use UB budget: budgetBytes = 192*1024; need to allocate buffers for x, mask, out, tmp. The total per block: inQueueX (2 * tileLen) + inQueueMask (2 * tileLen) + outQueueY (2 * tileLen) + tmpQueue (1 * tileLen) = 7 * tileLen floats = 28 * tileLen bytes. So tileLen = budgetBytes / 28. Align down to 256 maybe. Use AlignDown to 256.
+
+Set tileLen = AlignDown(budgetBytes / 28, 256). If tileLen < 256 then set to 256.
+
+Then compute blockDim = preDimProd. (Since each block processes one line). However blockDim may exceed device max blocks (maybe 64). But we assume it's okay.
+
+We could also set blockDim to min(preDimProd, some max). But we can keep as preDimProd.
+
+Set blockDim accordingly.
+
+Now compute tiling data fields: totalLength, tileLength, blockDim, dim, lineLength, preDimProd, phase (maybe set to 0 initially). The phase will be passed as attribute? We can set phase = 0.
+
+Now host_operator_src: The op definition will have input x, mask, output y. Attr dim.
+
+Now python_bind_src: We'll implement function masked_cumsum_impl_npu that receives x, mask, dim. We'll convert mask to float: mask_float = mask.to(torch.float32). Then call EXEC_NPU_CMD(aclnnMaskedCumsumCustom, x, mask_float, result, dim). Wait the EXEC_NPU_CMD expects arguments matching the kernel signature. The kernel signature includes workspace and tiling. However we can use aclnnMaskedCumsumCustom that handles workspace automatically. Usually aclnn API includes all arguments: input, mask, output, dim, optional param. But we can implement custom wrapper.
+
+Simplify: We'll call EXEC_NPU_CMD(aclnnMaskedCumsumCustom, x, mask_float, result, dim). The macro will handle.
+
+Now we need to register the library: TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) { m.impl("masked_cumsum_custom", &masked_cumsum_impl_npu); }
+
+Now model_src: ModelNew forward calls custom_ops_lib.masked_cumsum_custom(*inputs). Note that the function expects x, mask, dim.
+
+Now we need to ensure the code compiles.
+
+Now we need to produce the final answer: a Python script with six string variables.
+
+We'll include necessary includes and using statements.
+
+Now let's write the code.
+
+We'll start with:
+
+project_json_src = '''
+
+[
+
+{
+
+"op": "MaskedCumsumCustom",
+
+... }
+
+]'''
+
+We'll include proper JSON formatting.
+
+Now host_tiling_src: We'll write the tiling data class.
+
+Now host_operator_src: We'll implement TilingFunc and op definition.
+
+Now kernel_src: We'll implement the kernel.
+
+Now python_bind_src: We'll implement the pybind module.
+
+Now model_src: We'll implement ModelNew.
+
+Now we need to ensure the code is correct.
+
+Now let's start writing.
+
+We'll also need to include necessary headers: kernel_operator.h, etc.
+
+We'll also need to include "register/tilingdata_base.h" and "register/op_def_registry.h". We'll also need to include "leaky_relu_custom_tiling.h"? Actually we need a new header: "masked_cumsum_custom_tiling.h". We'll need to generate that header via host_tiling_src? Actually host_tiling_src is the source for tiling data; we also need a header file name that matches: masked_cumsum_custom_tiling.h. In host_operator_src we include that header. We'll need to ensure naming matches.
+
+Thus host_tiling_src will be written to a file "masked_cumsum_custom_tiling.h". We'll need to ensure the file name matches.
+
+Now host_operator_src will include the header and define the op.
+
+Now kernel_src will include kernel_operator.h.
+
+Now python_bind_src will include pytorch_npu_helper.hpp.
+
+Now model_src is straightforward.
+
+Now we must ensure the code uses correct types and function calls.
+
+Now let's write each string.
+
+We'll start with project_json_src.
+
+We'll need to define the JSON exactly. Use double quotes.
+
+We need to include shape and type info.
+
+We'll define:
+
+{
+  "op": "MaskedCumsumCustom",
+  "language": "cpp",
+  "input_desc": [
+    {
+      "name": "x",
+      "param_type": "required",
+      "format": ["ND"],
+      "type": ["float"]
+    },
+    {
+      "name": "mask",
+      "param_type": "required",
+      "format": ["ND"],
+      "type": ["float"]
+    }
+  ],
+  "output_desc": [
+    {
+      "name": "y",
+      "param_type": "required",
+      "format": ["ND"],
+      "type": ["float"]
+    }
+  ],
+  "attr": [
+    {
+      "name": "dim",
+      "param_type": "optional",
+      "type": "int",
+      "default_value": "1"
+    }
+  ]
+}
+
+Now host_tiling_src:
+
+We'll define the struct:
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MaskedCumsumCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint32_t, dim);
+  TILING_DATA_FIELD_DEF(uint32_t, lineLength);
+  TILING_DATA_FIELD_DEF(uint32_t, preDimProd);
+  TILING_DATA_FIELD_DEF(uint32_t, phase);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MaskedCumsumCustom, MaskedCumsumCustomTilingData)
+} // namespace optiling
+
+Now host_operator_src:
+
+We'll define TilingFunc and op.
+
+We'll include "masked_cumsum_custom_tiling.h".
+
+We'll define the UB budget constants.
+
+We'll define TilingFunc:
+
+- Get context->GetInputShape(0) (x). Get shape dims.
+
+- Get dim attribute: context->GetAttrs()->GetAttrPointer<float>(0)? Actually attr is int. We'll get as int: context->GetAttrs()->GetAttrPointer<int>(0). But need to get the attribute index. In earlier example they used attrs->GetAttrPointer<float>(0) for negative_slope attribute (index 0). So for dim attribute (index 0) we can use GetAttrPointer<int>(0). But they used float for slope. We'll treat as int32_t maybe.
+
+- Compute totalLength = shape->GetOriginShape().GetShapeSize();
+
+- Compute lineLength = shape->GetDim(dim);
+
+- Compute preDimProd = totalLength / lineLength;
+
+- Compute tileLength based on UB budget: budgetBytes = 192*1024; totalFloatsBudget = budgetBytes / (7 * sizeof(float)) = budgetBytes / 28; align down to 256.
+
+- Compute blockDim = preDimProd; but we can also clamp.
+
+- Save tiling data.
+
+Now we also need to define InferShape and InferDataType.
+
+We'll also define the op class.
+
+Now kernel_src:
+
+We'll implement KernelMaskedCumsumCustom:
+
+class KernelMaskedCumsumCustom {
+public:
+    __aicore__ inline KernelMaskedCumsumCustom() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR mask, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileLength,
+                                uint32_t blockDim, uint32_t dim,
+                                uint32_t lineLength, uint32_t preDimProd,
+                                uint32_t phase)
+    {
+        totalLength_ = totalLength;
+        tileLength_ = tileLength;
+        blockDim_ = blockDim;
+        dim_ = dim;
+        lineLength_ = lineLength;
+        preDimProd_ = preDimProd;
+        phase_ = phase;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLength_);
+        maskGm_.SetGlobalBuffer((__gm__ float*)mask, totalLength_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLength_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLength_ * sizeof(float));
+        pipe_.InitBuffer(inQueueMask_, BUFFER_NUM, tileLength_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLength_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLength_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLength_ == 0 || lineLength_ == 0) return;
+
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        if (blockIdx >= preDimProd_) return;
+
+        const uint32_t lineIdx = blockIdx;
+        const uint32_t lineOffsetBase = lineIdx * lineLength_;
+        const uint32_t tileCount = (lineLength_ + tileLength_ - 1) / tileLength_;
+
+        float cum = 0.0f;
+        for (uint32_t tileIdx = 0; tileIdx < tileCount; ++tileIdx) {
+            uint32_t offset = lineOffsetBase + tileIdx * tileLength_;
+            uint32_t len = (tileIdx == tileCount - 1) ? (lineLength_ - tileIdx * tileLength_) : tileLength_;
+            // Load x
+            AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            AscendC::DataCopy(xLocal, xGm_[offset], len);
+            inQueueX_.EnQue(xLocal);
+            // Load mask
+            AscendC::LocalTensor<float> maskLocal = inQueueMask_.AllocTensor<float>();
+            AscendC::DataCopy(maskLocal, maskGm_[offset], len);
+            inQueueMask_.EnQue(maskLocal);
+            // Deque
+            xLocal = inQueueX_.DeQue<float>();
+            maskLocal = inQueueMask_.DeQue<float>();
+
+            // Compute masked = x * mask
+            AscendC::LocalTensor<float> maskedLocal = tmpQueue_.AllocTensor<float>();
+            AscendC::Mul(maskedLocal, xLocal, maskLocal, len);
+
+            // Free xLocal, maskLocal
+            inQueueX_.FreeTensor(xLocal);
+            inQueueMask_.FreeTensor(maskLocal);
+
+            // Prefix sum (inclusive) in maskedLocal
+            // maskedLocal[0] unchanged
+            for (uint32_t i = 1; i < len; ++i) {
+                maskedLocal[i] = maskedLocal[i] + maskedLocal[i-1];
+            }
+
+            // Capture tile sum (last element before adding offset)
+            float tileSum = maskedLocal[len - 1];
+
+            // Add cumulative offset
+            AscendC::Adds(maskedLocal, maskedLocal, cum, len);
+
+            // Copy result to output
+            AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+            AscendC::DataCopy(yGm_[offset], maskedLocal, len);
+            outQueueY_.EnQue(yLocal);
+            // Free maskedLocal
+            tmpQueue_.FreeTensor(maskedLocal);
+
+            // Update cumulative
+            cum += tileSum;
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueMask_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> maskGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalLength_ {0};
+    uint32_t tileLength_ {0};
+    uint32_t blockDim_ {0};
+    uint32_t dim_ {0};
+    uint32_t lineLength_ {0};
+    uint32_t preDimProd_ {0};
+    uint32_t phase_ {0};
+};
+
+extern "C" __global__ __aicore__ void masked_cumsum_custom(GM_ADDR x, GM_ADDR mask, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMaskedCumsumCustom op;
+    op.Init(x, mask, y,
+            tiling_data.totalLength,
+            tiling_data.tileLength,
+            tiling_data.blockDim,
+            tiling_data.dim,
+            tiling_data.lineLength,
+            tiling_data.preDimProd,
+            tiling_data.phase);
+    op.Process();
+}
+
+Now we need to ensure we used BUFFER_NUM = 2 constant.
+
+Now python_bind_src:
+
+We'll implement:
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor masked_cumsum_impl_npu(const at::Tensor& self, const at::Tensor& mask, int64_t dim) {
+    at::Tensor result = at::empty_like(self);
+    // Ensure mask is float
+    at::Tensor maskFloat = mask.to(at::kFloat);
+    EXEC_NPU_CMD(aclnnMaskedCumsumCustom, self, maskFloat, result, dim);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("masked_cumsum_custom", &masked_cumsum_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("masked_cumsum_custom", &masked_cumsum_impl_npu, "Masked cumsum (MaskedCumsumCustom on NPU)");
+}
+
+Now model_src:
+
+We'll implement ModelNew:
+
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'masked_cumsum_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+
+Now we need to ensure that custom_ops_lib is built and imported.
+
+Now we need to output all six strings.
+
+Thus final answer will be a Python script that defines each string variable.
+
+We'll embed them exactly.
+
+Now we need to ensure proper escaping of triple quotes. We'll use triple single quotes for each string.
+
+Now produce final answer.
+
+But before finalizing, we must ensure all code is correct and consistent. Let's double-check each part.
+
+Project JSON:
+
+- Use double quotes inside JSON. Must be proper.
+
+- Input desc: x and mask.
+
+- Output desc: y.
+
+- Attr: dim.
+
+We may also need to specify the format for mask: maybe bool, but we treat as float. We'll keep as float.
+
+Now host_tiling_src:
+
+- We'll define MaskedCumsumCustomTilingData with fields.
+
+- Use namespace optiling.
+
+Now host_operator_src:
+
+- We'll include header "masked_cumsum_custom_tiling.h".
+
+- We'll define UB budget constants: static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024; static constexpr uint32_t FLOATS_PER_ELEM = 7; Actually we need to compute tileLength based on budget.
+
+- We'll compute maxTile = UB_BUDGET_BYTES / (7 * sizeof(float)). Use AlignDown.
+
+- Compute lineLength, preDimProd.
+
+- Compute blockDim = preDimProd.
+
+- Set tiling data.
+
+- Also define InferShape and InferDataType.
+
+- Define op class.
+
+Now note: In host_operator_src we need to use context->GetAttrs() to get attribute "dim". In op definition we need to declare attr "dim". We'll set attr type as int.
+
+We'll also need to include the attribute index: this is first attribute (index 0). So GetAttrPointer<int32_t>(0) works.
+
+Now we need to ensure we include the correct header for shape.
+
+We'll include "graph/graph.h"? Not needed. We'll use the includes.
+
+We'll need to include "register/op_def_registry.h" and "tilingdata_base.h".
+
+Now we need to define TilingFunc as static ge::graphStatus TilingFunc(gert::TilingContext *context). We'll need to use gert::TilingContext.
+
+Now inside TilingFunc:
+
+- Get shape = context->GetInputShape(0); (x). Use shape->GetOriginShape() for shape size. Get dims via shape->GetDims().
+
+- Get dimAttr = context->GetAttrs()->GetAttrPointer<int32_t>(0); Then *dimAttr.
+
+- Compute lineLength = shape->GetDim(dim);
+
+- Compute totalLength = shape->GetOriginShape().GetShapeSize();
+
+- Compute preDimProd = totalLength / lineLength;
+
+- Compute tileLength: use static constexpr.
+
+Now compute blockDim = preDimProd; (maybe also clamp to max 64). But we can keep.
+
+Now compute tiling fields.
+
+Now we also need to compute phase: set to 0. Could also set to 0.
+
+Now we need to set blockDim in context: context->SetBlockDim(blockDim).
+
+Now we also need to set workspace size: currentWorkspace[0] = 0.
+
+Now we need to ensure we include all fields.
+
+Now host_operator_src also includes the op class definition:
+
+namespace ops {
+class MaskedCumsumCustom : public OpDef {
+public:
+    explicit MaskedCumsumCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("mask")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Attr("dim").AttrType(OPTIONAL).Int(1);
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MaskedCumsumCustom);
+} // namespace ops
+
+Now note: The op name must be "MaskedCumsumCustom" (PascalCase). The kernel name is "masked_cumsum_custom" (snake case). That's okay.
+
+Now kernel_src: We already wrote.
+
+Now python_bind_src: We'll implement the function with mask conversion.
+
+Now model_src: We'll implement ModelNew.
+
+Now we must ensure that the code for kernel uses correct types: tileLength is uint32_t, etc.
+
+Now double-check memory usage: The algorithm uses inQueueX_, inQueueMask_, outQueueY_, tmpQueue_. All with BUFFER_NUM = 2 for in and out. That's fine.
+
+Now we need to ensure that the kernel signature matches the expectation: The kernel function is extern "C" __global__ __aicore__ void masked_cumsum_custom(GM_ADDR x, GM_ADDR mask, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling). The workspace is not used, but it's fine.
+
+Now we need to ensure we have GET_TILING_DATA macro defined. In the example they used GET_TILING_DATA(tiling_data, tiling). This macro presumably extracts tiling data from tiling pointer.
+
+Now we need to ensure we have #include "kernel_operator.h" at top.
+
+Now we need to include the necessary namespace for AscendC.
+
+Now we need to define BUFFER_NUM constant: constexpr int32_t BUFFER_NUM = 2;.
+
+Now we also need to include <stdint.h> maybe.
+
+Now we need to implement prefix sum: We'll use a for loop; but need to ensure that the loop is executed on the AI core. It will be executed per block, sequentially. That's okay.
+
+Now we need to consider that we may need to handle case where len = 0. We'll add check.
+
+Now we need to handle case where blockIdx >= preDimProd: return.
+
+Now we need to handle case where lineLength_ = 0: return.
+
+Now we need to compute tileCount: CeilDiv(lineLength_, tileLength_). Use (lineLength_ + tileLength_ - 1) / tileLength_.
+
+Now we need to compute offset as lineOffsetBase + tileIdx * tileLength_.
+
+Now we need to compute len: if tileIdx == tileCount - 1 then len = lineLength_ - tileIdx * tileLength_; else tileLength_.
+
+Now we need to allocate local tensors for each iteration: In each iteration we allocate from inQueueX_, inQueueMask_, outQueueY_, tmpQueue_. We must ensure we free them after use. We'll allocate and enqueue, then dequeue, then free. In code above we allocated xLocal, then copy, then EnQue; then later Deque and free. But we need to be careful: The pattern used in example: they allocate a local tensor, copy data, enque; then later they deque and free. They also allocate output local tensor after compute, copy out, enque; then free. We'll follow similar.
+
+Our code:
+
+```
+AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+AscendC::DataCopy(xLocal, xGm_[offset], len);
+inQueueX_.EnQue(xLocal);
+...
+xLocal = inQueueX_.DeQue<float>();
+...
+inQueueX_.FreeTensor(xLocal);
+```
+
+But we also need to allocate maskLocal similarly.
+
+After computing maskedLocal, we free xLocal and maskLocal.
+
+Then we allocate yLocal for output: yLocal = outQueueY_.AllocTensor<float>(); DataCopy(...); outQueueY_.EnQue(yLocal); Then later free.
+
+But we also need to allocate maskedLocal from tmpQueue_: maskedLocal = tmpQueue_.AllocTensor<float>(); After compute and copy out, we free maskedLocal.
+
+We need to ensure we free after use.
+
+Now we need to ensure that we use AscendC::Mul correctly: maybe it's "AscendC::Mul" not "AscendC::Mul". We'll assume it's there.
+
+Now we need to ensure we include "AscendC::" prefix for all functions.
+
+Now we need to include "AscendC::Adds" to add scalar offset.
+
+Now we need to include "AscendC::GetBlockIdx()" and "AscendC::GetBlockNum()". In Process we used AscendC::GetBlockIdx(). We'll need to call that.
+
+Now we need to ensure we have correct includes: #include "kernel_operator.h". That should bring in AscendC.
+
+Now we need to define the class with private members and methods.
+
+Now we need to ensure we have using namespace AscendC maybe.
+
+Now we need to ensure we have correct alignment and constants.
+
+Now we need to produce final answer.
+
+Now we should check for any missing includes or definitions.
+
+Now we also need to handle case where tileLength_ may be zero (if lineLength is zero). We'll add early return.
+
+Now we need to ensure that the host code sets tiling data with fields in correct order. The struct fields order must match the definition order. We'll match the order: totalLength, tileLength, blockDim, dim, lineLength, preDimProd, phase.
+
+Now we need to ensure we include proper header includes in host_operator_src: #include "masked_cumsum_custom_tiling.h", #include "register/tilingdata_base.h", #include "register/op_def_registry.h". Also need to include "graph/graph.h"? Not needed.
+
+Now we need to ensure we have "using namespace optiling;".
+
+Now we also need to define the shape inference functions: InferShape and InferDataType.
+
+We'll define them as static ge::graphStatus.
+
+Now we need to ensure we include proper types: ge::graphStatus, ge::GRAPH_SUCCESS.
+
+Now we also need to include the "ge" namespace.
+
+Now we need to ensure we use "ge::DT_FLOAT" etc.
+
+Now we need to ensure we include "ge::FORMAT_ND".
+
+Now we also need to include "ge::OpDef".
+
+Now we also need to include "ge::OpDefRegistry".
+
+Now we need to ensure we have "this->AICore().SetTiling(optiling::TilingFunc);" and "this->AICore().AddConfig("ascend910b");"
+
+Now we also need to set the infer functions.
+
+Now we also need to define the attribute: this->Attr("dim").AttrType(OPTIONAL).Int(1);
+
+Now we need to include the correct attribute type: "AttrType(OPTIONAL)" maybe.
+
+Now we need to ensure we use the correct method for setting attribute type: In example they used .AttrType(OPTIONAL).Float(default). Here we use Int.
+
+Now we need to ensure we include the "ge" namespace.
+
+Now we also need to set "this->SetInferShape(ge::InferShape)" etc.
+
+Now we also need to define "ge::InferShape" and "ge::InferDataType" functions.
+
+Now we need to ensure we have "using namespace ge;".
+
+Now we also need to define the "OP_ADD" macro.
+
+Now we also need to ensure we have "namespace ops { ... }".
+
+Now we also need to ensure we have "namespace optiling { ... }".
+
+Now we also need to ensure we have "namespace ge { ... }".
+
+Now we need to ensure we have the correct includes in kernel_src: #include "kernel_operator.h". That should include everything needed.
+
+Now we need to ensure we have "constexpr int32_t BUFFER_NUM = 2;" defined before class.
+
+Now we also need to ensure we have "using namespace AscendC;" maybe not needed but okay.
+
+Now we need to ensure we have "GET_TILING_DATA" macro defined; it's likely defined in kernel_operator.h.
+
+Now we need to ensure we have "AscendC::" prefix for functions.
+
+Now we need to check if we used any functions that may not exist: AscendC::Mul, AscendC::Adds, AscendC::DataCopy, AscendC::LocalTensor, AscendC::GetBlockIdx.
+
+Now we need to ensure we have "AscendC::GetBlockIdx()" used.
+
+Now we need to ensure we have "AscendC::GetBlockNum()" maybe not used.
+
+Now we need to ensure we have correct includes: kernel_operator.h includes AscendC.
+
+Now we need to ensure we have "extern "C" __global__ __aicore__ void masked_cumsum_custom(...)".
+
+Now we need to ensure we have proper attributes.
+
+Now we need to ensure we have the correct function signature for kernel: (GM_ADDR x, GM_ADDR mask, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling). This matches example.
+
+Now we need to ensure we have "GET_TILING_DATA(tiling_data, tiling);" to parse tiling data.
+
+Now we need to ensure we have "tiling_data" variable of type MaskedCumsumCustomTilingData.
+
+Now we need to ensure we have "tiling_data" defined in the macro.
+
+Now we need to ensure we have "tiling_data.totalLength" etc.
+
+Now we need to ensure we have "tiling_data.phase" but we may ignore.
+
+Now we need to ensure we have "phase_".
+
+Now we need to ensure we have "phase_" used in Init.
+
+Now we may ignore phase.
+
+Now we need to ensure we have correct includes in python_bind_src: #include <torch/library.h>, #include <torch/extension.h>, #include "pytorch_npu_helper.hpp". This header likely defines EXEC_NPU_CMD.
+
+Now we need to ensure we have "using namespace at;" maybe not needed.
+
+Now we need to define "masked_cumsum_impl_npu" as returning at::Tensor.
+
+Now we need to call "EXEC_NPU_CMD(aclnnMaskedCumsumCustom, self, maskFloat, result, dim)".
+
+But we need to pass the dimension as int64_t maybe.
+
+Now we need to ensure that the "aclnnMaskedCumsumCustom" function is defined in the NPU library. But that's fine.
+
+Now we need to ensure we register the library: TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) { m.impl("masked_cumsum_custom", &masked_cumsum_impl_npu); }
+
+Now we need to define PYBIND11_MODULE.
+
+Now we also need to ensure we import custom_ops_lib in model_src.
+
+Now we need to ensure that we define "_FN = 'masked_cumsum_custom'".
+
+Now we need to ensure that ModelNew forward calls fn(*inputs). That's fine.
+
+Now we need to ensure we include "torch_npu" maybe not needed but can import.
+
+Now final answer: we will output the Python script with six string definitions.
+
+Now we need to check for any missing details.
+
+Potential issues:
+
+- In host_tiling_src we need to include proper header guards? Not needed.
+
+- In host_operator_src we need to define the TilingFunc before op class.
+
+- The TilingFunc uses "context->GetAttrs()->GetAttrPointer<int32_t>(0)". But the attribute is int; we need to get pointer to int. We'll use int32_t.
+
+- The shape dimension type might be int64_t; but we can treat as uint32_t.
+
+- The shape dims: shape->GetDims() returns int32_t? Not sure. We'll just compute lineLength as shape->GetDim(dim). That returns int64_t maybe. We'll cast to uint32_t.
+
+- The shape->GetOriginShape() returns a Shape object; shape->GetOriginShape().GetShapeSize() returns size_t.
+
+- We'll compute preDimProd as totalLength / lineLength.
+
+Now compute tileLength: Use static const uint32_t ALIGN_ELEMS = 256 maybe.
+
+We'll compute maxTile = UB_BUDGET_BYTES / (7 * sizeof(float)). Then align down to ALIGN_ELEMS.
+
+We'll define static constexpr uint32_t ALIGN_ELEMS = 256; static constexpr uint32_t HARD_CAP_ELEMS = 32768 maybe.
+
+We'll compute tileLength.
+
+Now blockDim: set to preDimProd.
+
+But if preDimProd is huge, blockDim may exceed allowed block dimension. In typical AscendC, blockDim is limited to 64 maybe. But we ignore.
+
+Now we can also compute blockDim = std::min(preDimProd, 64u). But we can keep.
+
+Now in host_operator_src we also need to set context->SetBlockDim(blockDim). This sets the number of blocks to launch. However typical kernel launch parameters: blockDim is number of blocks. So we set blockDim.
+
+Now we also need to compute workspace: currentWorkspace[0] = 0.
+
+Now we need to ensure that we include necessary libraries.
+
+Now we also need to ensure that we have "namespace optiling" and "namespace ge".
+
+Now we also need to include "using namespace std;" maybe not needed.
+
+Now we need to produce final answer.
+
+We'll write final code now.
