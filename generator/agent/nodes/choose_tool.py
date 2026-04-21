@@ -84,6 +84,9 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
     npu_arch_results = state.get("npu_arch_results", [])
     code_style_results = state.get("code_style_results", [])
     security_check_results = state.get("security_check_results", [])
+    ascend_search_results = state.get("ascend_search_results", [])
+    ascend_fetch_results = state.get("ascend_fetch_results", [])
+    ascend_allowed_urls = state.get("ascend_search_allowed_urls", [])
     reg_results = state.get("registered_tool_results", [])
 
     existing = ""
@@ -113,6 +116,16 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
         existing += "Code style (excerpt):\n" + "\n".join(code_style_results[:1]) + "\n\n"
     if security_check_results:
         existing += "Security check (excerpt):\n" + "\n".join(security_check_results[:1]) + "\n\n"
+    if ascend_search_results:
+        existing += "Ascend docs search (excerpt):\n" + "\n".join(ascend_search_results[:2]) + "\n\n"
+    if ascend_fetch_results:
+        existing += "Ascend docs fetch (excerpt):\n" + "\n".join(ascend_fetch_results[:2]) + "\n\n"
+    if ascend_allowed_urls:
+        existing += (
+            "Ascend fetch allowed URLs (excerpt):\n"
+            + "\n".join(str(x) for x in ascend_allowed_urls[:5])
+            + "\n\n"
+        )
     if reg_results:
         existing += "Registered tool results (excerpt):\n" + "\n".join(reg_results[:2]) + "\n\n"
     return existing
@@ -147,18 +160,6 @@ def _build_tool_selection_prompt(
     tools_line = "\n".join(f"- {t}" for t in tools_desc)
     at_max = round_count >= MAX_QUERY_ROUNDS
 
-    examples: List[str] = []
-    example_idx = 1
-    for spec in specs:
-        for ex in (spec.examples or [])[:2]:
-            examples.append(f"Example {example_idx} (tool={spec.name}):\n{ex}")
-            example_idx += 1
-    examples.append(
-        'Example (downstream may proceed without further retrieval — use null args only):\n'
-        '{"tool":"ANSWER","query":"","args":null}'
-    )
-    few_shot = "\n\n".join(examples)
-
     routing_instructions = (
         "Your role here is **orchestration only**. You are **not** the model that writes the Ascend C "
         "kernel or the six-string bundle. Another agent will read your JSON and either run a tool or "
@@ -172,7 +173,7 @@ def _build_tool_selection_prompt(
         "- Output **ANSWER** only when the task text **plus** the \"Already retrieved\" excerpts already "
         "give the downstream agent enough **fresh, task-specific** evidence (not generic memory). If "
         "that section is empty or thin, you should normally **call a tool first**.\n"
-        "- Otherwise choose **one** tool and a focused English `query`. Prefer a tool whenever there is "
+        "- Otherwise choose **one** tool and a focused `query`. Prefer a tool whenever there is "
         "any doubt: retrieved material improves grounding, aligns with current CANN guidance, and "
         "reduces hallucination risk for the downstream model. Treat proactive retrieval as your "
         "responsibility to the pipeline.\n\n"
@@ -186,7 +187,11 @@ def _build_tool_selection_prompt(
         "skips real tool use.\n"
         '- For a normal tool call, use `"args": null` unless you are using a **plugin** tool whose docs '
         "explicitly require a small parameter object.\n"
-        '- `"query"` is the natural-language request for the tool; use `""` when `tool` is ANSWER.\n\n'
+        '- `"query"` is the natural-language request for the tool; use `""` when `tool` is ANSWER.\n'
+        "- If you choose `ascend_search`, `query` must be Chinese keywords. "
+        "`lang/doc_type/version` are fixed by the system and must not be invented in args.\n"
+        "- If you choose `ascend_fetch`, provide one URL from previously returned `ascend_search` results "
+        "inside `query`; when multiple URLs are present, only the first URL will be fetched.\n\n"
     )
 
     prompt = (
@@ -196,7 +201,7 @@ def _build_tool_selection_prompt(
         "You must output exactly one JSON object.\n"
         "JSON fields:\n"
         '  "tool": string — lowercase tool key from the list above, or ANSWER;\n'
-        '  "query": string — English request for that tool; empty string when tool is ANSWER;\n'
+        '  "query": string — request for that tool; empty string when tool is ANSWER;\n'
         '  "args": null or a small object only when a plugin documents structured parameters.\n'
     )
     if existing_results:
@@ -206,7 +211,6 @@ def _build_tool_selection_prompt(
             f"\nYou have reached the maximum number of query rounds ({MAX_QUERY_ROUNDS}). "
             'You must output exactly: {"tool":"ANSWER","query":"","args":null}\n'
         )
-    prompt += f"\nFormat reference:\n{few_shot}\n\n"
     prompt += "Output JSON only:"
     return prompt
 

@@ -21,6 +21,8 @@ from .nodes import (
     env_check_npu_node,
     kb_query_node,
     kb_shell_search_node,
+    ascend_search_node,
+    ascend_fetch_node,
     npu_arch_node,
     security_check_node,
     tiling_calc_node,
@@ -133,6 +135,20 @@ def _meta() -> Dict[str, Dict[str, Any]]:
                 '{"tool":"security_check","query":"security scan elementwise kernel snippet","args":null}'
             ],
         },
+        "ascend_search": {
+            "display_name": "Ascend docs search",
+            "description": "Search Ascend online docs.",
+            "parameter_docs": 'Use "query" in Chinese only (关键词必须中文).',
+            "examples": ['{"tool":"ascend_search","query":"AscendC DataCopy 对齐约束","args":null}'],
+        },
+        "ascend_fetch": {
+            "display_name": "Ascend docs fetch",
+            "description": "Fetch one URL from previous ascend_search results and extract main_content/code_examples.",
+            "parameter_docs": 'Use "query" containing exactly one URL from ascend_search history. If multiple URLs are provided, only the first is used.',
+            "examples": [
+                '{"tool":"ascend_fetch","query":"https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/85RC1alpha001/API/ascendcopapi/atlasascendc_api_07_0104.html","args":null}'
+            ],
+        },
     }
 
 
@@ -149,6 +165,8 @@ def _handler_for(
     api_retriever: Any,
     code_quality_retriever: Any,
     kb_shell_retriever: Any,
+    ascend_search_retriever: Any,
+    ascend_fetch_retriever: Any,
 ) -> ToolHandler:
     def h(state: Dict[str, Any]) -> Dict[str, Any]:
         if name == "kb":
@@ -181,6 +199,10 @@ def _handler_for(
             return security_check_node(state, code_quality_retriever)
         if name == "kb_shell_search":
             return kb_shell_search_node(state, kb_shell_retriever)
+        if name == "ascend_search":
+            return ascend_search_node(state, ascend_search_retriever)
+        if name == "ascend_fetch":
+            return ascend_fetch_node(state, ascend_fetch_retriever)
         raise KeyError(name)
 
     return h
@@ -213,6 +235,8 @@ def register_builtin_tools_for_mode(
     api_retriever: Any = None,
     code_quality_retriever: Any = None,
     kb_shell_retriever: Any = None,
+    ascend_search_retriever: Any = None,
+    ascend_fetch_retriever: Any = None,
     plugin_snapshot: Optional[Dict[str, RegisteredToolSpec]] = None,
 ) -> None:
     """
@@ -246,6 +270,8 @@ def register_builtin_tools_for_mode(
                     api_retriever,
                     code_quality_retriever,
                     kb_shell_retriever,
+                    ascend_search_retriever,
+                    ascend_fetch_retriever,
                 ),
                 examples=list(m.get("examples") or []),
             ),

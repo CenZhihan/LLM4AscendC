@@ -75,6 +75,9 @@ class GeneratorAgentState(MessagesState):
     npu_arch_results: Annotated[List[str], _add_list]
     code_style_results: Annotated[List[str], _add_list]
     security_check_results: Annotated[List[str], _add_list]
+    ascend_search_results: Annotated[List[str], _add_list]
+    ascend_fetch_results: Annotated[List[str], _add_list]
+    ascend_search_allowed_urls: Annotated[List[str], _add_list]
     registered_tool_results: Annotated[List[str], _add_list]
 
     # Structured env check results (for programmatic access)
@@ -92,6 +95,8 @@ class GeneratorAgentState(MessagesState):
     npu_arch_result: NotRequired[Dict[str, Any]]         # NPU architecture query
     code_style_result: NotRequired[Dict[str, Any]]       # Code style check
     security_check_result: NotRequired[Dict[str, Any]]   # Security pattern check
+    ascend_search_result: NotRequired[Dict[str, Any]]    # Ascend online docs search
+    ascend_fetch_result: NotRequired[Dict[str, Any]]     # Ascend online docs fetch
 
     # Tool call logging
     tool_calls_log: Annotated[List[Dict[str, Any]], _add_tool_calls]
@@ -156,6 +161,9 @@ def create_initial_state(
         "npu_arch_results": [],
         "code_style_results": [],
         "security_check_results": [],
+        "ascend_search_results": [],
+        "ascend_fetch_results": [],
+        "ascend_search_allowed_urls": [],
         "registered_tool_results": [],
         "tool_calls_log": [],
         "query_round_count": 0,

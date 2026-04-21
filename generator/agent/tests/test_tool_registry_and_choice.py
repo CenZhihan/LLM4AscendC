@@ -10,6 +10,8 @@ from generator.agent.agent_config import (
     normalize_tool_choice_name,
     has_plugin,
 )
+from generator.agent.nodes.ascend_fetch import ascend_fetch_node
+from generator.agent.nodes.ascend_search import ascend_search_node
 from generator.agent.tool_choice import parse_tool_choice_json
 from generator.agent.tool_registry import RegisteredToolSpec, get_tool_registry, register_tool
 
@@ -75,6 +77,8 @@ class TestNormalizeToolChoice(unittest.TestCase):
         self.assertEqual(normalize_tool_choice_name("kb"), "kb")
         self.assertEqual(normalize_tool_choice_name("KB"), "kb")
         self.assertEqual(normalize_tool_choice_name("CODE_RAG"), "code_rag")
+        self.assertEqual(normalize_tool_choice_name("ASCEND_SEARCH"), "ascend_search")
+        self.assertEqual(normalize_tool_choice_name("ASCEND_FETCH"), "ascend_fetch")
         self.assertEqual(normalize_tool_choice_name("ANSWER"), "answer")
 
 
@@ -96,6 +100,33 @@ class TestPluginCannotShadowBuiltin(unittest.TestCase):
                     handler=lambda s: {},
                 )
             )
+
+
+class TestAscendNodesPolicy(unittest.TestCase):
+    def test_search_non_chinese_query_rejected(self):
+        state = {
+            "messages": [],
+            "current_query": "DataCopy alignment",
+            "query_round_count": 0,
+        }
+        out = ascend_search_node(state)  # type: ignore[arg-type]
+        self.assertEqual(out.get("query_round_count"), 1)
+        self.assertTrue(out.get("ascend_search_results"))
+        self.assertIn("query must contain Chinese", out["ascend_search_results"][0])
+
+    def test_fetch_rejects_url_not_in_whitelist(self):
+        state = {
+            "messages": [],
+            "current_query": "https://example.com/not-allowed",
+            "query_round_count": 1,
+            "ascend_search_allowed_urls": [
+                "https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/85RC1alpha001/..."
+            ],
+        }
+        out = ascend_fetch_node(state)  # type: ignore[arg-type]
+        self.assertEqual(out.get("query_round_count"), 2)
+        self.assertTrue(out.get("ascend_fetch_results"))
+        self.assertIn("not in allowed list", out["ascend_fetch_results"][0])
 
 
 @unittest.skipUnless(
@@ -145,6 +176,8 @@ class TestChooseToolParseFailure(unittest.TestCase):
                 api_retriever=None,
                 code_quality_retriever=None,
                 kb_shell_retriever=None,
+                ascend_search_retriever=None,
+                ascend_fetch_retriever=None,
                 plugin_snapshot=None,
             )
             state = {

@@ -68,6 +68,8 @@ def _format_retrieved_content(state: GeneratorAgentState) -> str:
     npu_arch_results = state.get("npu_arch_results", [])
     code_style_results = state.get("code_style_results", [])
     security_check_results = state.get("security_check_results", [])
+    ascend_search_results = state.get("ascend_search_results", [])
+    ascend_fetch_results = state.get("ascend_fetch_results", [])
     registered_tool_results = state.get("registered_tool_results", [])
 
     parts: list = []
@@ -114,6 +116,12 @@ def _format_retrieved_content(state: GeneratorAgentState) -> str:
 
     if security_check_results:
         parts.append("[Security scan]\n" + "\n\n".join(security_check_results[:4]))
+
+    if ascend_search_results:
+        parts.append("[Ascend docs search]\n" + "\n\n".join(ascend_search_results[:6]))
+
+    if ascend_fetch_results:
+        parts.append("[Ascend docs fetch]\n" + "\n\n".join(ascend_fetch_results[:6]))
 
     if registered_tool_results:
         parts.append("[Registered tools]\n" + "\n\n".join(registered_tool_results[:6]))

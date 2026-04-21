@@ -27,6 +27,8 @@ from .agent_config import (
     has_npu_arch,
     has_code_style,
     has_security_check,
+    has_ascend_search,
+    has_ascend_fetch,
     parse_tool_mode,
     get_llm_config_compatible,
 )
@@ -43,6 +45,8 @@ from .retrievers.tiling_retriever import TilingRetriever
 from .retrievers.api_doc_retriever import ApiDocRetriever
 from .retrievers.code_quality_retriever import CodeQualityRetriever
 from .retrievers.kb_shell_search import KBShellSearchRetriever
+from .retrievers.ascend_docs_search_retriever import AscendDocsSearchRetriever
+from .retrievers.ascend_docs_fetch_retriever import AscendDocsFetchRetriever
 
 
 def _entry_node(state: GeneratorAgentState) -> dict:
@@ -138,6 +142,8 @@ def build_agent_app(
         else None
     )
     _kb_shell_retriever = KBShellSearchRetriever() if has_kb_shell_search(tool_mode) else None
+    _ascend_search_retriever = AscendDocsSearchRetriever() if has_ascend_search(tool_mode) else None
+    _ascend_fetch_retriever = AscendDocsFetchRetriever() if has_ascend_fetch(tool_mode) else None
 
     plugin_snapshot = snapshot_plugin_specs(tool_mode)
     register_builtin_tools_for_mode(
@@ -153,6 +159,8 @@ def build_agent_app(
         api_retriever=_api_retriever,
         code_quality_retriever=_code_quality_retriever,
         kb_shell_retriever=_kb_shell_retriever,
+        ascend_search_retriever=_ascend_search_retriever,
+        ascend_fetch_retriever=_ascend_fetch_retriever,
         plugin_snapshot=plugin_snapshot,
     )
 

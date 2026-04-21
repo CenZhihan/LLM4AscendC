@@ -285,6 +285,8 @@ result = generate_kernel_with_agent(task, parse_tool_mode("kb,code_rag,env_check
 | `npu_arch` | NPU 架构 / UB 容量等 |
 | `code_style` | Ascend C 代码风格检查 |
 | `security_check` | 不安全模式扫描 |
+| `ascend_search` | 在线 Ascend 文档搜索（固定：`lang=zh`、`doc_type=DOC`、`version=8.5.0`） |
+| `ascend_fetch` | 在线 Ascend 文档单 URL 抓取（仅允许抓取本会话 `ascend_search` 返回过的 URL） |
 
 ### 3.3 提示策略（`generator/prompt_generators/`）
 
@@ -327,6 +329,8 @@ Agent 基于 LangGraph `StateGraph`：在 `build_agent_app` 入口会 **`get_too
 | NPU 架构 | `npu_arch` | 内置芯片表 | UB、宏、特性 |
 | 代码风格 | `code_style` | 规则集 | 风格问题 |
 | 安全检查 | `security_check` | 规则集 | 危险模式 |
+| 在线文档搜索 | `ascend_search` | hiascend 在线文档 | 固定参数检索，`query` 必须中文 |
+| 在线文档抓取 | `ascend_fetch` | hiascend 在线文档详情页 | 每次仅 1 个 URL，且必须来自历史 `ascend_search` 结果；沉淀 `main_content/code_examples` |
 
 底层仍以各 **Retriever** 实现为主；**`tool_dispatch`** 节点根据 `state["next_action"]`（小写键或 `ANSWER`）在 **同一 Registry** 上查找并调用 `handler`。
 
@@ -365,7 +369,7 @@ entry
                     └─ 否则 → tool_dispatch（Registry handler）→ choose_tool
 ```
 
-- **`choose_tool`**：向 LLM 发送 **全英文** 说明与 few-shot（含 CANN / API 快速迭代、**优先用已启用工具**获取最新与最规范用法、工具检索有效的编排指引）；模型必须只输出一个 JSON 对象（见下节）。不再发起「二次 JSON 修复」模型调用。
+- **`choose_tool`**：向 LLM 发送编排说明（含 CANN / API 快速迭代、**优先用已启用工具**获取最新与最规范用法、工具检索有效的编排指引）；模型必须只输出一个 JSON 对象（见下节），且不再包含 few-shot 格式示例块。
 - **`tool_dispatch`**：按 Registry 调用对应 `handler`（内部仍为各 `*_node`），写回各 `*_results` / `tool_calls_log`；`query_round_count` 由各工具节点与 `choose_tool` 的 burn 逻辑按原语义更新。
 - **`answer`**：根据 `messages` 与聚合检索结果生成最终代码。
 - 最大轮数：`generator/agent/agent_state.py` 中 **`MAX_QUERY_ROUNDS`**（默认 3）；达到上限后 **`choose_tool` 侧** 也会强制要求输出 `ANSWER`。
@@ -420,13 +424,19 @@ result = generate_kernel_with_agent(task, custom_mode)
 
 在代码中传入 **`llm_config=dict`** 时，将 **直接使用** 该字典（需自行包含 `api_key`、`base_url`、`model`），不再读取上述文件。
 
-#### 3.5.6 在线文档检索工具试跑（未接入 Agent 路由）
+#### 3.5.6 在线文档 Search/Fetch（已接入 Agent）
 
-为便于先观察在线文档检索返回结构，仓库提供了两类 retriever 与一个合并测试脚本：
+仓库提供两类在线文档 retriever，并已通过 `ascend_search` / `ascend_fetch` 接入 Agent 工具路由：
 
 - `generator/agent/retrievers/ascend_docs_search_retriever.py`：在线文档搜索（hiascend）
 - `generator/agent/retrievers/ascend_docs_fetch_retriever.py`：按 URL 抓取并结构化提取正文/API/代码/表格
 - `tools/test_ascend_docs_tools.py`：`search` / `fetch` / `chain` 三模式本地试跑
+
+Agent 侧当前约束如下：
+
+- `ascend_search`：LLM 仅提供中文 `query`，节点内部固定 `lang=zh`、`doc_type=DOC`、`version_filter=8.5.0`。
+- `ascend_fetch`：每次仅抓取一个 URL（若 query 含多个 URL 仅取第一个），且 URL 必须出现在本会话历史 `ascend_search` 结果中。
+- Agent 主结果面当前仅聚合 `main_content` 与 `code_examples`（`tables`/`links` 暂不进入主上下文，底层 retriever 能力仍保留）。
 
 示例：
 

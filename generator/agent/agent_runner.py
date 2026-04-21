@@ -113,6 +113,9 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "kb_results_count": len(final_state.get("kb_results", [])),
         "web_results_count": len(final_state.get("web_results", [])),
         "code_rag_results_count": len(final_state.get("code_rag_results", [])),
+        "ascend_search_results_count": len(final_state.get("ascend_search_results", [])),
+        "ascend_fetch_results_count": len(final_state.get("ascend_fetch_results", [])),
+        "ascend_search_allowed_urls_count": len(final_state.get("ascend_search_allowed_urls", [])),
     }
 
 
