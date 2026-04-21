@@ -15,6 +15,7 @@ from .agent_config import (
     has_kb,
     has_web,
     has_code_rag,
+    has_code_search_snippet,
     has_env_check_env,
     has_env_check_npu,
     has_env_check_api,
@@ -38,7 +39,7 @@ from .nodes import (
     tool_dispatch_node,
     answer_node,
 )
-from .retrievers import KBRetriever, WebRetriever, CodeRetriever
+from .retrievers import KBRetriever, WebRetriever, CodeRetriever, CodeSearchSnippetRetriever
 from .retrievers.env_checker import EnvCheckRetriever
 from .retrievers.npu_arch_retriever import NpuArchRetriever
 from .retrievers.tiling_retriever import TilingRetriever
@@ -112,6 +113,9 @@ def build_agent_app(
     _kb_retriever = kb_retriever or (KBRetriever() if has_kb(tool_mode) else None)
     _web_retriever = web_retriever or (WebRetriever() if has_web(tool_mode) else None)
     _code_retriever = code_retriever or (CodeRetriever() if has_code_rag(tool_mode) else None)
+    _code_search_snippet_retriever = (
+        CodeSearchSnippetRetriever() if has_code_search_snippet(tool_mode) else None
+    )
     _env_retriever = (
         EnvCheckRetriever()
         if (
@@ -153,6 +157,7 @@ def build_agent_app(
         kb_retriever=_kb_retriever,
         web_retriever=_web_retriever,
         code_retriever=_code_retriever,
+        code_search_snippet_retriever=_code_search_snippet_retriever,
         env_retriever=_env_retriever,
         npu_arch_retriever=_npu_arch_retriever,
         tiling_retriever=_tiling_retriever,

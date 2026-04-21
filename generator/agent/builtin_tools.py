@@ -15,6 +15,7 @@ from .nodes import (
     api_constraint_node,
     api_lookup_node,
     code_rag_node,
+    code_search_snippet_node,
     code_style_node,
     env_check_api_node,
     env_check_env_node,
@@ -63,6 +64,17 @@ def _meta() -> Dict[str, Dict[str, Any]]:
             "usage_guidance": (
                 "Describe the kernel pattern, op family, or API usage you need (shapes, fusion, tiling) "
                 "in `query` in English."
+            ),
+        },
+        "code_search_snippet": {
+            "display_name": "Code Search Snippect",
+            "description": "Search curated local snippets from CANN skills and asc-devkit/examples without using the general code RAG corpus.",
+            "parameter_docs": 'Use "query" for the concrete pattern, API, or operator structure you want to find. Optional args may include {"source":"cann_skills|asc_devkit|all"}.',
+            "examples": ['{"tool":"code_search_snippet","query":"host tiling GetInputShape InferShape example","args":{"source":"all"}}'],
+            "usage_guidance": (
+                "Use this when you need high-precision local examples from curated sources only. Mention the "
+                "operator pattern, host/kernel area, and API names in `query`; prefer this over `code_rag` when "
+                "you want to avoid polluted repo examples."
             ),
         },
         "env_check_env": {
@@ -231,6 +243,7 @@ def _handler_for(
     kb_retriever: Any,
     web_retriever: Any,
     code_retriever: Any,
+    code_search_snippet_retriever: Any,
     env_retriever: Any,
     npu_arch_retriever: Any,
     tiling_retriever: Any,
@@ -247,6 +260,8 @@ def _handler_for(
             return web_search_node(state, client, model, web_retriever)
         if name == "code_rag":
             return code_rag_node(state, code_retriever)
+        if name == "code_search_snippet":
+            return code_search_snippet_node(state, code_search_snippet_retriever)
         if name == "env_check_env":
             return env_check_env_node(state, env_retriever)
         if name == "env_check_npu":
@@ -301,6 +316,7 @@ def register_builtin_tools_for_mode(
     kb_retriever: Any = None,
     web_retriever: Any = None,
     code_retriever: Any = None,
+    code_search_snippet_retriever: Any = None,
     env_retriever: Any = None,
     npu_arch_retriever: Any = None,
     tiling_retriever: Any = None,
@@ -336,6 +352,7 @@ def register_builtin_tools_for_mode(
                     kb_retriever,
                     web_retriever,
                     code_retriever,
+                    code_search_snippet_retriever,
                     env_retriever,
                     npu_arch_retriever,
                     tiling_retriever,

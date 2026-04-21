@@ -48,6 +48,7 @@ class GeneratorAgentState(MessagesState):
         kb_results: KB knowledge base results (API documentation)
         web_results: Web search results
         code_rag_results: Code RAG retrieval results
+        code_search_snippet_results: Restricted snippet retrieval results
         tool_calls_log: Tool call history for debugging/reporting
         query_round_count: Current round number (0 to MAX_QUERY_ROUNDS)
         next_action: Next tool action (lowercase tool key or ANSWER)
@@ -64,6 +65,7 @@ class GeneratorAgentState(MessagesState):
     kb_results: Annotated[List[str], _add_list]
     web_results: Annotated[List[str], _add_list]
     code_rag_results: Annotated[List[str], _add_list]
+    code_search_snippet_results: Annotated[List[str], _add_list]
     env_check_results: Annotated[List[str], _add_list]
     kb_shell_search_results: Annotated[List[str], _add_list]
     api_lookup_results: Annotated[List[str], _add_list]
@@ -150,6 +152,7 @@ def create_initial_state(
         "kb_results": [],
         "web_results": [],
         "code_rag_results": [],
+        "code_search_snippet_results": [],
         "env_check_results": [],
         "kb_shell_search_results": [],
         "api_lookup_results": [],

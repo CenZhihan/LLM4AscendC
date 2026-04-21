@@ -58,6 +58,7 @@ def _format_retrieved_content(state: GeneratorAgentState) -> str:
     kb_results = state.get("kb_results", [])
     web_results = state.get("web_results", [])
     code_rag_results = state.get("code_rag_results", [])
+    code_search_snippet_results = state.get("code_search_snippet_results", [])
     env_check_results = state.get("env_check_results", [])
     kb_shell_results = state.get("kb_shell_search_results", [])
     api_lookup_results = state.get("api_lookup_results", [])
@@ -85,6 +86,10 @@ def _format_retrieved_content(state: GeneratorAgentState) -> str:
     if code_rag_results:
         code_text = "\n\n".join(code_rag_results[:4])
         parts.append(f"[Code RAG retrieval]\n{code_text}")
+
+    if code_search_snippet_results:
+        snippet_text = "\n\n".join(code_search_snippet_results[:4])
+        parts.append(f"[Code Search Snippect retrieval]\n{snippet_text}")
 
     if env_check_results:
         env_text = "\n\n".join(env_check_results[:4])

@@ -108,7 +108,7 @@ def main():
         default="no_tool",
         help=(
             "检索工具模式：预置名 no_tool/kb_only/web_only/.../all，"
-            "或逗号分隔列表如 kb,web,code_rag 及已注册的插件名（如 kb,my_plugin）。"
+            "或逗号分隔列表如 kb,web,code_rag,code_search_snippet 及已注册的插件名（如 kb,my_plugin）。"
         ),
 
     )

@@ -6,6 +6,7 @@ Provides unified retrieval interfaces for the generator agent.
 from .kb_retriever import KBRetriever, query_knowledge
 from .web_retriever import WebRetriever, web_search
 from .code_retriever import CodeRetriever, query_code_rag
+from .code_search_snippet_retriever import CodeSearchSnippetRetriever, CodeSearchSnippetResult
 from .env_checker import (
     EnvCheckRetriever,
     check_env,
@@ -49,6 +50,7 @@ __all__ = [
     'KBRetriever', 'query_knowledge',
     'WebRetriever', 'web_search',
     'CodeRetriever', 'query_code_rag',
+    'CodeSearchSnippetRetriever', 'CodeSearchSnippetResult',
     'EnvCheckRetriever',
     'check_env',
     'query_npu_devices',

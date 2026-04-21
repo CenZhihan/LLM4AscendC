@@ -6,6 +6,7 @@ Each node handles a specific action in the agent workflow:
 - kb_query: KB knowledge base query
 - web_search: Web search
 - code_rag: Code RAG retrieval
+- code_search_snippet: Restricted snippet retrieval from CANN skills / asc-devkit
 - env_check_env: Environment overview check
 - env_check_npu: NPU device query
 - env_check_api: API compatibility check
@@ -24,6 +25,7 @@ from .choose_tool import choose_tool_node
 from .kb_query import kb_query_node
 from .web_search import web_search_node
 from .code_rag import code_rag_node
+from .code_search_snippet import code_search_snippet_node
 from .env_check import env_check_env_node, env_check_npu_node, env_check_api_node
 from .npu_arch import npu_arch_node
 from .tiling_calc import tiling_calc_node
@@ -44,6 +46,7 @@ __all__ = [
     'kb_query_node',
     'web_search_node',
     'code_rag_node',
+    'code_search_snippet_node',
     'env_check_env_node',
     'env_check_npu_node',
     'env_check_api_node',

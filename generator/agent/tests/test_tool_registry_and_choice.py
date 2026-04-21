@@ -179,6 +179,16 @@ class TestApiAndEnvNodes(unittest.TestCase):
 
 
 class TestParseToolModePlugins(unittest.TestCase):
+    def test_parse_builtin_snippect_tool(self):
+        m = parse_tool_mode("kb,code_search_snippet")
+        self.assertIn("kb", m)
+        self.assertIn("code_search_snippet", m)
+
+    def test_parse_builtin_snippet_alias(self):
+        m = parse_tool_mode("kb,code_search_snippet")
+        self.assertIn("kb", m)
+        self.assertIn("code_search_snippet", m)
+
     def test_parse_kb_and_plugin(self):
         register_tool(
             RegisteredToolSpec(
@@ -210,6 +220,9 @@ class TestNormalizeToolChoice(unittest.TestCase):
         self.assertEqual(normalize_tool_choice_name("kb"), "kb")
         self.assertEqual(normalize_tool_choice_name("KB"), "kb")
         self.assertEqual(normalize_tool_choice_name("CODE_RAG"), "code_rag")
+        self.assertEqual(normalize_tool_choice_name("code_search_snippet"), "code_search_snippet")
+        self.assertEqual(normalize_tool_choice_name("CODE_SEARCH_SNIPPECT"), "code_search_snippet")
+        self.assertEqual(normalize_tool_choice_name("CODE_SEARCH_SNIPPET"), "code_search_snippet")
         self.assertEqual(normalize_tool_choice_name("ASCEND_SEARCH"), "ascend_search")
         self.assertEqual(normalize_tool_choice_name("ASCEND_FETCH"), "ascend_fetch")
         self.assertEqual(normalize_tool_choice_name("ANSWER"), "answer")

@@ -74,6 +74,7 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
     kb_results = state.get("kb_results", [])
     web_results = state.get("web_results", [])
     code_rag_results = state.get("code_rag_results", [])
+    code_search_snippet_results = state.get("code_search_snippet_results", [])
     env_check_results = state.get("env_check_results", [])
     kb_shell_results = state.get("kb_shell_search_results", [])
     api_lookup_results = state.get("api_lookup_results", [])
@@ -96,6 +97,12 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
         existing += "Web results (excerpt):\n" + "\n".join(web_results[:2]) + "\n\n"
     if code_rag_results:
         existing += "Code RAG results (excerpt):\n" + "\n".join(code_rag_results[:1]) + "\n\n"
+    if code_search_snippet_results:
+        existing += (
+            "Code Search Snippect results (excerpt):\n"
+            + "\n".join(code_search_snippet_results[:1])
+            + "\n\n"
+        )
     if env_check_results:
         existing += "Environment check (excerpt):\n" + "\n".join(env_check_results[:1]) + "\n\n"
     if kb_shell_results:

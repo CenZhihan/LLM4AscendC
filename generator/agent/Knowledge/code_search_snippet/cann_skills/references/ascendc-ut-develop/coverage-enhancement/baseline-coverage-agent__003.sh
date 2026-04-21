@@ -1,0 +1,1 @@
+cd /mnt/workspace/ops-transformer && bash build.sh -u --ophost --ops='moe_distribute_combine_add_rms_norm' --soc='Ascend910b','Ascend950' --cov 2>&1 | tee /mnt/workspace/ut_gen/output/moe_distribute_combine_add_rms_norm/log/round_0.log

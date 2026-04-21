@@ -15,6 +15,7 @@ BUILTIN_TOOL_NAMES: FrozenSet[str] = frozenset(
         "kb",
         "web",
         "code_rag",
+        "code_search_snippet",
         "env_check_env",
         "env_check_npu",
         "env_check_api",
@@ -84,6 +85,10 @@ def has_web(mode: AgentToolMode) -> bool:
 
 def has_code_rag(mode: AgentToolMode) -> bool:
     return "code_rag" in mode
+
+
+def has_code_search_snippet(mode: AgentToolMode) -> bool:
+    return "code_search_snippet" in mode
 
 
 def has_env_check_env(mode: AgentToolMode) -> bool:
@@ -161,7 +166,11 @@ def has_plugin(mode: AgentToolMode, raw_key: str) -> bool:
 
 
 def _normalize_tool_token(tok: str) -> str:
-    return tok.strip().lower()
+    normalized = tok.strip().lower().replace("-", "_")
+    aliases = {
+        "code_search_snippet": "code_search_snippet",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _resolve_mode_token(tok: str) -> str:
@@ -253,6 +262,8 @@ def normalize_tool_choice_name(raw: str) -> Optional[str]:
         "kb": "kb",
         "web": "web",
         "code_rag": "code_rag",
+        "code_search_snippet": "code_search_snippet",
+        "code_search_snippet": "code_search_snippet",
         "env_check_env": "env_check_env",
         "env_check_npu": "env_check_npu",
         "env_check_api": "env_check_api",
@@ -273,6 +284,8 @@ def normalize_tool_choice_name(raw: str) -> Optional[str]:
         "KB": "kb",
         "WEB": "web",
         "CODE_RAG": "code_rag",
+        "CODE_SEARCH_SNIPPET": "code_search_snippet",
+        "CODE_SEARCH_SNIPPECT": "code_search_snippet",
         "ENV_CHECK_ENV": "env_check_env",
         "ENV_CHECK_NPU": "env_check_npu",
         "ENV_CHECK_API": "env_check_api",

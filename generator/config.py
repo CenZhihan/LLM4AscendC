@@ -82,5 +82,32 @@ agent_web_max_chars = 4000
 agent_code_rag_top_k = rag_top_k
 agent_code_rag_max_chars = rag_max_chars
 
+# Code snippet search configuration: restricted local corpus, no embedding index.
+agent_code_search_snippet_top_k = 4
+agent_code_search_snippet_max_chars = 10000
+agent_code_search_snippet_knowledge_root = os.path.join(
+    _project_root, 'agent', 'Knowledge', 'code_search_snippet'
+)
+agent_code_search_snippet_source_cann_skills_root = os.path.join(
+    _generator_root, 'CANN_skills', 'skills'
+)
+
+_code_search_team_root = os.path.join(
+    _generator_root, 'CANN_skills', 'teams', 'ascendc-kernel-dev-team'
+)
+
+_raw_code_search_asc_devkit = os.environ.get('ASCENDC_CODE_SEARCH_ASC_DEVKIT', '').strip()
+if _raw_code_search_asc_devkit:
+    if os.path.basename(os.path.normpath(_raw_code_search_asc_devkit)) == 'examples':
+        agent_code_search_snippet_source_asc_devkit_examples = _raw_code_search_asc_devkit
+    else:
+        agent_code_search_snippet_source_asc_devkit_examples = os.path.join(
+            _raw_code_search_asc_devkit, 'examples'
+        )
+else:
+    agent_code_search_snippet_source_asc_devkit_examples = os.path.join(
+        _code_search_team_root, 'asc-devkit', 'examples'
+    )
+
 # Agent workflow configuration
 agent_max_query_rounds = 5  # Maximum query rounds before forced ANSWER
