@@ -26,6 +26,7 @@ class RegisteredToolSpec:
     parameter_docs: str
     handler: ToolHandler = field(repr=False)
     examples: List[str] = field(default_factory=list)
+    usage_guidance: str = ""
 
 
 class ToolRegistry:
@@ -53,6 +54,7 @@ class ToolRegistry:
             parameter_docs=spec.parameter_docs,
             handler=spec.handler,
             examples=list(spec.examples),
+            usage_guidance=str(getattr(spec, "usage_guidance", None) or ""),
         )
 
     def is_registered(self, name: str) -> bool:

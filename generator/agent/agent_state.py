@@ -12,9 +12,7 @@ except ImportError:
 
 from langgraph.graph import MessagesState
 
-
-# Maximum query rounds before forced ANSWER
-MAX_QUERY_ROUNDS = 3
+from ..config import agent_max_query_rounds as MAX_QUERY_ROUNDS
 
 
 def _add_list(left: List[str], right: List[str]) -> List[str]:

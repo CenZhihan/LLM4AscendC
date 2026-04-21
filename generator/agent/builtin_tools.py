@@ -40,48 +40,85 @@ def _meta() -> Dict[str, Dict[str, Any]]:
             "description": "Query Huawei Ascend C API documentation (Chroma / LlamaIndex)",
             "parameter_docs": 'Use "query" for the English search question.',
             "examples": ['{"tool":"kb","query":"Ascend C GELU kernel API","args":null}'],
+            "usage_guidance": (
+                "Use **English** in `query` for best retrieval. Ask for concrete APIs, constraints, or "
+                "patterns (e.g. elementwise tiling, DataCopy alignment, dtype rules)."
+            ),
         },
         "web": {
             "display_name": "Web search",
             "description": "Search the public web for docs and tutorials (ddgs).",
             "parameter_docs": 'Use "query" for the search question.',
             "examples": ['{"tool":"web","query":"Ascend C custom operator tutorial","args":null}'],
+            "usage_guidance": (
+                "Put one focused search line in `query`; avoid a single overly broad word unless you "
+                "are exploring."
+            ),
         },
         "code_rag": {
             "display_name": "Code RAG",
             "description": "Retrieve similar Ascend C kernel implementations from the indexed code corpus.",
             "parameter_docs": 'Use "query" for what to look up in code.',
             "examples": ['{"tool":"code_rag","query":"Ascend C softmax kernel example","args":null}'],
+            "usage_guidance": (
+                "Describe the kernel pattern, op family, or API usage you need (shapes, fusion, tiling) "
+                "in `query` in English."
+            ),
         },
         "env_check_env": {
             "display_name": "Environment (CANN)",
             "description": "Summarize CANN / toolchain environment and broad API compatibility hints.",
             "parameter_docs": 'Use "query" for what to verify in the environment.',
             "examples": ['{"tool":"env_check_env","query":"check CANN environment","args":null}'],
+            "usage_guidance": (
+                "State what to verify (CANN version, compiler paths, generic compatibility) in `query`; "
+                "keep it task-relevant."
+            ),
         },
         "env_check_npu": {
             "display_name": "NPU device",
             "description": "Query NPU device status and resource usage via the env checker.",
             "parameter_docs": 'Use "query" for the device query intent. Prefer args like {"query_type":"memory|temp|power|usages|list|info","device_id":0}.',
             "examples": ['{"tool":"env_check_npu","query":"NPU memory for device 0","args":{"query_type":"memory","device_id":0}}'],
+            "usage_guidance": (
+                "Prefer structured `args`: `{\"query_type\":\"memory|temp|power|usages|list|info\","
+                "\"device_id\":0}`. Put a short natural-language intent in `query` that matches "
+                "`query_type` and device."
+            ),
         },
         "env_check_api": {
             "display_name": "API header check",
             "description": "Verify whether an Ascend C API symbol appears in installed headers.",
             "parameter_docs": 'Use an exact symbol name in query or args.api_name. Never use generic words like "signature" or "constraints" as the API name.',
             "examples": ['{"tool":"env_check_api","query":"check if AscendC::DataCopy exists","args":{"api_name":"AscendC::DataCopy"}}'],
+            "usage_guidance": (
+                "Identify **one concrete API symbol** first. Put the exact symbol in `query` or "
+                "`args.api_name`. Good symbols: `AscendC::DataCopy`, `Muls`, `DataCopyPad`, `MatmulType`, "
+                "`GlobalTensor::SetValue`. Bad placeholders as the API name: `api`, `signature`, "
+                "`signatures`, `constraints`, `alternative`, `details`, `docs`."
+            ),
         },
         "kb_shell_search": {
             "display_name": "KB shell search",
             "description": "Run grep/find style search over packaged knowledge-base markdown trees.",
             "parameter_docs": 'Use "query" for path / pattern / intent.',
             "examples": ['{"tool":"kb_shell_search","query":"search DataCopy in Knowledge/api/","args":null}'],
+            "usage_guidance": (
+                "Put path, filename glob, or grep-like pattern in `query`; anchor to the packaged KB tree "
+                "when possible."
+            ),
         },
         "api_lookup": {
             "display_name": "API signature lookup",
             "description": "Look up API signatures, dtypes, and repeatTimes limits from structured docs.",
             "parameter_docs": 'Use an exact API symbol in query or args.api_name, e.g. AscendC::DataCopy or MatmulType. Do not pass generic meta words like "signatures".',
             "examples": ['{"tool":"api_lookup","query":"AscendC::DataCopy","args":{"api_name":"AscendC::DataCopy"}}'],
+            "usage_guidance": (
+                "Identify **one concrete API symbol** first. Good symbols: `AscendC::DataCopy`, `Muls`, "
+                "`DataCopyPad`, `MatmulType`, `GlobalTensor::SetValue`. Bad placeholders: `api`, `signature`, "
+                "`signatures`, `constraints`, `alternative`, `details`, `docs`. If useful, put the exact "
+                "symbol in `args`, e.g. `{\"api_name\":\"AscendC::DataCopy\"}`."
+            ),
         },
         "api_constraint": {
             "display_name": "API constraint check",
@@ -90,6 +127,10 @@ def _meta() -> Dict[str, Dict[str, Any]]:
             "examples": [
                 '{"tool":"api_constraint","query":"check DataCopyPad constraints","args":{"api_name":"DataCopyPad","count":512,"dtype":"half","is_gm_to_ub":true}}'
             ],
+            "usage_guidance": (
+                "Use the same **single-symbol discipline** as `api_lookup`. `args` must carry `api_name` "
+                "plus the use-site context (count, dtype, GM/UB direction, etc.) per parameter_docs."
+            ),
         },
         "api_alternative": {
             "display_name": "API alternatives",
@@ -98,6 +139,10 @@ def _meta() -> Dict[str, Dict[str, Any]]:
             "examples": [
                 '{"tool":"api_alternative","query":"alternative for GlobalTensor::SetValue","args":{"api_name":"GlobalTensor::SetValue","reason":"not found"}}'
             ],
+            "usage_guidance": (
+                "Name the **exact unavailable symbol** in `query` or `args.api_name`; optional `args.reason` "
+                "helps narrow replacements."
+            ),
         },
         "tiling_calc": {
             "display_name": "Tiling calculation",
@@ -106,6 +151,10 @@ def _meta() -> Dict[str, Dict[str, Any]]:
             "examples": [
                 '{"tool":"tiling_calc","query":"tiling for 1024 float elements elementwise","args":null}'
             ],
+            "usage_guidance": (
+                "Include element counts, dtypes, operator kind, and chip hint in `query` so tiling can be "
+                "grounded."
+            ),
         },
         "tiling_validate": {
             "display_name": "Tiling validation",
@@ -114,18 +163,30 @@ def _meta() -> Dict[str, Dict[str, Any]]:
             "examples": [
                 '{"tool":"tiling_validate","query":"validate tiling chip=DAV_2201 block_num=4","args":null}'
             ],
+            "usage_guidance": (
+                "Paste or describe the proposed tiling parameters and target chip in `query` so rules can "
+                "be checked."
+            ),
         },
         "npu_arch": {
             "display_name": "NPU architecture",
             "description": "Return UB size, compile macros, and feature flags for a chip name.",
             "parameter_docs": 'Use "query" with chip id, e.g. Ascend910B2.',
             "examples": ['{"tool":"npu_arch","query":"Ascend910B2 chip specs","args":null}'],
+            "usage_guidance": (
+                "Put the **chip id** (e.g. Ascend910B2) in `query`; ask for UB, macros, or feature flags as "
+                "needed."
+            ),
         },
         "code_style": {
             "display_name": "Code style",
             "description": "Check Ascend C coding-style rules on kernel / host snippets.",
             "parameter_docs": 'Use "query" with code excerpt or file intent.',
             "examples": ['{"tool":"code_style","query":"check style for elementwise kernel","args":null}'],
+            "usage_guidance": (
+                "Embed or point to the smallest relevant **code excerpt** in `query` (or describe the "
+                "snippet role) so checks are focused."
+            ),
         },
         "security_check": {
             "display_name": "Security patterns",
@@ -134,12 +195,19 @@ def _meta() -> Dict[str, Dict[str, Any]]:
             "examples": [
                 '{"tool":"security_check","query":"security scan elementwise kernel snippet","args":null}'
             ],
+            "usage_guidance": (
+                "Provide the **kernel/host snippet** or a tight description of what to scan in `query`."
+            ),
         },
         "ascend_search": {
             "display_name": "Ascend docs search",
             "description": "Search Ascend online docs.",
             "parameter_docs": 'Use "query" in Chinese only (关键词必须中文).',
             "examples": ['{"tool":"ascend_search","query":"AscendC DataCopy 对齐约束","args":null}'],
+            "usage_guidance": (
+                "Put **Chinese keywords only** in `query`. `lang`, `doc_type`, and `version` are fixed "
+                "server-side — **do not** invent them in `args`."
+            ),
         },
         "ascend_fetch": {
             "display_name": "Ascend docs fetch",
@@ -148,6 +216,10 @@ def _meta() -> Dict[str, Dict[str, Any]]:
             "examples": [
                 '{"tool":"ascend_fetch","query":"https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/85RC1alpha001/API/ascendcopapi/atlasascendc_api_07_0104.html","args":null}'
             ],
+            "usage_guidance": (
+                "Put **one** URL from a **prior `ascend_search` result** in `query`. If multiple URLs appear "
+                "in `query`, only the **first** is fetched."
+            ),
         },
     }
 
@@ -274,6 +346,7 @@ def register_builtin_tools_for_mode(
                     ascend_fetch_retriever,
                 ),
                 examples=list(m.get("examples") or []),
+                usage_guidance=str(m.get("usage_guidance") or ""),
             ),
             allow_builtin_name=True,
         )

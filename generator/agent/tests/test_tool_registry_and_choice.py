@@ -235,6 +235,68 @@ class TestPluginCannotShadowBuiltin(unittest.TestCase):
             )
 
 
+class TestRegisteredToolSpecUsageGuidance(unittest.TestCase):
+    def test_register_persists_usage_guidance(self):
+        register_tool(
+            RegisteredToolSpec(
+                name="guidance_test_tool",
+                display_name="GuidanceTest",
+                description="Test tool.",
+                parameter_docs="Use query.",
+                handler=_echo_handler,
+                examples=['{"tool":"guidance_test_tool","query":"x","args":null}'],
+                usage_guidance="Always set query to a single token.",
+            )
+        )
+        try:
+            spec = get_tool_registry().get("guidance_test_tool")
+            self.assertIsNotNone(spec)
+            assert spec is not None
+            self.assertEqual(spec.usage_guidance, "Always set query to a single token.")
+        finally:
+            get_tool_registry().unregister("guidance_test_tool")
+
+
+class TestChooseToolPromptDynamicTools(unittest.TestCase):
+    def test_kb_only_includes_per_tool_block_not_disabled_tools(self):
+        from generator.agent.builtin_tools import register_builtin_tools_for_mode
+        from generator.agent.nodes.choose_tool import _build_tool_selection_prompt
+
+        class _C:
+            class _Chat:
+                completions = None
+
+            chat = _Chat()
+
+        register_builtin_tools_for_mode(
+            frozenset({"kb"}),
+            client=_C(),
+            model="dummy",
+            kb_retriever=None,
+            web_retriever=None,
+            code_retriever=None,
+            env_retriever=None,
+            npu_arch_retriever=None,
+            tiling_retriever=None,
+            api_retriever=None,
+            code_quality_retriever=None,
+            kb_shell_retriever=None,
+            ascend_search_retriever=None,
+            ascend_fetch_retriever=None,
+            plugin_snapshot=None,
+        )
+        try:
+            p = _build_tool_selection_prompt("do task", "", frozenset({"kb"}), 0, "")
+            self.assertIn("### `kb`", p)
+            self.assertIn("Usage guidance:", p)
+            self.assertIn("English", p)
+            self.assertNotIn("### `web`", p)
+            self.assertNotIn("### `code_rag`", p)
+            self.assertIn("exactly one", p.lower())
+        finally:
+            get_tool_registry().clear()
+
+
 class TestAscendNodesPolicy(unittest.TestCase):
     def test_search_non_chinese_query_rejected(self):
         state = {
