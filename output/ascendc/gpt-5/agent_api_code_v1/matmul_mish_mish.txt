@@ -1,0 +1,435 @@
+project_json_src='''
+[
+  {
+    "op": "MatmulMishMishCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float16"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float16"]
+      },
+      {
+        "name": "bias",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": []
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulMishMishCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, tileN);
+  TILING_DATA_FIELD_DEF(uint32_t, tileK);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulMishMishCustom, MatmulMishMishCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "matmul_mish_mish_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+}
+
+namespace optiling {
+
+// UB budgeting notes:
+// - We'll accumulate a tile of N (float) => tileN * 4 bytes
+// - Process K in chunks of tileK (half -> cast to float in UB) => tileK * 2 bytes in + tileK * 4 bytes tmp
+// - For each N row within tileN, we need a w-segment of tileK (half) re-used per row.
+// Total roughly: out(N float) + x(K half/float) + w(K half) + tmp (K float) ~= 4*tileN + 6*tileK + 4*tileK bytes.
+// We keep conservative per-core UB share:
+static constexpr uint32_t UB_BYTES = 192 * 1024; // 192KB
+static constexpr uint32_t ALIGN_ELEMS = 256;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    MatmulMishMishCustomTilingData tiling;
+
+    const gert::Shape *x_shape = context->GetInputShape(0);   // [M, K]
+    const gert::Shape *w_shape = context->GetInputShape(1);   // [N, K]
+    if (x_shape->GetDimNum() != 2 || w_shape->GetDimNum() != 2) {
+        return ge::GRAPH_FAILED;
+    }
+    const uint64_t M = static_cast<uint64_t>(x_shape->GetDim(0));
+    const uint64_t K = static_cast<uint64_t>(x_shape->GetDim(1));
+    const uint64_t N = static_cast<uint64_t>(w_shape->GetDim(0));
+    if (K != static_cast<uint64_t>(w_shape->GetDim(1))) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Choose tileK and tileN based on UB_BYTES.
+    // bytes ~= 4*tileN + 10*tileK
+    uint32_t maxTileK = UB_BYTES / 10;
+    maxTileK = AlignDown(maxTileK, ALIGN_ELEMS);
+    if (maxTileK < ALIGN_ELEMS) maxTileK = ALIGN_ELEMS;
+
+    uint32_t tileK = static_cast<uint32_t>(K);
+    if (tileK > maxTileK) tileK = maxTileK;
+
+    // Leave headroom for y-accumulator: 4*tileN <= UB_BYTES/4
+    uint32_t maxTileN = (UB_BYTES / 4) / 4;  // conservative
+    maxTileN = AlignDown(maxTileN, ALIGN_ELEMS);
+    if (maxTileN < ALIGN_ELEMS) maxTileN = ALIGN_ELEMS;
+
+    uint32_t tileN = static_cast<uint32_t>(N);
+    if (tileN > maxTileN) tileN = maxTileN;
+
+    // BlockDim: assign rows to cores.
+    uint32_t blockDim = static_cast<uint32_t>(M);
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_m(static_cast<uint32_t>(M));
+    tiling.set_n(static_cast<uint32_t>(N));
+    tiling.set_k(static_cast<uint32_t>(K));
+    tiling.set_tileN(tileN);
+    tiling.set_tileK(tileK);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // no workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);  // [M, K]
+    const gert::Shape *w_shape = context->GetInputShape(1);  // [N, K]
+    if (x_shape->GetDimNum() != 2 || w_shape->GetDimNum() != 2) {
+        return GRAPH_FAILED;
+    }
+    const int64_t M = x_shape->GetDim(0);
+    const int64_t Kx = x_shape->GetDim(1);
+    const int64_t N = w_shape->GetDim(0);
+    const int64_t Kw = w_shape->GetDim(1);
+    if (Kx != Kw) return GRAPH_FAILED;
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, M);
+    y_shape->SetDim(1, N);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // Output is float accumulation
+    context->SetOutputDataType(0, ge::DT_FLOAT);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class MatmulMishMishCustom : public OpDef {
+public:
+    explicit MatmulMishMishCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulMishMishCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+// Helper: Mish y = x * tanh(softplus(x)); softplus(x) = ln(1 + exp(x))
+__aicore__ inline void MishOnce(AscendC::LocalTensor<float>& out, const AscendC::LocalTensor<float>& in, uint32_t len,
+                                AscendC::LocalTensor<float>& tmp0, AscendC::LocalTensor<float>& tmp1)
+{
+    // tmp0 = exp(in)
+    AscendC::Exp(tmp0, in, len);
+    // tmp0 = 1 + exp(in)
+    AscendC::Adds(tmp0, tmp0, 1.0f, len);
+    // tmp0 = ln(1 + exp(in)) = softplus
+    AscendC::Ln(tmp0, tmp0, len);
+    // tmp1 = tanh(tmp0)
+    AscendC::Tanh(tmp1, tmp0, len);
+    // out = in * tmp1
+    AscendC::Mul(out, in, tmp1, len);
+}
+
+class KernelMatmulMishMishCustom {
+public:
+    __aicore__ inline KernelMatmulMishMishCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                uint32_t m, uint32_t n, uint32_t k,
+                                uint32_t tileN, uint32_t tileK)
+    {
+        m_ = m;
+        n_ = n;
+        k_ = k;
+        tileN_ = tileN == 0 ? 256u : tileN;
+        tileK_ = tileK == 0 ? 1024u : tileK;
+
+        xGm_.SetGlobalBuffer((__gm__ half*)x, static_cast<uint64_t>(m_) * k_);
+        wGm_.SetGlobalBuffer((__gm__ half*)w, static_cast<uint64_t>(n_) * k_);
+        bGm_.SetGlobalBuffer((__gm__ float*)b, n_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint64_t>(m_) * n_);
+
+        // Queues:
+        // - xSeg_half: tileK half
+        // - xSeg: tileK float
+        // - wSeg_half: tileK half
+        // - wSeg: tileK float
+        // - yTile: tileN float
+        // - tmp0/tmp1: tileN float for Mish
+        pipe_.InitBuffer(inQueueXHalf_, BUFFER_NUM, tileK_ * sizeof(half));
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileK_ * sizeof(float));
+        pipe_.InitBuffer(inQueueWHalf_, BUFFER_NUM, tileK_ * sizeof(half));
+        pipe_.InitBuffer(inQueueW_, BUFFER_NUM, tileK_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileN_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue0_, BUFFER_NUM, tileN_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue1_, BUFFER_NUM, tileN_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (m_ == 0 || n_ == 0 || k_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        for (uint32_t row = blockIdx; row < m_; row += blockNum) {
+            // process N dimension in tiles
+            for (uint32_t nBase = 0; nBase < n_; nBase += tileN_) {
+                const uint32_t curN = AscendC::min<uint32_t>(tileN_, n_ - nBase);
+
+                // yTile = bias[nBase:nBase+curN]
+                AscendC::LocalTensor<float> yTile = outQueueY_.AllocTensor<float>();
+                AscendC::DataCopy(yTile, bGm_[nBase], curN);
+
+                // for k in chunks
+                for (uint32_t kBase = 0; kBase < k_; kBase += tileK_) {
+                    const uint32_t curK = AscendC::min<uint32_t>(tileK_, k_ - kBase);
+
+                    // Load x segment: x[row, kBase:kBase+curK] (half -> float)
+                    AscendC::LocalTensor<half> xSegH = inQueueXHalf_.AllocTensor<half>();
+                    AscendC::DataCopy(xSegH, xGm_[row * k_ + kBase], curK);
+                    AscendC::LocalTensor<float> xSeg = inQueueX_.AllocTensor<float>();
+                    AscendC::Cast(xSeg, xSegH, curK);
+
+                    // Accumulate for each output column in current N-tile
+                    for (uint32_t j = 0; j < curN; ++j) {
+                        // Load weight row segment: weight[nBase + j, kBase: kBase+curK] (half -> float)
+                        AscendC::LocalTensor<half> wSegH = inQueueWHalf_.AllocTensor<half>();
+                        AscendC::DataCopy(wSegH, wGm_[(nBase + j) * k_ + kBase], curK);
+                        AscendC::LocalTensor<float> wSeg = inQueueW_.AllocTensor<float>();
+                        AscendC::Cast(wSeg, wSegH, curK);
+
+                        // tmpMul = wSeg * xSeg elementwise
+                        // ReduceSum(tmpMul) -> scalar add into yTile[j]
+                        AscendC::LocalTensor<float> tmpMul = inQueueW_.AllocTensor<float>();
+                        AscendC::Mul(tmpMul, wSeg, xSeg, curK);
+
+                        float partial = 0.0f;
+                        // reduction by chunking over tmpMul
+                        // NOTE: Use a simple loop to accumulate values
+                        for (uint32_t t = 0; t < curK; ++t) {
+                            // Simulate scalar read; create a 1-element tensor view
+                            // In practice, use a proper reduce intrinsic if available.
+                            // Here we use DataCopy to a 1-element scratch in tmpQueue0_
+                            AscendC::LocalTensor<float> scratch = tmpQueue0_.AllocTensor<float>();
+                            AscendC::DataCopy(scratch, tmpMul[t], 1);
+                            // Accumulate
+                            // Ideally, we should read back to scalar. Simulate with Muls and Add
+                            // but for simplicity, assume we can extract scalar via a helper.
+                            // Using a workaround: scratch[0] added via vector Add on yTile slice [j:j+1]
+                            AscendC::LocalTensor<float> ySlice = tmpQueue1_.AllocTensor<float>();
+                            AscendC::DataCopy(ySlice, yTile[j], 1);
+                            AscendC::Add(ySlice, ySlice, scratch, 1);
+                            AscendC::DataCopy(yTile[j], ySlice, 1);
+                            tmpQueue1_.FreeTensor(ySlice);
+                            tmpQueue0_.FreeTensor(scratch);
+                        }
+
+                        inQueueW_.FreeTensor(tmpMul);
+                        inQueueW_.FreeTensor(wSeg);
+                        inQueueWHalf_.FreeTensor(wSegH);
+                    }
+
+                    inQueueX_.FreeTensor(xSeg);
+                    inQueueXHalf_.FreeTensor(xSegH);
+                }
+
+                // Apply Mish twice: yTile = mish(mish(yTile))
+                AscendC::LocalTensor<float> tmp0 = tmpQueue0_.AllocTensor<float>();
+                AscendC::LocalTensor<float> tmp1 = tmpQueue1_.AllocTensor<float>();
+                MishOnce(yTile, yTile, curN, tmp0, tmp1);
+                MishOnce(yTile, yTile, curN, tmp0, tmp1);
+                tmpQueue1_.FreeTensor(tmp1);
+                tmpQueue0_.FreeTensor(tmp0);
+
+                // Write back
+                AscendC::DataCopy(yGm_[row * n_ + nBase], yTile, curN);
+                outQueueY_.FreeTensor(yTile);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueXHalf_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueWHalf_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueW_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue0_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue1_;
+
+    AscendC::GlobalTensor<half> xGm_;
+    AscendC::GlobalTensor<half> wGm_;
+    AscendC::GlobalTensor<float> bGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t m_{0};
+    uint32_t n_{0};
+    uint32_t k_{0};
+    uint32_t tileN_{0};
+    uint32_t tileK_{0};
+};
+
+extern "C" __global__ __aicore__ void matmul_mish_mish_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR y,
+                                                              GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulMishMishCustom op;
+    op.Init(x, weight, bias, y,
+            tiling_data.m, tiling_data.n, tiling_data.k,
+            tiling_data.tileN, tiling_data.tileK);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+static inline at::Tensor ensure_contiguous_npu(const at::Tensor& t) {
+    return t.is_contiguous() ? t : t.contiguous();
+}
+
+at::Tensor matmul_mish_mish_impl_npu(const at::Tensor& x_in, const at::Tensor& weight_in, const at::Tensor& bias_in) {
+    // Inputs: x [M,K], weight [N,K], bias [N]
+    // Kernel expects: x, weight in float16; bias in float; output float
+    TORCH_CHECK(x_in.dim() == 2 && weight_in.dim() == 2, "x and weight must be 2D");
+    TORCH_CHECK(bias_in.dim() == 1, "bias must be 1D");
+    TORCH_CHECK(x_in.size(1) == weight_in.size(1), "K mismatch");
+    TORCH_CHECK(weight_in.size(0) == bias_in.size(0), "N mismatch");
+
+    auto x_half = ensure_contiguous_npu(x_in.to(at::kHalf));
+    auto w_half = ensure_contiguous_npu(weight_in.to(at::kHalf));
+    auto b_float = ensure_contiguous_npu(bias_in.to(at::kFloat));
+
+    at::Tensor y = at::empty({x_in.size(0), weight_in.size(0)}, x_in.options().dtype(at::kFloat));
+
+    EXEC_NPU_CMD(aclnnMatmulMishMishCustom, x_half, w_half, b_float, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_mish_mish_custom", &matmul_mish_mish_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_mish_mish_custom", &matmul_mish_mish_impl_npu,
+          "Fused Linear + Mish + Mish (MatmulMishMishCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'matmul_mish_mish_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x, weight, bias):
+        # custom fused op: y = mish(mish(x @ weight.T + bias))
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, weight, bias)
+'''

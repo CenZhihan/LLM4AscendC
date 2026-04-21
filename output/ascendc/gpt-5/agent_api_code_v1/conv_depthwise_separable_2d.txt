@@ -1,0 +1,591 @@
+project_json_src='''
+[
+  {
+    "op": "ConvDepthwiseSeparable2dCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["NCHW"],
+        "type": ["float"]
+      },
+      {
+        "name": "w_depthwise",
+        "param_type": "required",
+        "format": ["NCHW"],
+        "type": ["float"]
+      },
+      {
+        "name": "w_pointwise",
+        "param_type": "required",
+        "format": ["NCHW"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["NCHW"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "stride",
+        "param_type": "optional",
+        "type": "listInt",
+        "default_value": "[1, 1]"
+      },
+      {
+        "name": "padding",
+        "param_type": "optional",
+        "type": "listInt",
+        "default_value": "[1, 1]"
+      },
+      {
+        "name": "groups",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "64"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(ConvDepthwiseSeparable2dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cin);
+  TILING_DATA_FIELD_DEF(uint32_t, cout);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, tileH);
+  TILING_DATA_FIELD_DEF(uint32_t, ocTile);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint32_t, padH);
+  TILING_DATA_FIELD_DEF(uint32_t, padW);
+  TILING_DATA_FIELD_DEF(uint32_t, strideH);
+  TILING_DATA_FIELD_DEF(uint32_t, strideW);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvDepthwiseSeparable2dCustom, ConvDepthwiseSeparable2dCustomTilingData)
+
+} // namespace optiling
+"""
+
+host_operator_src="""
+#include "conv_depthwise_separable_2d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+
+} // namespace
+
+namespace optiling {
+
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024; // conservative per-core budget
+static constexpr uint32_t ALIGN_W_ELEMS = 256;          // prefer wide DMA/vector lengths
+static constexpr uint32_t MAX_BLOCKS = 24;
+static constexpr uint32_t MIN_BLOCKS = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    ConvDepthwiseSeparable2dCustomTilingData tiling;
+
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *wdw_shape = context->GetInputShape(1);
+    const gert::Shape *wpw_shape = context->GetInputShape(2);
+
+    // Expect NCHW
+    const uint32_t n = static_cast<uint32_t>(x_shape->GetDim(0));
+    const uint32_t cin = static_cast<uint32_t>(x_shape->GetDim(1));
+    const uint32_t h = static_cast<uint32_t>(x_shape->GetDim(2));
+    const uint32_t w = static_cast<uint32_t>(x_shape->GetDim(3));
+    const uint32_t cout = static_cast<uint32_t>(wpw_shape->GetDim(0));
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int64_t *stride = attrs->GetAttrPointer<int64_t>(0);
+    const int64_t *padding = attrs->GetAttrPointer<int64_t>(1);
+    const int64_t *groups = attrs->GetAttrPointer<int64_t>(2);
+
+    const uint32_t strideH = (stride != nullptr) ? static_cast<uint32_t>(stride[0]) : 1u;
+    const uint32_t strideW = (stride != nullptr) ? static_cast<uint32_t>(stride[1]) : 1u;
+    const uint32_t padH = (padding != nullptr) ? static_cast<uint32_t>(padding[0]) : 1u;
+    const uint32_t padW = (padding != nullptr) ? static_cast<uint32_t>(padding[1]) : 1u;
+    (void)groups; // depthwise stage uses groups=cin by design
+
+    // We will:
+    // - Load per-channel input rows for a tile of tileH rows across full width.
+    // - Compute depthwise 3x3 for that channel over tileH x W into a temporary buffer.
+    // - Accumulate to pointwise outputs for a small ocTile of output channels.
+    // UB usage rough: inputTile (tileH+2)*(W+2) + dwOut(tileH*W) + yAcc(ocTile*tileH*W) + some overhead.
+    // Choose ocTile small (e.g., 4 or 8) and compute tileH from UB budget.
+    uint32_t ocTile = 8; // default
+    // bytes per element
+    const uint32_t bytes = 4;
+    // Assume inputTile ~ (tileH+2)*(W+2) + dwOut(tileH*W) ~ ~ (2W+2 + W)*tileH ~ 3W*tileH (approx), worst add margin.
+    // yAcc ~ ocTile * tileH * W
+    // Total approx bytes ~ bytes * tileH * ( (3W) + ocTile * W ) = bytes * tileH * W * (3 + ocTile)
+    uint64_t approxDen = static_cast<uint64_t>(bytes) * static_cast<uint64_t>(w) * static_cast<uint64_t>(3 + ocTile);
+    uint32_t tileH = (approxDen > 0) ? static_cast<uint32_t>(UB_BUDGET_BYTES / approxDen) : 1u;
+
+    if (tileH == 0) tileH = 1;
+    // Align tileH so that tileH*W aligns to vector-friendly length
+    const uint32_t alignElems = ALIGN_W_ELEMS;
+    uint32_t lineElems = w;
+    uint32_t tileElems = tileH * lineElems;
+    if (tileElems < alignElems) {
+        // Try to increase ocTile if possible to improve utilization
+        if (ocTile < 16) ocTile = 16;
+        tileH = 1;
+        tileElems = lineElems;
+    } else {
+        uint32_t alignedTileElems = AlignDown(tileElems, alignElems);
+        if (alignedTileElems == 0) alignedTileElems = tileElems;
+        tileH = alignedTileElems / lineElems;
+        if (tileH == 0) tileH = 1;
+    }
+    // Bound ocTile based on width to avoid too large UB accumulators
+    if (w >= 1024) ocTile = 4;
+
+    const uint32_t tilesPerImg = CeilDiv(h, tileH);
+    uint32_t totalTiles = n * tilesPerImg;
+    uint32_t blockDim = totalTiles;
+    if (blockDim < MIN_BLOCKS) blockDim = MIN_BLOCKS;
+    if (blockDim > MAX_BLOCKS) blockDim = MAX_BLOCKS;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_n(n);
+    tiling.set_cin(cin);
+    tiling.set_cout(cout);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_tileH(tileH);
+    tiling.set_ocTile(ocTile);
+    tiling.set_blockDim(blockDim);
+    tiling.set_padH(padH);
+    tiling.set_padW(padW);
+    tiling.set_strideH(strideH);
+    tiling.set_strideW(strideW);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *wdw_shape = context->GetInputShape(1);
+    const gert::Shape *wpw_shape = context->GetInputShape(2);
+    (void)wdw_shape;
+
+    // Output shape: [N, Cout, H_out, W_out] with stride=1 padding=1 for depthwise; pointwise preserves spatial
+    gert::Shape *y_shape = context->GetOutputShape(0);
+
+    std::vector<int64_t> y_dims(4);
+    y_dims[0] = x_shape->GetDim(0);
+    y_dims[1] = wpw_shape->GetDim(0);
+    y_dims[2] = x_shape->GetDim(2);
+    y_dims[3] = x_shape->GetDim(3);
+
+    y_shape->SetDimNum(4);
+    for (size_t i = 0; i < 4; ++i) y_shape->SetDim(i, y_dims[i]);
+
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+
+class ConvDepthwiseSeparable2dCustom : public OpDef {
+public:
+    explicit ConvDepthwiseSeparable2dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+
+        this->Input("w_depthwise")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+
+        this->Input("w_pointwise")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+
+        this->Attr("stride").AttrType(OPTIONAL).ListInt({1, 1});
+        this->Attr("padding").AttrType(OPTIONAL).ListInt({1, 1});
+        this->Attr("groups").AttrType(OPTIONAL).Int(64);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvDepthwiseSeparable2dCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t QUEUE_DEPTH = 2;
+
+// Helper for index calculations in NCHW layout
+__aicore__ inline uint64_t OffsetNCHW(uint32_t n, uint32_t c, uint32_t h, uint32_t w,
+                                      uint32_t C, uint32_t H, uint32_t W)
+{
+    return static_cast<uint64_t>(n) * C * H * W +
+           static_cast<uint64_t>(c) * H * W +
+           static_cast<uint64_t>(h) * W +
+           static_cast<uint64_t>(w);
+}
+
+class KernelConvDepthwiseSeparable2dCustom {
+public:
+    __aicore__ inline KernelConvDepthwiseSeparable2dCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR wdw, GM_ADDR wpw, GM_ADDR y,
+                                uint32_t n, uint32_t cin, uint32_t cout,
+                                uint32_t h, uint32_t w,
+                                uint32_t tileH, uint32_t ocTile,
+                                uint32_t padH, uint32_t padW,
+                                uint32_t strideH, uint32_t strideW)
+    {
+        n_ = n; cin_ = cin; cout_ = cout; h_ = h; w_ = w;
+        tileH_ = tileH; ocTile_ = ocTile;
+        padH_ = padH; padW_ = padW;
+        strideH_ = strideH; strideW_ = strideW;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint64_t>(n_) * cin_ * h_ * w_);
+        wdwGm_.SetGlobalBuffer((__gm__ float*)wdw, static_cast<uint64_t>(cin_) * 1u * 3u * 3u);
+        wpwGm_.SetGlobalBuffer((__gm__ float*)wpw, static_cast<uint64_t>(cout_) * cin_ * 1u * 1u);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint64_t>(n_) * cout_ * h_ * w_);
+
+        // Queues/buffers:
+        // - inTile (per-channel) with padding border: (tileH+2)*(w+2)
+        // - dwOut per-channel: tileH*w
+        // - yAcc per ocTile: ocTile*tileH*w
+        const uint32_t inTileElems = (tileH_ + 2u) * (w_ + 2u);
+        const uint32_t dwOutElems = tileH_ * w_;
+        const uint32_t yAccElems = ocTile_ * tileH_ * w_;
+
+        pipe_.InitBuffer(inTileQ_, QUEUE_DEPTH, inTileElems * sizeof(float));
+        pipe_.InitBuffer(dwOutQ_, 1, dwOutElems * sizeof(float));
+        pipe_.InitBuffer(yAccQ_, 1, yAccElems * sizeof(float));
+        pipe_.InitBuffer(kDwQ_, 1, 9u * sizeof(float));
+        pipe_.InitBuffer(kPwQ_, 1, ocTile_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (n_ == 0 || cin_ == 0 || cout_ == 0 || h_ == 0 || w_ == 0) return;
+
+        const uint32_t tilesPerImg = (tileH_ == 0) ? 1u : ( (h_ + tileH_ - 1u) / tileH_ );
+        const uint32_t totalTiles = n_ * tilesPerImg;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        for (uint32_t t = blockIdx; t < totalTiles; t += blockNum) {
+            const uint32_t nIdx = t / tilesPerImg;
+            const uint32_t thIdx = t % tilesPerImg;
+            const uint32_t hBase = thIdx * tileH_;
+            uint32_t curTileH = tileH_;
+            if (hBase + curTileH > h_) curTileH = h_ - hBase;
+
+            // oc tiles
+            for (uint32_t ocBase = 0; ocBase < cout_; ocBase += ocTile_) {
+                const uint32_t ocSpan = (ocBase + ocTile_ <= cout_) ? ocTile_ : (cout_ - ocBase);
+
+                // yAcc buffer zero-initialized
+                AscendC::LocalTensor<float> yAcc = yAccQ_.AllocTensor<float>();
+                AscendC::Duplicate(yAcc, 0.0f, ocSpan * curTileH * w_);
+
+                // accumulate over input channels
+                for (uint32_t ic = 0; ic < cin_; ++ic) {
+                    // Load depthwise weights (9 floats for channel ic)
+                    AscendC::LocalTensor<float> kDw = kDwQ_.AllocTensor<float>();
+                    // wdw layout: [cin, 1, 3, 3]
+                    const uint64_t kdwOff = static_cast<uint64_t>(ic) * 9u;
+                    AscendC::DataCopy(kDw, wdwGm_[kdwOff], 9u);
+
+                    // Compute depthwise conv on (curTileH, w_) for this channel ic into dwOut
+                    AscendC::LocalTensor<float> inTile = inTileQ_.AllocTensor<float>();
+                    AscendC::LocalTensor<float> dwOut = dwOutQ_.AllocTensor<float>();
+
+                    // Build input tile with zero padding
+                    BuildPaddedInputTile(nIdx, ic, hBase, curTileH, inTile);
+
+                    // Depthwise 3x3 conv with stride 1, padding included in inTile
+                    DwConv3x3(inTile, kDw, dwOut, curTileH, w_);
+
+                    // Accumulate pointwise: yAcc[oc, pos] += dwOut[pos] * wpw[oc, ic]
+                    // For current oc-tile, load the ocSpan weights for this ic once and apply
+                    AscendC::LocalTensor<float> kPw = kPwQ_.AllocTensor<float>();
+                    // wpw layout: [cout, cin, 1, 1]
+                    AscendC::GlobalTensor<float> wpwSlice = wpwGm_[static_cast<uint64_t>(ocBase) * cin_ + ic * 1u];
+                    // The above indexing may not be contiguous in memory for ocSpan>1; handle by copying a loop
+                    // Copy ocSpan weights individually
+                    for (uint32_t oco = 0; oco < ocSpan; ++oco) {
+                        float tmp;
+                        AscendC::DataCopy(reinterpret_cast<AscendC::LocalTensor<float>&>(kPw[oco]), wpwGm_[static_cast<uint64_t>(ocBase + oco) * cin_ + ic], 1u);
+                        (void)tmp;
+                    }
+
+                    // yAcc accumulation: for each oc within ocSpan, yAcc[oco, :] += dwOut[:] * kPw[oco]
+                    AccumulatePointwise(yAcc, dwOut, kPw, ocSpan, curTileH, w_);
+
+                    // Free temporaries
+                    kPwQ_.FreeTensor(kPw);
+                    dwOutQ_.FreeTensor(dwOut);
+                    inTileQ_.FreeTensor(inTile);
+                    kDwQ_.FreeTensor(kDw);
+                }
+
+                // Write yAcc to output y GM at [nIdx, ocBase:ocBase+ocSpan, hBase:hBase+curTileH, :]
+                StoreYTile(nIdx, ocBase, ocSpan, hBase, curTileH, yAcc);
+
+                yAccQ_.FreeTensor(yAcc);
+            } // oc tiles
+        } // tiles loop
+    }
+
+private:
+    // Build padded input tile (tileH+2, w+2) for given n, ic, starting at hBase rows
+    __aicore__ inline void BuildPaddedInputTile(uint32_t nIdx, uint32_t ic, uint32_t hBase, uint32_t curTileH,
+                                                AscendC::LocalTensor<float>& inTile)
+    {
+        const uint32_t padTop = 1u;
+        const uint32_t padLeft = 1u;
+        const uint32_t padBottom = 1u;
+        const uint32_t padRight = 1u;
+        const uint32_t tileRows = curTileH + padTop + padBottom; // +2
+        const uint32_t tileCols = w_ + padLeft + padRight; // +2
+
+        // Fill full tile with zeros
+        AscendC::Duplicate(inTile, 0.0f, tileRows * tileCols);
+
+        // For each row r in 0..curTileH-1, copy x[nIdx, ic, hBase+r, 0:w_] into inTile at row (r+1), col offset 1
+        for (uint32_t r = 0; r < curTileH; ++r) {
+            uint32_t inH = hBase + r;
+            // Source GM offset for start of row
+            const uint64_t srcOff = OffsetNCHW(nIdx, ic, inH, 0, cin_, h_, w_);
+            // Dest local offset
+            const uint32_t dstOff = (r + padTop) * tileCols + padLeft;
+
+            // Copy the row
+            AscendC::DataCopy(inTile[dstOff], xGm_[srcOff], w_);
+        }
+        // Top and bottom padding rows already zero from Duplicate; left/right padded cols remain zero.
+    }
+
+    // Depthwise 3x3 convolution: inTile (curTileH+2, w+2) -> dwOut (curTileH, w)
+    __aicore__ inline void DwConv3x3(AscendC::LocalTensor<float>& inTile,
+                                     AscendC::LocalTensor<float>& kDw,
+                                     AscendC::LocalTensor<float>& dwOut,
+                                     uint32_t curTileH, uint32_t W)
+    {
+        const uint32_t tileCols = W + 2u;
+        // For each output row
+        for (uint32_t r = 0; r < curTileH; ++r) {
+            const uint32_t base0 = (r + 0u) * tileCols;
+            const uint32_t base1 = (r + 1u) * tileCols;
+            const uint32_t base2 = (r + 2u) * tileCols;
+            // For vector-friendly, compute each row segment in chunks
+            const uint32_t len = W;
+
+            // temp buffers for row-wise accumulation
+            // y = k00 * row0[0:W] + k01 * row0[1:W+1] + k02 * row0[2:W+2]
+            //   + k10 * row1[0:W] + k11 * row1[1:W+1] + k12 * row1[2:W+2]
+            //   + k20 * row2[0:W] + k21 * row2[1:W+1] + k22 * row2[2:W+2]
+            // Compute incrementally into dwOut row
+            AscendC::LocalTensor<float> tmp = dwOutQ_.AllocTensor<float>();
+            AscendC::Duplicate(tmp, 0.0f, len);
+
+            // Row 0
+            RowFma(tmp, inTile[base0 + 0u], inTile[base0 + 1u], inTile[base0 + 2u], kDw, 0u, len);
+            // Row 1
+            RowFma(tmp, inTile[base1 + 0u], inTile[base1 + 1u], inTile[base1 + 2u], kDw, 3u, len);
+            // Row 2
+            RowFma(tmp, inTile[base2 + 0u], inTile[base2 + 1u], inTile[base2 + 2u], kDw, 6u, len);
+
+            // Store to dwOut row r
+            const uint32_t dstRowOff = r * W;
+            AscendC::DataCopy(dwOut[dstRowOff], tmp, len);
+            dwOutQ_.FreeTensor(tmp);
+        }
+    }
+
+    // RowFma: tmp += a*k[idx] + b*k[idx+1] + c*k[idx+2] over len elements
+    __aicore__ inline void RowFma(AscendC::LocalTensor<float>& tmp,
+                                  AscendC::LocalTensor<float> a,
+                                  AscendC::LocalTensor<float> b,
+                                  AscendC::LocalTensor<float> c,
+                                  AscendC::LocalTensor<float>& kDw,
+                                  uint32_t kOff,
+                                  uint32_t len)
+    {
+        // t = a * k0
+        AscendC::LocalTensor<float> t = yAccQ_.AllocTensor<float>();
+        AscendC::Muls(t, a, kDw[kOff + 0u], len);
+        // t += b * k1
+        AscendC::Madd(t, b, kDw[kOff + 1u], t, len);
+        // t += c * k2
+        AscendC::Madd(t, c, kDw[kOff + 2u], t, len);
+        // tmp += t
+        AscendC::Add(tmp, tmp, t, len);
+        yAccQ_.FreeTensor(t);
+    }
+
+    // Accumulate pointwise: yAcc[ocSpan, curTileH, W] += dwOut[curTileH,W] * kPw[ocSpan]
+    __aicore__ inline void AccumulatePointwise(AscendC::LocalTensor<float>& yAcc,
+                                               AscendC::LocalTensor<float>& dwOut,
+                                               AscendC::LocalTensor<float>& kPw,
+                                               uint32_t ocSpan, uint32_t curTileH, uint32_t W)
+    {
+        const uint32_t posElems = curTileH * W;
+        for (uint32_t oco = 0; oco < ocSpan; ++oco) {
+            // yAcc slice for this oc
+            AscendC::LocalTensor<float> yAccSlice = yAcc[oco * posElems];
+            // yAccSlice += dwOut * kPw[oco]
+            AscendC::Madd(yAccSlice, dwOut, kPw[oco], yAccSlice, posElems);
+        }
+    }
+
+    // Store yAcc of shape (ocSpan, curTileH, W) into yGm at [nIdx, ocBase:ocBase+ocSpan, hBase:hBase+curTileH, :]
+    __aicore__ inline void StoreYTile(uint32_t nIdx, uint32_t ocBase, uint32_t ocSpan,
+                                      uint32_t hBase, uint32_t curTileH,
+                                      AscendC::LocalTensor<float>& yAcc)
+    {
+        const uint32_t posElems = curTileH * w_;
+        for (uint32_t oco = 0; oco < ocSpan; ++oco) {
+            const uint64_t baseOut = OffsetNCHW(nIdx, ocBase + oco, 0, 0, cout_, h_, w_);
+            // For each row in tile
+            for (uint32_t r = 0; r < curTileH; ++r) {
+                const uint64_t dstOff = baseOut + static_cast<uint64_t>(hBase + r) * w_;
+                const uint32_t srcOff = oco * posElems + r * w_;
+                AscendC::DataCopy(yGm_[dstOff], yAcc[srcOff], w_);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, QUEUE_DEPTH> inTileQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> dwOutQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> yAccQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> kDwQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> kPwQ_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wdwGm_;
+    AscendC::GlobalTensor<float> wpwGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t n_{0}, cin_{0}, cout_{0}, h_{0}, w_{0};
+    uint32_t tileH_{1}, ocTile_{4};
+    uint32_t padH_{1}, padW_{1}, strideH_{1}, strideW_{1};
+};
+
+extern "C" __global__ __aicore__ void conv_depthwise_separable_2d_custom(GM_ADDR x, GM_ADDR w_depthwise, GM_ADDR w_pointwise, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConvDepthwiseSeparable2dCustom op;
+    op.Init(x, w_depthwise, w_pointwise, y,
+            tiling_data.n, tiling_data.cin, tiling_data.cout,
+            tiling_data.h, tiling_data.w,
+            tiling_data.tileH, tiling_data.ocTile,
+            tiling_data.padH, tiling_data.padW,
+            tiling_data.strideH, tiling_data.strideW);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor conv_depthwise_separable_2d_impl_npu(const at::Tensor& x,
+                                                const at::Tensor& w_depthwise,
+                                                const at::Tensor& w_pointwise)
+{
+    // Output tensor shape: [N, Cout, H, W]
+    auto N = x.size(0);
+    auto H = x.size(2);
+    auto W = x.size(3);
+    auto Cout = w_pointwise.size(0);
+    at::Tensor y = at::empty({N, Cout, H, W}, x.options());
+    EXEC_NPU_CMD(aclnnConvDepthwiseSeparable2dCustom, x, w_depthwise, w_pointwise, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_depthwise_separable_2d_custom", &conv_depthwise_separable_2d_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_depthwise_separable_2d_custom", &conv_depthwise_separable_2d_impl_npu,
+          "Fused Depthwise(3x3, s=1, p=1) + Pointwise(1x1) Conv2D (ConvDepthwiseSeparable2dCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'conv_depthwise_separable_2d_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''

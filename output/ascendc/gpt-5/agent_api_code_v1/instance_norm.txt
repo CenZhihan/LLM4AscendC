@@ -1,0 +1,393 @@
+project_json_src='''
+[
+  {
+    "op": "InstanceNormCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "epsilon",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "1e-5"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(InstanceNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, groupSize);   // h * w
+  TILING_DATA_FIELD_DEF(uint32_t, totalElems);  // n * c * h * w
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);  // spatial tile len
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(float, epsilon);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(InstanceNormCustom, InstanceNormCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "instance_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+// UB model for this kernel:
+//   inQueue: 2 * tile
+//   outQueue: 2 * tile
+//   tmpQueue (compute): 1 * tile
+//   reduceWsQueue: 1 * tile
+// Total floats ~= 6 * tile => bytes = 24 * tile
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
+static constexpr uint32_t ALIGN_ELEMS = 2048;            // favor large DMA bursts
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;        // avoid too-large per-iter latency
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return (x / a) * a;
+}
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (a + b - 1u) / b;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    InstanceNormCustomTilingData tiling;
+
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const int32_t dims = static_cast<int32_t>(x_shape->GetOriginShape().GetDimNum());
+    if (dims != 4) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const uint32_t n = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    const uint32_t c = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    const uint32_t h = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(2));
+    const uint32_t w = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(3));
+    const uint32_t groupSize = h * w;
+    const uint64_t totalElems64 = static_cast<uint64_t>(n) * c * h * w;
+    if (totalElems64 > 0xFFFFFFFFull) {
+        return ge::GRAPH_FAILED;
+    }
+    const uint32_t totalElems = static_cast<uint32_t>(totalElems64);
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    float epsilon = 1e-5f;
+    if (attrs && attrs->GetAttrNum() > 0) {
+        const float *epsPtr = attrs->GetAttrPointer<float>(0);
+        if (epsPtr != nullptr) {
+            epsilon = *epsPtr;
+        }
+    }
+
+    // tileLen from UB budget: bytes = 24 * tileLen
+    uint32_t maxTile = UB_BUDGET_BYTES / 24;  // in elements
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t tileLen = maxTile;
+    if (groupSize < tileLen) {
+        const uint32_t aligned = AlignDown(groupSize, ALIGN_ELEMS);
+        tileLen = (aligned > 0) ? aligned : groupSize;
+    }
+
+    // BlockDim based on number of instance-channels (groups)
+    const uint32_t groups = (n == 0 || c == 0) ? 1u : (n * c);
+    uint32_t blockDim = groups;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_groupSize(groupSize);
+    tiling.set_totalElems(totalElems);
+    tiling.set_tileLength(tileLen);
+    tiling.set_blockDim(blockDim);
+    tiling.set_epsilon(epsilon);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class InstanceNormCustom : public OpDef {
+public:
+    explicit InstanceNormCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("epsilon").AttrType(OPTIONAL).Float(1e-5);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(InstanceNormCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+#include "lib/reduce/reduce.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelInstanceNormCustom {
+public:
+    __aicore__ inline KernelInstanceNormCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t h, uint32_t w,
+                                uint32_t groupSize, uint32_t totalElems,
+                                uint32_t tileLength, float epsilon)
+    {
+        n_ = n;
+        c_ = c;
+        h_ = h;
+        w_ = w;
+        groups_ = (n_ == 0 || c_ == 0) ? 0 : (n_ * c_);
+        groupSize_ = groupSize;
+        totalLen_ = totalElems;
+        tileLen_ = tileLength;
+        eps_ = epsilon;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inQueue_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueue_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));        // for sqr/shift
+        pipe_.InitBuffer(reduceWsQueue_, 1, tileLen_ * sizeof(float));   // reduce workspace
+        pipe_.InitBuffer(reduceDstQueue_, 1, sizeof(float));             // scalar reduce out
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0 || tileLen_ == 0 || groups_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        // grid-stride over groups (N*C)
+        for (uint32_t g = blockIdx; g < groups_; g += blockNum) {
+            const uint32_t base = g * groupSize_;
+            // Pass 1: accumulate sum and sumsq over H*W for this group
+            float sum = 0.0f;
+            float sumsq = 0.0f;
+
+            for (uint32_t offset = 0; offset < groupSize_; offset += tileLen_) {
+                uint32_t len = groupSize_ - offset;
+                if (len > tileLen_) len = tileLen_;
+
+                CopyIn(base + offset, len);
+
+                // xLocal is in inQueue_
+                AscendC::LocalTensor<float> xLocal = inQueue_.DeQue<float>();
+                AscendC::LocalTensor<float> tLocal = tmpQueue_.AllocTensor<float>();
+                AscendC::LocalTensor<float> redDst = reduceDstQueue_.AllocTensor<float>();
+                AscendC::LocalTensor<float> redWs = reduceWsQueue_.AllocTensor<float>();
+
+                // Reduce sum(x)
+                AscendC::ReduceSum(redDst, xLocal, redWs, static_cast<int32_t>(len));
+                // Read reduced scalar
+                float tileSum = redDst.GetValue(0);
+                sum += tileSum;
+
+                // tLocal = x * x
+                AscendC::Mul(tLocal, xLocal, xLocal, len);
+                // Reduce sum(x^2)
+                AscendC::ReduceSum(redDst, tLocal, redWs, static_cast<int32_t>(len));
+                float tileSumSq = redDst.GetValue(0);
+                sumsq += tileSumSq;
+
+                reduceWsQueue_.FreeTensor(redWs);
+                reduceDstQueue_.FreeTensor(redDst);
+                tmpQueue_.FreeTensor(tLocal);
+                inQueue_.FreeTensor(xLocal);
+            }
+
+            const float cnt = static_cast<float>(groupSize_);
+            const float mean = sum / cnt;
+            const float var = sumsq / cnt - mean * mean;
+            const float invStd = rsqrtf(var + eps_);
+
+            // Pass 2: normalize and write out
+            for (uint32_t offset = 0; offset < groupSize_; offset += tileLen_) {
+                uint32_t len = groupSize_ - offset;
+                if (len > tileLen_) len = tileLen_;
+
+                CopyIn(base + offset, len);
+
+                AscendC::LocalTensor<float> xLocal = inQueue_.DeQue<float>();
+                AscendC::LocalTensor<float> yLocal = outQueue_.AllocTensor<float>();
+                AscendC::LocalTensor<float> tLocal = tmpQueue_.AllocTensor<float>();
+
+                // tLocal = x - mean
+                AscendC::Adds(tLocal, xLocal, -mean, len);
+                // yLocal = tLocal * invStd
+                AscendC::Muls(yLocal, tLocal, invStd, len);
+
+                tmpQueue_.FreeTensor(tLocal);
+                outQueue_.EnQue(yLocal);
+                inQueue_.FreeTensor(xLocal);
+
+                CopyOut(base + offset, len);
+            }
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueue_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm_[gmOffset], len);
+        inQueue_.EnQue(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueue_.DeQue<float>();
+        AscendC::DataCopy(yGm_[gmOffset], yLocal, len);
+        outQueue_.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> reduceWsQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> reduceDstQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t n_ {0}, c_ {0}, h_ {0}, w_ {0};
+    uint32_t groups_ {0};
+    uint32_t groupSize_ {0};
+    uint32_t totalLen_ {0};
+    uint32_t tileLen_ {0};
+    float eps_ {1e-5f};
+};
+
+extern "C" __global__ __aicore__ void instance_norm_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelInstanceNormCustom op;
+    op.Init(x, y,
+            tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w,
+            tiling_data.groupSize, tiling_data.totalElems,
+            tiling_data.tileLength, tiling_data.epsilon);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor instance_norm_impl_npu(const at::Tensor& self, double epsilon = 1e-5) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnInstanceNormCustom, self, static_cast<float>(epsilon), result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("instance_norm_custom", &instance_norm_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("instance_norm_custom", &instance_norm_impl_npu, "InstanceNorm2d (InstanceNormCustom on NPU)",
+          py::arg("x"), py::arg("epsilon") = 1e-5);
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'instance_norm_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.num_features = num_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x)
+'''

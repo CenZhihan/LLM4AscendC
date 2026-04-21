@@ -1,0 +1,438 @@
+project_json_src='''
+[
+  {
+    "op": "MatmulScalingResidualAddCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "w",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "b",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "scaling",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulScalingResidualAddCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulScalingResidualAddCustom, MatmulScalingResidualAddCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "matmul_scaling_residual_add_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+
+// UB model for post-scale+residual pass (y = y * s + y):
+//   inY: 2 * tile
+//   outY: 2 * tile
+// Total floats = 4 * tile => bytes = 16 * tile
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
+static constexpr uint32_t ALIGN_ELEMS = 2048;
+static constexpr uint32_t HARD_CAP_ELEMS = 65536;
+} // namespace
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    MatmulScalingResidualAddCustomTilingData tiling;
+
+    const auto *x_shape = context->GetInputShape(0);
+    const auto *w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+
+    // Shapes:
+    // x: [M, K], w: [N, K], b: [N], y: [M, N]
+    const uint32_t dims_x = static_cast<uint32_t>(x_shape->GetOriginShape().GetDimNum());
+    const uint32_t dims_w = static_cast<uint32_t>(w_shape->GetOriginShape().GetDimNum());
+    if (dims_x < 2 || dims_w < 2) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    const uint64_t M = x_shape->GetOriginShape().GetDim(x_shape->GetOriginShape().GetDimNum() - 2);
+    const uint64_t Kx = x_shape->GetOriginShape().GetDim(x_shape->GetOriginShape().GetDimNum() - 1);
+    const uint64_t N = w_shape->GetOriginShape().GetDim(w_shape->GetOriginShape().GetDimNum() - 2);
+    const uint64_t Kw = w_shape->GetOriginShape().GetDim(w_shape->GetOriginShape().GetDimNum() - 1);
+    if (Kx != Kw) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    const uint64_t totalLen64 = M * N;
+    if (totalLen64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    const uint32_t totalLength = static_cast<uint32_t>(totalLen64);
+
+    // Post-pass tileLen from UB budget: bytes = 16 * tileLen
+    uint32_t maxTile = UB_BUDGET_BYTES / 16;
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t tileLen = maxTile;
+    if (totalLength < tileLen) {
+        const uint32_t aligned = AlignDown(totalLength, ALIGN_ELEMS);
+        tileLen = (aligned > 0) ? aligned : totalLength;
+    }
+
+    const uint32_t numTiles = (tileLen == 0) ? 1u : CeilDiv(totalLength, tileLen);
+    uint32_t blockDim = numTiles;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileLength(tileLen);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return GRAPH_PARAM_INVALID;
+    }
+
+    // x: [M, K], w: [N, K]
+    const auto &x_os = x_shape->GetOriginShape();
+    const auto &w_os = w_shape->GetOriginShape();
+    if (x_os.GetDimNum() < 2 || w_os.GetDimNum() < 2) {
+        return GRAPH_PARAM_INVALID;
+    }
+
+    const int64_t M = x_os.GetDim(x_os.GetDimNum() - 2);
+    const int64_t N = w_os.GetDim(w_os.GetDimNum() - 2);
+    if (M < 0 || N < 0) {
+        return GRAPH_PARAM_INVALID;
+    }
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    std::vector<int64_t> out_dims = {M, N};
+    y_shape->SetDimNum(2);
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        y_shape->SetDim(i, out_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    const ge::DataType w_dtype = context->GetInputDataType(1);
+    const ge::DataType b_dtype = context->GetInputDataType(2);
+    const ge::DataType s_dtype = context->GetInputDataType(3);
+    if (x_dtype != ge::DT_FLOAT || w_dtype != ge::DT_FLOAT || b_dtype != ge::DT_FLOAT || s_dtype != ge::DT_FLOAT) {
+        return GRAPH_PARAM_INVALID;
+    }
+    context->SetOutputDataType(0, ge::DT_FLOAT);
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+class MatmulScalingResidualAddCustom : public OpDef {
+public:
+    explicit MatmulScalingResidualAddCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("scaling")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        // Let GE provide cube tiling for the matmul; we provide our post-pass tiling via TilingFunc.
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulScalingResidualAddCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+// Post-scale+residual pass queues
+constexpr int32_t VEC_BUFFER_NUM = 2;
+
+class KernelPostScaleResidual {
+public:
+    __aicore__ inline KernelPostScaleResidual() {}
+
+    __aicore__ inline void Init(GM_ADDR y, GM_ADDR scaling,
+                                uint32_t totalLength, uint32_t tileLength)
+    {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+        sGm_.SetGlobalBuffer((__gm__ float*)scaling, 1); // expects a scalar tensor
+
+        pipe_.InitBuffer(inQueueY_, VEC_BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, VEC_BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(scalarQueue_, 1, 1 * sizeof(float));
+
+        // Load scaling scalar to local once; alpha = 1 + s
+        AscendC::LocalTensor<float> sLocal = scalarQueue_.AllocTensor<float>();
+        AscendC::DataCopy(sLocal, sGm_[0], 1);
+        scalarQueue_.EnQue<float>(sLocal);
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0 || tileLen_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        const uint32_t strideElems = blockNum * tileLen_;
+        uint32_t base = blockIdx * tileLen_;
+        if (base >= totalLen_) {
+            // free scalar
+            AscendC::LocalTensor<float> sLocal = scalarQueue_.DeQue<float>();
+            scalarQueue_.FreeTensor(sLocal);
+            return;
+        }
+
+        // prefetch first tile
+        uint32_t curLen = totalLen_ - base;
+        if (curLen > tileLen_) curLen = tileLen_;
+        CopyIn(base, curLen);
+
+        // Load scalar alpha
+        AscendC::LocalTensor<float> sLocal = scalarQueue_.DeQue<float>();
+        float sVal = sLocal.GetValue(0);
+        const float alpha = sVal + 1.0f;
+        scalarQueue_.FreeTensor(sLocal);
+
+        while (true) {
+            const uint32_t nextBase = base + strideElems;
+            uint32_t nextLen = 0;
+            if (nextBase < totalLen_) {
+                nextLen = totalLen_ - nextBase;
+                if (nextLen > tileLen_) nextLen = tileLen_;
+                CopyIn(nextBase, nextLen);
+            }
+
+            Compute(curLen, alpha);
+            CopyOut(base, curLen);
+
+            if (nextLen == 0) break;
+            base = nextBase;
+            curLen = nextLen;
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocal = inQueueY_.AllocTensor<float>();
+        AscendC::DataCopy(yLocal, yGm_[gmOffset], len);
+        inQueueY_.EnQue(yLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t len, float alpha)
+    {
+        AscendC::LocalTensor<float> yIn = inQueueY_.DeQue<float>();
+        AscendC::LocalTensor<float> yOut = outQueueY_.AllocTensor<float>();
+
+        // y = y * alpha
+        AscendC::Muls(yOut, yIn, alpha, len);
+
+        outQueueY_.EnQue<float>(yOut);
+        inQueueY_.FreeTensor(yIn);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueueY_.DeQue<float>();
+        AscendC::DataCopy(yGm_[gmOffset], yLocal, len);
+        outQueueY_.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, VEC_BUFFER_NUM> inQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, VEC_BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> scalarQueue_;
+
+    AscendC::GlobalTensor<float> yGm_;
+    AscendC::GlobalTensor<float> sGm_;
+
+    uint32_t totalLen_{0};
+    uint32_t tileLen_{0};
+};
+
+
+// Matmul + bias using cube, followed by post scaling
+extern "C" __global__ __aicore__ void matmul_scaling_residual_add_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b,
+                                                                          GM_ADDR scaling, GM_ADDR y,
+                                                                          GM_ADDR workspace, GM_ADDR tiling)
+{
+    // Access tiling: cubeTilingData is provided by GE; custom fields for post-pass are in our tiling data
+    GET_TILING_DATA(tilingData, tiling);
+
+    // Define matmul tensor types: x [M,K], w [N,K] (B is transposed), y [M,N]
+    using A_TYPE = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL>;
+    using B_TYPE = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, true,  LayoutMode::NORMAL>;
+    using C_TYPE = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL>;
+    using BIAS_TYPE = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float>;
+
+    AscendC::TPipe pipe;
+
+    // Use full L1/L0C for better matmul performance
+    tilingData.cubeTilingData.shareMode = 0;
+    tilingData.cubeTilingData.shareL1Size = FULL_L1_SIZE;
+    tilingData.cubeTilingData.shareL0CSize = FULL_L0C_SIZE;
+    tilingData.cubeTilingData.shareUbSize = 0;
+
+    // Create and register cube matmul
+    // BatchMatmulKernel is used as a utility wrapper for single-matmul as well.
+    BatchMatmulKernel<A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE> mmKernel;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mmKernel.matmulObj, &tilingData.cubeTilingData);
+
+    // Init and run matmul: C = A * B^T + Bias
+    mmKernel.Init(x, w, b, y, workspace, tilingData.cubeTilingData);
+    // batchNum=1 for single matmul
+    mmKernel.Process<true>(&pipe, 1, 1);
+
+    // Post scale+residual: y = y * (1 + scaling[0])
+    KernelPostScaleResidual post;
+    post.Init(y, scaling, tilingData.totalLength, tilingData.tileLength);
+    post.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor matmul_scaling_residual_add_impl_npu(const at::Tensor& x,
+                                                const at::Tensor& w,
+                                                const at::Tensor& b,
+                                                const at::Tensor& scaling) {
+    // x: [M, K], w: [N, K], b: [N], scaling: [1]
+    auto M = x.size(0);
+    auto N = w.size(0);
+    at::Tensor y = at::empty({M, N}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulScalingResidualAddCustom, x, w, b, scaling, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_scaling_residual_add_custom", &matmul_scaling_residual_add_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_scaling_residual_add_custom", &matmul_scaling_residual_add_impl_npu,
+          "Fused Linear + Scale-Residual (MatmulScalingResidualAddCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'matmul_scaling_residual_add_custom'
+
+class ModelNew(torch.nn.Module):
+    """
+    Pybind: (x, w, b, scaling) — scaling scalar float tensor.
+    Computes y = F.linear(x, w, b); returns y * scaling + y.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x, w, b, scaling):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, w, b, scaling)
+'''

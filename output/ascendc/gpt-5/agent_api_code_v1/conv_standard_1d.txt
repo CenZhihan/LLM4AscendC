@@ -1,0 +1,450 @@
+project_json_src='''
+[
+  {
+    "op": "ConvStandard1dCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": []
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(ConvStandard1dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, Cin);
+  TILING_DATA_FIELD_DEF(uint32_t, Lin);
+  TILING_DATA_FIELD_DEF(uint32_t, Cout);
+  TILING_DATA_FIELD_DEF(uint32_t, Kh);
+  TILING_DATA_FIELD_DEF(uint32_t, Lout);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLen);
+  TILING_DATA_FIELD_DEF(uint32_t, coutTile);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvStandard1dCustom, ConvStandard1dCustomTilingData)
+
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "conv_standard_1d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+
+static constexpr uint32_t UB_BUDGET_BYTES = 180 * 1024;  // conservative per-core share
+static constexpr uint32_t ALIGN_ELEMS = 256;             // DMA/vector friendly
+static constexpr uint32_t MIN_TILE = 128;
+static constexpr uint32_t MAX_BLOCKS = 24;
+static constexpr uint32_t MIN_BLOCKS = 8;
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return (a == 0) ? x : (x / a) * a;
+}
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (a + b - 1u) / b;
+}
+
+} // anonymous namespace
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    ConvStandard1dCustomTilingData tiling;
+
+    // Extract shapes: x[N, Cin, Lin], weight[Cout, Cin, Kh]
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+    if (x_shape->GetStorageShape().GetDimNum() != 3 || w_shape->GetStorageShape().GetDimNum() != 3) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const uint32_t N   = static_cast<uint32_t>(x_shape->GetStorageShape().GetDim(0));
+    const uint32_t Cin = static_cast<uint32_t>(x_shape->GetStorageShape().GetDim(1));
+    const uint32_t Lin = static_cast<uint32_t>(x_shape->GetStorageShape().GetDim(2));
+    const uint32_t Cout = static_cast<uint32_t>(w_shape->GetStorageShape().GetDim(0));
+    const uint32_t Kh   = static_cast<uint32_t>(w_shape->GetStorageShape().GetDim(2));
+
+    if (Lin < Kh) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const uint32_t Lout = Lin - Kh + 1;
+
+    // Choose coutTile conservatively
+    uint32_t coutTile = (Cout >= 8u) ? 8u : Cout;
+    if (coutTile == 0u) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // UB budget in float elements
+    const uint32_t ubElems = UB_BUDGET_BYTES / 4u;
+
+    // UB model:
+    //   X window: Cin * (tileLen + Kh - 1)
+    //   Weights (per-output channel processing): Cin * Kh
+    //   Output vector: tileLen
+    //   Temp vector: tileLen
+    // We process one output channel at a time; to reduce DMA latency, we may prefetch a small number
+    // of output channels (coutTilePack). But to keep UB simple and robust, use per-channel weights.
+    // So required elements per tile:
+    //   elems = Cin*(tileLen + Kh - 1) + (Cin*Kh) + tileLen + tileLen
+    //         = (Cin + 2) * tileLen + Cin*(Kh - 1) + Cin*Kh
+    //         = (Cin + 2) * tileLen + Cin*(2*Kh - 1)
+    //
+    // Additionally we may hold a small scratch, leave margin -> keep the same formula with safety.
+    const uint32_t constTerm = Cin * (2u * Kh - 1u);
+    uint32_t maxTileLen = 0;
+    if (ubElems > constTerm) {
+        maxTileLen = (ubElems - constTerm) / (Cin + 2u);
+    }
+    // Align and clamp tile length
+    if (maxTileLen > Lout) maxTileLen = Lout;
+    uint32_t tileLen = AlignDown(maxTileLen, ALIGN_ELEMS);
+    if (tileLen == 0u) {
+        tileLen = (maxTileLen > MIN_TILE) ? AlignDown(maxTileLen, MIN_TILE) : (maxTileLen == 0u ? 1u : maxTileLen);
+    }
+    if (tileLen < MIN_TILE && Lout >= MIN_TILE) {
+        tileLen = MIN_TILE;
+    }
+
+    const uint32_t tilesPerN = CeilDiv(Lout, tileLen);
+    uint32_t totalTiles = N * tilesPerN;
+    if (totalTiles == 0u) totalTiles = 1u;
+
+    uint32_t blockDim = totalTiles;
+    if (blockDim < MIN_BLOCKS) blockDim = MIN_BLOCKS;
+    if (blockDim > MAX_BLOCKS) blockDim = MAX_BLOCKS;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_N(N);
+    tiling.set_Cin(Cin);
+    tiling.set_Lin(Lin);
+    tiling.set_Cout(Cout);
+    tiling.set_Kh(Kh);
+    tiling.set_Lout(Lout);
+    tiling.set_tileLen(tileLen);
+    tiling.set_coutTile(coutTile);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+    if (x_shape->GetStorageShape().GetDimNum() != 3 || w_shape->GetStorageShape().GetDimNum() != 3) {
+        return GRAPH_FAILED;
+    }
+    const int64_t N   = x_shape->GetStorageShape().GetDim(0);
+    const int64_t Cin = x_shape->GetStorageShape().GetDim(1);
+    const int64_t Lin = x_shape->GetStorageShape().GetDim(2);
+    const int64_t Cout = w_shape->GetStorageShape().GetDim(0);
+    const int64_t Kh   = w_shape->GetStorageShape().GetDim(2);
+    if (Lin < Kh) {
+        return GRAPH_FAILED;
+    }
+    const int64_t Lout = Lin - Kh + 1;
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(3);
+    y_shape->SetDim(0, N);
+    y_shape->SetDim(1, Cout);
+    y_shape->SetDim(2, Lout);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    const ge::DataType w_dtype = context->GetInputDataType(1);
+    if (x_dtype != ge::DT_FLOAT || w_dtype != ge::DT_FLOAT) {
+        return GRAPH_FAILED;
+    }
+    context->SetOutputDataType(0, ge::DT_FLOAT);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class ConvStandard1dCustom : public OpDef {
+public:
+    explicit ConvStandard1dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvStandard1dCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+class KernelConvStandard1dCustom {
+public:
+    __aicore__ inline KernelConvStandard1dCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                uint32_t N, uint32_t Cin, uint32_t Lin,
+                                uint32_t Cout, uint32_t Kh, uint32_t Lout,
+                                uint32_t tileLen)
+    {
+        N_ = N; Cin_ = Cin; Lin_ = Lin;
+        Cout_ = Cout; Kh_ = Kh; Lout_ = Lout;
+        tileLen_ = tileLen;
+        winStride_ = tileLen_ + Kh_ - 1;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint32_t>(N_ * Cin_ * Lin_));
+        wGm_.SetGlobalBuffer((__gm__ float*)w, static_cast<uint32_t>(Cout_ * Cin_ * Kh_));
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint32_t>(N_ * Cout_ * Lout_));
+
+        // Buffers:
+        //  X window: Cin * (tileLen + Kh - 1)
+        //  Weight (per channel): Cin * Kh
+        //  Output vector: tileLen
+        //  Temp vector: tileLen
+        const uint32_t xWinElems = Cin_ * (tileLen_ + Kh_ - 1);
+        const uint32_t wElems    = Cin_ * Kh_;
+        const uint32_t yElems    = tileLen_;
+
+        pipe_.InitBuffer(inQueueX_, 1, xWinElems * sizeof(float));
+        pipe_.InitBuffer(inQueueW_, 1, wElems * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, 1, yElems * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, yElems * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (Lout_ == 0 || tileLen_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        const uint32_t tilesPerN = (Lout_ + tileLen_ - 1) / tileLen_;
+        uint64_t totalTiles = static_cast<uint64_t>(N_) * static_cast<uint64_t>(tilesPerN);
+
+        for (uint64_t tileId = blockIdx; tileId < totalTiles; tileId += blockNum) {
+            const uint32_t n = static_cast<uint32_t>(tileId / tilesPerN);
+            const uint32_t t = static_cast<uint32_t>(tileId % tilesPerN);
+            const uint32_t baseL = t * tileLen_;
+            uint32_t curLen = Lout_ - baseL;
+            if (curLen > tileLen_) curLen = tileLen_;
+            const uint32_t curWinLen = curLen + Kh_ - 1;
+
+            // Copy input window for this (n, baseL)
+            CopyInX(n, baseL, curWinLen);
+
+            // Fetch the X window local tensor
+            AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+
+            // For each output channel, compute and write
+            const uint32_t yNBase = n * Cout_ * Lout_;
+            for (uint32_t co = 0; co < Cout_; ++co) {
+                // Copy weights for this output channel
+                CopyInW(co);
+
+                AscendC::LocalTensor<float> wLocal = inQueueW_.DeQue<float>();
+                AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+
+                // Initialize yLocal to zeros using a safe source vector (first segment of x)
+                AscendC::LocalTensor<float> xSeg0 = xLocal; // start at 0
+                AscendC::Muls(yLocal, xSeg0, 0.0f, curLen);
+
+                // Accumulate over Cin and Kh
+                for (uint32_t ci = 0; ci < Cin_; ++ci) {
+                    const uint32_t xCiBase = ci * winStride_;
+                    const uint32_t wCiBase = ci * Kh_;
+                    for (uint32_t k = 0; k < Kh_; ++k) {
+                        // scalar weight value
+                        float wv = wLocal.GetValue(wCiBase + k);
+                        AscendC::LocalTensor<float> xSeg = xLocal[xCiBase + k];
+                        AscendC::LocalTensor<float> tVec = tmpQueue_.AllocTensor<float>();
+                        AscendC::Muls(tVec, xSeg, wv, curLen);
+                        AscendC::Add(yLocal, yLocal, tVec, curLen);
+                        tmpQueue_.FreeTensor(tVec);
+                    }
+                }
+
+                // Write back yLocal to GM
+                const uint32_t yOff = yNBase + co * Lout_ + baseL;
+                AscendC::DataCopy(yGm_[yOff], yLocal, curLen);
+
+                outQueueY_.FreeTensor(yLocal);
+                inQueueW_.FreeTensor(wLocal);
+            }
+
+            inQueueX_.FreeTensor(xLocal);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyInX(uint32_t n, uint32_t baseL, uint32_t curWinLen)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+        const uint32_t xNBase = n * Cin_ * Lin_;
+        // Pack each channel segment
+        for (uint32_t ci = 0; ci < Cin_; ++ci) {
+            const uint32_t gmOff = xNBase + ci * Lin_ + baseL;
+            const uint32_t locOff = ci * winStride_;
+            AscendC::DataCopy(xLocal[locOff], xGm_[gmOff], curWinLen);
+        }
+        inQueueX_.EnQue(xLocal);
+    }
+
+    __aicore__ inline void CopyInW(uint32_t co)
+    {
+        AscendC::LocalTensor<float> wLocal = inQueueW_.AllocTensor<float>();
+        const uint32_t wOff = co * Cin_ * Kh_;
+        AscendC::DataCopy(wLocal, wGm_[wOff], Cin_ * Kh_);
+        inQueueW_.EnQue(wLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1>  inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1>  inQueueW_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t N_{0}, Cin_{0}, Lin_{0};
+    uint32_t Cout_{0}, Kh_{0}, Lout_{0};
+    uint32_t tileLen_{0};
+    uint32_t winStride_{0}; // tileLen_ + Kh_ - 1
+};
+
+extern "C" __global__ __aicore__ void conv_standard_1d_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConvStandard1dCustom op;
+    op.Init(x, weight, y,
+            tiling_data.N, tiling_data.Cin, tiling_data.Lin,
+            tiling_data.Cout, tiling_data.Kh, tiling_data.Lout,
+            tiling_data.tileLen);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+static inline at::Tensor make_output_for_conv1d(const at::Tensor& x, const at::Tensor& weight) {
+    TORCH_CHECK(x.dim() == 3, "x must be 3D [N, C_in, L_in]");
+    TORCH_CHECK(weight.dim() == 3, "weight must be 3D [C_out, C_in, K]");
+    TORCH_CHECK(x.scalar_type() == at::kFloat && weight.scalar_type() == at::kFloat, "Only float32 is supported");
+
+    const int64_t N = x.size(0);
+    const int64_t Cin = x.size(1);
+    const int64_t Lin = x.size(2);
+    const int64_t Cout = weight.size(0);
+    const int64_t Cw = weight.size(1);
+    const int64_t K = weight.size(2);
+    TORCH_CHECK(Cin == Cw, "Input channels must match weight channels");
+    TORCH_CHECK(Lin >= K, "Input length must be >= kernel size");
+    const int64_t Lout = Lin - K + 1;
+    auto y = at::empty({N, Cout, Lout}, x.options());
+    return y;
+}
+
+at::Tensor conv_standard_1d_impl_npu(const at::Tensor& x, const at::Tensor& weight) {
+    at::Tensor y = make_output_for_conv1d(x, weight);
+    EXEC_NPU_CMD(aclnnConvStandard1dCustom, x, weight, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_standard_1d_custom", &conv_standard_1d_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_standard_1d_custom", &conv_standard_1d_impl_npu, "1D standard convolution (ConvStandard1dCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'conv_standard_1d_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''

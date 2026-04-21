@@ -14,7 +14,7 @@ from langgraph.graph import MessagesState
 
 
 # Maximum query rounds before forced ANSWER
-MAX_QUERY_ROUNDS = 3
+MAX_QUERY_ROUNDS = 5
 
 
 def _add_list(left: List[str], right: List[str]) -> List[str]:

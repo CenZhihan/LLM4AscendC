@@ -1,0 +1,498 @@
+project_json_src='''
+[
+  {
+    "op": "ConvStandard2dAsymmetricInputAsymmetricKernelCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": []
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvStandard2dAsymmetricInputAsymmetricKernelCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+
+  TILING_DATA_FIELD_DEF(uint32_t, Cout);
+  TILING_DATA_FIELD_DEF(uint32_t, Kh);
+  TILING_DATA_FIELD_DEF(uint32_t, Kw);
+
+  TILING_DATA_FIELD_DEF(uint32_t, Ho);
+  TILING_DATA_FIELD_DEF(uint32_t, Wo);
+
+  TILING_DATA_FIELD_DEF(uint32_t, tileH);
+  TILING_DATA_FIELD_DEF(uint32_t, tileW);
+  TILING_DATA_FIELD_DEF(uint32_t, tileCout);
+
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvStandard2dAsymmetricInputAsymmetricKernelCustom,
+                           ConvStandard2dAsymmetricInputAsymmetricKernelCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "conv_standard_2d_asymmetric_input_asymmetric_kernel_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return (a == 0) ? x : (x / a) * a;
+}
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (a + b - 1u) / b;
+}
+} // namespace
+
+namespace optiling {
+
+// Conservative per-core UB budget and alignment heuristics
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
+static constexpr uint32_t ALIGN_W = 8;      // prefer vector-friendly width
+static constexpr uint32_t ALIGN_CO = 8;     // prefer channel-out tiles multiple of 8
+static constexpr uint32_t MAX_TCOUT = 32;   // cap for per-tile Cout
+static constexpr uint32_t MIN_TCOUT = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    ConvStandard2dAsymmetricInputAsymmetricKernelCustomTilingData tiling;
+
+    const gert::Shape *xshape = context->GetInputShape(0);
+    const gert::Shape *wshape = context->GetInputShape(1);
+
+    const uint32_t N  = static_cast<uint32_t>(xshape->GetDim(0));
+    const uint32_t C  = static_cast<uint32_t>(xshape->GetDim(1));
+    const uint32_t H  = static_cast<uint32_t>(xshape->GetDim(2));
+    const uint32_t W  = static_cast<uint32_t>(xshape->GetDim(3));
+
+    const uint32_t Cout = static_cast<uint32_t>(wshape->GetDim(0));
+    const uint32_t Cw   = static_cast<uint32_t>(wshape->GetDim(1));
+    const uint32_t Kh   = static_cast<uint32_t>(wshape->GetDim(2));
+    const uint32_t Kw   = static_cast<uint32_t>(wshape->GetDim(3));
+
+    if (C != Cw) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Stride=(1,1), Pad=(0,0), Dilation=(1,1)
+    const uint32_t Ho = (H >= Kh) ? (H - Kh + 1) : 0u;
+    const uint32_t Wo = (W >= Kw) ? (W - Kw + 1) : 0u;
+
+    // Choose tileCout first
+    uint32_t tileCout = Cout;
+    if (tileCout > MAX_TCOUT) tileCout = MAX_TCOUT;
+    tileCout = AlignDown(tileCout, ALIGN_CO);
+    if (tileCout < MIN_TCOUT) tileCout = (Cout < MIN_TCOUT) ? Cout : MIN_TCOUT;
+
+    // Bytes used by weights per tile: tileCout * C * Kh * Kw * 4
+    const uint64_t weightBytes = static_cast<uint64_t>(tileCout) * C * Kh * Kw * sizeof(float);
+
+    // Remaining UB for y-tile and an input row buffer:
+    // yTile: tileH * tileW * 4
+    // rowBuf: tileW * 4
+    uint64_t remain = (UB_BUDGET_BYTES > weightBytes) ? (UB_BUDGET_BYTES - weightBytes) : 0u;
+
+    // Try to pick tileW as large as possible under remain, aligned
+    uint32_t tileW = Wo;
+    if (tileW > 128u) tileW = 128u; // cap to avoid long rows
+    tileW = AlignDown(tileW, ALIGN_W);
+    if (tileW == 0) tileW = (Wo > 0) ? std::min<uint32_t>(Wo, ALIGN_W) : 0u;
+
+    // Compute max tileH under remain: yTile + rowBuf <= remain
+    // 4 * (tileH * tileW + tileW) <= remain  => tileH <= (remain / 4 - tileW) / tileW
+    uint32_t tileH = 1u;
+    if (tileW > 0) {
+        uint64_t elemsBudget = remain / sizeof(float);
+        if (elemsBudget > tileW) {
+            uint64_t maxTH = (elemsBudget - tileW) / tileW;
+            if (maxTH == 0) maxTH = 1;
+            if (maxTH > 64u) maxTH = 64u; // cap to avoid long loops
+            tileH = static_cast<uint32_t>(maxTH);
+        }
+    }
+    if (tileH > Ho) tileH = Ho;
+    if (tileH == 0 && Ho > 0) tileH = 1;
+
+    // Safety fallbacks
+    if (tileW == 0 && Wo > 0) tileW = 1;
+    if (Ho == 0 || Wo == 0) {
+        tileH = 0;
+        tileW = 0;
+    }
+
+    // Decide blockDim as number of tiles, but clamp
+    const uint32_t tilesN   = (N == 0) ? 0u : N;
+    const uint32_t tilesOC  = (tileCout == 0) ? 0u : CeilDiv(Cout, tileCout);
+    const uint32_t tilesH   = (tileH == 0) ? 0u : CeilDiv(Ho, tileH);
+    const uint32_t tilesW   = (tileW == 0) ? 0u : CeilDiv(Wo, tileW);
+    const uint64_t totalTiles64 = static_cast<uint64_t>(tilesN) * tilesOC * tilesH * tilesW;
+    uint32_t blockDim = (totalTiles64 == 0) ? 1u : static_cast<uint32_t>(std::min<uint64_t>(totalTiles64, 24u));
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_N(N);
+    tiling.set_C(C);
+    tiling.set_H(H);
+    tiling.set_W(W);
+    tiling.set_Cout(Cout);
+    tiling.set_Kh(Kh);
+    tiling.set_Kw(Kw);
+    tiling.set_Ho(Ho);
+    tiling.set_Wo(Wo);
+    tiling.set_tileH(tileH);
+    tiling.set_tileW(tileW);
+    tiling.set_tileCout(tileCout);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspaces = context->GetWorkspaceSizes(1);
+    workspaces[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *xshape = context->GetInputShape(0);
+    const gert::Shape *wshape = context->GetInputShape(1);
+
+    const int64_t N  = xshape->GetDim(0);
+    const int64_t C  = xshape->GetDim(1);
+    const int64_t H  = xshape->GetDim(2);
+    const int64_t W  = xshape->GetDim(3);
+
+    const int64_t Cout = wshape->GetDim(0);
+    const int64_t Cw   = wshape->GetDim(1);
+    const int64_t Kh   = wshape->GetDim(2);
+    const int64_t Kw   = wshape->GetDim(3);
+
+    if (C != Cw || H < Kh || W < Kw) {
+        return GRAPH_FAILED;
+    }
+
+    const int64_t Ho = H - Kh + 1;
+    const int64_t Wo = W - Kw + 1;
+
+    gert::Shape *yshape = context->GetOutputShape(0);
+    yshape->SetDimNum(4);
+    yshape->SetDim(0, N);
+    yshape->SetDim(1, Cout);
+    yshape->SetDim(2, Ho);
+    yshape->SetDim(3, Wo);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    const ge::DataType w_dtype = context->GetInputDataType(1);
+    if (x_dtype != w_dtype) {
+        return GRAPH_FAILED;
+    }
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class ConvStandard2dAsymmetricInputAsymmetricKernelCustom : public OpDef {
+public:
+    explicit ConvStandard2dAsymmetricInputAsymmetricKernelCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape);
+        this->SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvStandard2dAsymmetricInputAsymmetricKernelCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelConvStandard2dAsymmetricInputAsymmetricKernelCustom {
+public:
+    __aicore__ inline KernelConvStandard2dAsymmetricInputAsymmetricKernelCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                uint32_t N, uint32_t C, uint32_t H, uint32_t W,
+                                uint32_t Cout, uint32_t Kh, uint32_t Kw,
+                                uint32_t Ho, uint32_t Wo,
+                                uint32_t tileH, uint32_t tileW, uint32_t tileCout)
+    {
+        N_ = N; C_ = C; H_ = H; W_ = W;
+        Cout_ = Cout; Kh_ = Kh; Kw_ = Kw;
+        Ho_ = Ho; Wo_ = Wo;
+        tH_ = tileH; tW_ = tileW; tCo_ = tileCout;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint64_t>(N_) * C_ * H_ * W_);
+        wGm_.SetGlobalBuffer((__gm__ float*)w, static_cast<uint64_t>(Cout_) * C_ * Kh_ * Kw_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint64_t>(N_) * Cout_ * Ho_ * Wo_);
+
+        // Buffers: y-tile (tH * tW), temp row (tW), scalar weight (1)
+        pipe_.InitBuffer(yTileQ_, 1, tH_ * tW_ * sizeof(float));
+        pipe_.InitBuffer(rowQ_, 1, tW_ * sizeof(float));
+        pipe_.InitBuffer(scalarQ_, 1, sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (N_ == 0 || C_ == 0 || Ho_ == 0 || Wo_ == 0 || Cout_ == 0 || tH_ == 0 || tW_ == 0) {
+            return;
+        }
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        const uint32_t tilesN  = N_;
+        const uint32_t tilesOC = CeilDiv(Cout_, tCo_);
+        const uint32_t tilesH  = CeilDiv(Ho_, tH_);
+        const uint32_t tilesW  = CeilDiv(Wo_, tW_);
+        const uint64_t totalTiles = static_cast<uint64_t>(tilesN) * tilesOC * tilesH * tilesW;
+
+        // Grid-stride over tiles
+        for (uint64_t tileId = blockIdx; tileId < totalTiles; tileId += blockNum) {
+            // Decode tile id into (nIdx, ocStart, hStart, wStart)
+            uint64_t tmp = tileId;
+            const uint32_t wTileIdx = static_cast<uint32_t>(tmp % tilesW); tmp /= tilesW;
+            const uint32_t hTileIdx = static_cast<uint32_t>(tmp % tilesH); tmp /= tilesH;
+            const uint32_t ocTileIdx = static_cast<uint32_t>(tmp % tilesOC); tmp /= tilesOC;
+            const uint32_t nIdx = static_cast<uint32_t>(tmp % tilesN);
+
+            const uint32_t ocStart = ocTileIdx * tCo_;
+            const uint32_t hStart  = hTileIdx * tH_;
+            const uint32_t wStart  = wTileIdx * tW_;
+
+            const uint32_t curCo = MinU32(tCo_, Cout_ - ocStart);
+            const uint32_t curH  = MinU32(tH_, Ho_ - hStart);
+            const uint32_t curW  = MinU32(tW_, Wo_ - wStart);
+
+            // Loop over oc in this tile, compute each oc plane tile (curH x curW)
+            for (uint32_t ocOff = 0; ocOff < curCo; ++ocOff) {
+                const uint32_t oc = ocStart + ocOff;
+
+                // Allocate buffers
+                AscendC::LocalTensor<float> yTile = yTileQ_.AllocTensor<float>();
+                AscendC::LocalTensor<float> rowBuf = rowQ_.AllocTensor<float>();
+                AscendC::LocalTensor<float> wScalarLT = scalarQ_.AllocTensor<float>();
+
+                // Initialize yTile to 0
+                AscendC::Dup(yTile, 0.0f, curH * curW);
+
+                // Accumulate over input channels and kernel window
+                for (uint32_t c = 0; c < C_; ++c) {
+                    for (uint32_t r = 0; r < Kh_; ++r) {
+                        for (uint32_t s = 0; s < Kw_; ++s) {
+                            // Load weight scalar for (oc,c,r,s)
+                            const uint64_t wOff = WOffset(oc, c, r, s);
+                            AscendC::DataCopy(wScalarLT, wGm_[wOff], 1);
+                            // Assume API to read scalar from local tensor
+                            float wval = wScalarLT.GetValue(0);
+
+                            // For each output row within tile
+                            for (uint32_t oh = 0; oh < curH; ++oh) {
+                                const uint32_t hIn = hStart + oh + r;
+                                const uint32_t wIn0 = wStart + s;
+
+                                // Load a contiguous input row segment of length curW
+                                const uint64_t xOff = XOffset(nIdx, c, hIn, wIn0);
+                                AscendC::DataCopy(rowBuf, xGm_[xOff], curW);
+
+                                // yRow index within yTile
+                                const uint32_t yRowOff = oh * curW;
+
+                                // temp = rowBuf * wval; yRow += temp
+                                AscendC::LocalTensor<float> yRow = yTile[yRowOff];
+                                AscendC::Muls(rowBuf, rowBuf, wval, curW);
+                                AscendC::Add(yRow, yRow, rowBuf, curW);
+                            }
+                        }
+                    }
+                }
+
+                // Store yTile to GM at [nIdx, oc, hStart:hStart+curH, wStart:wStart+curW]
+                for (uint32_t oh = 0; oh < curH; ++oh) {
+                    const uint64_t yOff = YOffset(nIdx, oc, hStart + oh, wStart);
+                    const uint32_t yRowOff = oh * curW;
+                    AscendC::LocalTensor<float> yRow = yTile[yRowOff];
+                    AscendC::DataCopy(yGm_[yOff], yRow, curW);
+                }
+
+                scalarQ_.FreeTensor(wScalarLT);
+                rowQ_.FreeTensor(rowBuf);
+                yTileQ_.FreeTensor(yTile);
+            }
+        }
+    }
+
+private:
+    __aicore__ static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+    __aicore__ static inline uint32_t MinU32(uint32_t a, uint32_t b) { return (a < b) ? a : b; }
+
+    __aicore__ inline uint64_t XOffset(uint32_t n, uint32_t c, uint32_t h, uint32_t w) const
+    {
+        return (((static_cast<uint64_t>(n) * C_ + c) * H_ + h) * W_ + w);
+    }
+    __aicore__ inline uint64_t WOffset(uint32_t oc, uint32_t c, uint32_t r, uint32_t s) const
+    {
+        return ((((static_cast<uint64_t>(oc) * C_ + c) * Kh_ + r) * Kw_ + s));
+    }
+    __aicore__ inline uint64_t YOffset(uint32_t n, uint32_t oc, uint32_t h, uint32_t w) const
+    {
+        return (((static_cast<uint64_t>(n) * Cout_ + oc) * Ho_ + h) * Wo_ + w);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> yTileQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> rowQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> scalarQ_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t N_{0}, C_{0}, H_{0}, W_{0};
+    uint32_t Cout_{0}, Kh_{0}, Kw_{0};
+    uint32_t Ho_{0}, Wo_{0};
+    uint32_t tH_{0}, tW_{0}, tCo_{0};
+};
+
+extern "C" __global__ __aicore__ void conv_standard_2d_asymmetric_input_asymmetric_kernel_custom(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tilingGm)
+{
+    if (g_coreType == AscendC::AIV) {
+        return;
+    }
+    GET_TILING_DATA(tiling_data, tilingGm);
+
+    KernelConvStandard2dAsymmetricInputAsymmetricKernelCustom op;
+    op.Init(x, weight, y,
+            tiling_data.N, tiling_data.C, tiling_data.H, tiling_data.W,
+            tiling_data.Cout, tiling_data.Kh, tiling_data.Kw,
+            tiling_data.Ho, tiling_data.Wo,
+            tiling_data.tileH, tiling_data.tileW, tiling_data.tileCout);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor conv2d_standard_impl_npu(const at::Tensor& self, const at::Tensor& weight) {
+    TORCH_CHECK(self.dim() == 4, "Input must be NCHW");
+    TORCH_CHECK(weight.dim() == 4, "Weight must be OIHW");
+
+    auto N = self.size(0);
+    auto C = self.size(1);
+    auto H = self.size(2);
+    auto W = self.size(3);
+
+    auto Cout = weight.size(0);
+    auto Cw   = weight.size(1);
+    auto Kh   = weight.size(2);
+    auto Kw   = weight.size(3);
+
+    TORCH_CHECK(C == Cw, "Input C must equal weight C");
+
+    TORCH_CHECK(H >= Kh && W >= Kw, "Invalid kernel larger than input");
+    auto Ho = H - Kh + 1;
+    auto Wo = W - Kw + 1;
+
+    at::Tensor result = at::empty({N, Cout, Ho, Wo}, self.options());
+    EXEC_NPU_CMD(aclnnConvStandard2dAsymmetricInputAsymmetricKernelCustom, self, weight, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_standard_2d_asymmetric_input_asymmetric_kernel_custom", &conv2d_standard_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_standard_2d_asymmetric_input_asymmetric_kernel_custom",
+          &conv2d_standard_impl_npu,
+          "Conv2D stride1 pad0 dilation1 groups1 (ConvStandard2dAsymmetricInputAsymmetricKernelCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'conv_standard_2d_asymmetric_input_asymmetric_kernel_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
