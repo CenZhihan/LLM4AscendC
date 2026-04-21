@@ -428,6 +428,13 @@ class ApiDocRetriever:
     def __init__(self):
         self._knowledge_path = _get_knowledge_path()
 
+    def known_api_names(self) -> List[str]:
+        names = set(_API_KNOWLEDGE.keys())
+        names.update(_API_ALIASES.keys())
+        names.update(_API_BLACKLIST.keys())
+        names.update(_API_ALTERNATIVES.keys())
+        return sorted(names)
+
     def is_available(self) -> bool:
         """Check if API docs are available."""
         return self._knowledge_path is not None
@@ -472,6 +479,14 @@ class ApiDocRetriever:
                         f"repeatTimes 限制: {info.get('repeat_limit', 'N/A')}",
             )
 
+        doc_hit = self._search_docs(name)
+        if doc_hit is not None:
+            return doc_hit
+
+        header_hit = self._search_headers(name)
+        if header_hit is not None:
+            return header_hit
+
         return ApiSignatureResult(
             api_name=api_name,
             signature="",
@@ -483,6 +498,64 @@ class ApiDocRetriever:
             details=f"未找到 API '{api_name}' 的签名信息。\n"
                     f"可能原因: API 名称不正确、或该 API 未在知识库中收录。\n"
                     f"建议: 查阅 asc-devkit/docs/api/context/ 下的官方 API 文档。",
+        )
+
+    def _search_docs(self, api_name: str) -> Optional[ApiSignatureResult]:
+        if not self._knowledge_path:
+            return None
+        pattern = re.compile(rf"\b{re.escape(api_name)}\b", re.IGNORECASE)
+        for path in sorted(Path(self._knowledge_path).glob("*.md")):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            match = pattern.search(text)
+            if not match:
+                continue
+            start = max(0, match.start() - 160)
+            end = min(len(text), match.end() + 240)
+            snippet = " ".join(text[start:end].split())
+            return ApiSignatureResult(
+                api_name=api_name,
+                signature="",
+                supported_dtypes=[],
+                repeat_times_limit=None,
+                params=[],
+                example_call="",
+                source_doc=path.name,
+                details=f"在文档 {path.name} 中检索到 {api_name} 的相关片段: {snippet}",
+            )
+        return None
+
+    def _search_headers(self, api_name: str) -> Optional[ApiSignatureResult]:
+        try:
+            from .env_checker import check_api_exists
+        except Exception:
+            return None
+
+        header_result = check_api_exists(api_name)
+        if not header_result.found:
+            return None
+
+        signature = ""
+        if header_result.matches:
+            parts = header_result.matches[0].split(":", 2)
+            signature = parts[2].strip() if len(parts) >= 3 else header_result.matches[0].strip()
+
+        details = [header_result.summary]
+        if header_result.matches:
+            details.append("匹配示例:")
+            details.extend(header_result.matches[:3])
+
+        return ApiSignatureResult(
+            api_name=api_name,
+            signature=signature,
+            supported_dtypes=[],
+            repeat_times_limit=None,
+            params=[],
+            example_call="",
+            source_doc=", ".join(header_result.header_files[:3]),
+            details="\n".join(details),
         )
 
     def check_constraints(

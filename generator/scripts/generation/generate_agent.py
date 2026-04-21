@@ -16,6 +16,7 @@ from generator.agent import (
     generate_kernel_with_agent,
     KernelGenerationTask,
 )
+
 from generator.agent.agent_config import (
     parse_tool_mode,
     AgentToolMode,
@@ -24,6 +25,7 @@ from generator.agent.agent_config import (
     get_llm_config_compatible,
     model_slug_for_path,
 )
+
 from generator.agent.retrievers.code_retriever import CodeRetriever
 from generator.dataset import dataset
 from generator.config import rag_index_path, rag_embedding_model
@@ -108,6 +110,7 @@ def main():
             "检索工具模式：预置名 no_tool/kb_only/web_only/.../all，"
             "或逗号分隔列表如 kb,web,code_rag 及已注册的插件名（如 kb,my_plugin）。"
         ),
+
     )
     parser.add_argument(
         "--strategy",

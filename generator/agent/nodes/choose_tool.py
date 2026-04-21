@@ -131,6 +131,17 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
     return existing
 
 
+def _summarize_called_tools(state: GeneratorAgentState) -> str:
+    """Return a compact list of tool keys already called this session (from tool_calls_log)."""
+    logs = state.get("tool_calls_log") or []
+    called: List[str] = []
+    for entry in logs:
+        tool = (entry.get("tool") or "").strip()
+        if tool and tool not in called:
+            called.append(tool)
+    return ", ".join(called) if called else ""
+
+
 def _registry_tools_for_prompt(tool_mode: AgentToolMode) -> List[Any]:
     reg = get_tool_registry()
     out: List[Any] = []
@@ -146,6 +157,7 @@ def _build_tool_selection_prompt(
     existing_results: str,
     tool_mode: AgentToolMode,
     round_count: int,
+    called_tools_str: str = "",
 ) -> str:
     specs = _registry_tools_for_prompt(tool_mode)
     tools_desc: List[str] = []
@@ -159,59 +171,93 @@ def _build_tool_selection_prompt(
 
     tools_line = "\n".join(f"- {t}" for t in tools_desc)
     at_max = round_count >= MAX_QUERY_ROUNDS
+    rounds_left = MAX_QUERY_ROUNDS - round_count
+
+    called_note = (
+        f"Tools already called this session: **{called_tools_str}**"
+        if called_tools_str
+        else "Tools already called this session: **(none yet)**"
+    )
+
+    ascend_lines = ""
+    if "ascend_search" in tool_mode:
+        ascend_lines += (
+            "  • `ascend_search` — *Ascend online docs search*: put **Chinese keywords only** in `query`; "
+            "`lang`, `doc_type`, and `version` are fixed server-side — **do not** invent them in `args`.\n"
+        )
+    if "ascend_fetch" in tool_mode:
+        ascend_lines += (
+            "  • `ascend_fetch` — *Ascend online docs fetch*: put **one** URL from a **prior "
+            "`ascend_search` result** in `query`; if multiple URLs appear, only the **first** is used.\n"
+        )
 
     routing_instructions = (
-        "Your role here is **orchestration only**. You are **not** the model that writes the Ascend C "
-        "kernel or the six-string bundle. Another agent will read your JSON and either run a tool or "
-        "produce the final code.\n\n"
-        "**CANN / API context:** CANN releases and recommended usage patterns change quickly. Even when "
-        "the task looks familiar, **prefer using the enabled tools** so the downstream agent gets the "
-        "**latest** documentation and the **most canonical** Ascend C patterns. The tools available "
-        "in this session are **high-signal and very effective** at retrieving authoritative material; "
-        "lean on them rather than relying on static intuition alone.\n\n"
-        "**What you must decide:**\n"
-        "- Output **ANSWER** only when the task text **plus** the \"Already retrieved\" excerpts already "
-        "give the downstream agent enough **fresh, task-specific** evidence (not generic memory). If "
-        "that section is empty or thin, you should normally **call a tool first**.\n"
-        "- Otherwise choose **one** tool and a focused `query`. Prefer a tool whenever there is "
-        "any doubt: retrieved material improves grounding, aligns with current CANN guidance, and "
-        "reduces hallucination risk for the downstream model. Treat proactive retrieval as your "
-        "responsibility to the pipeline.\n\n"
-        "**Strict output rules (avoid common failures):**\n"
-        "- Output **one** JSON object only. No markdown fences, no commentary before or after the object, "
-        "and no second JSON or trailing code.\n"
-        "- For **ANSWER**, you must use exactly: "
-        '`{"tool":"ANSWER","query":"","args":null}`. '
-        "**Never** put generated code, `project_json_src`, partial answers, or any narrative inside "
-        '`args`. Putting the solution in `args` breaks parsing (\"Extra data\" / invalid JSON) and '
-        "skips real tool use.\n"
-        '- For a normal tool call, use `"args": null` unless you are using a **plugin** tool whose docs '
-        "explicitly require a small parameter object.\n"
-        '- `"query"` is the natural-language request for the tool; use `""` when `tool` is ANSWER.\n'
-        "- If you choose `ascend_search`, `query` must be Chinese keywords. "
-        "`lang/doc_type/version` are fixed by the system and must not be invented in args.\n"
-        "- If you choose `ascend_fetch`, provide one URL from previously returned `ascend_search` results "
-        "inside `query`; when multiple URLs are present, only the first URL will be fetched.\n\n"
+        "You are a **tool orchestrator**. Your only job is to pick the next tool to call. "
+        "You are NOT the model that writes code — a separate agent does that after all tools finish.\n\n"
+        f"**Rounds remaining: {rounds_left} of {MAX_QUERY_ROUNDS}.**\n"
+        "You need to make **one or more tool calls** to gather evidence before the downstream "
+        "code-generation agent can produce a correct Ascend C kernel. "
+        "**Chain tool calls continuously** — use every remaining round to retrieve more information "
+        "from a different source.\n\n"
+        "**You MUST call a tool** unless the \"Already retrieved\" section already contains "
+        "comprehensive, task-specific evidence that covers API signatures, usage patterns, AND "
+        "hardware constraints. If that section is empty, thin, or covers only one aspect, call a tool.\n\n"
+        "**Each tool serves a distinct purpose — use them together for maximum coverage:**\n"
+        "  • `kb` / `kb_shell_search` — *Official API docs*: authoritative signatures, dtype rules, "
+        "parameter constraints from Huawei documentation\n"
+        "  • `code_rag` — *Real kernel implementations*: how APIs are actually used in working "
+        "Ascend C kernels from the code corpus\n"
+        "  • `api_lookup` / `api_constraint` / `api_alternative` — *Structured API detail*: "
+        "alignment rules, count limits, fallback APIs when primary symbol is unavailable\n"
+        "  • `env_check_env` / `env_check_npu` / `env_check_api` — *Runtime facts*: "
+        "CANN version, NPU device status, whether a specific API symbol exists in installed headers\n"
+        "  • `npu_arch` — *Chip-level specs*: UB size, compile macros, feature flags for a specific chip\n"
+        "  • `tiling_calc` / `tiling_validate` — *Hardware-specific tiling*: "
+        "block count proposals and UB capacity validation\n"
+        "  • `code_style` / `security_check` — *Code quality*: style rules and risky patterns\n"
+        f"{ascend_lines}"
+        "\n"
+        "**API-oriented query construction rules:**\n"
+        "  • For `api_lookup`, `api_constraint`, `api_alternative`, and `env_check_api`, identify one concrete API symbol first.\n"
+        "  • Good symbols: `AscendC::DataCopy`, `Muls`, `DataCopyPad`, `MatmulType`, `GlobalTensor::SetValue`.\n"
+        "  • Bad placeholders: `api`, `signature`, `signatures`, `constraints`, `alternative`, `details`, `docs`.\n"
+        "  • If useful, put the exact symbol in `args`, e.g. `{\"api_name\":\"AscendC::DataCopy\"}`.\n"
+        "  • For `env_check_npu`, prefer structured args such as `{\"query_type\":\"memory\",\"device_id\":0}`.\n\n"
+        f"{called_note}\n"
+        f"If number of tools is larger than or equal to {MAX_QUERY_ROUNDS}, **Do NOT repeat a tool that already returned results** — pick a different tool to "
+        f"broaden coverage. Only repeat if the previous result was empty or failed or the number of tools is less than {MAX_QUERY_ROUNDS}.\n\n"
+        "**ANSWER is a last resort.** Output ANSWER only when:\n"
+        "  (a) the retrieved content already comprehensively covers the task, OR\n"
+        "  (b) you have no rounds left.\n\n"
+        "**Strict output rules:**\n"
+        "- Output **one** JSON object only. No markdown fences, no commentary before or after.\n"
+        '- Tool call: `{"tool": "<key>", "query": "<question or exact symbol>", "args": null|{...}}`\n'
+        '- ANSWER: `{"tool": "ANSWER", "query": "", "args": null}`\n'
+        "- Never put code, partial answers, or any narrative inside `args`.\n\n"
     )
 
     prompt = (
-        f"Task specification (shared with the downstream code-generation agent):\n{user_question}\n\n"
+        f"Task specification:\n{user_question}\n\n"
         f"{routing_instructions}"
-        f"Available tools for this session (field \"tool\" must be one of these keys or ANSWER):\n{tools_line}\n"
-        "You must output exactly one JSON object.\n"
-        "JSON fields:\n"
-        '  "tool": string — lowercase tool key from the list above, or ANSWER;\n'
-        '  "query": string — request for that tool; empty string when tool is ANSWER;\n'
-        '  "args": null or a small object only when a plugin documents structured parameters.\n'
+        f"Available tools (\"tool\" must be one of these keys or ANSWER):\n{tools_line}\n\n"
+        'JSON schema: {"tool": string, "query": string, "args": null | object}\n'
+        "Additional hard requirements:\n"
+        "- Emit exactly **one** JSON object; no markdown fences and no prose outside that object.\n"
+        '- `"tool"`: lowercase key from the list above, or `ANSWER`.\n'
+        '- `"query"`: natural-language request for the tool; use `""` when `tool` is `ANSWER`.\n'
+        '- `"args"`: use `null` for typical built-in tools unless that tool explicitly documents a small object '
+        '(e.g. `api_name`, NPU `query_type` / `device_id`).\n'
+        '- For **ANSWER** use exactly `{"tool":"ANSWER","query":"","args":null}` as JSON; never put generated '
+        "code, `project_json_src`, or any narrative inside `args`.\n"
     )
     if existing_results:
-        prompt += f"\nAlready retrieved (may be empty):\n{existing_results}\n"
+        prompt += f"\nAlready retrieved:\n{existing_results}\n"
     if at_max:
         prompt += (
-            f"\nYou have reached the maximum number of query rounds ({MAX_QUERY_ROUNDS}). "
-            'You must output exactly: {"tool":"ANSWER","query":"","args":null}\n'
+            f"\nMaximum rounds reached ({MAX_QUERY_ROUNDS}). "
+            'Output exactly: {"tool":"ANSWER","query":"","args":null}\n'
         )
-    prompt += "Output JSON only:"
+    prompt += "\nOutput JSON only:"
     return prompt
 
 
@@ -278,7 +324,9 @@ def choose_tool_node(
             "tool_choice_json": {"tool": "ANSWER", "query": "", "args": None},
         }
 
-    prompt = _build_tool_selection_prompt(user_question, existing_results, tool_mode, round_count)
+    called_tools_str = _summarize_called_tools(state)
+    prompt = _build_tool_selection_prompt(user_question, existing_results, tool_mode, round_count, called_tools_str)
+    
     if not prompt:
         return {
             **base_patch,

@@ -1,23 +1,18 @@
-"""
-API constraint check node for generator agent.
-
-Checks if a call context violates API constraints.
-"""
+"""API constraint check node for generator agent."""
 import re
 import json
 import dataclasses
 from typing import Dict, Any
 
-from langchain_core.messages import HumanMessage
-
 from ..agent_state import GeneratorAgentState
+from ..query_utils import extract_api_name, get_tool_args
 from ..retrievers.api_doc_retriever import ApiDocRetriever
 
 
-def _extract_constraint_input(query: str) -> tuple:
+def _extract_constraint_input(query: str, args: Dict[str, Any]) -> tuple:
     """Extract API name and call context from query."""
-    api_name = "unknown"
-    context: Dict[str, Any] = {}
+    api_name = extract_api_name(query, args=args)
+    context: Dict[str, Any] = dict(args or {})
 
     # Try to parse JSON-like dict for context
     match = re.search(r"\{.*\}", query, re.DOTALL)
@@ -27,11 +22,6 @@ def _extract_constraint_input(query: str) -> tuple:
             context.update(parsed)
         except json.JSONDecodeError:
             pass
-
-    # Extract API name
-    m = re.search(r"(?:check|检查)\s*(?:API[:：]?\s*)?([A-Za-z_]\w*)", query, re.IGNORECASE)
-    if m:
-        api_name = m.group(1)
 
     # Extract key=value pairs for context
     for key in ["count", "repeat_times", "ub_usage_bytes", "ub_capacity_bytes"]:
@@ -97,7 +87,8 @@ def api_constraint_node(
         }
 
     query = state.get("current_query", "")
-    api_name, context = _extract_constraint_input(query)
+    args = get_tool_args(state)
+    api_name, context = _extract_constraint_input(query, args)
     result = api_retriever.check_constraints(api_name, context)
 
     round_num = state.get("query_round_count", 0) + 1
@@ -105,7 +96,7 @@ def api_constraint_node(
     log_entry = {
         "round": round_num,
         "tool": "api_constraint",
-        "query": f"API: {api_name}",
+        "query": query or f"API: {api_name}",
         "response": display_text,
     }
 

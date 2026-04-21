@@ -1,33 +1,17 @@
-"""
-API alternative finder node for generator agent.
-
-Finds alternative APIs when the primary API is not suitable.
-"""
 import re
+"""API alternative finder node for generator agent."""
 import dataclasses
 from typing import Dict, Any
 
-from langchain_core.messages import HumanMessage
-
 from ..agent_state import GeneratorAgentState
+from ..query_utils import extract_api_name, get_tool_args
 from ..retrievers.api_doc_retriever import ApiDocRetriever
 
 
-def _extract_alternative_input(query: str) -> tuple:
+def _extract_alternative_input(query: str, args: Dict[str, Any]) -> tuple:
     """Extract API name and reason from query."""
-    api_name = "unknown"
-    reason = "不可用"
-
-    # Extract API name
-    m = re.search(r"(?:替代|alternative|替换)\s*(?:for\s+|的\s*)?([A-Za-z_]\w*)", query, re.IGNORECASE)
-    if m:
-        api_name = m.group(1)
-
-    # Also check for "API: XXX" pattern
-    if api_name == "unknown":
-        m = re.search(r"API[:：]?\s*([A-Za-z_]\w*)", query, re.IGNORECASE)
-        if m:
-            api_name = m.group(1)
+    api_name = extract_api_name(query, args=args)
+    reason = str(args.get("reason") or "不可用")
 
     # Extract reason
     if "性能" in query or "perf" in query.lower() or "slow" in query.lower():
@@ -85,7 +69,8 @@ def api_alternative_node(
         }
 
     query = state.get("current_query", "")
-    api_name, reason = _extract_alternative_input(query)
+    args = get_tool_args(state)
+    api_name, reason = _extract_alternative_input(query, args)
     result = api_retriever.find_alternatives(api_name, reason)
 
     round_num = state.get("query_round_count", 0) + 1
@@ -93,7 +78,7 @@ def api_alternative_node(
     log_entry = {
         "round": round_num,
         "tool": "api_alternative",
-        "query": f"API: {api_name}",
+        "query": query or f"API: {api_name}",
         "response": display_text,
     }
 

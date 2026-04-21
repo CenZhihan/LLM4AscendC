@@ -62,14 +62,14 @@ def _meta() -> Dict[str, Dict[str, Any]]:
         "env_check_npu": {
             "display_name": "NPU device",
             "description": "Query NPU device status and resource usage via the env checker.",
-            "parameter_docs": 'Use "query" for the device query intent.',
-            "examples": ['{"tool":"env_check_npu","query":"query NPU device status","args":null}'],
+            "parameter_docs": 'Use "query" for the device query intent. Prefer args like {"query_type":"memory|temp|power|usages|list|info","device_id":0}.',
+            "examples": ['{"tool":"env_check_npu","query":"NPU memory for device 0","args":{"query_type":"memory","device_id":0}}'],
         },
         "env_check_api": {
             "display_name": "API header check",
             "description": "Verify whether an Ascend C API symbol appears in installed headers.",
-            "parameter_docs": 'Use "query" to name the API or describe the check.',
-            "examples": ['{"tool":"env_check_api","query":"check if AscendC::DataCopy exists","args":null}'],
+            "parameter_docs": 'Use an exact symbol name in query or args.api_name. Never use generic words like "signature" or "constraints" as the API name.',
+            "examples": ['{"tool":"env_check_api","query":"check if AscendC::DataCopy exists","args":{"api_name":"AscendC::DataCopy"}}'],
         },
         "kb_shell_search": {
             "display_name": "KB shell search",
@@ -80,23 +80,23 @@ def _meta() -> Dict[str, Dict[str, Any]]:
         "api_lookup": {
             "display_name": "API signature lookup",
             "description": "Look up API signatures, dtypes, and repeatTimes limits from structured docs.",
-            "parameter_docs": 'Use "query" to name the API.',
-            "examples": ['{"tool":"api_lookup","query":"lookup AscendC::DataCopy signature","args":null}'],
+            "parameter_docs": 'Use an exact API symbol in query or args.api_name, e.g. AscendC::DataCopy or MatmulType. Do not pass generic meta words like "signatures".',
+            "examples": ['{"tool":"api_lookup","query":"AscendC::DataCopy","args":{"api_name":"AscendC::DataCopy"}}'],
         },
         "api_constraint": {
             "display_name": "API constraint check",
             "description": "Check alignment, blockCount, and platform constraints for an API use site.",
-            "parameter_docs": 'Use "query" to describe the API and parameters.',
+            "parameter_docs": 'Provide the exact API symbol plus structured context in args, e.g. {"api_name":"DataCopyPad","count":512,"dtype":"half","is_gm_to_ub":true}.',
             "examples": [
-                '{"tool":"api_constraint","query":"check DataCopy constraints count=512 dtype=half","args":null}'
+                '{"tool":"api_constraint","query":"check DataCopyPad constraints","args":{"api_name":"DataCopyPad","count":512,"dtype":"half","is_gm_to_ub":true}}'
             ],
         },
         "api_alternative": {
             "display_name": "API alternatives",
             "description": "Suggest equivalent APIs when the primary symbol is unavailable.",
-            "parameter_docs": 'Use "query" to name the unavailable API.',
+            "parameter_docs": 'Provide the exact unavailable API in query or args.api_name and optionally args.reason.',
             "examples": [
-                '{"tool":"api_alternative","query":"alternative for GlobalTensor::SetValue","args":null}'
+                '{"tool":"api_alternative","query":"alternative for GlobalTensor::SetValue","args":{"api_name":"GlobalTensor::SetValue","reason":"not found"}}'
             ],
         },
         "tiling_calc": {

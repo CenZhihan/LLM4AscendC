@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
+from unittest import mock
 
 from generator.agent.agent_config import (
     parse_tool_mode,
@@ -12,6 +13,9 @@ from generator.agent.agent_config import (
 )
 from generator.agent.nodes.ascend_fetch import ascend_fetch_node
 from generator.agent.nodes.ascend_search import ascend_search_node
+from generator.agent.query_utils import extract_api_name, extract_npu_query_params
+from generator.agent.retrievers.api_doc_retriever import ApiDocRetriever, ApiSignatureResult
+from generator.agent.retrievers.env_checker import ApiCheckResult, NpuDeviceResult
 from generator.agent.tool_choice import parse_tool_choice_json
 from generator.agent.tool_registry import RegisteredToolSpec, get_tool_registry, register_tool
 
@@ -43,6 +47,135 @@ class TestToolChoiceJson(unittest.TestCase):
         self.assertIsNone(err)
         assert c is not None
         self.assertEqual(c.tool, "ANSWER")
+
+
+class TestQueryUtils(unittest.TestCase):
+    def test_extract_api_name_ignores_meta_words(self):
+        self.assertEqual(
+            extract_api_name(
+                "Need the exact signature details for AscendC::DataCopy, not generic signatures",
+                known_names=["DataCopy", "Muls"],
+            ),
+            "AscendC::DataCopy",
+        )
+
+    def test_extract_api_name_prefers_args(self):
+        self.assertEqual(
+            extract_api_name("API: signatures", args={"api_name": "MatmulType"}),
+            "MatmulType",
+        )
+
+    def test_extract_npu_query_params(self):
+        query_type, device_id = extract_npu_query_params(
+            "check NPU memory on device 1",
+            args={"query_type": "memory", "device_id": 1},
+        )
+        self.assertEqual(query_type, "memory")
+        self.assertEqual(device_id, 1)
+
+
+class TestApiRetrieverFallback(unittest.TestCase):
+    def test_lookup_signature_falls_back_to_header_search(self):
+        retriever = ApiDocRetriever()
+        with mock.patch(
+            "generator.agent.retrievers.env_checker.check_api_exists",
+            return_value=ApiCheckResult(
+                found=True,
+                api_name="MatmulType",
+                header_files=["matmul.h"],
+                matches=["matmul.h:42:using MatmulType = int;"],
+                summary="found in headers",
+            ),
+        ):
+            result = retriever.lookup_signature("MatmulType")
+        self.assertEqual(result.api_name, "MatmulType")
+        self.assertIn("MatmulType", result.signature)
+        self.assertIn("found in headers", result.details)
+
+
+class TestApiAndEnvNodes(unittest.TestCase):
+    def test_api_lookup_node_uses_structured_args(self):
+        from generator.agent.nodes.api_lookup import api_lookup_node
+
+        class _Retriever:
+            def is_available(self):
+                return True
+
+            def known_api_names(self):
+                return ["DataCopy"]
+
+            def lookup_signature(self, api_name):
+                return ApiSignatureResult(
+                    api_name=api_name,
+                    signature="sig",
+                    supported_dtypes=[],
+                    repeat_times_limit=None,
+                    params=[],
+                    example_call="",
+                    source_doc="doc.md",
+                    details="ok",
+                )
+
+        out = api_lookup_node(
+            {
+                "current_query": "API: signatures",
+                "tool_choice_json": {"tool": "api_lookup", "query": "API: signatures", "args": {"api_name": "DataCopy"}},
+                "query_round_count": 0,
+            },
+            _Retriever(),
+        )
+        self.assertEqual(out["api_lookup_result"]["api_name"], "DataCopy")
+
+    def test_env_check_api_node_uses_structured_args(self):
+        from generator.agent.nodes.env_check import env_check_api_node
+
+        class _Retriever:
+            def is_available(self):
+                return True
+
+            def check_api_exists(self, api_name):
+                return ApiCheckResult(
+                    found=True,
+                    api_name=api_name,
+                    header_files=["a.h"],
+                    matches=["a.h:1:MatmulType"],
+                    summary="ok",
+                )
+
+        out = env_check_api_node(
+            {
+                "current_query": "check api signatures",
+                "tool_choice_json": {"tool": "env_check_api", "query": "check api signatures", "args": {"api_name": "MatmulType"}},
+                "query_round_count": 0,
+            },
+            _Retriever(),
+        )
+        self.assertEqual(out["env_check_api_result"]["api_name"], "MatmulType")
+
+    def test_env_check_npu_node_uses_query_type_and_device(self):
+        from generator.agent.nodes.env_check import env_check_npu_node
+
+        class _Retriever:
+            def is_available(self):
+                return True
+
+            def query_npu_devices(self, device_id=None, query_type="info"):
+                return NpuDeviceResult(
+                    available=True,
+                    query_type=query_type,
+                    raw_output=f"device={device_id}, type={query_type}",
+                )
+
+        out = env_check_npu_node(
+            {
+                "current_query": "check NPU memory on device 1",
+                "tool_choice_json": {"tool": "env_check_npu", "query": "check NPU memory on device 1", "args": {"query_type": "memory", "device_id": 1}},
+                "query_round_count": 0,
+            },
+            _Retriever(),
+        )
+        self.assertEqual(out["env_check_npu_result"]["query_type"], "memory")
+        self.assertIn("device=1", out["env_check_npu_result"]["raw_output"])
 
 
 class TestParseToolModePlugins(unittest.TestCase):

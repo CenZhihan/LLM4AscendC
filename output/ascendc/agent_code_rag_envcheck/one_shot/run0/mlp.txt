@@ -1,0 +1,514 @@
+project_json_src='''
+[
+  {
+    "op": "MlpCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "w_packed",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "b_packed",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "input_size",
+        "param_type": "required",
+        "type": "int"
+      },
+      {
+        "name": "hidden1_size",
+        "param_type": "required",
+        "type": "int"
+      },
+      {
+        "name": "hidden2_size",
+        "param_type": "required",
+        "type": "int"
+      },
+      {
+        "name": "output_size",
+        "param_type": "required",
+        "type": "int"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MlpCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, inSize);
+  TILING_DATA_FIELD_DEF(uint32_t, h1);
+  TILING_DATA_FIELD_DEF(uint32_t, h2);
+  TILING_DATA_FIELD_DEF(uint32_t, outSize);
+  TILING_DATA_FIELD_DEF(uint32_t, tileK);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint64_t, w1Offset);
+  TILING_DATA_FIELD_DEF(uint64_t, w2Offset);
+  TILING_DATA_FIELD_DEF(uint64_t, w3Offset);
+  TILING_DATA_FIELD_DEF(uint64_t, b1Offset);
+  TILING_DATA_FIELD_DEF(uint64_t, b2Offset);
+  TILING_DATA_FIELD_DEF(uint64_t, b3Offset);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MlpCustom, MlpCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "mlp_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+} // namespace
+
+namespace optiling {
+
+// UB model for GEMV kernel per core:
+//   xTile: 1 * tileK
+//   wTile: 1 * tileK
+//   mulTmp: 1 * tileK
+//   small scalars: negligible
+// Total bytes ~ 12 * tileK
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
+static constexpr uint32_t ALIGN_ELEMS = 256;
+static constexpr uint32_t BLOCKDIM_MAX = 24;
+static constexpr uint32_t BLOCKDIM_MIN = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    MlpCustomTilingData tiling;
+
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const uint32_t dimNum = static_cast<uint32_t>(x_shape->GetOriginShape().GetDimNum());
+    if (dimNum < 2) {
+        return ge::GRAPH_FAILED;
+    }
+    const uint64_t batch64 = static_cast<uint64_t>(x_shape->GetOriginShape().GetDim(0));
+    const uint64_t inSize64 = static_cast<uint64_t>(x_shape->GetOriginShape().GetDim(1));
+    const uint32_t batch = static_cast<uint32_t>(batch64);
+    const uint32_t inSize = static_cast<uint32_t>(inSize64);
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t *attr_inSize = attrs->GetAttrPointer<int32_t>(0);
+    const int32_t *attr_h1 = attrs->GetAttrPointer<int32_t>(1);
+    const int32_t *attr_h2 = attrs->GetAttrPointer<int32_t>(2);
+    const int32_t *attr_outSize = attrs->GetAttrPointer<int32_t>(3);
+
+    const uint32_t h1 = static_cast<uint32_t>(*attr_h1);
+    const uint32_t h2 = static_cast<uint32_t>(*attr_h2);
+    const uint32_t outSize = static_cast<uint32_t>(*attr_outSize);
+
+    // verify input_size matches x.shape[1] if provided
+    (void)attr_inSize; // allow mismatch; kernel uses x.shape[1] as ground truth
+
+    // Offsets in packed buffers (in elements)
+    const uint64_t w1Offset = 0ULL;
+    const uint64_t w1n = static_cast<uint64_t>(h1) * static_cast<uint64_t>(inSize);
+    const uint64_t w2Offset = w1Offset + w1n;
+    const uint64_t w2n = static_cast<uint64_t>(h2) * static_cast<uint64_t>(h1);
+    const uint64_t w3Offset = w2Offset + w2n;
+    const uint64_t b1Offset = 0ULL;
+    const uint64_t b2Offset = b1Offset + static_cast<uint64_t>(h1);
+    const uint64_t b3Offset = b2Offset + static_cast<uint64_t>(h2);
+
+    // tileK from UB budget: bytes ~ 12 * tileK
+    uint32_t maxTile = UB_BUDGET_BYTES / 12;
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+
+    // K dims are inSize, h1, h2; choose min of them and cap to maxTile
+    uint32_t kMin = inSize;
+    if (h1 < kMin) kMin = h1;
+    if (h2 < kMin) kMin = h2;
+    uint32_t tileK = (kMin < maxTile) ? AlignDown(kMin, ALIGN_ELEMS) : maxTile;
+    if (tileK == 0) tileK = ALIGN_ELEMS;
+
+    // blockDim tuned to batch
+    uint32_t blockDim = batch;
+    if (blockDim < BLOCKDIM_MIN) blockDim = BLOCKDIM_MIN;
+    if (blockDim > BLOCKDIM_MAX) blockDim = BLOCKDIM_MAX;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_batch(batch);
+    tiling.set_inSize(inSize);
+    tiling.set_h1(h1);
+    tiling.set_h2(h2);
+    tiling.set_outSize(outSize);
+    tiling.set_tileK(tileK);
+    tiling.set_blockDim(blockDim);
+    tiling.set_w1Offset(w1Offset);
+    tiling.set_w2Offset(w2Offset);
+    tiling.set_w3Offset(w3Offset);
+    tiling.set_b1Offset(b1Offset);
+    tiling.set_b2Offset(b2Offset);
+    tiling.set_b3Offset(b3Offset);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // Workspace: per-batch row: h1 + h2 floats
+    size_t *ws = context->GetWorkspaceSizes(1);
+    ws[0] = static_cast<size_t>(batch) * (static_cast<size_t>(h1) + static_cast<size_t>(h2)) * sizeof(float);
+
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t *attr_outSize = attrs->GetAttrPointer<int32_t>(3);
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    std::vector<int64_t> dims;
+    dims.push_back(x_shape->GetShapeDim(0));
+    dims.push_back(static_cast<int64_t>(*attr_outSize));
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, dims[0]);
+    y_shape->SetDim(1, dims[1]);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class MlpCustom : public OpDef {
+public:
+    explicit MlpCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w_packed")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b_packed")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("input_size").AttrType(REQUIRED).Int();
+        this->Attr("hidden1_size").AttrType(REQUIRED).Int();
+        this->Attr("hidden2_size").AttrType(REQUIRED).Int();
+        this->Attr("output_size").AttrType(REQUIRED).Int();
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(MlpCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelMlpCustom {
+public:
+    __aicore__ inline KernelMlpCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR wPacked, GM_ADDR bPacked, GM_ADDR y,
+                                GM_ADDR workspace,
+                                uint32_t batch, uint32_t inSize,
+                                uint32_t h1, uint32_t h2, uint32_t outSize,
+                                uint32_t tileK,
+                                uint64_t w1Offset, uint64_t w2Offset, uint64_t w3Offset,
+                                uint64_t b1Offset, uint64_t b2Offset, uint64_t b3Offset)
+    {
+        batch_ = batch;
+        inSize_ = inSize;
+        h1_ = h1;
+        h2_ = h2;
+        outSize_ = outSize;
+        tileK_ = tileK;
+
+        w1Offset_ = w1Offset;
+        w2Offset_ = w2Offset;
+        w3Offset_ = w3Offset;
+        b1Offset_ = b1Offset;
+        b2Offset_ = b2Offset;
+        b3Offset_ = b3Offset;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint64_t>(batch_) * inSize_);
+        wGm_.SetGlobalBuffer((__gm__ float*)wPacked, w1Offset_ + w2Offset_ + w3Offset_ + 1); // dummy size
+        bGm_.SetGlobalBuffer((__gm__ float*)bPacked, b3Offset_ + outSize_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint64_t>(batch_) * outSize_);
+
+        // Workspace: per row stores y1 (h1) + y2 (h2)
+        wsRowSpan_ = static_cast<uint64_t>(h1_) + static_cast<uint64_t>(h2_);
+        wsGm_.SetGlobalBuffer((__gm__ float*)workspace,
+                              static_cast<uint64_t>(batch_) * wsRowSpan_);
+
+        // Queues for vector tiles
+        pipe_.InitBuffer(xTileQ_, BUFFER_NUM, tileK_ * sizeof(float));
+        pipe_.InitBuffer(wTileQ_, BUFFER_NUM, tileK_ * sizeof(float));
+        pipe_.InitBuffer(mulQ_,   BUFFER_NUM, tileK_ * sizeof(float));
+        pipe_.InitBuffer(scalarQ_, 4, sizeof(float)); // scalars: acc, part, bias, tmp/out
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (batch_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        for (uint32_t row = blockIdx; row < batch_; row += blockNum) {
+            ComputeRow(row);
+        }
+    }
+
+private:
+    __aicore__ inline void ComputeRow(uint32_t row)
+    {
+        const uint64_t xBase0 = static_cast<uint64_t>(row) * static_cast<uint64_t>(inSize_);
+        const uint64_t wsBase = static_cast<uint64_t>(row) * wsRowSpan_;
+        // Layer 1: y1 = ReLU(W1 * x + b1), W1[h1, inSize]
+        for (uint32_t i = 0; i < h1_; ++i) {
+            floatScalarInitZero();
+            ReduceDotRow(xGm_, xBase0, inSize_,
+                         wGm_, w1Offset_ + static_cast<uint64_t>(i) * static_cast<uint64_t>(inSize_),
+                         accLocal_);
+            // accLocal_ += b1[i]
+            LoadBiasAdd(bGm_, b1Offset_ + i, accLocal_);
+            // ReLU
+            AscendC::Maxs(accLocal_, accLocal_, 0.0f, 1);
+            // store to workspace y1
+            AscendC::DataCopy(wsGm_[wsBase + i], accLocal_, 1);
+        }
+
+        // Layer 2: y2 = ReLU(W2 * y1 + b2), W2[h2, h1]
+        for (uint32_t i = 0; i < h2_; ++i) {
+            floatScalarInitZero();
+            ReduceDotRow(wsGm_, wsBase + 0ULL, h1_,
+                         wGm_, w2Offset_ + static_cast<uint64_t>(i) * static_cast<uint64_t>(h1_),
+                         accLocal_);
+            // accLocal_ += b2[i]
+            LoadBiasAdd(bGm_, b2Offset_ + i, accLocal_);
+            // ReLU
+            AscendC::Maxs(accLocal_, accLocal_, 0.0f, 1);
+            // store to workspace y2
+            AscendC::DataCopy(wsGm_[wsBase + static_cast<uint64_t>(h1_) + i], accLocal_, 1);
+        }
+
+        // Layer 3: y = W3 * y2 + b3, W3[outSize, h2]
+        const uint64_t yBase = static_cast<uint64_t>(row) * static_cast<uint64_t>(outSize_);
+        for (uint32_t i = 0; i < outSize_; ++i) {
+            floatScalarInitZero();
+            ReduceDotRow(wsGm_, wsBase + static_cast<uint64_t>(h1_), h2_,
+                         wGm_, w3Offset_ + static_cast<uint64_t>(i) * static_cast<uint64_t>(h2_),
+                         accLocal_);
+            // accLocal_ += b3[i]
+            LoadBiasAdd(bGm_, b3Offset_ + i, accLocal_);
+            // store to output
+            AscendC::DataCopy(yGm_[yBase + i], accLocal_, 1);
+        }
+    }
+
+    // Initialize accLocal_ to zero
+    __aicore__ inline void floatScalarInitZero()
+    {
+        accLocal_ = scalarQ_.AllocTensor<float>();
+        AscendC::Dup(accLocal_, 0.0f, 1);
+    }
+
+    // accLocal_ = accLocal_ + b[off]
+    __aicore__ inline void LoadBiasAdd(AscendC::GlobalTensor<float> &bGm, uint64_t off,
+                                       AscendC::LocalTensor<float> &acc)
+    {
+        AscendC::LocalTensor<float> biasLocal = scalarQ_.AllocTensor<float>();
+        AscendC::DataCopy(biasLocal, bGm[off], 1);
+        AscendC::Add(acc, acc, biasLocal, 1);
+        scalarQ_.FreeTensor(biasLocal);
+    }
+
+    // Compute dot product: accLocal_ += reduce_sum( (xBase[0:K]) * (wRowBase[0:K]) )
+    __aicore__ inline void ReduceDotRow(AscendC::GlobalTensor<float> &xGm, uint64_t xBase, uint32_t K,
+                                        AscendC::GlobalTensor<float> &wGm, uint64_t wBase,
+                                        AscendC::LocalTensor<float> &acc)
+    {
+        uint32_t done = 0;
+        while (done < K) {
+            uint32_t len = K - done;
+            if (len > tileK_) len = tileK_;
+
+            AscendC::LocalTensor<float> xLocal = xTileQ_.AllocTensor<float>();
+            AscendC::LocalTensor<float> wLocal = wTileQ_.AllocTensor<float>();
+            AscendC::LocalTensor<float> mulLocal = mulQ_.AllocTensor<float>();
+            AscendC::LocalTensor<float> partLocal = scalarQ_.AllocTensor<float>();
+
+            AscendC::DataCopy(xLocal, xGm[xBase + done], len);
+            AscendC::DataCopy(wLocal, wGm[wBase + done], len);
+            AscendC::Mul(mulLocal, xLocal, wLocal, len);
+            AscendC::ReduceSum(partLocal, mulLocal, len);
+            AscendC::Add(acc, acc, partLocal, 1);
+
+            scalarQ_.FreeTensor(partLocal);
+            mulQ_.FreeTensor(mulLocal);
+            wTileQ_.FreeTensor(wLocal);
+            xTileQ_.FreeTensor(xLocal);
+
+            done += len;
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> xTileQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> wTileQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> mulQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 4>          scalarQ_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> bGm_;
+    AscendC::GlobalTensor<float> yGm_;
+    AscendC::GlobalTensor<float> wsGm_;
+
+    uint32_t batch_{0};
+    uint32_t inSize_{0};
+    uint32_t h1_{0};
+    uint32_t h2_{0};
+    uint32_t outSize_{0};
+    uint32_t tileK_{256};
+
+    uint64_t w1Offset_{0};
+    uint64_t w2Offset_{0};
+    uint64_t w3Offset_{0};
+    uint64_t b1Offset_{0};
+    uint64_t b2Offset_{0};
+    uint64_t b3Offset_{0};
+
+    uint64_t wsRowSpan_{0};
+
+    AscendC::LocalTensor<float> accLocal_;
+};
+
+extern "C" __global__ __aicore__ void mlp_custom(GM_ADDR x, GM_ADDR w_packed, GM_ADDR b_packed, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMlpCustom op;
+    op.Init(x, w_packed, b_packed, y, workspace,
+            tiling_data.batch, tiling_data.inSize,
+            tiling_data.h1, tiling_data.h2, tiling_data.outSize,
+            tiling_data.tileK,
+            tiling_data.w1Offset, tiling_data.w2Offset, tiling_data.w3Offset,
+            tiling_data.b1Offset, tiling_data.b2Offset, tiling_data.b3Offset);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor mlp_impl_npu(const at::Tensor& x,
+                        const at::Tensor& w_packed,
+                        const at::Tensor& b_packed,
+                        int64_t input_size,
+                        int64_t hidden1_size,
+                        int64_t hidden2_size,
+                        int64_t output_size) {
+    TORCH_CHECK(x.is_npu(), "x must be on NPU");
+    TORCH_CHECK(w_packed.is_npu() && b_packed.is_npu(), "packed weights/biases must be on NPU");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "only float32 supported");
+    at::Tensor y = at::empty({x.size(0), output_size}, x.options());
+    // attrs passed after tensors
+    EXEC_NPU_CMD(aclnnMlpCustom, x, w_packed, b_packed,
+                 static_cast<int>(input_size),
+                 static_cast<int>(hidden1_size),
+                 static_cast<int>(hidden2_size),
+                 static_cast<int>(output_size),
+                 y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("mlp_custom", &mlp_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mlp_custom", &mlp_impl_npu, "Three-layer MLP with packed weights (MlpCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'mlp_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, input_size, layer_sizes, output_size):
+        super(ModelNew, self).__init__()
+        self.input_size = int(input_size)
+        self.h1 = int(layer_sizes[0])
+        self.h2 = int(layer_sizes[1])
+        self.output_size = int(output_size)
+
+    def forward(self, x, w_packed, b_packed):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, w_packed, b_packed,
+                  self.input_size, self.h1, self.h2, self.output_size)
+'''
