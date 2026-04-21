@@ -1,0 +1,346 @@
+We need to generate a custom kernel transformation for argmin_over_a_dimension_custom (kernel name). The kernel name is `argmin_over_a_dimension_custom`. In PascalCase, the operator name would be `ArgminOverADimensionCustom`. We need to replace torch.argmin with a custom AscendC kernel that finds index of minimum along a dimension. Input is a tensor shape (batch_size, dim1, dim2) = (128, 4096, 4095). dim=1 meaning we compute argmin across dim1 (the second dimension). The output shape is (batch_size, dim2) = (128, 4095) because argmin reduces along dim1.
+
+The kernel must be implemented in AscendC with tiling and such.
+
+We need to produce the six embedded Python strings: `project_json_src`, `host_tiling_src`, `host_operator_src`, `kernel_src`, `python_bind_src`, `model_src`.
+
+We'll need to follow similar pattern as the example for LeakyReLU but with modifications for argmin across a dimension.
+
+We need to be mindful of input format: The input_desc will have name "x", type float, shape ND (3D). Output_desc will be indices: type int32 (or int64). Usually argmin returns int64. But for NPU, maybe int32. Let's assume int32.
+
+The attr: we need to pass dimension as attribute (int). Name: dim (or maybe "axis").
+
+Tiling: For argmin across dimension, each block can handle a portion of the output (i.e., each output element (batch, dim2) corresponds to a reduction across dim1). So we can tile across output points: each block deals with a certain number of output elements (each output point is reduction across full dim1). But can also use a tile length for number of elements to process per iteration, maybe multiple output points per block.
+
+In LeakyReLU, tiling considered totalLength (elements). For argmin, we need to reduce across an axis; we could treat each output point independently: each output point's computation is scanning across dim1 elements.
+
+Thus tiling may involve blockDim = number of output points (batch * dim2). But need to handle large size: (128 * 4095 = 524160) ~ 0.5M. Could use blockDim = 512 maybe, each block processes multiple output points.
+
+Simplify: Use a tileLength representing number of output elements per block (like number of argmin reductions to do per block). Then totalLength is number of output points.
+
+In host operator, we compute tiling accordingly: totalLength = batch * dim2. tileLength = min(UB budget etc). Each block will process tileLength output points, scanning across dim1 per point. For each point we need to keep track of the minimum value and index.
+
+Because the input is float, we need to store min and index per output point. The kernel will allocate local buffers for each output point. Since each block processes multiple output points, we need to store per point: current min value and index. We can use a local tensor with size tileLength for min values and another for indices. Or we can compute sequentially: for each point, read all dim1 elements and compute min index; store index.
+
+Because AscendC vector instructions can compute min across vectors, but need index. We can use the vector min instruction with keepdim? There's a "V min" that returns min values but not indices; but we can also use "FindIndex" maybe. We need to see what's available in AscendC: There's "AscendC::Mins" (elementwise min) and "ArgMin" maybe. Actually there is "AscendC::ArgMin" maybe. Let's search memory: In the AscendC programming guide, there are reduction operations: "ReduceMax", "ReduceMin", "ReduceSum", "ReduceMean" etc. However they operate on a tensor and return a scalar (or reduce across axis). But we need index of min across dimension. There is "AscendC::Mins" that returns elementwise min between two tensors; not helpful.
+
+Better approach: Use a loop that iterates over the dim1 dimension for each output point, compare current value with previous min and update index. Since each block processes tileLength output points in parallel, we can vectorize across them: process multiple input elements at a time using SIMD instructions. For each output point, we need to compare a vector of input values (across dim1) with the current min vector and update indices accordingly. That is more complex.
+
+Simplify: Use a scalar loop per output point: For each output point, we load each element from global memory and compare; compute min index. Since dim1 = 4096, and there are many output points, this might be slower but still feasible with tiling.
+
+Better approach: Use block dimension = number of output points; each block loops over dim1 elements for its assigned output point. Since dim1 = 4096, each block will have loop of 4096 iterations; each iteration loads one float and compare. That's fine.
+
+But we need to handle tiling across output points: Use blockDim = totalLength (maybe up to 512 or 1024). For each block, tileLength indicates number of output points each block processes? Actually if we set blockDim = totalLength (i.e., number of output points), then each block processes exactly one output point (full reduction). That's simplest: blockDim = totalLength, each block loops over dim1.
+
+But host operator sets blockDim based on tiling; maybe we can set blockDim = totalLength (if totalLength <= 512?). But totalLength = batch * dim2 = 524160 > 1024; blockDim limited to 64 maybe? Usually blockDim can be up to 64 or 1024 for Ascend. In example LeakyReLU, blockDim up to 24, but that's small. For more, we can use grid-stride: have many blocks each processing multiple output points.
+
+Thus we need a more flexible tiling: Use blockDim = 64 maybe, each block processes tileLength output points sequentially.
+
+Better: Let's adopt a strategy: Let totalLength = total number of output points. Let blockDim = 64 (or 128) for stability. Compute tileLength = totalLength / blockDim, rounded up maybe to some alignment.
+
+Alternatively, we can just have each block process a contiguous segment of output points: use grid-stride loop. In Process(), compute base index = blockIdx * tileLen; then loop while base < totalLen: process a tile (tileLen output points). For each output point, we need to compute argmin across dim1. Within each tile, we can process each output point sequentially (one after another). For each output point, we need to know its original input location: batch index = (outputIdx / dim2), dim2_idx = outputIdx % dim2. Input slice: x[batch, :, dim2_idx] of length dim1. So we need to compute pointer offset accordingly.
+
+Thus tiling: we need to pass dim1 as attribute or known shape? Input shape is known: we can get shape from context.
+
+We can compute totalLength as shape[0] * shape[2] (batch * dim2) if dim = 1. But we can compute generic: totalLength = shape[0] * shape[2] when dim = 1. We can also compute tileLength as something like min(UB budget / (2 * dim1?), but we need memory for local buffers: we need to store per output point: current min value (float) and index (int). For tileLength output points, we need arrays of tileLength floats and tileLength ints. So memory usage = tileLength * (sizeof(float) + sizeof(int)). Since UB budget is limited, tileLength can be up to maybe 8k elements.
+
+We can adopt similar to LeakyReLU: UB budget = 192KB; each element 4 bytes for float and 4 bytes for int = 8 bytes per point. So max tileLength ~ 192KB / 8 = 24576 elements. Align down to maybe 2048. So tileLength can be up to 24576. Use alignment 2048.
+
+Thus we can set tileLength = min(UB_BUDGET_BYTES / (sizeof(float) + sizeof(int)), HARD_CAP). Use HARD_CAP = 32768 maybe.
+
+Now we need to design the kernel:
+
+In Kernel class:
+
+- Init receives GM addresses x, y, totalLength, tileLength, dim (axis), inputShape dims maybe.
+
+- For simplicity, we can compute input strides: totalLengthIn = shape[0] * shape[1] * shape[2]; shape[0]=batch, shape[1]=dim1, shape[2]=dim2.
+
+- Output length = totalLengthOut = shape[0] * shape[2] (if dim=1). We can compute as totalLengthOut = totalLength (which we set in tiling as output length). For generic dim, we could compute but we assume dim=1.
+
+- We need to store the axis size: dim1 = shape[1].
+
+- We'll store dimAxis = dim1.
+
+- The tiling can compute totalLength = batch * dim2 (output length). tileLength computed as above.
+
+- In Process(), we compute blockIdx and tile.
+
+Pseudo:
+
+```
+const uint32_t blockNum = AscendC::GetBlockNum();
+const uint32_t blockIdx = AscendC::GetBlockIdx();
+const uint32_t strideElems = blockNum * tileLen_; // grid stride across output points
+uint32_t base = blockIdx * tileLen_; // start index for this block's first tile
+while (base < totalLen_) {
+    uint32_t curTileLen = totalLen_ - base;
+    if (curTileLen > tileLen_) curTileLen = tileLen_;
+    // Compute for each output point in this tile
+    for (uint32_t i = 0; i < curTileLen; ++i) {
+        uint32_t outIdx = base + i;
+        // compute batch and dim2 indices
+        uint32_t batchIdx = outIdx / dim2_; // dim2_ = shape[2]
+        uint32_t dim2Idx = outIdx % dim2_;
+        // compute pointer to start of input slice
+        // offset = batchIdx * dim1_ * dim2_ + dim2Idx (since dim=1)
+        // Actually x[batch][dim][dim2], with dim=1 means scanning over dim1 dimension (axis 1). So offset = (batchIdx * dim1_ + 0) * dim2_ + dim2Idx? Wait we need to linearize: shape (batch, dim1, dim2). For a given batch, dim2, we need all indices along dim1. So offset = ((batchIdx * dim1_ + 0) * dim2_ + dim2Idx). But we can compute start pointer as xGm + (batchIdx * dim1_ * dim2_ + dim2Idx). Since stride over dim1 is dim2_, because memory layout is row-major: x[batch][i][j] = x + (batch*dim1 + i)*dim2 + j. Actually for 3D with shape (B, D1, D2), linear offset = ((batch * D1) + d1) * D2 + d2. So for each output point, we want d2 = dim2Idx, d1 varies. So start offset = (batchIdx * dim1_ ) * dim2_ + dim2Idx. Then each step of d1 increments offset by dim2_.
+
+        // Then loop over d1 from 0 to dim1_-1:
+        float minVal = 3.4028235e38f; // large
+        int minIdx = 0;
+        for (uint32_t d1 = 0; d1 < dim1_; ++d1) {
+            uint32_t offset = ((batchIdx * dim1_ + d1) * dim2_ + dim2Idx);
+            float val = xGm[offset];
+            if (val < minVal) {
+                minVal = val;
+                minIdx = d1;
+            }
+        }
+        // store result
+        yGm[outIdx] = minIdx;
+    }
+
+    // move base
+    base += strideElems;
+}
+```
+
+But we need to handle the loops efficiently using vector operations maybe. But for simplicity, we can implement scalar loops.
+
+But we need to ensure performance: Each block processes tileLen output points, each scanning dim1 = 4096 elements. So total operations per block ~ tileLen * dim1 = 4096 * tileLen. If tileLen ~ 8192 (max maybe 24576), that's ~33 million comparisons per block. With blockNum maybe 64, total operations ~2B. That's okay.
+
+However memory access pattern: Each block reads a lot of data (tileLen * dim1 floats) from global memory; using scalar loads may be okay but may not saturate bandwidth. We can try to use vector loads: load a chunk of floats (e.g., 128 elements) using LocalTensor and compute min across them with vector min. But we also need to track index. That's more complex. But for this exercise, we can implement simple loops.
+
+But we also need to store results as int (int32). The output type is int maybe; we can use int32_t.
+
+Now for the kernel code: We'll include kernel_operator.h and define the KernelArgmin class.
+
+We'll also need to implement the tiling data and host operator.
+
+Now we must generate the six Python strings:
+
+1) `project_json_src`: JSON for operator definition with input and output desc and attr for dim.
+
+2) `host_tiling_src`: Defines tiling data struct.
+
+3) `host_operator_src`: Defines the operator and tiling function.
+
+4) `kernel_src`: Kernel implementation with the kernel function "argmin_over_a_dimension_custom".
+
+5) `python_bind_src`: PyTorch library binding.
+
+6) `model_src`: ModelNew class using custom ops.
+
+We need to be careful to use the correct names: kernel function name must be exactly `argmin_over_a_dimension_custom`. The operator name in JSON and host_operator_src should be `ArgminOverADimensionCustom`.
+
+Also the pybind function name must match the kernel name: we can define a function `argmin_over_a_dimension_custom` that calls `aclnnArgminOverADimensionCustom`. The NPU API might be `aclnnArgMin` maybe. We'll use placeholder `aclnnArgminOverADimensionCustom`. We'll need to register the library as `myops` on PrivateUse1.
+
+But we also need to provide `custom_ops_lib` module. The model uses custom_ops_lib.
+
+Now we need to implement the get_init_inputs function: It expects init_inputs: [dim] (i.e., dimension to argmin). In the original model, `dim` is passed to __init__, not to forward. However for custom kernel, we need to pass dim as attribute (like negative_slope). So we can pass dim as an attribute in operator definition. In the forward of ModelNew, we will call the custom op with the input and dim.
+
+In the `get_init_inputs` for the new model: we need to return [dim]. But we can embed dim value in model initialization. In the model_src, we may accept dim as argument. But we can also have ModelNew __init__ accept dim.
+
+We need to follow pattern of example: In model_src, they used `_FN = 'leaky_relu_custom'`. Then they call `fn(*inputs)`. In original model, get_init_inputs returns [] because no init args; but they still have ModelNew with *init_inputs but not used. They used get_init_inputs for LeakyReLU? Actually they defined get_init_inputs returns [].
+
+In our case, we have dimension attribute which is needed for operator. But we can also set it as an attribute of operator, not as input. The operator definition has an attr "dim". So we don't need to pass as input; we can set default. However in original model, they used `dim` as init argument. In new model, we can keep it as init argument, but we can pass as a constant attribute to the operator. However the forward signature is `def forward(self, *inputs)`, we can call the custom op with input and the dim attribute. If dim is constant known at compile time, we can embed it as attribute in operator definition. But if we want to support dynamic dim per forward, we can pass as argument to the kernel (like additional parameter). However in the operator definition we only have attr; we cannot pass as runtime argument. So for simplicity, we can assume dim is known at compile time and set as attribute.
+
+Thus ModelNew's forward will call custom_ops_lib.argmin_over_a_dimension_custom(x) where the operator uses default dim = 1. But if we need to pass dim we can modify to accept extra argument.
+
+Better: Keep the interface same: Model receives dim as init, but we can set the attribute at operator registration time to that value. However the operator is compiled once; we cannot change attr per instance. So we can just ignore init_inputs and assume dim=1.
+
+Given the problem: "Replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels." The architecture uses dim=1, so we can assume dim is known.
+
+Thus we can produce model_src that does not need extra inputs; we can set ModelNew with init_inputs but not used. Or we can just ignore.
+
+Now produce code for each string.
+
+We'll need to include proper includes and namespaces.
+
+We'll need to compute tiling.
+
+Let's design host tiling:
+
+- In host_tiling_src, define struct ArgminOverADimensionCustomTilingData with fields: uint32_t totalLength; uint32_t tileLength; uint32_t blockDim; uint32_t dimAxis; uint32_t inputShape0; uint32_t inputShape1; uint32_t inputShape2; maybe not needed. But we can compute dimAxis from attributes.
+
+Better: In tiling function, we compute totalLength = output length = shape[0] * shape[2] (when dim=1). We need shape[1] as axis size (dim1). Also need shape[2] (dim2). We'll store them in tiling for kernel to use.
+
+Simplify: Store axisSize and other dims.
+
+Define fields: uint32_t totalLength; uint32_t tileLength; uint32_t blockDim; uint32_t axisSize; uint32_t strideDim2; maybe stride across dim2 for input.
+
+But we can compute strideDim2 = 1 (the step of indices across dim2). Actually in linear addressing, for shape (B, D1, D2), stride over dim2 = 1, stride over dim1 = D2, stride over batch = D1*D2. So we can compute offset as ((batchIdx * D1 + d1) * D2 + d2). So we need D2 and D1.
+
+Thus tiling data fields: uint32_t totalLengthOut; uint32_t tileLength; uint32_t blockDim; uint32_t axisSize; uint32_t dim2; uint32_t batchSize; But we can compute dim2 = shape[2] known from input shape; we can compute in kernel.
+
+Thus we can pass shape dims as attributes maybe.
+
+Simplify: Use shape info: context->GetInputShape(0) returns a shape object. We can extract dims.
+
+Define:
+
+```
+gert::Shape *inputShape = context->GetInputShape(0);
+int32_t batch = inputShape->GetShape().GetDim(0);
+int32_t dim1 = inputShape->GetShape().GetDim(1);
+int32_t dim2 = inputShape->GetShape().GetDim(2);
+```
+
+Then compute totalLengthOut = batch * dim2.
+
+Compute axisSize = dim1.
+
+Compute tileLength similar to earlier: UB_BUDGET_BYTES = 192*1024; each output point needs 2 values: min float (4 bytes) + index (4 bytes) = 8 bytes. So maxTile = UB_BUDGET_BYTES / 8 = 24576. Align down to 2048 maybe.
+
+Set tileLength = maxTile (or less if totalLength < tileLength). Use alignment.
+
+Compute blockDim: number of tiles needed: numTiles = ceil(totalLengthOut / tileLength). Then set blockDim = min(numTiles, some max like 64). If blockDim < 8 set to 8. If > 64 set to 64. Or we can choose blockDim = numTiles if <= 64 else 64.
+
+Simplify: Use blockDim = numTiles (maybe up to 64). Use tiling approach: each block processes tileLength output points using grid stride.
+
+Thus blockDim = (totalLengthOut + tileLength - 1) / tileLength; then clamp to [8,64].
+
+Now in tiling data, set fields accordingly.
+
+In kernel, we need to retrieve tiling data: GET_TILING_DATA.
+
+Define Kernel class:
+
+```
+class KernelArgminOverADimensionCustom {
+    Init(GM_ADDR x, GM_ADDR y, uint32_t totalLengthOut, uint32_t tileLength, uint32_t blockDim, uint32_t axisSize, uint32_t dim2)
+    // store members.
+    Process() {
+        // compute block idx and stride
+        // loop over tiles.
+    }
+}
+```
+
+We need to allocate local buffers for min values and indices per tile? Actually each block will process tileLength output points sequentially; we can allocate local buffers for min float and index for each point as we compute. But we can also compute directly using registers. Since we have loops, we can allocate local arrays:
+
+- Use AscendC::LocalTensor<float> minVals = pipe_.AllocTensor<float>(); size tileLength.
+
+- Use AscendC::LocalTensor<int32_t> minIdxs = pipe_.AllocTensor<int32_t>(); size tileLength.
+
+But we also need to initialize minVals to large values. Then for each d1 iteration, we load the vector of values for each output point at that axis index and compare.
+
+But we can also do per point scalar loops; then we don't need local buffers.
+
+Simplify: Use per point scalar loops, no need for local buffers beyond temporary variables.
+
+Thus we don't need to allocate local tensors except maybe for reading input values. But we can just read from GM directly.
+
+But the AscendC kernel requires using queues for GM->UB->GM copy; we can do DataCopy for each element or for each chunk. But reading each element individually might be inefficient; but okay.
+
+Better: Use a chunked approach: For each output point we can copy a chunk of the slice (the whole dim1 dimension) into a local buffer, then compute min. But that may be complex.
+
+Simplify: Use direct reading: For each d1 index, compute offset and load value using xGm[offset] which returns a value.
+
+But we cannot directly index global memory with []? In AscendC, GlobalTensor supports operator[] returning value at offset. Actually we can use xGm[offset] to read.
+
+We also need to store result: yGm[outIdx] = minIdx.
+
+Thus we can implement Process as described.
+
+Now ensure we include the kernel function signature:
+
+```
+extern "C" __global__ __aicore__ void argmin_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+```
+
+Now for python_bind_src: implement function that calls aclnnArgminOverADimensionCustom.
+
+We need to define at::Tensor argmin_over_a_dimension_custom_impl(const at::Tensor& self, int64_t dim) -> at::Tensor.
+
+But our operator attr includes dim; we need to pass it. So implement accordingly.
+
+Now for model_src: ModelNew class that uses custom_ops_lib.argmin_over_a_dimension_custom.
+
+Now we need to ensure we adhere to naming: The pybind library name can be "custom_ops_lib". In example, they used custom_ops_lib. We'll use same.
+
+Now we need to embed the code strings in Python raw strings (triple quotes). Ensure proper escaping.
+
+We'll output code for the transformation: The final answer should be a Python code file containing the six strings definitions.
+
+But the problem says "Just output the code, no other text, and NO testing code!" So we just output the code with the strings.
+
+Thus final answer: a Python script that defines the six strings.
+
+Now we must ensure that each string is defined as a Python string with triple quotes, containing the source code.
+
+We must ensure correct handling of triple quotes inside string: Use triple single quotes or triple double quotes, but we need to escape any triple quotes inside content. Our content may contain triple quotes in comments? Not likely.
+
+We'll use triple double quotes for each string and embed content within.
+
+Be careful: In Python, backslashes and newlines must be correct.
+
+We'll define each string variable name exactly as required: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+We need to import custom_ops_lib? In model_src they used `import custom_ops_lib`. That's fine.
+
+Now produce final code.
+
+Potential issues: The operator definition expects attribute "dim". In host_operator_src we need to set attr "dim". We'll use int type.
+
+Now go into details for host_operator_src:
+
+We'll need to include "argmin_over_a_dimension_custom_tiling.h" which defines the tiling data class.
+
+We'll need to define the op class ArgminOverADimensionCustom.
+
+Define input "x" with type float.
+
+Define output "y" with type int32 (or int64). Let's use int32.
+
+Define attr "dim" with type int, default 1.
+
+Set tiling function.
+
+Also need to implement InferShape and InferDataType.
+
+InferShape: output shape = input shape with axis removed.
+
+If dim=1: shape (batch, dim1, dim2) -> (batch, dim2). So we can compute shape.
+
+But for simplicity we can just set output shape equal to input shape with dimension 1 removed? But we can compute.
+
+We'll implement something like:
+
+```
+gert::Shape outputShape;
+outputShape.SetDim(0, inputShape.GetDim(0));
+outputShape.SetDim(1, inputShape.GetDim(2));
+context->SetOutputShape(0, &outputShape);
+```
+
+But the API may be different. Let's assume we can do:
+
+```
+gert::Shape *outputShape = context->GetOutputShape(0);
+outputShape->ReShape(inputShape.GetShape());
+outputShape->StripDim(attr_dim);
+```
+
+But we don't need to be exactly correct; the host operator will compile. We'll include placeholder.
+
+Better to just copy shape and rely on shape inference.
+
+Simplify: In InferShape, get input shape, get dims, compute new shape, set output shape accordingly.
+
+In InferDataType: set output dtype to int32.
+
+Now the tiling function: We'll compute as earlier.
+
+Now kernel: We'll implement as described.
+
+Now final code.
+
+We'll ensure to include proper namespaces.
+
+Now proceed to write the strings.
+
+We'll write them in a single Python file.
+
+Now let's write the code.

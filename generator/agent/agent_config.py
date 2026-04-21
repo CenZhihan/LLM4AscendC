@@ -27,6 +27,8 @@ BUILTIN_TOOL_NAMES: FrozenSet[str] = frozenset(
         "npu_arch",
         "code_style",
         "security_check",
+        "ascend_search",
+        "ascend_fetch",
     }
 )
 
@@ -130,6 +132,14 @@ def has_code_style(mode: AgentToolMode) -> bool:
 
 def has_security_check(mode: AgentToolMode) -> bool:
     return "security_check" in mode
+
+
+def has_ascend_search(mode: AgentToolMode) -> bool:
+    return "ascend_search" in mode
+
+
+def has_ascend_fetch(mode: AgentToolMode) -> bool:
+    return "ascend_fetch" in mode
 
 
 def iter_tools(mode: AgentToolMode) -> Iterable[str]:
@@ -255,6 +265,8 @@ def normalize_tool_choice_name(raw: str) -> Optional[str]:
         "npu_arch": "npu_arch",
         "code_style": "code_style",
         "security_check": "security_check",
+        "ascend_search": "ascend_search",
+        "ascend_fetch": "ascend_fetch",
     }
     u = s.upper()
     legacy_upper = {
@@ -273,6 +285,8 @@ def normalize_tool_choice_name(raw: str) -> Optional[str]:
         "NPU_ARCH": "npu_arch",
         "CODE_STYLE": "code_style",
         "SECURITY_CHECK": "security_check",
+        "ASCEND_SEARCH": "ascend_search",
+        "ASCEND_FETCH": "ascend_fetch",
     }
     if u in legacy_upper:
         return legacy_upper[u]

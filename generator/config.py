@@ -83,4 +83,4 @@ agent_code_rag_top_k = rag_top_k
 agent_code_rag_max_chars = rag_max_chars
 
 # Agent workflow configuration
-agent_max_query_rounds = 3  # Maximum query rounds before forced ANSWER
+agent_max_query_rounds = 5  # Maximum query rounds before forced ANSWER

@@ -6,7 +6,6 @@ LLM outputs a single JSON object (ToolChoiceV1) selecting the next action.
 from __future__ import annotations
 
 import time
-import os
 from typing import Any, Dict, List, Tuple
 
 from langchain_core.messages import HumanMessage
@@ -85,6 +84,9 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
     npu_arch_results = state.get("npu_arch_results", [])
     code_style_results = state.get("code_style_results", [])
     security_check_results = state.get("security_check_results", [])
+    ascend_search_results = state.get("ascend_search_results", [])
+    ascend_fetch_results = state.get("ascend_fetch_results", [])
+    ascend_allowed_urls = state.get("ascend_search_allowed_urls", [])
     reg_results = state.get("registered_tool_results", [])
 
     existing = ""
@@ -114,6 +116,16 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
         existing += "Code style (excerpt):\n" + "\n".join(code_style_results[:1]) + "\n\n"
     if security_check_results:
         existing += "Security check (excerpt):\n" + "\n".join(security_check_results[:1]) + "\n\n"
+    if ascend_search_results:
+        existing += "Ascend docs search (excerpt):\n" + "\n".join(ascend_search_results[:2]) + "\n\n"
+    if ascend_fetch_results:
+        existing += "Ascend docs fetch (excerpt):\n" + "\n".join(ascend_fetch_results[:2]) + "\n\n"
+    if ascend_allowed_urls:
+        existing += (
+            "Ascend fetch allowed URLs (excerpt):\n"
+            + "\n".join(str(x) for x in ascend_allowed_urls[:5])
+            + "\n\n"
+        )
     if reg_results:
         existing += "Registered tool results (excerpt):\n" + "\n".join(reg_results[:2]) + "\n\n"
     return existing
@@ -140,6 +152,32 @@ def _registry_tools_for_prompt(tool_mode: AgentToolMode) -> List[Any]:
     return out
 
 
+def _format_enabled_tools_manual(specs: List[Any]) -> str:
+    """Per-enabled-tool block: name, summary, parameters, usage_guidance, examples (for choose_tool prompt)."""
+    blocks: List[str] = []
+    for spec in sorted(specs, key=lambda s: getattr(s, "name", "")):
+        name = getattr(spec, "name", "") or ""
+        display = getattr(spec, "display_name", "") or ""
+        desc = (getattr(spec, "description", None) or "").strip().rstrip(".")
+        params = (getattr(spec, "parameter_docs", None) or "").strip()
+        ug = (getattr(spec, "usage_guidance", None) or "").strip()
+        examples = list(getattr(spec, "examples", None) or [])
+        lines: List[str] = [
+            f"### `{name}` — {display}",
+            f"Summary: {desc}.",
+            f"Parameters: {params}",
+        ]
+        if ug:
+            lines.append("Usage guidance:")
+            lines.append(ug)
+        if examples:
+            lines.append("Examples:")
+            for ex in examples:
+                lines.append(f"  - {ex}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) + "\n"
+
+
 def _build_tool_selection_prompt(
     user_question: str,
     existing_results: str,
@@ -148,16 +186,11 @@ def _build_tool_selection_prompt(
     called_tools_str: str = "",
 ) -> str:
     specs = _registry_tools_for_prompt(tool_mode)
-    tools_desc: List[str] = []
-    for spec in specs:
-        desc = (spec.description or "").rstrip(".")
-        tools_desc.append(
-            f"{spec.name} ({spec.display_name}): {desc}. Parameters: {spec.parameter_docs}"
-        )
-    if not tools_desc:
+    if not specs:
         return ""
 
-    tools_line = "\n".join(f"- {t}" for t in tools_desc)
+    tools_manual = _format_enabled_tools_manual(specs)
+    tool_keys_csv = ", ".join(f"`{s.name}`" for s in sorted(specs, key=lambda x: x.name))
     at_max = round_count >= MAX_QUERY_ROUNDS
     rounds_left = MAX_QUERY_ROUNDS - round_count
 
@@ -178,25 +211,8 @@ def _build_tool_selection_prompt(
         "**You MUST call a tool** unless the \"Already retrieved\" section already contains "
         "comprehensive, task-specific evidence that covers API signatures, usage patterns, AND "
         "hardware constraints. If that section is empty, thin, or covers only one aspect, call a tool.\n\n"
-        "**Each tool serves a distinct purpose — use them together for maximum coverage:**\n"
-        "  • `kb` / `kb_shell_search` — *Official API docs*: authoritative signatures, dtype rules, "
-        "parameter constraints from Huawei documentation\n"
-        "  • `code_rag` — *Real kernel implementations*: how APIs are actually used in working "
-        "Ascend C kernels from the code corpus\n"
-        "  • `api_lookup` / `api_constraint` / `api_alternative` — *Structured API detail*: "
-        "alignment rules, count limits, fallback APIs when primary symbol is unavailable\n"
-        "  • `env_check_env` / `env_check_npu` / `env_check_api` — *Runtime facts*: "
-        "CANN version, NPU device status, whether a specific API symbol exists in installed headers\n"
-        "  • `npu_arch` — *Chip-level specs*: UB size, compile macros, feature flags for a specific chip\n"
-        "  • `tiling_calc` / `tiling_validate` — *Hardware-specific tiling*: "
-        "block count proposals and UB capacity validation\n"
-        "  • `code_style` / `security_check` — *Code quality*: style rules and risky patterns\n\n"
-        "**API-oriented query construction rules:**\n"
-        "  • For `api_lookup`, `api_constraint`, `api_alternative`, and `env_check_api`, identify one concrete API symbol first.\n"
-        "  • Good symbols: `AscendC::DataCopy`, `Muls`, `DataCopyPad`, `MatmulType`, `GlobalTensor::SetValue`.\n"
-        "  • Bad placeholders: `api`, `signature`, `signatures`, `constraints`, `alternative`, `details`, `docs`.\n"
-        "  • If useful, put the exact symbol in `args`, e.g. `{\"api_name\":\"AscendC::DataCopy\"}`.\n"
-        "  • For `env_check_npu`, prefer structured args such as `{\"query_type\":\"memory\",\"device_id\":0}`.\n\n"
+        "Across rounds, combine different **enabled** information sources (docs, code, runtime checks, "
+        "online references as available) until the downstream agent has enough complementary evidence.\n\n"
         f"{called_note}\n"
         f"If number of tools is larger than or equal to {MAX_QUERY_ROUNDS}, **Do NOT repeat a tool that already returned results** — pick a different tool to "
         f"broaden coverage. Only repeat if the previous result was empty or failed or the number of tools is less than {MAX_QUERY_ROUNDS}.\n\n"
@@ -204,8 +220,11 @@ def _build_tool_selection_prompt(
         "  (a) the retrieved content already comprehensively covers the task, OR\n"
         "  (b) you have no rounds left.\n\n"
         "**Strict output rules:**\n"
+        "- This step selects **exactly one** tool key (or ANSWER): output **one** JSON object only; "
+        "never bundle multiple tools in one object.\n"
         "- Output **one** JSON object only. No markdown fences, no commentary before or after.\n"
-        '- Tool call: `{"tool": "<key>", "query": "<question or exact symbol>", "args": null|{...}}`\n'
+        '- Tool call (wire format v1): `{"tool": "<key>", "query": "<question or exact symbol>", "args": null|{...}}` — '
+        'the key name `query` is fixed by the parser for this protocol; semantics follow each tool\'s Parameters.\n'
         '- ANSWER: `{"tool": "ANSWER", "query": "", "args": null}`\n'
         "- Never put code, partial answers, or any narrative inside `args`.\n\n"
     )
@@ -213,8 +232,19 @@ def _build_tool_selection_prompt(
     prompt = (
         f"Task specification:\n{user_question}\n\n"
         f"{routing_instructions}"
-        f"Available tools (\"tool\" must be one of these keys or ANSWER):\n{tools_line}\n\n"
-        'JSON schema: {"tool": string, "query": string, "args": null | object}\n'
+        f"Available tools for this session (`tool` must be one of: {tool_keys_csv}, or `ANSWER`):\n\n"
+        f"{tools_manual}"
+        "Tool-choice JSON (v1 — keys are fixed for parsing): object with string fields `tool` and `query`, "
+        "and `args` as null or object. Meaning of `query` vs `args` is **not** generic: follow each tool's "
+        "**Parameters** and **Usage guidance** above.\n"
+        "Additional hard requirements:\n"
+        "- Emit exactly **one** JSON object; no markdown fences and no prose outside that object.\n"
+        "- Follow each tool's **Parameters** and **Usage guidance** above for `query` / `args`; use "
+        '`"args": null` when that tool does not require a structured object.\n'
+        '- `"tool"`: lowercase key from the enabled list above, or `ANSWER`.\n'
+        '- `"query"`: string slot for the tool\'s primary text request in this protocol; use `""` when `tool` is `ANSWER`.\n'
+        '- For **ANSWER** use exactly `{"tool":"ANSWER","query":"","args":null}` as JSON; never put generated '
+        "code, `project_json_src`, or any narrative inside `args`.\n"
     )
     if existing_results:
         prompt += f"\nAlready retrieved:\n{existing_results}\n"
