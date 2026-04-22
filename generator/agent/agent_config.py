@@ -242,7 +242,8 @@ def tool_mode_to_string(mode: AgentToolMode) -> str:
     }
     if mode in predefined_map:
         return predefined_map[mode]
-    return ",".join(sorted(mode))
+    # Underscore join: safe for filesystem paths and CLI tools (comma breaks msopgen -i paths).
+    return "_".join(sorted(mode))
 
 
 def normalize_tool_choice_name(raw: str) -> Optional[str]:

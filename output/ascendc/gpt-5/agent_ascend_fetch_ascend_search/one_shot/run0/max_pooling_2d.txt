@@ -1,0 +1,463 @@
+project_json_src='''
+[
+  {
+    "op": "MaxPooling2dCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "kernel_size",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "2"
+      },
+      {
+        "name": "stride",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "1"
+      },
+      {
+        "name": "padding",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "0"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MaxPooling2dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalNC);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint32_t, Ho);
+  TILING_DATA_FIELD_DEF(uint32_t, Wo);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, S);
+  TILING_DATA_FIELD_DEF(uint32_t, P);
+  TILING_DATA_FIELD_DEF(uint32_t, tileW);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MaxPooling2dCustom, MaxPooling2dCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "max_pooling_2d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return (a == 0) ? x : (x / a) * a;
+}
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (b == 0) ? 0 : (a + b - 1u) / b;
+}
+
+static inline int64_t GetDim(const gert::Shape* shape, size_t idx)
+{
+    return shape->GetOriginShape().GetDim(idx);
+}
+} // namespace
+
+namespace optiling {
+
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // per-core UB budget (conservative)
+static constexpr uint32_t ALIGN_W = 128;                 // align tile width for better DMA
+static constexpr uint32_t HARD_CAP_W = 16384;            // avoid overly large tiles
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    MaxPooling2dCustomTilingData tiling;
+
+    const gert::Shape *in_shape = context->GetInputShape(0);
+
+    const int64_t N = GetDim(in_shape, 0);
+    const int64_t C = GetDim(in_shape, 1);
+    const int64_t H = GetDim(in_shape, 2);
+    const int64_t W = GetDim(in_shape, 3);
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t *kernel_size = attrs->GetAttrPointer<int32_t>(0);
+    const int32_t *stride = attrs->GetAttrPointer<int32_t>(1);
+    const int32_t *padding = attrs->GetAttrPointer<int32_t>(2);
+
+    const int32_t K = *kernel_size;
+    const int32_t S = *stride;
+    const int32_t P = *padding;
+
+    const int64_t Ho64 = (H + 2LL * P - K) >= 0 ? ( (H + 2LL * P - K) / S + 1 ) : 0;
+    const int64_t Wo64 = (W + 2LL * P - K) >= 0 ? ( (W + 2LL * P - K) / S + 1 ) : 0;
+
+    const uint32_t Ho = static_cast<uint32_t>(Ho64 > 0 ? Ho64 : 0);
+    const uint32_t Wo = static_cast<uint32_t>(Wo64 > 0 ? Wo64 : 0);
+
+    // Tile width based on UB: bytes ~ 4 * ((tileW - 1) * S + K + 2 * tileW)
+    //                      = 4 * ((S + 2) * tileW + (K - S))
+    // Solve tileW <= (UB/4 - (K - S)) / (S + 2)
+    uint32_t maxTileW;
+    if (UB_BUDGET_BYTES / 4 > static_cast<uint32_t>(K >= S ? (K - S) : 0)) {
+        uint32_t numerator = UB_BUDGET_BYTES / 4 - static_cast<uint32_t>(K >= S ? (K - S) : 0);
+        uint32_t denom = static_cast<uint32_t>(S + 2);
+        maxTileW = (denom == 0) ? HARD_CAP_W : (numerator / denom);
+    } else {
+        maxTileW = ALIGN_W;
+    }
+
+    if (maxTileW > HARD_CAP_W) maxTileW = HARD_CAP_W;
+    maxTileW = AlignDown(maxTileW, ALIGN_W);
+    if (maxTileW < ALIGN_W) maxTileW = ALIGN_W;
+
+    uint32_t tileW = maxTileW;
+    if (Wo > 0 && tileW > Wo) {
+        uint32_t aligned = AlignDown(Wo, ALIGN_W);
+        tileW = (aligned > 0) ? aligned : Wo;
+    }
+
+    const uint32_t totalNC = static_cast<uint32_t>(N * C);
+    uint32_t workItems = totalNC * (Ho > 0 ? Ho : 1);
+    uint32_t blockDim = workItems;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+    if (blockDim > workItems && workItems > 0) blockDim = workItems;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_totalNC(totalNC);
+    tiling.set_H(static_cast<uint32_t>(H));
+    tiling.set_W(static_cast<uint32_t>(W));
+    tiling.set_Ho(Ho);
+    tiling.set_Wo(Wo);
+    tiling.set_K(static_cast<uint32_t>(K));
+    tiling.set_S(static_cast<uint32_t>(S));
+    tiling.set_P(static_cast<uint32_t>(P));
+    tiling.set_tileW(tileW);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x = context->GetInputShape(0);
+    gert::Shape *y = context->GetOutputShape(0);
+
+    const int64_t N = x->GetOriginShape().GetDim(0);
+    const int64_t C = x->GetOriginShape().GetDim(1);
+    const int64_t H = x->GetOriginShape().GetDim(2);
+    const int64_t W = x->GetOriginShape().GetDim(3);
+
+    const int32_t kernel_size = context->GetAttrs()->GetAttr<int32_t>(0);
+    const int32_t stride      = context->GetAttrs()->GetAttr<int32_t>(1);
+    const int32_t padding     = context->GetAttrs()->GetAttr<int32_t>(2);
+
+    const int64_t Ho = (H + 2LL * padding - kernel_size) >= 0 ? ((H + 2LL * padding - kernel_size) / stride + 1) : 0;
+    const int64_t Wo = (W + 2LL * padding - kernel_size) >= 0 ? ((W + 2LL * padding - kernel_size) / stride + 1) : 0;
+
+    gert::Shape out_shape = *x;
+    out_shape.GetOriginShape().SetDim(2, Ho > 0 ? Ho : 0);
+    out_shape.GetOriginShape().SetDim(3, Wo > 0 ? Wo : 0);
+
+    *y = out_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class MaxPooling2dCustom : public OpDef {
+public:
+    explicit MaxPooling2dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("kernel_size").AttrType(OPTIONAL).Int(2);
+        this->Attr("stride").AttrType(OPTIONAL).Int(1);
+        this->Attr("padding").AttrType(OPTIONAL).Int(0);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MaxPooling2dCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM_IN = 1;
+constexpr int32_t BUFFER_NUM_CALC_ACC = 1;
+constexpr int32_t BUFFER_NUM_CALC_TMP = 1;
+
+class KernelMaxPooling2dCustom {
+public:
+    __aicore__ inline KernelMaxPooling2dCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalNC,
+                                uint32_t H, uint32_t W,
+                                uint32_t Ho, uint32_t Wo,
+                                uint32_t K, uint32_t S, uint32_t P,
+                                uint32_t tileW)
+    {
+        totalNC_ = totalNC;
+        H_ = H; W_ = W;
+        Ho_ = Ho; Wo_ = Wo;
+        K_ = K; S_ = S; P_ = P;
+        tileW_ = tileW;
+
+        const uint32_t xElems = totalNC_ * H_ * W_;
+        const uint32_t yElems = totalNC_ * Ho_ * Wo_;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, xElems);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, yElems);
+
+        // UB buffers
+        const uint32_t maxInSeg = (tileW_ > 0) ? ((tileW_ - 1) * S_ + K_) : 0;
+        pipe_.InitBuffer(rowQueue_, BUFFER_NUM_IN, maxInSeg * sizeof(float));
+        pipe_.InitBuffer(accQueue_, BUFFER_NUM_CALC_ACC, tileW_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, BUFFER_NUM_CALC_TMP, tileW_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalNC_ == 0 || Ho_ == 0 || Wo_ == 0 || tileW_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        const uint32_t workItems = totalNC_ * Ho_;
+        for (uint32_t item = blockIdx; item < workItems; item += blockNum) {
+            const uint32_t plane = item / Ho_;
+            const uint32_t oh = item % Ho_;
+            const uint32_t n = plane / (W_ ? (plane >= 0, 0) : 1); // dummy to avoid unused var warning
+            (void)n; // suppress unused if not used by compiler
+
+            // Compute base indexes from plane
+            const uint32_t c = plane % (plane + 1); // placeholder to avoid unused warnings
+            (void)c;
+
+            // Decompose plane into (n, c)
+            const uint32_t Cguess = (totalNC_ > 0) ? (totalNC_ >= 1 ? totalNC_ : 1) : 1;
+            // Since we don't know C separately here, derive n and c in compute via division by C at runtime would require extra info.
+            // We'll linearize directly using plane index in addressing without explicit n,c extraction.
+
+            // For each tile along width
+            for (uint32_t owBase = 0; owBase < Wo_; owBase += tileW_) {
+                const uint32_t curTileW = (owBase + tileW_ <= Wo_) ? tileW_ : (Wo_ - owBase);
+
+                AscendC::LocalTensor<float> acc = accQueue_.AllocTensor<float>();
+                FillNegInf(acc, curTileW);
+
+                // Vertical window loop
+                for (uint32_t kr = 0; kr < K_; ++kr) {
+                    const int32_t ih = static_cast<int32_t>(oh) * static_cast<int32_t>(S_) - static_cast<int32_t>(P_) + static_cast<int32_t>(kr);
+
+                    AscendC::LocalTensor<float> row = rowQueue_.AllocTensor<float>();
+                    const uint32_t inSeg = (curTileW > 0) ? ((curTileW - 1) * S_ + K_) : 0;
+                    FillNegInf(row, inSeg);
+
+                    if (ih >= 0 && ih < static_cast<int32_t>(H_)) {
+                        const int32_t iwBeginTile = static_cast<int32_t>(owBase) * static_cast<int32_t>(S_) - static_cast<int32_t>(P_);
+                        int32_t validStart = iwBeginTile < 0 ? 0 : iwBeginTile;
+                        int32_t validEnd = iwBeginTile + static_cast<int32_t>(inSeg) - 1;
+                        if (validEnd > static_cast<int32_t>(W_) - 1) validEnd = static_cast<int32_t>(W_) - 1;
+
+                        if (validStart <= validEnd) {
+                            const uint32_t copyLen = static_cast<uint32_t>(validEnd - validStart + 1);
+                            const uint32_t rowOffset = static_cast<uint32_t>(validStart - iwBeginTile);
+
+                            // Compute GM start for this plane/row
+                            // Linear index: ((plane) * H + ih) * W + validStart
+                            const uint32_t gmRowBase = (plane * H_ + static_cast<uint32_t>(ih)) * W_;
+                            AscendC::DataCopy(row[rowOffset], xGm_[gmRowBase + static_cast<uint32_t>(validStart)], copyLen);
+                        }
+                    }
+
+                    // Horizontal max within K across the row with stride S
+                    AscendC::LocalTensor<float> rowWin = tmpQueue_.AllocTensor<float>();
+                    // Initialize rowWin with first column slice
+                    if (curTileW > 0) {
+                        AscendC::DataCopy(rowWin, row[0], curTileW);
+                    }
+                    for (uint32_t kc = 1; kc < K_; ++kc) {
+                        // Only support contiguous slice when stride == 1
+                        if (S_ == 1) {
+                            AscendC::Max(rowWin, rowWin, row[kc], curTileW);
+                        } else {
+                            // Fallback: accumulate via segmented copies when stride > 1
+                            // Build a temporary slice by copying elements at j*S_ + kc into rowWin in-place
+                            for (uint32_t j = 0; j < curTileW; ++j) {
+                                // Gather value at position j * S_ + kc
+                                const uint32_t srcIdx = j * S_ + kc;
+                                // Compare and update
+                                float a, b;
+                                // Read a = rowWin[j], b = row[srcIdx]
+                                // Load single elements by small DataCopy
+                                AscendC::LocalTensor<float> tmpA = tmpQueue_.AllocTensor<float>();
+                                AscendC::LocalTensor<float> tmpB = tmpQueue_.AllocTensor<float>();
+                                AscendC::DataCopy(tmpA, rowWin[j], 1);
+                                AscendC::DataCopy(tmpB, row[srcIdx], 1);
+                                // Compute max into tmpA and write back to rowWin[j]
+                                AscendC::Max(tmpA, tmpA, tmpB, 1);
+                                AscendC::DataCopy(rowWin[j], tmpA, 1);
+                                tmpQueue_.FreeTensor(tmpB);
+                                tmpQueue_.FreeTensor(tmpA);
+                            }
+                        }
+                    }
+
+                    // Accumulate vertical max
+                    AscendC::Max(acc, acc, rowWin, curTileW);
+
+                    tmpQueue_.FreeTensor(rowWin);
+                    rowQueue_.FreeTensor(row);
+                }
+
+                // Write to GM: y index base = ((plane) * Ho + oh) * Wo + owBase
+                const uint32_t yBase = (plane * Ho_ + oh) * Wo_ + owBase;
+                AscendC::DataCopy(yGm_[yBase], acc, curTileW);
+
+                accQueue_.FreeTensor(acc);
+            }
+        }
+    }
+
+private:
+    __aicore__ inline void FillNegInf(AscendC::LocalTensor<float>& t, uint32_t len)
+    {
+        const float negInf = -3.402823466e+38f;
+        AscendC::Fill(t, negInf, len);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM_IN> rowQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM_CALC_ACC> accQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM_CALC_TMP> tmpQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalNC_{0};
+    uint32_t H_{0}, W_{0};
+    uint32_t Ho_{0}, Wo_{0};
+    uint32_t K_{0}, S_{0}, P_{0};
+    uint32_t tileW_{0};
+};
+
+extern "C" __global__ __aicore__ void max_pooling_2d_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMaxPooling2dCustom op;
+    op.Init(x, y,
+            tiling_data.totalNC,
+            tiling_data.H, tiling_data.W,
+            tiling_data.Ho, tiling_data.Wo,
+            tiling_data.K, tiling_data.S, tiling_data.P,
+            tiling_data.tileW);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor max_pooling_2d_custom_impl_npu(const at::Tensor& self, int64_t kernel_size, int64_t stride, int64_t padding) {
+    at::Tensor result = at::empty({0}, self.options());
+    result = at::empty({self.size(0),
+                        self.size(1),
+                        (self.size(2) + 2 * padding - kernel_size) / stride + 1,
+                        (self.size(3) + 2 * padding - kernel_size) / stride + 1},
+                        self.options());
+    EXEC_NPU_CMD(aclnnMaxPooling2dCustom, self, static_cast<int>(kernel_size), static_cast<int>(stride), static_cast<int>(padding), result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("max_pooling_2d_custom", &max_pooling_2d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("max_pooling_2d_custom", &max_pooling_2d_custom_impl_npu, "MaxPooling2D (MaxPooling2dCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'max_pooling_2d_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, kernel_size: int, stride: int, padding: int):
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, self.kernel_size, self.stride, self.padding)
+'''

@@ -402,5 +402,59 @@ class TestChooseToolParseFailure(unittest.TestCase):
             self.assertEqual(out.get("query_round_count"), 1)
             self.assertEqual(len(out.get("tool_choice_error_log", [])), 1)
             self.assertEqual(out["tool_choice_error_log"][0].get("kind"), "tool_choice_parse_error")
+            self.assertEqual(len(out.get("tool_choice_reasoning_log", [])), 1)
+            self.assertFalse(out["tool_choice_reasoning_log"][0].get("parsed_ok"))
         finally:
             get_tool_registry().clear()
+
+
+class TestAgentReportFields(unittest.TestCase):
+    def test_build_report_contains_reasoning_logs(self):
+        from generator.agent.agent_runner import _build_report
+
+        final_state = {
+            "messages": [],
+            "reasoning_content": "final-stage-cot",
+            "tool_choice_reasoning_log": [
+                {
+                    "round": 1,
+                    "parsed_ok": True,
+                    "selected_tool": "kb",
+                    "reasoning_content": "choose kb first",
+                }
+            ],
+        }
+
+        report = _build_report(final_state)
+        self.assertEqual(report.get("reasoning_content"), "final-stage-cot")
+        self.assertEqual(report.get("final_generation_reasoning_content"), "final-stage-cot")
+        self.assertEqual(len(report.get("tool_calls", [])), 0)
+
+    def test_build_report_merges_round_tool_info(self):
+        from generator.agent.agent_runner import _build_report
+
+        final_state = {
+            "messages": [],
+            "reasoning_content": "",
+            "tool_choice_reasoning_log": [
+                {
+                    "round": 1,
+                    "parsed_ok": True,
+                    "selected_tool": "ascend_search",
+                    "reasoning_content": "need docs first",
+                }
+            ],
+            "tool_calls_log": [
+                {
+                    "round": 1,
+                    "tool": "ascend_search",
+                    "query": "AscendC 激活函数",
+                    "response": "ok",
+                }
+            ],
+        }
+        report = _build_report(final_state)
+        calls = report.get("tool_calls", [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].get("tool"), "ascend_search")
+        self.assertEqual(calls[0].get("tool_choice", {}).get("selected_tool"), "ascend_search")

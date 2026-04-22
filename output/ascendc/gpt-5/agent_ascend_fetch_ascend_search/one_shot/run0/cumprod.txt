@@ -1,0 +1,377 @@
+project_json_src='''
+[
+  {
+    "op": "CumprodCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "dim",
+        "param_type": "required",
+        "type": "int"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CumprodCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(int32_t, dim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CumprodCustom, CumprodCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "cumprod_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return (x / a) * a;
+}
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (a + b - 1u) / b;
+}
+
+static inline uint64_t ProdDims(const gert::Shape &shape, uint32_t start, uint32_t end)
+{
+    // multiply dims in [start, end)
+    uint64_t p = 1;
+    for (uint32_t i = start; i < end; ++i) {
+        p *= static_cast<uint64_t>(shape.GetDim(i));
+    }
+    return p;
+}
+
+} // anonymous
+
+namespace optiling {
+
+// UB model for this kernel:
+//   inQueue: 2 * tile
+//   outQueue: 2 * tile
+// Total floats = 4 * tile => bytes = 16 * tile
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
+static constexpr uint32_t ALIGN_ELEMS = 2048;            // favor larger DMA bursts
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;        // avoid too-large per-iter latency
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    CumprodCustomTilingData tiling;
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t *dimAttr = attrs->GetAttrPointer<int32_t>(0);
+
+    const gert::Shape &shape = context->GetInputShape(0)->GetOriginShape();
+    const uint32_t rank = shape.GetDimNum();
+
+    int32_t dim = *dimAttr;
+    if (dim < 0) {
+        dim += static_cast<int32_t>(rank);
+    }
+    if (dim < 0 || dim >= static_cast<int32_t>(rank)) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const uint64_t totalLen64 = shape.GetShapeSize();
+    const uint32_t totalLength = static_cast<uint32_t>(totalLen64);
+
+    const uint64_t outer64 = (dim > 0) ? ProdDims(shape, 0, static_cast<uint32_t>(dim)) : 1;
+    const uint64_t cols64 = static_cast<uint64_t>(shape.GetDim(static_cast<uint32_t>(dim)));
+    const uint64_t tail64 = (static_cast<uint32_t>(dim) + 1 < rank)
+        ? ProdDims(shape, static_cast<uint32_t>(dim) + 1, rank)
+        : 1;
+
+    // This implementation is optimized for cumprod along the last dimension (tail == 1).
+    // If tail != 1, the memory is not contiguous for the scan; not supported in this kernel.
+    if (tail64 != 1) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const uint32_t rows = static_cast<uint32_t>(outer64);
+    const uint32_t cols = static_cast<uint32_t>(cols64);
+
+    uint32_t maxTile = UB_BUDGET_BYTES / 16;  // elements
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t tileLen = maxTile;
+    if (cols < tileLen) {
+        const uint32_t aligned = AlignDown(cols, ALIGN_ELEMS);
+        tileLen = (aligned > 0) ? aligned : cols;
+    }
+    if (tileLen == 0) tileLen = cols;
+
+    // Adaptive blockDim based on rows.
+    uint32_t blockDim = rows;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+    if (rows == 0u) blockDim = 1u;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+    tiling.set_tileLength(tileLen);
+    tiling.set_blockDim(blockDim);
+    tiling.set_dim(dim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class CumprodCustom : public OpDef {
+public:
+    explicit CumprodCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("dim").AttrType(REQUIRED).Int(0);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CumprodCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCumprodCustom {
+public:
+    __aicore__ inline KernelCumprodCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t rows,
+                                uint32_t cols, uint32_t tileLength, int32_t dim)
+    {
+        totalLen_ = totalLength;
+        rows_ = rows;
+        cols_ = cols;
+        tileLen_ = tileLength;
+        dim_ = dim;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inQueue_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueue_, BUFFER_NUM, tileLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0 || cols_ == 0 || rows_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        for (uint32_t row = blockIdx; row < rows_; row += blockNum) {
+            uint32_t rowBase = row * cols_;
+            // Prefetch first tile of this row
+            uint32_t pos = 0;
+            uint32_t len0 = cols_ - pos;
+            if (len0 > tileLen_) len0 = tileLen_;
+            if (len0 > 0) {
+                CopyIn(rowBase + pos, len0);
+            }
+
+            carry_ = 1.0f;
+
+            while (pos < cols_) {
+                uint32_t nextPos = pos + len0;
+                uint32_t nextLen = 0;
+                if (nextPos < cols_) {
+                    nextLen = cols_ - nextPos;
+                    if (nextLen > tileLen_) nextLen = tileLen_;
+                    CopyIn(rowBase + nextPos, nextLen);
+                }
+
+                ComputeTile(len0);
+                CopyOut(rowBase + pos, len0);
+
+                pos = nextPos;
+                len0 = nextLen;
+            }
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueue_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm_[gmOffset], len);
+        inQueue_.EnQue(xLocal);
+    }
+
+    __aicore__ inline void ComputeTile(uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueue_.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueue_.AllocTensor<float>();
+
+        // Elementwise sequential prefix product within tile:
+        // y[i] = carry_ * product_{k=0..i} x[k]
+        float *xin = reinterpret_cast<float*>(xLocal.GetBuffer());
+        float *yout = reinterpret_cast<float*>(yLocal.GetBuffer());
+
+        float c = carry_;
+        for (uint32_t i = 0; i < len; ++i) {
+            c = c * xin[i];
+            yout[i] = c;
+        }
+        carry_ = c;
+
+        outQueue_.EnQue<float>(yLocal);
+        inQueue_.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueue_.DeQue<float>();
+        AscendC::DataCopy(yGm_[gmOffset], yLocal, len);
+        outQueue_.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalLen_ {0};
+    uint32_t rows_ {0};
+    uint32_t cols_ {0};
+    uint32_t tileLen_ {0};
+    int32_t dim_ {0};
+    float carry_ {1.0f};
+};
+
+extern "C" __global__ __aicore__ void cumprod_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCumprodCustom op;
+    op.Init(x, y,
+            tiling_data.totalLength,
+            tiling_data.rows,
+            tiling_data.cols,
+            tiling_data.tileLength,
+            tiling_data.dim);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor cumprod_impl_npu(const at::Tensor& self, int64_t dim) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnCumprodCustom, self, static_cast<int32_t>(dim), result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cumprod_custom", &cumprod_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cumprod_custom", &cumprod_impl_npu, "CumProd along dim (CumprodCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'cumprod_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, self.dim)
+'''

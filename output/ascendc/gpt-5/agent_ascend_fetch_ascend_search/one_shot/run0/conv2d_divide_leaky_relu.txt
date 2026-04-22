@@ -1,0 +1,509 @@
+project_json_src='''
+[
+  {
+    "op": "Conv2dDivideLeakyReluCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "bias",
+        "param_type": "optional",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "divisor",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "2.0"
+      },
+      {
+        "name": "negative_slope",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "0.01"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(Conv2dDivideLeakyReluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, oc);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, oh);
+  TILING_DATA_FIELD_DEF(uint32_t, ow);
+  TILING_DATA_FIELD_DEF(uint32_t, tileOc);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint32_t, hasBias);
+  TILING_DATA_FIELD_DEF(float, divisor);
+  TILING_DATA_FIELD_DEF(float, negativeSlope);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv2dDivideLeakyReluCustom, Conv2dDivideLeakyReluCustomTilingData)
+
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "conv2d_divide_leaky_relu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (a + b - 1u) / b;
+}
+
+static inline uint32_t MinU32(uint32_t a, uint32_t b)
+{
+    return (a < b) ? a : b;
+}
+
+} // anonymous namespace
+
+namespace optiling {
+
+// UB budget estimation for this fused kernel.
+// Buffers per core (floats):
+//   wTile: tileOc * C * K * K
+//   xPatch: C * K * K
+//   yRow: OW
+//   tmpRow: OW
+//   biasTile: tileOc (if present)
+// Total bytes ≈ 4 * (tileOc * C*K*K + C*K*K + 2*OW + tileOc)
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    Conv2dDivideLeakyReluCustomTilingData tiling;
+
+    const gert::Shape *x_shape = context->GetInputShape(0);   // [N, C, H, W]
+    const gert::Shape *w_shape = context->GetInputShape(1);   // [OC, C, K, K]
+    const bool hasBias = (context->GetAllInputShape().size() > 2) &&
+                         (context->GetInputShape(2)->GetShapeSize() != 0);
+
+    const uint32_t N = static_cast<uint32_t>(x_shape->GetDim(0));
+    const uint32_t C = static_cast<uint32_t>(x_shape->GetDim(1));
+    const uint32_t H = static_cast<uint32_t>(x_shape->GetDim(2));
+    const uint32_t W = static_cast<uint32_t>(x_shape->GetDim(3));
+
+    const uint32_t OC = static_cast<uint32_t>(w_shape->GetDim(0));
+    const uint32_t KC = static_cast<uint32_t>(w_shape->GetDim(1)); // should equal C
+    const uint32_t K  = static_cast<uint32_t>(w_shape->GetDim(2)); // square kernel KxK
+
+    // Assume stride=1, padding=0, dilation=1
+    const uint32_t OH = (H >= K) ? (H - K + 1) : 0u;
+    const uint32_t OW = (W >= K) ? (W - K + 1) : 0u;
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    float divisor = 2.0f;
+    float negativeSlope = 0.01f;
+    if (attrs->GetAttrNum() >= 1) {
+        const float *div_ptr = attrs->GetAttrPointer<float>(0);
+        if (div_ptr) divisor = *div_ptr;
+    }
+    if (attrs->GetAttrNum() >= 2) {
+        const float *neg_ptr = attrs->GetAttrPointer<float>(1);
+        if (neg_ptr) negativeSlope = *neg_ptr;
+    }
+
+    // Compute tileOc to fit UB budget
+    const uint64_t L = static_cast<uint64_t>(C) * static_cast<uint64_t>(K) * static_cast<uint64_t>(K); // patch length
+    uint64_t ubFloats = UB_BUDGET_BYTES / 4u;
+    // Reserve for xPatch and two rows and some margin
+    uint64_t reserved = L + 2ull * OW + 2048ull; // floats
+    uint64_t availForWTile = (ubFloats > reserved) ? (ubFloats - reserved) : 0ull;
+    uint32_t tileOc = 1u;
+    if (L > 0ull) {
+        uint64_t maxOcByW = availForWTile / L;
+        if (maxOcByW == 0ull) tileOc = 1u;
+        else tileOc = static_cast<uint32_t>(maxOcByW);
+    }
+    if (tileOc == 0u) tileOc = 1u;
+    if (tileOc > OC) tileOc = OC;
+
+    // Parallelize over oc tiles
+    const uint32_t numTilesOc = (tileOc == 0) ? 1u : CeilDiv(OC, tileOc);
+    uint32_t blockDim = MinU32(32u, numTilesOc);
+    if (blockDim < 1u) blockDim = 1u;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_n(N);
+    tiling.set_c(C);
+    tiling.set_h(H);
+    tiling.set_w(W);
+    tiling.set_oc(OC);
+    tiling.set_k(K);
+    tiling.set_oh(OH);
+    tiling.set_ow(OW);
+    tiling.set_tileOc(tileOc);
+    tiling.set_blockDim(blockDim);
+    tiling.set_hasBias(hasBias ? 1u : 0u);
+    tiling.set_divisor(divisor);
+    tiling.set_negativeSlope(negativeSlope);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);   // [N,C,H,W]
+    const gert::Shape *w_shape = context->GetInputShape(1);   // [OC,C,K,K]
+    const int64_t N = x_shape->GetDim(0);
+    const int64_t C = x_shape->GetDim(1);
+    const int64_t H = x_shape->GetDim(2);
+    const int64_t W = x_shape->GetDim(3);
+    const int64_t OC = w_shape->GetDim(0);
+    const int64_t K = w_shape->GetDim(2);
+
+    // stride=1, padding=0, dilation=1
+    const int64_t OH = (H >= K) ? (H - K + 1) : 0;
+    const int64_t OW = (W >= K) ? (W - K + 1) : 0;
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    std::vector<int64_t> out_dims = {N, OC, OH, OW};
+    y_shape->SetDimNum(out_dims.size());
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        y_shape->SetDim(i, out_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+
+class Conv2dDivideLeakyReluCustom : public OpDef {
+public:
+    explicit Conv2dDivideLeakyReluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("bias")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("divisor").AttrType(OPTIONAL).Float(2.0);
+        this->Attr("negative_slope").AttrType(OPTIONAL).Float(0.01);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv2dDivideLeakyReluCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+class KernelConv2dDivideLeakyReluCustom {
+public:
+    __aicore__ inline KernelConv2dDivideLeakyReluCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t h, uint32_t w_in,
+                                uint32_t oc, uint32_t k, uint32_t oh, uint32_t ow,
+                                uint32_t tileOc, uint32_t hasBias,
+                                float divisor, float negativeSlope)
+    {
+        n_ = n; c_ = c; h_ = h; wIn_ = w_in; oc_ = oc; k_ = k;
+        oh_ = oh; ow_ = ow; tileOc_ = tileOc;
+        hasBias_ = (hasBias != 0u);
+        invDiv_ = 1.0f / divisor;
+        negCorr_ = negativeSlope - 1.0f;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint32_t>(n_) * c_ * h_ * wIn_);
+        wGm_.SetGlobalBuffer((__gm__ float*)w, static_cast<uint32_t>(oc_) * c_ * k_ * k_);
+        if (hasBias_) {
+            bGm_.SetGlobalBuffer((__gm__ float*)b, oc_);
+        }
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint32_t>(n_) * oc_ * oh_ * ow_);
+
+        const uint32_t L = c_ * k_ * k_;
+        // Initialize working buffers
+        pipe_.InitBuffer(wTileQ_, 1, tileOc_ * L * sizeof(float));
+        pipe_.InitBuffer(biasQ_, 1, tileOc_ * sizeof(float));
+        pipe_.InitBuffer(xPatchQ_, 1, L * sizeof(float));
+        pipe_.InitBuffer(yRowQ_, 1, ow_ * sizeof(float));
+        pipe_.InitBuffer(tmpRowQ_, 1, ow_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (oh_ == 0 || ow_ == 0 || k_ == 0 || c_ == 0 || oc_ == 0 || n_ == 0) {
+            return;
+        }
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        const uint32_t numTilesOc = CeilDivU32(oc_, tileOc_);
+        if (blockIdx >= numTilesOc) {
+            return;
+        }
+
+        const uint32_t L = c_ * k_ * k_;
+        const uint32_t ocStart = blockIdx * tileOc_;
+        const uint32_t ocEff = MinU32(tileOc_, oc_ - ocStart);
+
+        AscendC::LocalTensor<float> wTile = wTileQ_.AllocTensor<float>();
+        AscendC::LocalTensor<float> biasTile;
+        if (hasBias_) {
+            biasTile = biasQ_.AllocTensor<float>();
+        }
+        AscendC::LocalTensor<float> xPatch = xPatchQ_.AllocTensor<float>();
+        AscendC::LocalTensor<float> yRow = yRowQ_.AllocTensor<float>();
+        AscendC::LocalTensor<float> tmpRow = tmpRowQ_.AllocTensor<float>();
+
+        // Prefetch weights for oc tile
+        const uint32_t wOffset = ocStart * L;
+        AscendC::DataCopy(wTile, wGm_[wOffset], ocEff * L);
+
+        // Prefetch bias for oc tile if present
+        if (hasBias_) {
+            AscendC::DataCopy(biasTile, bGm_[ocStart], ocEff);
+        }
+
+        for (uint32_t n = 0; n < n_; ++n) {
+            for (uint32_t j = 0; j < ocEff; ++j) {
+                // For each output row
+                for (uint32_t oh = 0; oh < oh_; ++oh) {
+                    // Compute yRow[0..ow_-1] for (n, oc, oh, :)
+                    for (uint32_t owx = 0; owx < ow_; ++owx) {
+                        // Build input patch into xPatch
+                        uint32_t patchPos = 0;
+                        for (uint32_t ic = 0; ic < c_; ++ic) {
+                            for (uint32_t kh = 0; kh < k_; ++kh) {
+                                const uint32_t ih = oh + kh;
+                                // input row offset for start column
+                                const uint32_t iw = owx;
+                                const uint32_t inRowBase = (((n * c_ + ic) * h_ + ih) * wIn_);
+                                // Copy K contiguous elements for this kernel row
+                                AscendC::DataCopy(xPatch[patchPos], xGm_[inRowBase + iw], k_);
+                                patchPos += k_;
+                            }
+                        }
+
+                        // Dot product with weight vector for oc = ocStart + j
+                        const uint32_t wBase = j * L;
+                        float acc = 0.0f;
+                        for (uint32_t t = 0; t < L; ++t) {
+                            acc += wTile.GetValue(wBase + t) * xPatch.GetValue(t);
+                        }
+                        yRow.SetValue(owx, acc);
+                    }
+
+                    // Add bias if present
+                    if (hasBias_) {
+                        const float bval = biasTile.GetValue(j);
+                        AscendC::Dup(tmpRow, bval, ow_);
+                        AscendC::Add(yRow, yRow, tmpRow, ow_);
+                    }
+
+                    // Divide by divisor
+                    AscendC::Muls(yRow, yRow, invDiv_, ow_);
+
+                    // LeakyReLU: y = y + (negCorr_) * min(y, 0)
+                    AscendC::Mins(tmpRow, yRow, 0.0f, ow_);          // tmp = min(y, 0)
+                    AscendC::Muls(tmpRow, tmpRow, negCorr_, ow_);     // tmp = (negCorr) * tmp
+                    AscendC::Add(yRow, yRow, tmpRow, ow_);            // y = y + tmp
+
+                    // Write row to GM
+                    const uint32_t ocIdx = ocStart + j;
+                    const uint32_t yBase = (((n * oc_ + ocIdx) * oh_ + oh) * ow_);
+                    AscendC::DataCopy(yGm_[yBase], yRow, ow_);
+                }
+            }
+        }
+
+        tmpRowQ_.FreeTensor(tmpRow);
+        yRowQ_.FreeTensor(yRow);
+        xPatchQ_.FreeTensor(xPatch);
+        if (hasBias_) {
+            biasQ_.FreeTensor(biasTile);
+        }
+        wTileQ_.FreeTensor(wTile);
+    }
+
+private:
+    __aicore__ inline uint32_t CeilDivU32(uint32_t a, uint32_t b) const {
+        return (a + b - 1u) / b;
+    }
+    __aicore__ inline uint32_t MinU32(uint32_t a, uint32_t b) const {
+        return (a < b) ? a : b;
+    }
+
+private:
+    AscendC::TPipe pipe_;
+
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> wTileQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> biasQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> xPatchQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> yRowQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpRowQ_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> bGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t n_{0}, c_{0}, h_{0}, wIn_{0};
+    uint32_t oc_{0}, k_{0}, oh_{0}, ow_{0};
+    uint32_t tileOc_{1};
+    bool hasBias_{false};
+    float invDiv_{0.5f};
+    float negCorr_{-0.99f};
+};
+
+extern "C" __global__ __aicore__ void conv2d_divide_leaky_relu_custom(GM_ADDR x,
+                                                                       GM_ADDR weight,
+                                                                       GM_ADDR bias,
+                                                                       GM_ADDR y,
+                                                                       GM_ADDR workspace,
+                                                                       GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv2dDivideLeakyReluCustom op;
+    op.Init(x,
+            weight,
+            bias,
+            y,
+            tiling_data.n,
+            tiling_data.c,
+            tiling_data.h,
+            tiling_data.w,
+            tiling_data.oc,
+            tiling_data.k,
+            tiling_data.oh,
+            tiling_data.ow,
+            tiling_data.tileOc,
+            tiling_data.hasBias,
+            tiling_data.divisor,
+            tiling_data.negativeSlope);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor conv2d_divide_leaky_relu_impl_npu(const at::Tensor& x,
+                                             const at::Tensor& weight,
+                                             c10::optional<at::Tensor> bias_opt,
+                                             double divisor) {
+    at::Tensor result = at::empty({x.size(0), weight.size(0),
+                                   x.size(2) - weight.size(2) + 1,
+                                   x.size(3) - weight.size(3) + 1},
+                                   x.options());
+    if (bias_opt.has_value()) {
+        EXEC_NPU_CMD(aclnnConv2dDivideLeakyReluCustom, x, weight, bias_opt.value(), divisor, result);
+    } else {
+        // Pass an undefined tensor for optional bias
+        at::Tensor none_bias;
+        EXEC_NPU_CMD(aclnnConv2dDivideLeakyReluCustom, x, weight, none_bias, divisor, result);
+    }
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv2d_divide_leaky_relu_custom", &conv2d_divide_leaky_relu_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv2d_divide_leaky_relu_custom", &conv2d_divide_leaky_relu_impl_npu,
+          "Conv2D + divide + LeakyReLU fused (Conv2dDivideLeakyReluCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'conv2d_divide_leaky_relu_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''

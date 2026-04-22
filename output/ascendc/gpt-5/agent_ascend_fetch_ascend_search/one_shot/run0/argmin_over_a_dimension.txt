@@ -1,0 +1,427 @@
+project_json_src='''
+[
+  {
+    "op": "ArgminOverADimensionCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "dim",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "0"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ArgminOverADimensionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, outer);       // product of dims before reduce axis
+  TILING_DATA_FIELD_DEF(uint32_t, reduceLen);   // size along reduce axis
+  TILING_DATA_FIELD_DEF(uint32_t, inner);       // product of dims after reduce axis
+  TILING_DATA_FIELD_DEF(uint32_t, tileInner);   // how many 'inner' columns per tile
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(int32_t, dim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ArgminOverADimensionCustom, ArgminOverADimensionCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "argmin_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t CeilDiv(uint64_t a, uint64_t b)
+{
+    return static_cast<uint32_t>((a + b - 1u) / b);
+}
+static inline uint64_t Prod(const std::vector<int64_t>& v, size_t s, size_t e)
+{
+    uint64_t p = 1;
+    for (size_t i = s; i < e; ++i) p *= static_cast<uint64_t>(v[i]);
+    return p;
+}
+} // namespace
+
+namespace optiling {
+
+// UB model for this kernel (per core):
+//   - inQueueRow: 2 * tileInner * sizeof(float)
+//   - minVals:    1 * tileInner * sizeof(float)
+//   - minIdx:     1 * tileInner * sizeof(int32_t)
+//   - mask:       1 * tileInner * sizeof(uint8_t)
+//   - outQueue:   1 * tileInner * sizeof(int32_t)
+// Total bytes ≈ (2*4 + 4 + 4 + 1 + 4) * tileInner = 21 * tileInner
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
+static constexpr uint32_t BYTES_PER_COL = 21;            // as above
+static constexpr uint32_t ALIGN_ELEMS = 1024;            // favor larger DMA bursts
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;        // avoid too-large per-iter latency
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    ArgminOverADimensionCustomTilingData tiling;
+
+    // Get dims
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const std::vector<int64_t>& dims = x_shape->GetStorageShape();
+    if (dims.empty()) {
+        context->SetBlockDim(1);
+        tiling.set_outer(1);
+        tiling.set_reduceLen(1);
+        tiling.set_inner(1);
+        tiling.set_tileInner(1);
+        tiling.set_blockDim(1);
+        tiling.set_dim(0);
+        tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                            context->GetRawTilingData()->GetCapacity());
+        context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+        size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+        currentWorkspace[0] = 0;
+        return ge::GRAPH_SUCCESS;
+    }
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t* dimPtr = attrs->GetAttrPointer<int32_t>(0);
+    int32_t dim = (dimPtr != nullptr) ? *dimPtr : 0;
+
+    const int32_t rank = static_cast<int32_t>(dims.size());
+    // canonicalize dimension
+    if (dim < 0) dim += rank;
+    if (dim < 0) dim = 0;
+    if (dim >= rank) dim = rank - 1;
+
+    const uint64_t outer = static_cast<uint64_t>(Prod(dims, 0, static_cast<size_t>(dim)));
+    const uint64_t reduceLen = static_cast<uint64_t>(dims[dim]);
+    const uint64_t inner = static_cast<uint64_t>(Prod(dims, static_cast<size_t>(dim + 1), dims.size()));
+
+    // tileInner from UB budget
+    uint32_t maxTile = UB_BUDGET_BYTES / BYTES_PER_COL;  // elements
+    // align down
+    maxTile = (maxTile / ALIGN_ELEMS) * ALIGN_ELEMS;
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = (HARD_CAP_ELEMS / ALIGN_ELEMS) * ALIGN_ELEMS;
+    uint32_t tileInner = static_cast<uint32_t>(inner < maxTile ? inner : maxTile);
+    if (inner < ALIGN_ELEMS) {
+        tileInner = static_cast<uint32_t>(inner);
+    }
+
+    // blockDim selects number of groups (outer) parallelized
+    uint32_t groups = static_cast<uint32_t>(outer == 0 ? 1 : outer);
+    uint32_t blockDim = groups;
+    if (blockDim == 0) blockDim = 1;
+    if (blockDim > 24u) blockDim = 24u;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_outer(static_cast<uint32_t>(outer));
+    tiling.set_reduceLen(static_cast<uint32_t>(reduceLen));
+    tiling.set_inner(static_cast<uint32_t>(inner));
+    tiling.set_tileInner(tileInner);
+    tiling.set_blockDim(blockDim);
+    tiling.set_dim(dim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const std::vector<int64_t>& in_dims = x_shape->GetOriginShape().GetStorageShape();
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t* dimPtr = attrs->GetAttrPointer<int32_t>(0);
+
+    int32_t dim = (dimPtr != nullptr) ? *dimPtr : 0;
+    int32_t rank = static_cast<int32_t>(in_dims.size());
+    if (rank == 0) {
+        gert::Shape *y_shape0 = context->GetOutputShape(0);
+        y_shape0->SetDimNum(0);
+        return GRAPH_SUCCESS;
+    }
+    if (dim < 0) dim += rank;
+    if (dim < 0) dim = 0;
+    if (dim >= rank) dim = rank - 1;
+
+    std::vector<int64_t> out_dims;
+    out_dims.reserve(static_cast<size_t>(rank - 1));
+    for (int32_t i = 0; i < rank; ++i) {
+        if (i == dim) continue;
+        out_dims.push_back(in_dims[i]);
+    }
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(out_dims.size());
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        y_shape->SetDim(i, out_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // Argmin returns indices; we use int32 here
+    context->SetOutputDataType(0, ge::DT_INT32);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class ArgminOverADimensionCustom : public OpDef {
+public:
+    explicit ArgminOverADimensionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("dim").AttrType(OPTIONAL).Int(0);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ArgminOverADimensionCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t IN_BUFFER_NUM = 2;
+constexpr int32_t OUT_BUFFER_NUM = 2;
+
+class KernelArgminOverADimensionCustom {
+public:
+    __aicore__ inline KernelArgminOverADimensionCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t outer, uint32_t reduceLen, uint32_t inner,
+                                uint32_t tileInner, int32_t dim)
+    {
+        outer_ = outer;
+        reduceLen_ = reduceLen;
+        inner_ = inner;
+        tileInner_ = tileInner;
+        dim_ = dim;
+
+        // total elements in x
+        uint32_t totalLen = 1;
+        // Avoid overflow in simple init
+        // x length = outer * reduceLen * inner
+        // output length = outer * inner
+        // Configure GM tensors
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint64_t>(outer_) * reduceLen_ * inner_);
+        yGm_.SetGlobalBuffer((__gm__ int32_t*)y, static_cast<uint64_t>(outer_) * inner_);
+
+        // Queues: in rows, out indices, and calc buffers for min and mask
+        pipe_.InitBuffer(inQueueRow_, IN_BUFFER_NUM, tileInner_ * sizeof(float));
+        pipe_.InitBuffer(outQueueIdx_, OUT_BUFFER_NUM, tileInner_ * sizeof(int32_t));
+        pipe_.InitBuffer(minValBuf_, 1, tileInner_ * sizeof(float));
+        pipe_.InitBuffer(minIdxBuf_, 1, tileInner_ * sizeof(int32_t));
+        pipe_.InitBuffer(maskBuf_, 1, tileInner_ * sizeof(uint8_t));
+        pipe_.InitBuffer(tmpIdxBuf_, 1, tileInner_ * sizeof(int32_t));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (outer_ == 0 || inner_ == 0 || reduceLen_ == 0 || tileInner_ == 0) {
+            return;
+        }
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        // Each group corresponds to a prefix combination; groups = outer_
+        for (uint32_t g = blockIdx; g < outer_; g += blockNum) {
+            // Base offset for this group in x
+            const uint64_t baseX = (static_cast<uint64_t>(g) * reduceLen_) * inner_;
+            const uint64_t baseY = static_cast<uint64_t>(g) * inner_;
+            ReduceOneGroup(baseX, baseY);
+        }
+    }
+
+private:
+    __aicore__ inline void ReduceOneGroup(uint64_t baseX, uint64_t baseY)
+    {
+        const float INIT_MAX = 1.0e30f;
+
+        for (uint32_t colBase = 0; colBase < inner_; colBase += tileInner_) {
+            const uint32_t colLen = (colBase + tileInner_ <= inner_) ? tileInner_ : (inner_ - colBase);
+
+            // Allocate and initialize minVals and minIdx
+            AscendC::LocalTensor<float> minVals = minValBuf_.AllocTensor<float>();
+            AscendC::LocalTensor<int32_t> minIdx = minIdxBuf_.AllocTensor<int32_t>();
+            AscendC::LocalTensor<uint8_t> mask = maskBuf_.AllocTensor<uint8_t>();
+            AscendC::LocalTensor<int32_t> curIdxVec = tmpIdxBuf_.AllocTensor<int32_t>();
+
+            AscendC::Dup(minVals, INIT_MAX, colLen);
+            AscendC::Dup(minIdx, 0, colLen);
+
+            // Stream over reduceLen rows
+            for (uint32_t r = 0; r < reduceLen_; ++r) {
+                const uint64_t xOffset = baseX + static_cast<uint64_t>(r) * inner_ + colBase;
+
+                // Prefetch row tile
+                AscendC::LocalTensor<float> rowLocal = inQueueRow_.AllocTensor<float>();
+                AscendC::DataCopy(rowLocal, xGm_[xOffset], colLen);
+                inQueueRow_.EnQue(rowLocal);
+
+                // Dequeue and compute
+                AscendC::LocalTensor<float> row = inQueueRow_.DeQue<float>();
+
+                // mask = row < minVals
+                AscendC::Less(mask, row, minVals, colLen);
+                // minVals = select(mask, row, minVals)
+                AscendC::Select(minVals, row, minVals, mask, colLen);
+                // curIdxVec = r
+                AscendC::Dup(curIdxVec, static_cast<int32_t>(r), colLen);
+                // minIdx = select(mask, curIdxVec, minIdx)
+                AscendC::Select(minIdx, curIdxVec, minIdx, mask, colLen);
+
+                inQueueRow_.FreeTensor(row);
+            }
+
+            // Write out indices for this tile
+            AscendC::LocalTensor<int32_t> outLocal = outQueueIdx_.AllocTensor<int32_t>();
+            // Copy from VECCALC minIdx to VECOUT buffer
+            AscendC::DataCopy(outLocal, minIdx, colLen);
+            outQueueIdx_.EnQue(outLocal);
+
+            // GM copy
+            AscendC::LocalTensor<int32_t> outLocalDeq = outQueueIdx_.DeQue<int32_t>();
+            AscendC::DataCopy(yGm_[baseY + colBase], outLocalDeq, colLen);
+            outQueueIdx_.FreeTensor(outLocalDeq);
+
+            // Free calc buffers
+            tmpIdxBuf_.FreeTensor(curIdxVec);
+            maskBuf_.FreeTensor(mask);
+            minIdxBuf_.FreeTensor(minIdx);
+            minValBuf_.FreeTensor(minVals);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, IN_BUFFER_NUM> inQueueRow_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, OUT_BUFFER_NUM> outQueueIdx_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> minValBuf_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> minIdxBuf_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> maskBuf_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpIdxBuf_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<int32_t> yGm_;
+
+    uint32_t outer_{0};
+    uint32_t reduceLen_{0};
+    uint32_t inner_{0};
+    uint32_t tileInner_{0};
+    int32_t dim_{0};
+};
+
+extern "C" __global__ __aicore__ void argmin_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelArgminOverADimensionCustom op;
+    op.Init(x, y,
+            tiling_data.outer, tiling_data.reduceLen, tiling_data.inner,
+            tiling_data.tileInner, tiling_data.dim);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor argmin_over_a_dimension_custom_impl_npu(const at::Tensor& self, int64_t dim) {
+    // Prepare output shape by removing the specified dimension
+    int64_t rank = self.dim();
+    int64_t cdim = dim >= 0 ? dim : (dim + rank);
+    if (cdim < 0) cdim = 0;
+    if (cdim >= rank) cdim = rank - 1;
+    std::vector<int64_t> out_sizes;
+    out_sizes.reserve(static_cast<size_t>(rank > 0 ? rank - 1 : 0));
+    for (int64_t i = 0; i < rank; ++i) {
+        if (i == cdim) continue;
+        out_sizes.push_back(self.size(i));
+    }
+
+    // Kernel outputs int32 indices; convert to int64 for PyTorch contract
+    at::Tensor result_i32 = at::empty(out_sizes, self.options().dtype(at::kInt));
+    EXEC_NPU_CMD(aclnnArgminOverADimensionCustom, self, static_cast<int>(cdim), result_i32);
+    return result_i32.to(at::kLong);
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("argmin_over_a_dimension_custom", &argmin_over_a_dimension_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("argmin_over_a_dimension_custom", &argmin_over_a_dimension_custom_impl_npu,
+          "Argmin over a dimension (ArgminOverADimensionCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'argmin_over_a_dimension_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, self.dim)
+'''

@@ -1,0 +1,419 @@
+project_json_src='''
+[
+  {
+    "op": "GemmReluDivideCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "w",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "b",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "divisor",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "1.0"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(GemmReluDivideCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, M);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);  // M*N
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);   // post-op vector tile (elements)
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);     // aicore blocks to launch (we keep 1 for safety)
+  TILING_DATA_FIELD_DEF(float, divisor);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmReluDivideCustom, GemmReluDivideCustomTilingData)
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return (a == 0) ? x : (x / a) * a;
+}
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (b == 0) ? 0u : (a + b - 1u) / b;
+}
+
+} // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "gemm_relu_divide_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+// UB model for post-ops over Y:
+//   inQueueY: 2 * tile
+//   outQueueY: 2 * tile
+// Total floats = 4 * tile => bytes = 16 * tile
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
+static constexpr uint32_t ALIGN_ELEMS = 2048;            // favor larger DMA bursts
+static constexpr uint32_t HARD_CAP_ELEMS = 65536;        // cap per-iter length
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    GemmReluDivideCustomTilingData tiling;
+
+    // Shapes:
+    // x: [M, K], w: [N, K] (PyTorch F.linear uses w [N,K], we use isTrans=true in kernel to interpret as [K,N])
+    const auto &xShape = context->GetInputShape(0)->GetOriginShape();
+    const auto &wShape = context->GetInputShape(1)->GetOriginShape();
+    if (xShape.GetDimNum() != 2 || wShape.GetDimNum() != 2) {
+        return ge::GRAPH_FAILED;
+    }
+    const uint32_t M = static_cast<uint32_t>(xShape.GetDim(0));
+    const uint32_t K = static_cast<uint32_t>(xShape.GetDim(1));
+    const uint32_t N = static_cast<uint32_t>(wShape.GetDim(0)); // w: [N,K]
+
+    const uint64_t total64 = static_cast<uint64_t>(M) * static_cast<uint64_t>(N);
+    if (total64 > 0xFFFFFFFFull) {
+        return ge::GRAPH_FAILED;
+    }
+    const uint32_t totalLength = static_cast<uint32_t>(total64);
+
+    // Read divisor attribute
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const float *divisorAttr = attrs->GetAttrPointer<float>(0);
+    const float divisor = (divisorAttr != nullptr) ? *divisorAttr : 1.0f;
+
+    // Derive tile size for post-op pass: bytes = 16 * tile
+    uint32_t maxTile = UB_BUDGET_BYTES / 16;
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t tileLen = maxTile;
+    if (totalLength < tileLen) {
+        const uint32_t aligned = AlignDown(totalLength, ALIGN_ELEMS);
+        tileLen = (aligned > 0u) ? aligned : totalLength;
+    }
+
+    // We keep blockDim = 1 to let the Matmul kernel compute whole GEMM once safely.
+    const uint32_t blockDim = 1u;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_M(M);
+    tiling.set_N(N);
+    tiling.set_K(K);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileLength(tileLen);
+    tiling.set_blockDim(blockDim);
+    tiling.set_divisor(divisor);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // No workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0); // [M,K]
+    const gert::Shape *w_shape = context->GetInputShape(1); // [N,K]
+    if (x_shape->GetDimNum() != 2 || w_shape->GetDimNum() != 2) {
+        return GRAPH_FAILED;
+    }
+    const int64_t M = x_shape->GetDim(0);
+    const int64_t N = w_shape->GetDim(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, M);
+    y_shape->SetDim(1, N);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class GemmReluDivideCustom : public OpDef {
+public:
+    explicit GemmReluDivideCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("divisor").AttrType(OPTIONAL).Float(1.0);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmReluDivideCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+constexpr int32_t POST_BUFFER_NUM = 2;
+
+using aType = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float>;
+using bType = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, true>; // w:[N,K], isTrans=true -> interpret as [K,N]
+using cType = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float>;
+using biasType = AscendC::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float>;
+
+class KernelGemmReluDivideCustom {
+public:
+    __aicore__ inline KernelGemmReluDivideCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                uint32_t M, uint32_t N, uint32_t K,
+                                uint32_t postTotalLen, uint32_t postTileLen,
+                                float divisor)
+    {
+        M_ = M;
+        N_ = N;
+        K_ = K;
+        totalLen_ = postTotalLen;
+        tileLen_ = postTileLen;
+
+        divisor_ = divisor;
+        invDiv_ = 1.0f / divisor_;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint64_t>(M_) * K_);
+        wGm_.SetGlobalBuffer((__gm__ float*)w, static_cast<uint64_t>(N_) * K_);
+        bGm_.SetGlobalBuffer((__gm__ float*)b, N_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint64_t>(M_) * N_);
+
+        pipe_.InitBuffer(inQueueY_, POST_BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, POST_BUFFER_NUM, tileLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // For safety we compute GEMM on a single core. Post-pass also single core.
+        if (AscendC::GetBlockIdx() == 0) {
+            ComputeGemm();
+            PostProcess();
+        }
+    }
+
+private:
+    __aicore__ inline void ComputeGemm()
+    {
+        // Matmul: C = A * B + Bias
+        AscendC::Matmul<aType, bType, cType, biasType> mm;
+        // Set matrix shapes and GM pointers
+        // A: [M_, K_], B: [K_, N_] (provided as w:[N_,K_] with isTrans=true)
+        // C: [M_, N_], Bias: [1, N_]
+        mm.SetOrgShape(M_, N_, K_);
+        mm.SetTensorA((__gm__ float*)xGm_.GetPhyAddr());
+        mm.SetTensorB((__gm__ float*)wGm_.GetPhyAddr());
+        mm.SetBias((__gm__ float*)bGm_.GetPhyAddr());
+        mm.SetTensorC((__gm__ float*)yGm_.GetPhyAddr());
+        mm.Gemm();
+        mm.End();
+    }
+
+    __aicore__ inline void CopyIn(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocalIn = inQueueY_.AllocTensor<float>();
+        AscendC::DataCopy(yLocalIn, yGm_[gmOffset], len);
+        inQueueY_.EnQue(yLocalIn);
+    }
+
+    __aicore__ inline void ComputePost(uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocalIn = inQueueY_.DeQue<float>();
+        AscendC::LocalTensor<float> yLocalOut = outQueueY_.AllocTensor<float>();
+
+        // ReLU: y = max(y, 0)
+        AscendC::Maxs(yLocalIn, yLocalIn, 0.0f, len);
+        // Divide by scalar: y = y * (1/divisor_)
+        AscendC::Muls(yLocalOut, yLocalIn, invDiv_, len);
+
+        outQueueY_.EnQue<float>(yLocalOut);
+        inQueueY_.FreeTensor(yLocalIn);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocalOut = outQueueY_.DeQue<float>();
+        AscendC::DataCopy(yGm_[gmOffset], yLocalOut, len);
+        outQueueY_.FreeTensor(yLocalOut);
+    }
+
+    __aicore__ inline void PostProcess()
+    {
+        if (totalLen_ == 0 || tileLen_ == 0) {
+            return;
+        }
+        uint32_t base = 0;
+        uint32_t remaining = totalLen_;
+
+        // Prefetch first
+        uint32_t cur = remaining > tileLen_ ? tileLen_ : remaining;
+        CopyIn(base, cur);
+
+        while (remaining > 0) {
+            uint32_t nextBase = base + cur;
+            uint32_t nextLen = 0;
+            if (nextBase < totalLen_) {
+                nextLen = (totalLen_ - nextBase);
+                if (nextLen > tileLen_) nextLen = tileLen_;
+                CopyIn(nextBase, nextLen);
+            }
+
+            ComputePost(cur);
+            CopyOut(base, cur);
+
+            if (nextLen == 0) break;
+
+            base = nextBase;
+            cur = nextLen;
+            remaining = totalLen_ - base;
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, POST_BUFFER_NUM> inQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, POST_BUFFER_NUM> outQueueY_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> bGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t M_{0};
+    uint32_t N_{0};
+    uint32_t K_{0};
+
+    uint32_t totalLen_{0};
+    uint32_t tileLen_{0};
+
+    float divisor_{1.0f};
+    float invDiv_{1.0f};
+};
+
+extern "C" __global__ __aicore__ void gemm_relu_divide_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGemmReluDivideCustom op;
+    op.Init(x, w, b, y,
+            tiling_data.M, tiling_data.N, tiling_data.K,
+            tiling_data.totalLength, tiling_data.tileLength,
+            tiling_data.divisor);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor gemm_relu_divide_impl_npu(const at::Tensor& x,
+                                     const at::Tensor& w,
+                                     const at::Tensor& b,
+                                     const at::Tensor& divisor_tensor) {
+    TORCH_CHECK(divisor_tensor.numel() == 1, \"divisor must be a scalar tensor\");
+    const double divisor = divisor_tensor.item<double>();
+    at::Tensor result = at::empty({x.size(0), w.size(0)}, x.options());
+    EXEC_NPU_CMD(aclnnGemmReluDivideCustom, x, w, b, static_cast<float>(divisor), result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"gemm_relu_divide_custom\", &gemm_relu_divide_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"gemm_relu_divide_custom\", &gemm_relu_divide_impl_npu,
+          \"GEMM + ReLU + divide (GemmReluDivideCustom on NPU)\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'gemm_relu_divide_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_features, out_features, divisor):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x, w, b, divisor):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, w, b, divisor)
+'''

@@ -1,0 +1,258 @@
+The user wants me to create an AscendC custom kernel implementation for the SELU activation function.
+
+SELU (Scaled Exponential Linear Unit) has the following formula:
+- If x > 0: return scale * x
+- If x <= 0: return scale * alpha * (exp(x) - 1)
+
+Where:
+- alpha ≈ 1.6732632423543772848170429916717
+- scale ≈ 1.0507009873554804934193349852946
+
+In PyTorch, `torch.selu(x)` implements this with these fixed constants.
+
+I need to create:
+1. `project_json_src` - JSON configuration for the operator
+2. `host_tiling_src` - Tiling data definitions
+3. `host_operator_src` - Operator definition and tiling function
+4. `kernel_src` - The actual AscendC kernel implementation
+5. `python_bind_src` - PyTorch binding
+6. `model_src` - The transformed model using custom kernels
+
+Let me create the SELU implementation:
+
+For SELU:
+- y = scale * x if x > 0
+- y = scale * alpha * (exp(x) - 1) if x <= 0
+
+Where alpha ≈ 1.6732632423543772848170429916717 and scale ≈ 1.0507009873554804934193349852946
+
+For the kernel implementation:
+1. Compare x with 0 to create a mask
+2. For x > 0: y = scale * x
+3. For x <= 0: y = scale * alpha * (exp(x) - 1)
+
+I can use:
+- `AscendC::Exp` for exp(x)
+
+
+- `AscendC::Adds` for (exp(x) - 1)
+- `AscendC::Muls` for multiplications
+- `AscendC::Sub` for subtraction or use comparison for mask
+
+Looking at the AscendC API:
+- Silu is available, which suggests Exp is available
+- I'll need to use mask-based operations
+
+Now I'll write the implementation. The kernel needs to compute exp(x) for x <= 0, apply the alpha scaling, then combine with the positive part using a mask-based selection.
+
+For the tiling strategy, I'll follow the same pattern as LeakyReLU—calculating available UB space and distributing work across blocks using grid-stride looping.
+
+Let me structure the code:
+
+```python
+project_json_src = '''
+[
+  {
+    "op": "SeluCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": []
+  }
+]
+'''
+
+host_tiling_src = """
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(SeluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(SeluCustom, SeluCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src = """
+#include "selu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+// UB model for this kernel:
+//   inQueueX: 2 * tile
+//   outQueueY: 2 * tile
+//   posQueue: 1 * tile (positive results)
+//   negQueue: 1 * tile (negative results)
+//   expQueue: 1 * tile (exp results)
+// Total floats = 7 * tile => bytes = 28 * tile
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
+static constexpr uint32_t ALIGN_ELEMS = 2048;
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return (x / a) * a;
+}
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (a + b - 1u) / b;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    SeluCustomTilingData tiling;
+    const uint32_t totalLength =
+        static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+
+    uint32_t maxTile = UB_BUDGET_BYTES / 28;
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t tileLen = maxTile;
+    if (totalLength < tileLen) {
+        const uint32_t aligned = AlignDown(totalLength, ALIGN_ELEMS);
+        tileLen = (aligned > 0) ? aligned : totalLength;
+    }
+
+    const uint32_t numTiles = (tileLen == 0) ? 1u : CeilDiv(totalLength, tileLen);
+    uint32_t blockDim = numTiles;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileLength(tileLen);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return ge::GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class SeluCustom : public OpDef {
+public:
+    explicit SeluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(SeluCustom);
+} // namespace ops
+"""
+
+kernel_src = """
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+// SELU constants: alpha ≈ 1.6732632423543772848170429916717, scale ≈ 1.0507009873554804934193349852946
+constexpr float SELU_ALPHA = 1.6732632423543772848170429916717f;
+constexpr float SELU_SCALE = 1.0507009873554804934193349852946f;
+constexpr float SELU_ALPHA_SCALE = SELU_ALPHA * SELU_SCALE;  // ≈ 1.7580993408473762
+
+class KernelSeluCustom {
+public:
+    __aicore__ inline KernelSeluCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileLength)
+    {
+        totalLen
+
+_ = totalLength;
+        tileLen_ = tileLength;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(posQueue_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(negQueue_, 1, tileLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0 || tileLen_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+I'm initializing the kernel with the total and tile lengths, then setting up global memory buffers for input and output tensors. The double buffering queues are configured to manage data transfer efficiently between global and local memory. During processing, I calculate the block index to determine which portion of data this kernel instance handles.
+
+The stride is computed as the product of available blocks and tile length to distribute work across all cores. I start by identifying the base offset for this block and exit early if it exceeds the total data size. To maintain continuous compute throughput, I prefetch the first tile before entering the main processing loop, adjusting the length if the remaining data is smaller than a full tile.
+
+Within the loop, I calculate the next tile's base address by advancing by the stride distance. If that address is within bounds, I determine its length and initiate the prefetch. The current tile undergoes computation before being written back to global memory. The loop terminates once all tiles have been processed and there are no more prefetches pending.
+
+For the copy operations, I'm allocating a local tensor from the input queue, copying data from global memory starting at the given offset, and enqueuing it. The compute kernel handles the SELU activation by first dequeuing the input tensor, then allocating tensors for the positive branch, negative branch, and output.
+
+For the positive branch, I scale the input directly by the SELU coefficient. For the negative branch, I compute the exponential of each element minus one, then multiply by the alpha scale coefficient. After both branches are computed, I compare the original input against zero to generate a mask that selects between the positive and negative results for each element.
+
+Once the selection is complete, I free the temporary tensors and enqueue the output. The copy out operation dequeues the result from the output queue and copies it back to global memory, then frees the local tensor.
+
+The external C function wraps this kernel, extracting tiling data from the provided workspace and initializing the kernel with the necessary addresses and parameters before executing the process loop. The torch library registration handles the custom operator binding, using the EXEC_NPU_CMD macro to invoke the underlying NPU implementation. This connects the high-level PyTorch operation to the custom operator that will be executed on the NPU device.
+
+The module exports the `selu_custom` operation through pybind11, allowing Python code to call it directly. When invoked, the function takes an input tensor, applies the SELU activation using the custom NPU implementation, and returns the result in the same tensor format.

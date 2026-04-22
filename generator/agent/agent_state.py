@@ -111,6 +111,7 @@ class GeneratorAgentState(MessagesState):
 
     tool_choice_parse_failed: NotRequired[bool]
     tool_choice_error_log: Annotated[List[Dict[str, Any]], _append_error_log]
+    tool_choice_reasoning_log: Annotated[List[Dict[str, Any]], _append_error_log]
 
     # Task context fields
     op_name: NotRequired[str]                # Operator name (e.g., "gelu")
@@ -168,5 +169,6 @@ def create_initial_state(
         "ascend_search_allowed_urls": [],
         "registered_tool_results": [],
         "tool_calls_log": [],
+        "tool_choice_reasoning_log": [],
         "query_round_count": 0,
     }
