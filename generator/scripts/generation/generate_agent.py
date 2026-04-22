@@ -159,6 +159,11 @@ def main():
         action="store_true",
         help="只生成 kernelbench102 中的 102 个算子"
     )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="测试模式：默认输出根目录改为 output/test/ascendc（仅在未传 --output-dir 时生效）",
+    )
 
     args = parser.parse_args()
 
@@ -218,8 +223,9 @@ def main():
         if args.output_dir:
             out_dir = args.output_dir
         else:
+            out_root = "output/test/ascendc" if args.test else "output/ascendc"
             out_dir = (
-                f"output/ascendc/{model_slug}/agent_{tool_mode_to_string(tool_mode)}"
+                f"{out_root}/{model_slug}/agent_{tool_mode_to_string(tool_mode)}"
                 f"/{strategy}/run{run}"
             )
 

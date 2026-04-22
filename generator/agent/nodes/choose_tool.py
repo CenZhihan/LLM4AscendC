@@ -6,10 +6,12 @@ LLM outputs a single JSON object (ToolChoiceV1) selecting the next action.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from langchain_core.messages import HumanMessage
 
+from generator.repo_root import REPO_ROOT
 from ..agent_state import GeneratorAgentState, MAX_QUERY_ROUNDS
 from ..agent_config import (
     AgentToolMode,
@@ -67,7 +69,36 @@ def _openai_completion(
 
 def _extract_user_question(state: GeneratorAgentState) -> str:
     user_msgs = [m for m in state["messages"] if isinstance(m, HumanMessage)]
-    return user_msgs[0].content if user_msgs else state["messages"][-1].content
+    base = user_msgs[0].content if user_msgs else state["messages"][-1].content
+    ref_block = _load_pytorch_reference_block(state)
+    if not ref_block:
+        return base
+    return f"{base}\n\n{ref_block}"
+
+
+def _load_pytorch_reference_block(state: GeneratorAgentState) -> str:
+    """Load per-op PyTorch reference source and append it to task specification."""
+    op = (state.get("op_name") or "").strip()
+    category = (state.get("category") or "").strip()
+    if not op or not category:
+        return ""
+    ref_path = Path(REPO_ROOT) / "vendor" / "mkb" / "reference" / category / f"{op}.py"
+    if not ref_path.is_file():
+        return ""
+    try:
+        ref_src = ref_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    ref_src = ref_src.strip()
+    if not ref_src:
+        return ""
+    max_chars = 6000
+    if len(ref_src) > max_chars:
+        ref_src = ref_src[:max_chars] + "\n# ... truncated ..."
+    return (
+        f"PyTorch reference implementation ({ref_path.as_posix()}):\n"
+        f"```python\n{ref_src}\n```"
+    )
 
 
 def _summarize_existing_results(state: GeneratorAgentState) -> str:
@@ -298,6 +329,32 @@ def _parse_error_payload(err: str, raw_model_output: str, round_after_burn: int)
     }
 
 
+def _reasoning_log_entry(
+    *,
+    round_num: int,
+    prompt: str,
+    raw_model_output: str,
+    reasoning_content: str,
+    parsed_ok: bool,
+    selected_tool: str,
+    parse_error: str = "",
+) -> Dict[str, Any]:
+    def _clip(text: str, max_len: int) -> str:
+        value = text or ""
+        return value if len(value) <= max_len else value[:max_len] + "...(truncated)"
+
+    return {
+        "ts": time.time(),
+        "round": round_num,
+        "parsed_ok": parsed_ok,
+        "selected_tool": selected_tool,
+        "parse_error": parse_error,
+        "prompt_excerpt": _clip(prompt, 2000),
+        "raw_model_output": _clip(raw_model_output, 4000),
+        "reasoning_content": _clip(reasoning_content, 4000),
+    }
+
+
 def choose_tool_node(
     state: GeneratorAgentState,
     client,
@@ -340,19 +397,29 @@ def choose_tool_node(
             "tool_choice_json": {"tool": "ANSWER", "query": "", "args": None},
         }
 
-    raw_response, _ = _openai_completion(
+    raw_response, reasoning = _openai_completion(
         client, model, [{"role": "user", "content": prompt}], stream=False
     )
     choice, err = parse_tool_choice_json(raw_response)
     if choice is None:
         new_round = round_count + 1
         entry = _parse_error_payload(err or "unknown", raw_response, new_round)
+        reasoning_entry = _reasoning_log_entry(
+            round_num=new_round,
+            prompt=prompt,
+            raw_model_output=raw_response,
+            reasoning_content=reasoning or "",
+            parsed_ok=False,
+            selected_tool="",
+            parse_error=err or "unknown",
+        )
         print(f"[choose_tool] JSON parse failed: {err!r}")
         return {
             **base_patch,
             "tool_choice_parse_failed": True,
             "query_round_count": new_round,
             "tool_choice_error_log": [entry],
+            "tool_choice_reasoning_log": [reasoning_entry],
             "next_action": "",
             "current_query": "",
             "tool_choice_json": {},
@@ -363,22 +430,41 @@ def choose_tool_node(
         new_round = round_count + 1
         msg = f"tool {choice.tool!r} resolved to {canon!r} which is not enabled in this session"
         entry = _semantic_tool_error_payload(choice, msg, raw_response, new_round)
+        reasoning_entry = _reasoning_log_entry(
+            round_num=new_round,
+            prompt=prompt,
+            raw_model_output=raw_response,
+            reasoning_content=reasoning or "",
+            parsed_ok=False,
+            selected_tool=choice.tool,
+            parse_error=msg,
+        )
         print(f"[choose_tool] {msg}")
         return {
             **base_patch,
             "tool_choice_parse_failed": True,
             "query_round_count": new_round,
             "tool_choice_error_log": [entry],
+            "tool_choice_reasoning_log": [reasoning_entry],
             "next_action": "",
             "current_query": "",
             "tool_choice_json": {},
         }
 
     next_action, current_query, tjson = _resolve_json_choice(choice, tool_mode, user_question)
+    reasoning_entry = _reasoning_log_entry(
+        round_num=round_count + 1,
+        prompt=prompt,
+        raw_model_output=raw_response,
+        reasoning_content=reasoning or "",
+        parsed_ok=True,
+        selected_tool=next_action,
+    )
     print(f"[choose_tool] model reply: {raw_response[:120]!r} -> next_action={next_action}")
     return {
         **base_patch,
         "next_action": next_action,
         "current_query": current_query,
         "tool_choice_json": tjson,
+        "tool_choice_reasoning_log": [reasoning_entry],
     }

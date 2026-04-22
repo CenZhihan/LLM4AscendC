@@ -53,6 +53,29 @@ def _openai_completion_stream(
     return "".join(content_parts).strip(), "".join(reasoning_parts)
 
 
+def _openai_completion_non_stream(
+    client,
+    model: str,
+    messages: list,
+) -> Tuple[str, str]:
+    """Call OpenAI-compatible API without streaming as fallback."""
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        stream=False,
+    )
+    msg = resp.choices[0].message
+    content = (getattr(msg, "content", None) or "").strip()
+    reasoning = (
+        getattr(msg, "reasoning_content", None)
+        or (getattr(msg, "model_extra", None) or {}).get("reasoning_content")
+        or ""
+    )
+    if reasoning and not isinstance(reasoning, str):
+        reasoning = ""
+    return content, (reasoning if isinstance(reasoning, str) else "")
+
+
 def _format_retrieved_content(state: GeneratorAgentState) -> str:
     """Format all retrieved content for the prompt (aligned with choose_tool summaries)."""
     kb_results = state.get("kb_results", [])
@@ -154,9 +177,9 @@ def answer_node(
     # Format retrieved content
     ref_text = _format_retrieved_content(state)
 
-    # Build system prompt
+    # Build prompt payload
     if ref_text:
-        system_prompt = (
+        user_prompt = (
             "You are an expert Ascend C kernel engineer. The following blocks are retrieval results "
             "and tool outputs gathered for the user task.\n"
             "Use them faithfully and produce the full Ascend C kernel / host / project artifacts "
@@ -166,17 +189,29 @@ def answer_node(
             "Generate the complete solution as instructed (code only where the task demands code)."
         )
     else:
-        system_prompt = (
+        user_prompt = (
             "You are an expert Ascend C kernel engineer.\n"
             "Generate the complete Ascend C artifacts requested below.\n\n"
             f"User instruction:\n{base_prompt}"
         )
 
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": user_prompt},
+    ]
+
     # Call LLM with streaming
     content, reasoning = _openai_completion_stream(
         client, model,
-        [{"role": "system", "content": system_prompt}]
+        messages
     )
+    if not content.strip():
+        # Some providers/models may return empty content with streaming in system-only style.
+        # Fallback to non-stream request with the same message payload.
+        content2, reasoning2 = _openai_completion_non_stream(client, model, messages)
+        if content2.strip():
+            content = content2
+            reasoning = reasoning2 or reasoning
 
     print(f"[answer] done, output length={len(content)} chars")
 

@@ -81,6 +81,8 @@ def _extract_final_answer(final_state: Dict[str, Any]) -> str:
 def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
     """Build detailed report from final state."""
     parse_errors = final_state.get("tool_choice_error_log", [])
+    choice_reasoning = final_state.get("tool_choice_reasoning_log", [])
+    tool_calls_log = final_state.get("tool_calls_log", [])
 
     def _summarize_parse_entry(e: Dict[str, Any]) -> Dict[str, Any]:
         raw = e.get("raw_model_output") or ""
@@ -95,20 +97,32 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
             "ts": e.get("ts"),
         }
 
+    tool_calls = [
+        {
+            "round": t.get("round"),
+            "tool": t.get("tool", ""),
+            "query": t.get("query", ""),
+            "response": t.get("response", "")[:500] + "..."
+            if len(t.get("response", "")) > 500
+            else t.get("response", ""),
+        }
+        for t in tool_calls_log
+    ]
+    reasoning_by_round = {
+        int(x.get("round")): x
+        for x in choice_reasoning
+        if isinstance(x, dict) and isinstance(x.get("round"), int)
+    }
+    for item in tool_calls:
+        r = item.get("round")
+        if isinstance(r, int):
+            item["tool_choice"] = reasoning_by_round.get(r, {})
+
     return {
         "reasoning_content": final_state.get("reasoning_content", ""),
+        "final_generation_reasoning_content": final_state.get("reasoning_content", ""),
         "answer": _extract_final_answer(final_state),
-        "tool_calls": [
-            {
-                "round": t.get("round"),
-                "tool": t.get("tool", ""),
-                "query": t.get("query", ""),
-                "response": t.get("response", "")[:500] + "..."
-                if len(t.get("response", "")) > 500
-                else t.get("response", ""),
-            }
-            for t in final_state.get("tool_calls_log", [])
-        ],
+        "tool_calls": tool_calls,
         "tool_choice_parse_errors": [_summarize_parse_entry(x) for x in parse_errors],
         "kb_results_count": len(final_state.get("kb_results", [])),
         "web_results_count": len(final_state.get("web_results", [])),

@@ -391,7 +391,7 @@ python3 generator/scripts/generation/generate_agent.py \
   --categories activation --workers 4
 ```
 
-**默认输出目录**（未传 `--output-dir` 时）：`output/ascendc/<model_slug>/agent_<tool_mode_string>/<strategy>/run<N>/`。其中 `<model_slug>` 由最终采用的模型名经路径安全化得到（与 `--model` 或配置文件中的 `XI_AI_MODEL` 一致，例如 `gpt-4o`）；`<tool_mode_string>` 为 `tool_mode_to_string` 的结果（如 `kb_only`、`kb,code_rag`）。传 `--output-dir` 则完全使用该路径，不再自动插入 `<model_slug>` 等分段。
+**默认输出目录**（未传 `--output-dir` 时）：`output/ascendc/<model_slug>/agent_<tool_mode_string>/<strategy>/run<N>/`。其中 `<model_slug>` 由最终采用的模型名经路径安全化得到（与 `--model` 或配置文件中的 `XI_AI_MODEL` 一致，例如 `gpt-4o`）；`<tool_mode_string>` 为 `tool_mode_to_string` 的结果（如 `kb_only`、自定义多工具时为排序后用下划线连接，例如 `ascend_fetch_ascend_search`）。传 `--output-dir` 则完全使用该路径，不再自动插入 `<model_slug>` 等分段。
 
 **Python API 方式**（适合脚本调用）：
 

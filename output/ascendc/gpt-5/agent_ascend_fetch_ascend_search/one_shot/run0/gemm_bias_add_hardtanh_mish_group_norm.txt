@@ -1,0 +1,532 @@
+project_json_src='''
+[
+  {
+    "op": "GemmBiasAddHardtanhMishGroupNormCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "lin_bias",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "bias",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "gn_gamma",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "gn_beta",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "num_groups",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "1"
+      },
+      {
+        "name": "eps",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "1e-5"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmBiasAddHardtanhMishGroupNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, M);          // batch rows
+  TILING_DATA_FIELD_DEF(uint32_t, N);          // out features
+  TILING_DATA_FIELD_DEF(uint32_t, K);          // in features
+  TILING_DATA_FIELD_DEF(uint32_t, tileN);      // N tile
+  TILING_DATA_FIELD_DEF(uint32_t, tileK);      // K tile
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);   // blocks to launch
+  TILING_DATA_FIELD_DEF(uint32_t, numGroups);  // group norm groups
+  TILING_DATA_FIELD_DEF(float, eps);           // epsilon for groupnorm
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmBiasAddHardtanhMishGroupNormCustom, GemmBiasAddHardtanhMishGroupNormCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+#include "gemm_bias_add_hardtanh_mish_group_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+}
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    GemmBiasAddHardtanhMishGroupNormCustomTilingData tiling;
+
+    const auto *x_shape = context->GetInputShape(0);
+    const auto *w_shape = context->GetInputShape(1);
+
+    // Expect x: [M, K], weight: [N, K]
+    const uint32_t rank_x = x_shape->GetStorageShape().GetDimNum();
+    const uint32_t rank_w = w_shape->GetStorageShape().GetDimNum();
+
+    if (rank_x < 2 || rank_w < 2) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const uint32_t M = static_cast<uint32_t>(x_shape->GetStorageShape().GetDim(x_shape->GetStorageShape().GetDimNum() - 2));
+    const uint32_t K = static_cast<uint32_t>(x_shape->GetStorageShape().GetDim(x_shape->GetStorageShape().GetDimNum() - 1));
+    const uint32_t N = static_cast<uint32_t>(w_shape->GetStorageShape().GetDim(w_shape->GetStorageShape().GetDimNum() - 2));
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t *numGroups = attrs->GetAttrPointer<int32_t>(0);
+    const float *eps = attrs->GetAttrPointer<float>(1);
+
+    // UB budgeting for our manual tiling:
+    // For each K-chunk and N-tile we need:
+    //   xChunk: tileK
+    //   wBlock: tileN * tileK
+    //   yTile: tileN
+    //   gammaTile + betaTile: 2 * tileN
+    //   group buffers (sum, sq, inv): 3 * numGroups
+    // Total floats ~= tileK * (tileN + 1) + 3 * tileN + 3 * numGroups
+    static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
+    static constexpr uint32_t BYTES_PER_FLOAT = 4;
+    static constexpr uint32_t ALIGN_TILE_N = 64;
+    static constexpr uint32_t ALIGN_TILE_K = 32;
+
+    uint32_t g = (*numGroups > 0) ? static_cast<uint32_t>(*numGroups) : 1u;
+    if (g > N) g = N;
+    if (N % g != 0) {
+        // force to a valid divisor configuration by clamping group number
+        for (uint32_t d = g; d >= 1; --d) {
+            if (N % d == 0) { g = d; break; }
+        }
+    }
+
+    // Start with conservative tiles
+    uint32_t tileN = (N >= 256u) ? 128u : AlignDown(N, ALIGN_TILE_N);
+    if (tileN == 0) tileN = (N < ALIGN_TILE_N) ? N : ALIGN_TILE_N;
+
+    uint32_t tileK = (K >= 512u) ? 64u : AlignDown(K, ALIGN_TILE_K);
+    if (tileK == 0) tileK = (K < ALIGN_TILE_K) ? K : ALIGN_TILE_K;
+
+    // Check UB fit and adjust if necessary
+    auto FitsUB = [&](uint32_t tN, uint32_t tK) -> bool {
+        uint64_t floats = static_cast<uint64_t>(tK) * (static_cast<uint64_t>(tN) + 1ull)
+                        + 3ull * static_cast<uint64_t>(tN)
+                        + 3ull * static_cast<uint64_t>(g);
+        uint64_t bytes = floats * BYTES_PER_FLOAT;
+        return bytes <= UB_BUDGET_BYTES;
+    };
+
+    while (!FitsUB(tileN, tileK)) {
+        if (tileN > ALIGN_TILE_N) {
+            tileN = AlignDown(tileN / 2u, ALIGN_TILE_N);
+            if (tileN == 0) tileN = ALIGN_TILE_N;
+        } else if (tileK > ALIGN_TILE_K) {
+            tileK = AlignDown(tileK / 2u, ALIGN_TILE_K);
+            if (tileK == 0) tileK = ALIGN_TILE_K;
+        } else {
+            // last resort
+            break;
+        }
+    }
+
+    // Block dim based on M
+    uint32_t blockDim = M;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 32u) blockDim = 32u;
+    if (blockDim > M) blockDim = M == 0 ? 1u : M;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_M(M);
+    tiling.set_N(N);
+    tiling.set_K(K);
+    tiling.set_tileN(tileN);
+    tiling.set_tileK(tileK);
+    tiling.set_blockDim(blockDim);
+    tiling.set_numGroups(g);
+    tiling.set_eps(*eps);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0; // in-place two-pass on y
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+    if (x_shape->GetOriginShape().GetDimNum() < 2 || w_shape->GetOriginShape().GetDimNum() < 2) {
+        return GRAPH_FAILED;
+    }
+    const int64_t M = x_shape->GetOriginShape().GetDim(x_shape->GetOriginShape().GetDimNum() - 2);
+    const int64_t N = w_shape->GetOriginShape().GetDim(w_shape->GetOriginShape().GetDimNum() - 2);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    std::vector<int64_t> dims = {M, N};
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, M);
+    y_shape->SetDim(1, N);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class GemmBiasAddHardtanhMishGroupNormCustom : public OpDef {
+public:
+    explicit GemmBiasAddHardtanhMishGroupNormCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x").ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight").ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("lin_bias").ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias").ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("gn_gamma").ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("gn_beta").ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y").ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("num_groups").AttrType(OPTIONAL).Int(1);
+        this->Attr("eps").AttrType(OPTIONAL).Float(1e-5f);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmBiasAddHardtanhMishGroupNormCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include <cmath>
+
+class KernelGemmBiasAddHardtanhMishGroupNormCustom {
+public:
+    __aicore__ inline KernelGemmBiasAddHardtanhMishGroupNormCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR lin_bias, GM_ADDR bias,
+                                GM_ADDR gamma, GM_ADDR beta, GM_ADDR y,
+                                uint32_t M, uint32_t N, uint32_t K,
+                                uint32_t tileN, uint32_t tileK,
+                                uint32_t numGroups, float eps)
+    {
+        M_ = M; N_ = N; K_ = K;
+        tN_ = tileN; tK_ = tileK;
+        G_ = numGroups; eps_ = eps;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint64_t>(M_) * K_);
+        wGm_.SetGlobalBuffer((__gm__ float*)weight, static_cast<uint64_t>(N_) * K_);
+        lbGm_.SetGlobalBuffer((__gm__ float*)lin_bias, N_);
+        bGm_.SetGlobalBuffer((__gm__ float*)bias, N_);
+        gammaGm_.SetGlobalBuffer((__gm__ float*)gamma, N_);
+        betaGm_.SetGlobalBuffer((__gm__ float*)beta, N_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint64_t>(M_) * N_);
+
+        // Buffers: xChunk (tK), wBlock (tN * tK), yTile (tN), gammaTile (tN), betaTile (tN), groupTmp(3*G)
+        pipe_.InitBuffer(xBuf_, 1, tK_ * sizeof(float));
+        pipe_.InitBuffer(wBuf_, 1, (uint32_t)(tN_ * tK_) * sizeof(float));
+        pipe_.InitBuffer(yBuf_, 1, tN_ * sizeof(float));
+        pipe_.InitBuffer(gammaBuf_, 1, tN_ * sizeof(float));
+        pipe_.InitBuffer(betaBuf_, 1, tN_ * sizeof(float));
+        pipe_.InitBuffer(groupBuf_, 1, (uint32_t)(3 * G_) * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (M_ == 0 || N_ == 0 || K_ == 0) return;
+
+        const uint32_t blockNum = (uint32_t)AscendC::GetBlockNum();
+        const uint32_t blockIdx = (uint32_t)AscendC::GetBlockIdx();
+
+        // Each block processes rows in a grid-stride manner
+        for (uint32_t m = blockIdx; m < M_; m += blockNum) {
+            // Initialize group accumulators: sums and sqSums
+            AscendC::LocalTensor<float> gLocal = groupBuf_.AllocTensor<float>();
+            float* groupSums = gLocal.GetData();
+            float* groupSqSums = groupSums + G_;
+            float* groupInvStd = groupSqSums + G_;
+            for (uint32_t gi = 0; gi < G_; ++gi) {
+                groupSums[gi] = 0.0f;
+                groupSqSums[gi] = 0.0f;
+                groupInvStd[gi] = 0.0f;
+            }
+
+            // First pass: compute Y = X*W^T + lin_bias + bias, then hardtanh + mish; accumulate group stats; write Y to GM
+            for (uint32_t n0 = 0; n0 < N_; n0 += tN_) {
+                uint32_t curTN = (n0 + tN_ <= N_) ? tN_ : (N_ - n0);
+
+                AscendC::LocalTensor<float> yLocal = yBuf_.AllocTensor<float>();
+                float* yPtr = yLocal.GetData();
+                for (uint32_t i = 0; i < curTN; ++i) yPtr[i] = 0.0f;
+
+                // Accumulate over K in chunks
+                for (uint32_t k0 = 0; k0 < K_; k0 += tK_) {
+                    uint32_t curTK = (k0 + tK_ <= K_) ? tK_ : (K_ - k0);
+
+                    // Load x chunk: x[m, k0:k0+curTK]
+                    AscendC::LocalTensor<float> xLocal = xBuf_.AllocTensor<float>();
+                    AscendC::DataCopy(xLocal, xGm_[m * K_ + k0], curTK);
+
+                    // Load weight block: rows n0..n0+curTN, cols k0..k0+curTK
+                    AscendC::LocalTensor<float> wLocal = wBuf_.AllocTensor<float>();
+                    // Copy by rows for contiguity
+                    for (uint32_t i = 0; i < curTN; ++i) {
+                        const uint64_t wRowOff = (uint64_t)(n0 + i) * K_ + k0;
+                        AscendC::DataCopy(wLocal[i * curTK], wGm_[wRowOff], curTK);
+                    }
+
+                    // Compute partial matmul for tile yPtr += w_row · x_chunk
+                    float* xv = xLocal.GetData();
+                    float* wv = wLocal.GetData();
+                    for (uint32_t i = 0; i < curTN; ++i) {
+                        float acc = 0.0f;
+                        float* wrow = wv + i * curTK;
+                        for (uint32_t kk = 0; kk < curTK; ++kk) {
+                            acc += wrow[kk] * xv[kk];
+                        }
+                        yPtr[i] += acc;
+                    }
+
+                    wBuf_.FreeTensor(wLocal);
+                    xBuf_.FreeTensor(xLocal);
+                }
+
+                // Add fused biases: lin_bias and bias, then hardtanh and mish, accumulate group stats
+                // Load biases slice
+                AscendC::LocalTensor<float> gBias = gammaBuf_.AllocTensor<float>(); // reuse buffer
+                AscendC::LocalTensor<float> bBias = betaBuf_.AllocTensor<float>();  // reuse buffer
+                AscendC::DataCopy(gBias, lbGm_[n0], curTN);
+                AscendC::DataCopy(bBias, bGm_[n0], curTN);
+                float* lbPtr = gBias.GetData();
+                float* bPtr = bBias.GetData();
+
+                for (uint32_t i = 0; i < curTN; ++i) {
+                    float v = yPtr[i] + lbPtr[i] + bPtr[i];
+                    // hardtanh clamp to [-1, 1]
+                    if (v < -1.0f) v = -1.0f;
+                    if (v > 1.0f) v = 1.0f;
+                    // mish activation: v * tanh(softplus(v)), softplus(v) = log1p(exp(v))
+                    float sp = log1pf(expf(v));
+                    float mv = v * tanhf(sp);
+                    yPtr[i] = mv;
+
+                    // accumulate group stats
+                    uint32_t ch = n0 + i;
+                    uint32_t gi = (G_ > 0) ? (ch * G_) / N_ : 0; // group index by partitioning channels
+                    groupSums[gi] += mv;
+                    groupSqSums[gi] += mv * mv;
+                }
+
+                // Write intermediate y (pre-norm) to GM
+                AscendC::DataCopy(yGm_[m * N_ + n0], yLocal, curTN);
+
+                betaBuf_.FreeTensor(bBias);
+                gammaBuf_.FreeTensor(gBias);
+                yBuf_.FreeTensor(yLocal);
+            }
+
+            // Finish stats: compute inv std for each group
+            const uint32_t Cpg = N_ / G_;
+            for (uint32_t gi = 0; gi < G_; ++gi) {
+                float mean = groupSums[gi] / (float)Cpg;
+                float var = groupSqSums[gi] / (float)Cpg - mean * mean;
+                if (var < 0.0f) var = 0.0f;
+                groupSums[gi] = mean;
+                groupInvStd[gi] = 1.0f / sqrtf(var + eps_);
+            }
+
+            // Second pass: normalize with group stats, apply gamma/beta and write back to y
+            for (uint32_t n0 = 0; n0 < N_; n0 += tN_) {
+                uint32_t curTN = (n0 + tN_ <= N_) ? tN_ : (N_ - n0);
+
+                AscendC::LocalTensor<float> yLocal = yBuf_.AllocTensor<float>();
+                AscendC::LocalTensor<float> gLocalTile = gammaBuf_.AllocTensor<float>();
+                AscendC::LocalTensor<float> bLocalTile = betaBuf_.AllocTensor<float>();
+                AscendC::DataCopy(yLocal, yGm_[m * N_ + n0], curTN);
+                AscendC::DataCopy(gLocalTile, gammaGm_[n0], curTN);
+                AscendC::DataCopy(bLocalTile, betaGm_[n0], curTN);
+
+                float* yPtr = yLocal.GetData();
+                float* gPtr = gLocalTile.GetData();
+                float* bPtr = bLocalTile.GetData();
+
+                for (uint32_t i = 0; i < curTN; ++i) {
+                    uint32_t ch = n0 + i;
+                    uint32_t gi = (G_ > 0) ? (ch * G_) / N_ : 0;
+                    float mean = groupSums[gi];
+                    float invStd = groupInvStd[gi];
+                    float norm = (yPtr[i] - mean) * invStd;
+                    yPtr[i] = norm * gPtr[i] + bPtr[i];
+                }
+
+                AscendC::DataCopy(yGm_[m * N_ + n0], yLocal, curTN);
+
+                betaBuf_.FreeTensor(bLocalTile);
+                gammaBuf_.FreeTensor(gLocalTile);
+                yBuf_.FreeTensor(yLocal);
+            }
+
+            groupBuf_.FreeTensor(gLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> xBuf_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> wBuf_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> yBuf_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> gammaBuf_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> betaBuf_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> groupBuf_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> lbGm_;
+    AscendC::GlobalTensor<float> bGm_;
+    AscendC::GlobalTensor<float> gammaGm_;
+    AscendC::GlobalTensor<float> betaGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t M_{0}, N_{0}, K_{0};
+    uint32_t tN_{0}, tK_{0};
+    uint32_t G_{1};
+    float eps_{1e-5f};
+};
+
+extern "C" __global__ __aicore__ void gemm_bias_add_hardtanh_mish_group_norm_custom(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR lin_bias, GM_ADDR bias,
+    GM_ADDR gn_gamma, GM_ADDR gn_beta, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGemmBiasAddHardtanhMishGroupNormCustom op;
+    op.Init(x, weight, lin_bias, bias, gn_gamma, gn_beta, y,
+            tiling_data.M, tiling_data.N, tiling_data.K,
+            tiling_data.tileN, tiling_data.tileK,
+            tiling_data.numGroups, tiling_data.eps);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor gemm_bias_add_hardtanh_mish_group_norm_impl_npu(const at::Tensor& x,
+                                                           const at::Tensor& weight,
+                                                           const at::Tensor& lin_bias,
+                                                           const at::Tensor& bias,
+                                                           const at::Tensor& gn_gamma,
+                                                           const at::Tensor& gn_beta,
+                                                           int64_t num_groups,
+                                                           double eps) {
+    auto M = x.size(-2);
+    auto N = weight.size(-2);
+    at::Tensor y = at::empty({M, N}, x.options());
+    EXEC_NPU_CMD(aclnnGemmBiasAddHardtanhMishGroupNormCustom, x, weight, lin_bias, bias, gn_gamma, gn_beta, num_groups, static_cast<float>(eps), y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_bias_add_hardtanh_mish_group_norm_custom", &gemm_bias_add_hardtanh_mish_group_norm_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_bias_add_hardtanh_mish_group_norm_custom", &gemm_bias_add_hardtanh_mish_group_norm_impl_npu,
+          "Fused GEMM + BiasAdd + Hardtanh + Mish + GroupNorm (GemmBiasAddHardtanhMishGroupNormCustom on NPU)",
+          py::arg("x"),
+          py::arg("weight"),
+          py::arg("lin_bias"),
+          py::arg("bias"),
+          py::arg("gn_gamma"),
+          py::arg("gn_beta"),
+          py::arg("num_groups"),
+          py::arg("eps") = 1e-5);
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'gemm_bias_add_hardtanh_mish_group_norm_custom'
+
+class ModelNew(torch.nn.Module):
+    """
+    Replaces linear + bias add + hardtanh + mish + group_norm with a single custom AscendC op.
+    Pybind: (x, weight, lin_bias, bias, gn_gamma, gn_beta, num_groups, eps) -> y
+    """
+    def __init__(self, in_features, out_features, bias_shape, num_groups, eps: float = 1e-5, *args, **kwargs):
+        super(ModelNew, self).__init__()
+        self.num_groups = num_groups
+        self.eps = eps
+
+    def forward(self, x, weight, lin_bias, bias, gn_gamma, gn_beta):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, weight, lin_bias, bias, gn_gamma, gn_beta, self.num_groups, self.eps)
+'''
