@@ -2,6 +2,7 @@
 Tool selection node for generator agent.
 
 LLM outputs a single JSON object (ToolChoiceV1) selecting the next action.
+The object may include an optional compact ``thinking`` summary for reporting.
 """
 from __future__ import annotations
 
@@ -257,11 +258,15 @@ def _build_tool_selection_prompt(
         "**ANSWER is a last resort.** Output ANSWER only when:\n"
         "  (a) the retrieved content already comprehensively covers the task, OR\n"
         "  (b) you have no rounds left.\n\n"
+        "Before choosing a tool, think in this order: current goal, missing information, why the next tool "
+        "is the best enabled choice, and what evidence you expect back. Put that brief audit trail into the "
+        "optional `thinking` object using short factual strings. Do not put hidden chain-of-thought or long prose there.\n\n"
         "**Strict output rules:**\n"
         "- This step selects **exactly one** tool key (or ANSWER): output **one** JSON object only; "
         "never bundle multiple tools in one object.\n"
         "- Output **one** JSON object only. No markdown fences, no commentary before or after.\n"
-        '- Tool call (wire format v1): `{"tool": "<key>", "query": "<question or exact symbol>", "args": null|{...}}` — '
+        '- Tool call (wire format v1): `{"tool": "<key>", "query": "<question or exact symbol>", "args": null|{...}, '
+        '"thinking": {"goal": "...", "missing_info": "...", "why_tool": "...", "expected_output": "..."}}` — '
         'the key name `query` is fixed by the parser for this protocol; semantics follow each tool\'s Parameters.\n'
         '- ANSWER: `{"tool": "ANSWER", "query": "", "args": null}`\n'
         "- Never put code, partial answers, or any narrative inside `args`.\n\n"
@@ -273,12 +278,13 @@ def _build_tool_selection_prompt(
         f"Available tools for this session (`tool` must be one of: {tool_keys_csv}, or `ANSWER`):\n\n"
         f"{tools_manual}"
         "Tool-choice JSON (v1 — keys are fixed for parsing): object with string fields `tool` and `query`, "
-        "and `args` as null or object. Meaning of `query` vs `args` is **not** generic: follow each tool's "
-        "**Parameters** and **Usage guidance** above.\n"
+        "and `args` as null or object. An optional `thinking` object may carry a short decision summary for reporting. "
+        "Meaning of `query` vs `args` is **not** generic: follow each tool's **Parameters** and **Usage guidance** above.\n"
         "Additional hard requirements:\n"
         "- Emit exactly **one** JSON object; no markdown fences and no prose outside that object.\n"
         "- Follow each tool's **Parameters** and **Usage guidance** above for `query` / `args`; use "
         '`"args": null` when that tool does not require a structured object.\n'
+        "- When possible, populate `thinking` with a concise summary of goal, missing info, tool rationale, and expected output.\n"
         '- `"tool"`: lowercase key from the enabled list above, or `ANSWER`.\n'
         '- `"query"`: string slot for the tool\'s primary text request in this protocol; use `""` when `tool` is `ANSWER`.\n'
         '- For **ANSWER** use exactly `{"tool":"ANSWER","query":"","args":null}` as JSON; never put generated '
@@ -303,11 +309,18 @@ def _resolve_json_choice(
     """Map validated ToolChoiceV1 to next_action, current_query, and tool_choice_json dict."""
     canon = normalize_tool_choice_name(choice.tool.strip())
     q = (choice.query or "").strip() or user_question.strip()
+    choice_json = {"tool": canon or choice.tool.strip(), "query": choice.query or "", "args": choice.args}
+    if choice.thinking is not None:
+        choice_json["thinking"] = choice.thinking
     if canon == "answer":
-        return "ANSWER", "", {"tool": "ANSWER", "query": "", "args": None}
+        answer_json = {"tool": "ANSWER", "query": "", "args": None}
+        if choice.thinking is not None:
+            answer_json["thinking"] = choice.thinking
+        return "ANSWER", "", answer_json
     if canon is None or canon not in tool_mode:
         raise RuntimeError("invalid tool for _resolve_json_choice (caller must validate)")
-    return canon, q, {"tool": canon, "query": choice.query or "", "args": choice.args}
+    choice_json["tool"] = canon
+    return canon, q, choice_json
 
 
 def _semantic_tool_error_payload(
@@ -344,6 +357,7 @@ def _reasoning_log_entry(
     reasoning_content: str,
     parsed_ok: bool,
     selected_tool: str,
+    structured_thinking: Dict[str, str] | None = None,
     parse_error: str = "",
 ) -> Dict[str, Any]:
     def _clip(text: str, max_len: int) -> str:
@@ -359,6 +373,10 @@ def _reasoning_log_entry(
         "prompt_excerpt": _clip(prompt, 2000),
         "raw_model_output": _clip(raw_model_output, 4000),
         "reasoning_content": _clip(reasoning_content, 4000),
+        "thinking": {
+            str(key): _clip(str(value), 400)
+            for key, value in (structured_thinking or {}).items()
+        },
     }
 
 
@@ -444,6 +462,7 @@ def choose_tool_node(
             reasoning_content=reasoning or "",
             parsed_ok=False,
             selected_tool=choice.tool,
+            structured_thinking=choice.thinking,
             parse_error=msg,
         )
         print(f"[choose_tool] {msg}")
@@ -466,6 +485,7 @@ def choose_tool_node(
         reasoning_content=reasoning or "",
         parsed_ok=True,
         selected_tool=next_action,
+        structured_thinking=choice.thinking,
     )
     print(f"[choose_tool] model reply: {raw_response[:120]!r} -> next_action={next_action}")
     return {

@@ -22,8 +22,8 @@ from generator.agent.agent_runner import KernelGenerationTask, generate_kernel_w
 
 CASE_STUDY_OPS = [
     "conv_pointwise_2d",
-    "gemm_add_relu",
-    "max_pooling_1d",
+    "gelu",
+    "relu",
 ]
 
 

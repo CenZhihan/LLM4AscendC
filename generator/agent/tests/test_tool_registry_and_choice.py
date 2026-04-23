@@ -48,6 +48,44 @@ class TestToolChoiceJson(unittest.TestCase):
         assert c is not None
         self.assertEqual(c.tool, "ANSWER")
 
+    def test_parse_valid_with_thinking(self):
+        raw = (
+            '{"tool":"kb","query":"DataCopy","args":null,'
+            '"thinking":{"goal":"find signature","missing_info":"exact params",'
+            '"why_tool":"kb has API docs","expected_output":"signature snippet"}}'
+        )
+        c, err = parse_tool_choice_json(raw)
+        self.assertIsNone(err)
+        self.assertIsNotNone(c)
+        assert c is not None
+        self.assertEqual(c.thinking, {
+            "goal": "find signature",
+            "missing_info": "exact params",
+            "why_tool": "kb has API docs",
+            "expected_output": "signature snippet",
+        })
+
+    def test_parse_valid_with_trailing_extra_brace(self):
+        raw = '{"tool":"api_lookup","query":"","args":{"api_name":"AscendC::Muls"}}}'
+        c, err = parse_tool_choice_json(raw)
+        self.assertIsNone(err)
+        self.assertIsNotNone(c)
+        assert c is not None
+        self.assertEqual(c.tool, "api_lookup")
+        self.assertEqual(c.args, {"api_name": "AscendC::Muls"})
+
+    def test_parse_skips_invalid_json_object_before_valid_one(self):
+        raw = (
+            '{"goal":"find docs"}\n'
+            '{"tool":"api_constraint","query":"","args":{"api_name":"AscendC::Matmul"}}'
+        )
+        c, err = parse_tool_choice_json(raw)
+        self.assertIsNone(err)
+        self.assertIsNotNone(c)
+        assert c is not None
+        self.assertEqual(c.tool, "api_constraint")
+        self.assertEqual(c.args, {"api_name": "AscendC::Matmul"})
+
 
 class TestQueryUtils(unittest.TestCase):
     def test_extract_api_name_ignores_meta_words(self):
@@ -306,6 +344,8 @@ class TestChooseToolPromptDynamicTools(unittest.TestCase):
             self.assertNotIn("### `web`", p)
             self.assertNotIn("### `code_rag`", p)
             self.assertIn("exactly one", p.lower())
+            self.assertIn("thinking", p)
+            self.assertIn("Before choosing a tool", p)
         finally:
             get_tool_registry().clear()
 
@@ -420,6 +460,10 @@ class TestAgentReportFields(unittest.TestCase):
                     "round": 1,
                     "parsed_ok": True,
                     "selected_tool": "kb",
+                    "thinking": {
+                        "goal": "find API",
+                        "missing_info": "signature",
+                    },
                     "reasoning_content": "choose kb first",
                 }
             ],
@@ -428,6 +472,9 @@ class TestAgentReportFields(unittest.TestCase):
         report = _build_report(final_state)
         self.assertEqual(report.get("reasoning_content"), "final-stage-cot")
         self.assertEqual(report.get("final_generation_reasoning_content"), "final-stage-cot")
+        trace = report.get("tool_selection_trace", [])
+        self.assertEqual(len(trace), 1)
+        self.assertEqual(trace[0].get("thinking", {}).get("goal"), "find API")
         self.assertEqual(len(report.get("tool_calls", [])), 0)
 
     def test_build_report_merges_round_tool_info(self):
@@ -441,6 +488,10 @@ class TestAgentReportFields(unittest.TestCase):
                     "round": 1,
                     "parsed_ok": True,
                     "selected_tool": "ascend_search",
+                    "thinking": {
+                        "goal": "find docs",
+                        "why_tool": "need official reference",
+                    },
                     "reasoning_content": "need docs first",
                 }
             ],
@@ -458,3 +509,4 @@ class TestAgentReportFields(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].get("tool"), "ascend_search")
         self.assertEqual(calls[0].get("tool_choice", {}).get("selected_tool"), "ascend_search")
+        self.assertEqual(calls[0].get("tool_choice", {}).get("thinking", {}).get("goal"), "find docs")

@@ -97,6 +97,21 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
             "ts": e.get("ts"),
         }
 
+    def _summarize_reasoning_entry(e: Dict[str, Any]) -> Dict[str, Any]:
+        reasoning = e.get("reasoning_content") or ""
+        if len(reasoning) > 2000:
+            reasoning = reasoning[:2000] + "...(truncated)"
+        thinking = e.get("thinking") if isinstance(e.get("thinking"), dict) else {}
+        return {
+            "round": e.get("round"),
+            "parsed_ok": e.get("parsed_ok"),
+            "selected_tool": e.get("selected_tool", ""),
+            "parse_error": e.get("parse_error", ""),
+            "thinking": thinking,
+            "reasoning_content": reasoning,
+            "ts": e.get("ts"),
+        }
+
     tool_calls = [
         {
             "round": t.get("round"),
@@ -122,6 +137,7 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "reasoning_content": final_state.get("reasoning_content", ""),
         "final_generation_reasoning_content": final_state.get("reasoning_content", ""),
         "answer": _extract_final_answer(final_state),
+        "tool_selection_trace": [_summarize_reasoning_entry(x) for x in choice_reasoning],
         "tool_calls": tool_calls,
         "tool_choice_parse_errors": [_summarize_parse_entry(x) for x in parse_errors],
         "kb_results_count": len(final_state.get("kb_results", [])),
