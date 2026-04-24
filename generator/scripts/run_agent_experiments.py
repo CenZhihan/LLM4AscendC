@@ -42,7 +42,11 @@ def main():
     p.add_argument("--tool_mode", default="all", help="Tool mode string (e.g. all, kb,web,code_rag,code_search_snippet or code_search_snippet)")
     p.add_argument("--strategy", default="one_shot", help="Prompt strategy name (one_shot, none, etc.)")
     p.add_argument("--outdir", default="output/agent_runs", help="Directory to write per-op JSON reports")
-    p.add_argument("--case-study", action="store_true", help="Run the three caseStudy operators: conv_pointwise_2d, gemm_add_relu, max_pooling_1d")
+    p.add_argument(
+        "--case-study",
+        action="store_true",
+        help="Run CASE_STUDY_OPS (default: conv_pointwise_2d, gelu, relu)",
+    )
     args = p.parse_args()
 
     ops = CASE_STUDY_OPS if args.case_study else args.ops
