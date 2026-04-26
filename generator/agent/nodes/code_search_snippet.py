@@ -1,4 +1,5 @@
-"""Restricted snippet search node for curated local Ascend C sources."""
+"""Structural block retrieval node for curated asc-devkit Ascend C sources."""
+import time
 from typing import Any, Dict
 
 from ..agent_state import GeneratorAgentState
@@ -17,30 +18,47 @@ def code_search_snippet_node(
     current_query = (state.get("current_query") or "").strip()
     tool_choice = state.get("tool_choice_json") or {}
     args = tool_choice.get("args") or {}
-    source = str(args.get("source") or "all")
+    source = str(args.get("source") or "asc_devkit")
+    artifact_types = args.get("artifact_types") or []
+    operator_families = args.get("operator_families") or []
+    source_groups = args.get("source_groups") or []
+    context_type = args.get("context_type") or None
+    api_patterns = args.get("api_patterns") or []
 
     query = retriever.build_query(op_name, category, current_query if current_query else None)
+    round_num = state.get("query_round_count", 0) + 1
+    start_time = time.time()
+
+    print(f"[Round {round_num}] tool=code_search_snippet start, query=\"{query[:100]}...\"")
 
     if retriever.is_available():
-        results = retriever.retrieve(query=query, source=source)
+        results = retriever.retrieve(
+            query=query,
+            source=source if source in {"all", "asc_devkit"} else "asc_devkit",
+            artifact_types=artifact_types,
+            operator_families=operator_families,
+            source_groups=source_groups,
+            context_type=context_type,
+            api_patterns=api_patterns if api_patterns else None,
+        )
     else:
         sources = retriever.available_sources()
         results = [
             "[code_search_snippet] unavailable. "
-            f"cann_skills={sources['cann_skills'] or 'missing'}, "
-            f"asc_devkit={sources['asc_devkit'] or 'missing'}"
+            f"manifest={sources['manifest_path']}, status={sources['asc_devkit']}"
         ]
 
-    round_num = state.get("query_round_count", 0) + 1
+    elapsed = time.time() - start_time
     response = "\n".join(results) if results else ""
     log_entry = {
         "round": round_num,
         "tool": "code_search_snippet",
         "query": query,
+        "args": args if isinstance(args, dict) else {},
         "response": response,
     }
 
-    print(f"[Round {round_num}] 工具=片段检索(CODE_SEARCH_SNIPPECT), 查询=\"{query[:100]}...\"")
+    print(f"[Round {round_num}] tool=code_search_snippet done in {elapsed:.2f}s, query=\"{query[:100]}...\"")
 
     return {
         "code_search_snippet_results": results,

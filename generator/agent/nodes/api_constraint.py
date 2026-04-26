@@ -97,6 +97,7 @@ def api_constraint_node(
         "round": round_num,
         "tool": "api_constraint",
         "query": query or f"API: {api_name}",
+        "args": args if isinstance(args, dict) else {},
         "response": display_text,
     }
 

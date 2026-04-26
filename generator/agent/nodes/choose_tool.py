@@ -7,6 +7,7 @@ The object may include an optional compact ``thinking`` summary for reporting.
 from __future__ import annotations
 
 import time
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -19,8 +20,21 @@ from ..agent_config import (
     NO_TOOL,
     normalize_tool_choice_name,
 )
+from ..query_utils import extract_api_name, extract_chip_name, extract_npu_query_params
 from ..tool_choice import ToolChoiceV1, parse_tool_choice_json
 from ..tool_registry import get_tool_registry
+
+
+_CODE_SEARCH_SOURCES = {"all", "cann_skills", "asc_devkit"}
+_CODE_SEARCH_ARTIFACT_TYPES = {"kernel", "host", "tiling", "opdef", "pybind"}
+_CODE_SEARCH_OPERATOR_FAMILIES = {"activation", "convolution", "matrix", "normalization", "elementwise"}
+_CODE_SEARCH_SOURCE_GROUPS = {
+    "asc_devkit_custom_op_host",
+    "asc_devkit_custom_op_kernel",
+    "asc_devkit_libraries_activation",
+    "asc_devkit_libraries_matrix",
+    "asc_devkit_basic_api_compute",
+}
 
 
 def _openai_completion(
@@ -270,6 +284,12 @@ def _build_tool_selection_prompt(
         'the key name `query` is fixed by the parser for this protocol; semantics follow each tool\'s Parameters.\n'
         '- ANSWER: `{"tool": "ANSWER", "query": "", "args": null}`\n'
         "- Never put code, partial answers, or any narrative inside `args`.\n\n"
+        "**Structured-args policy:**\n"
+        "- For `env_check_npu`, set `args.query_type` when it is inferable; only include `args.device_id` when the request explicitly names a device/card.\n"
+        "- For `env_check_api`, `api_lookup`, `api_constraint`, and `api_alternative`, include `args.api_name` whenever you can infer one exact API symbol.\n"
+        "- For `api_constraint`, include any obvious structured context such as `count`, `dtype`, `repeat_times`, or `is_gm_to_ub` when it is explicitly present.\n"
+        "- For `code_search_snippet`, set `args.source` to `all`, `cann_skills`, or `asc_devkit`; default to `all` when no narrower source is required.\n"
+        "- For `code_search_snippet`, also include inferable `args.artifact_types`, `args.operator_families`, and `args.source_groups` when the query clearly targets host/kernel/tiling/opdef or activation/matrix/convolution examples.\n\n"
     )
 
     prompt = (
@@ -301,6 +321,166 @@ def _build_tool_selection_prompt(
     return prompt
 
 
+def _query_mentions_explicit_device(query: str) -> bool:
+    text = (query or "").lower()
+    return bool(
+        re.search(r"(?:device|card|npu)\s*#?\s*\d+", text)
+        or re.search(r"设备\s*\d+", text)
+        or re.search(r"-i\s*\d+", text)
+    )
+
+
+def _normalize_string_list(values: Any, allowed: set[str]) -> List[str]:
+    if isinstance(values, str):
+        items = re.split(r"[,|]", values)
+    elif isinstance(values, (list, tuple, set)):
+        items = list(values)
+    else:
+        items = []
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        normalized = str(item or "").strip().lower().replace("-", "_")
+        if not normalized or normalized not in allowed or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def _infer_code_search_artifact_types(query: str) -> List[str]:
+    lowered = (query or "").lower()
+    inferred: List[str] = []
+    if any(token in lowered for token in ("infer shape", "infershape", "getinputshape", "setoutputshape", "op_host", "host")):
+        inferred.append("host")
+    if any(token in lowered for token in ("tiling", "setblockdim", "workspace", "tile")):
+        inferred.append("tiling")
+    if any(token in lowered for token in ("project_json", "opdef", "register op", "registration", "input_desc", "output_desc", "op_def_registry")):
+        inferred.append("opdef")
+    if any(token in lowered for token in ("pybind", "torch.library", "binding", "python bind")):
+        inferred.append("pybind")
+    if any(token in lowered for token in ("kernel", "gm_addr", "__aicore__", "tpipe", "tque", "localtensor", "globaltensor", "datacopy", "kernel_operator")):
+        inferred.append("kernel")
+    return _normalize_string_list(inferred, _CODE_SEARCH_ARTIFACT_TYPES)
+
+
+def _infer_code_search_operator_families(query: str) -> List[str]:
+    lowered = (query or "").lower()
+    inferred: List[str] = []
+    if any(token in lowered for token in ("gelu", "relu", "softmax", "activation", "leakyrelu")):
+        inferred.append("activation")
+    if any(token in lowered for token in ("conv", "convolution", "pointwise", "depthwise")):
+        inferred.append("convolution")
+    if any(token in lowered for token in ("matmul", "gemm", "mma", "gemv", "matrix")):
+        inferred.append("matrix")
+    if any(token in lowered for token in ("layernorm", "rmsnorm", "normalization")):
+        inferred.append("normalization")
+    if any(token in lowered for token in ("elementwise", "broadcast", "add", "sub", "mul", "div")):
+        inferred.append("elementwise")
+    return _normalize_string_list(inferred, _CODE_SEARCH_OPERATOR_FAMILIES)
+
+
+def _infer_code_search_source_groups(query: str, artifact_types: List[str], operator_families: List[str]) -> List[str]:
+    inferred: List[str] = []
+    lowered = (query or "").lower()
+    if any(kind in artifact_types for kind in ("host", "tiling", "opdef")):
+        inferred.append("asc_devkit_custom_op_host")
+    if "kernel" in artifact_types:
+        inferred.append("asc_devkit_custom_op_kernel")
+    if "activation" in operator_families:
+        inferred.append("asc_devkit_libraries_activation")
+    if "matrix" in operator_families or "convolution" in operator_families:
+        inferred.append("asc_devkit_libraries_matrix")
+    if any(token in lowered for token in ("maxs", "mins", "muls", "add", "sub", "datacopy")):
+        inferred.append("asc_devkit_basic_api_compute")
+    return _normalize_string_list(inferred, _CODE_SEARCH_SOURCE_GROUPS)
+
+
+def _normalize_choice_args(tool_name: str, query: str, args: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    current = dict(args or {})
+
+    if tool_name == "code_search_snippet":
+        source = str(current.get("source") or "asc_devkit").strip().lower()
+        if source == "cann_skills":
+            source = "asc_devkit"
+        current["source"] = source if source in _CODE_SEARCH_SOURCES else "asc_devkit"
+        artifact_types = _normalize_string_list(current.get("artifact_types"), _CODE_SEARCH_ARTIFACT_TYPES)
+        if not artifact_types:
+            artifact_types = _infer_code_search_artifact_types(query)
+        if artifact_types:
+            current["artifact_types"] = artifact_types
+        else:
+            current.pop("artifact_types", None)
+
+        operator_families = _normalize_string_list(current.get("operator_families"), _CODE_SEARCH_OPERATOR_FAMILIES)
+        if not operator_families:
+            operator_families = _infer_code_search_operator_families(query)
+        if operator_families:
+            current["operator_families"] = operator_families
+        else:
+            current.pop("operator_families", None)
+
+        source_groups = _normalize_string_list(current.get("source_groups"), _CODE_SEARCH_SOURCE_GROUPS)
+        if not source_groups:
+            source_groups = _infer_code_search_source_groups(query, artifact_types, operator_families)
+        if source_groups:
+            current["source_groups"] = source_groups
+        else:
+            current.pop("source_groups", None)
+
+        if current["source"] == "all" and source_groups and all(group.startswith("asc_devkit_") for group in source_groups):
+            current["source"] = "asc_devkit"
+        return current
+
+    if tool_name == "npu_arch":
+        chip_name = extract_chip_name(query, args=current)
+        if chip_name:
+            current["chip_name"] = chip_name
+        return current or None
+
+    if tool_name == "env_check_npu":
+        query_type, device_id = extract_npu_query_params(query, args=current)
+        current["query_type"] = query_type
+        if query_type in {"info", "list"} and not _query_mentions_explicit_device(query):
+            current.pop("device_id", None)
+        elif device_id is not None:
+            current["device_id"] = device_id
+        else:
+            current.pop("device_id", None)
+        return current
+
+    if tool_name in {"env_check_api", "api_lookup", "api_constraint", "api_alternative"}:
+        api_name = extract_api_name(query, args=current)
+        if api_name != "unknown":
+            current["api_name"] = api_name
+        else:
+            current.pop("api_name", None)
+
+        if tool_name == "api_constraint":
+            lowered = query.lower()
+            for key in ("count", "repeat_times", "ub_usage_bytes", "ub_capacity_bytes"):
+                if key in current:
+                    continue
+                match = re.search(rf"{key}\s*[=:]\s*(\d+)", lowered, re.IGNORECASE)
+                if match:
+                    current[key] = int(match.group(1))
+            for dtype in ("float", "half", "float16", "bfloat16", "int32", "int16", "int8"):
+                if dtype in lowered and "dtype" not in current:
+                    current["dtype"] = dtype
+                    break
+            if "is_gm_to_ub" not in current and "gm" in lowered and ("ub" in lowered or "global" in lowered):
+                current["is_gm_to_ub"] = True
+
+        if tool_name == "api_alternative":
+            reason = current.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                current["reason"] = "not found"
+
+        return current or None
+
+    return current or None
+
+
 def _resolve_json_choice(
     choice: ToolChoiceV1,
     tool_mode: AgentToolMode,
@@ -309,7 +489,8 @@ def _resolve_json_choice(
     """Map validated ToolChoiceV1 to next_action, current_query, and tool_choice_json dict."""
     canon = normalize_tool_choice_name(choice.tool.strip())
     q = (choice.query or "").strip() or user_question.strip()
-    choice_json = {"tool": canon or choice.tool.strip(), "query": choice.query or "", "args": choice.args}
+    normalized_args = _normalize_choice_args(canon or choice.tool.strip(), q, choice.args)
+    choice_json = {"tool": canon or choice.tool.strip(), "query": choice.query or "", "args": normalized_args}
     if choice.thinking is not None:
         choice_json["thinking"] = choice.thinking
     if canon == "answer":
@@ -358,6 +539,7 @@ def _reasoning_log_entry(
     parsed_ok: bool,
     selected_tool: str,
     structured_thinking: Dict[str, str] | None = None,
+    structured_args: Dict[str, Any] | None = None,
     parse_error: str = "",
 ) -> Dict[str, Any]:
     def _clip(text: str, max_len: int) -> str:
@@ -370,6 +552,7 @@ def _reasoning_log_entry(
         "parsed_ok": parsed_ok,
         "selected_tool": selected_tool,
         "parse_error": parse_error,
+        "args": dict(structured_args or {}),
         "prompt_excerpt": _clip(prompt, 2000),
         "raw_model_output": _clip(raw_model_output, 4000),
         "reasoning_content": _clip(reasoning_content, 4000),
@@ -436,6 +619,7 @@ def choose_tool_node(
             reasoning_content=reasoning or "",
             parsed_ok=False,
             selected_tool="",
+            structured_args=choice.args if choice is not None else None,
             parse_error=err or "unknown",
         )
         print(f"[choose_tool] JSON parse failed: {err!r}")
@@ -463,6 +647,7 @@ def choose_tool_node(
             parsed_ok=False,
             selected_tool=choice.tool,
             structured_thinking=choice.thinking,
+            structured_args=choice.args,
             parse_error=msg,
         )
         print(f"[choose_tool] {msg}")
@@ -486,6 +671,7 @@ def choose_tool_node(
         parsed_ok=True,
         selected_tool=next_action,
         structured_thinking=choice.thinking,
+        structured_args=tjson.get("args") if isinstance(tjson.get("args"), dict) else None,
     )
     print(f"[choose_tool] model reply: {raw_response[:120]!r} -> next_action={next_action}")
     return {

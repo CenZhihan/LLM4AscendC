@@ -79,6 +79,7 @@ def api_alternative_node(
         "round": round_num,
         "tool": "api_alternative",
         "query": query or f"API: {api_name}",
+        "args": args if isinstance(args, dict) else {},
         "response": display_text,
     }
 

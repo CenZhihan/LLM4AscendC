@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import tempfile
 import unittest
 from unittest import mock
 
+import numpy as np
+
+from generator.agent.retrievers import env_checker as env_checker_mod
 from generator.agent.agent_config import (
     parse_tool_mode,
     tool_mode_to_string,
@@ -13,8 +18,9 @@ from generator.agent.agent_config import (
 )
 from generator.agent.nodes.ascend_fetch import ascend_fetch_node
 from generator.agent.nodes.ascend_search import ascend_search_node
-from generator.agent.query_utils import extract_api_name, extract_npu_query_params
+from generator.agent.query_utils import extract_api_name, extract_chip_name, extract_npu_query_params
 from generator.agent.retrievers.api_doc_retriever import ApiDocRetriever, ApiSignatureResult
+from generator.agent.retrievers.code_search_snippet_retriever import CodeSearchSnippetRetriever, _build_query_intent
 from generator.agent.retrievers.env_checker import ApiCheckResult, NpuDeviceResult
 from generator.agent.tool_choice import parse_tool_choice_json
 from generator.agent.tool_registry import RegisteredToolSpec, get_tool_registry, register_tool
@@ -111,24 +117,57 @@ class TestQueryUtils(unittest.TestCase):
         self.assertEqual(query_type, "memory")
         self.assertEqual(device_id, 1)
 
+    def test_extract_chip_name_prefers_chip_token_over_meta_word(self):
+        self.assertEqual(
+            extract_chip_name(
+                "Ascend910B2 chip specs",
+                known_names=["Ascend910B2", "Ascend910B"],
+            ),
+            "Ascend910B2",
+        )
+
+    def test_extract_chip_name_prefers_args(self):
+        self.assertEqual(
+            extract_chip_name(
+                "chip specs",
+                args={"chip_name": "Ascend950DT"},
+                known_names=["Ascend950DT"],
+            ),
+            "Ascend950DT",
+        )
+
 
 class TestApiRetrieverFallback(unittest.TestCase):
-    def test_lookup_signature_falls_back_to_header_search(self):
-        retriever = ApiDocRetriever()
-        with mock.patch(
-            "generator.agent.retrievers.env_checker.check_api_exists",
-            return_value=ApiCheckResult(
-                found=True,
-                api_name="MatmulType",
-                header_files=["matmul.h"],
-                matches=["matmul.h:42:using MatmulType = int;"],
-                summary="found in headers",
-            ),
-        ):
+    def test_lookup_signature_uses_local_headers_and_doc_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            include_root = os.path.join(tmp, "include", "basic_api")
+            os.makedirs(include_root, exist_ok=True)
+            with open(os.path.join(include_root, "matmul.h"), "w", encoding="utf-8") as handle:
+                handle.write("using MatmulType = int;\n")
+            with open(os.path.join(tmp, "api-matmul.md"), "w", encoding="utf-8") as handle:
+                handle.write("# Matmul Guide\n\n## 类型\nMatmulType is used for matmul kernels.\n")
+
+            retriever = ApiDocRetriever(knowledge_path=tmp)
             result = retriever.lookup_signature("MatmulType")
+
         self.assertEqual(result.api_name, "MatmulType")
         self.assertIn("MatmulType", result.signature)
-        self.assertIn("found in headers", result.details)
+        self.assertIn("matmul.h", result.header_files)
+        self.assertTrue(result.doc_metadata)
+        self.assertEqual(result.doc_metadata[0]["path"], "api-matmul.md")
+
+    def test_lookup_signature_ignores_non_signature_header_hits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            include_root = os.path.join(tmp, "include", "basic_api")
+            os.makedirs(include_root, exist_ok=True)
+            with open(os.path.join(include_root, "fusion_gelu.h"), "w", encoding="utf-8") as handle:
+                handle.write("enum class GeluApproxiMate : uint8_t { ERF = 0, TANH = 1 };\n")
+
+            retriever = ApiDocRetriever(knowledge_path=tmp)
+            result = retriever.lookup_signature("Tanh")
+
+        self.assertEqual(result.signature, "")
+        self.assertIn("未找到 API 'Tanh'", result.details)
 
 
 class TestApiAndEnvNodes(unittest.TestCase):
@@ -152,6 +191,8 @@ class TestApiAndEnvNodes(unittest.TestCase):
                     example_call="",
                     source_doc="doc.md",
                     details="ok",
+                    header_files=["kernel_operator_data_copy_intf.h"],
+                    doc_metadata=[{"path": "api-datacopy.md", "title": "DataCopy", "section": "选择规则", "excerpt": "DataCopyPad"}],
                 )
 
         out = api_lookup_node(
@@ -163,6 +204,7 @@ class TestApiAndEnvNodes(unittest.TestCase):
             _Retriever(),
         )
         self.assertEqual(out["api_lookup_result"]["api_name"], "DataCopy")
+        self.assertIn("kernel_operator_data_copy_intf.h", out["api_lookup_results"][0])
 
     def test_env_check_api_node_uses_structured_args(self):
         from generator.agent.nodes.env_check import env_check_api_node
@@ -214,6 +256,700 @@ class TestApiAndEnvNodes(unittest.TestCase):
         )
         self.assertEqual(out["env_check_npu_result"]["query_type"], "memory")
         self.assertIn("device=1", out["env_check_npu_result"]["raw_output"])
+
+    def test_npu_arch_node_uses_structured_chip_arg(self):
+        from generator.agent.nodes.npu_arch import npu_arch_node
+        from generator.agent.retrievers.npu_arch_retriever import ChipSpecResult
+
+        class _Retriever:
+            def list_chips(self):
+                return ["Ascend910B2", "Ascend950DT"]
+
+            def lookup_chip_spec(self, chip_name):
+                return ChipSpecResult(
+                    chip_name=chip_name,
+                    npu_arch="DAV_2201",
+                    ub_capacity_bytes=196608,
+                    vector_core_num=4,
+                    cube_core_num=1,
+                    hbm_capacity_gb=64,
+                    max_block_dim=65535,
+                    max_tile_size={"float": 4096},
+                    supported_apis=["Vector"],
+                    features=["Pipeline"],
+                    arch_compile_macro="DAV_2201",
+                    soc_version=chip_name,
+                    details="ok",
+                )
+
+        out = npu_arch_node(
+            {
+                "current_query": "chip specs",
+                "tool_choice_json": {"tool": "npu_arch", "query": "chip specs", "args": {"chip_name": "Ascend950DT"}},
+                "query_round_count": 0,
+            },
+            _Retriever(),
+        )
+        self.assertEqual(out["npu_arch_result"]["chip_name"], "Ascend950DT")
+
+
+class TestEnvCheckApiExactMatching(unittest.TestCase):
+    def test_check_api_exists_ignores_identifier_substrings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            include_dir = os.path.join(tmp, "aarch64-linux", "ascendc", "act", "include")
+            os.makedirs(include_dir, exist_ok=True)
+            with open(os.path.join(include_dir, "fake.h"), "w", encoding="utf-8") as handle:
+                handle.write("uint64_t maxStepK_ = 0;\n")
+
+            with mock.patch.object(env_checker_mod, "_find_cann_home", return_value=tmp), \
+                 mock.patch.dict(os.environ, {"ASCEND_OPP_PATH": ""}, clear=False):
+                result = env_checker_mod.check_api_exists("Maxs")
+
+        self.assertFalse(result.found)
+
+    def test_check_api_exists_matches_exact_function_symbol(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            include_dir = os.path.join(tmp, "aarch64-linux", "ascendc", "act", "include")
+            os.makedirs(include_dir, exist_ok=True)
+            with open(os.path.join(include_dir, "fake.h"), "w", encoding="utf-8") as handle:
+                handle.write("__aicore__ inline void DataCopy(LocalTensor<float>& dst, const GlobalTensor<float>& src, uint32_t count);\n")
+
+            with mock.patch.object(env_checker_mod, "_find_cann_home", return_value=tmp), \
+                 mock.patch.dict(os.environ, {"ASCEND_OPP_PATH": ""}, clear=False):
+                result = env_checker_mod.check_api_exists("AscendC::DataCopy")
+
+        self.assertTrue(result.found)
+        self.assertTrue(any("DataCopy" in match for match in result.matches))
+
+
+class TestEnvCheckNpuRetriever(unittest.TestCase):
+    def test_info_query_ignores_device_id_flag(self):
+        with mock.patch.object(env_checker_mod, "_check_tool", return_value="npu-smi"), \
+             mock.patch.object(env_checker_mod, "_run_cmd", return_value="ok") as run_cmd:
+            result = env_checker_mod.query_npu_devices(device_id=0, query_type="info")
+
+        self.assertTrue(result.available)
+        run_cmd.assert_called_once_with("npu-smi info", timeout=15.0)
+
+    def test_scoped_query_maps_logical_device_to_card_id(self):
+        def _fake_run(cmd: str, timeout: float = 15.0) -> str:
+            if cmd == "npu-smi info -m":
+                return (
+                    "NPU ID                         Chip ID                        Chip Logic ID                  Chip Name\n"
+                    "5                              0                              0                              Ascend 910B2\n"
+                    "6                              0                              1                              Ascend 910B2\n"
+                )
+            if cmd == "npu-smi info -t memory -i 5":
+                return "HBM Capacity(MB): 65536"
+            raise AssertionError(f"unexpected cmd: {cmd}")
+
+        with mock.patch.object(env_checker_mod, "_check_tool", return_value="npu-smi"), \
+             mock.patch.object(env_checker_mod, "_run_cmd", side_effect=_fake_run):
+            result = env_checker_mod.query_npu_devices(device_id=0, query_type="memory")
+
+        self.assertTrue(result.available)
+        self.assertIn("65536", result.raw_output)
+
+
+class TestCodeSearchSnippetHybridRetriever(unittest.TestCase):
+    def _write_file(self, root: str, relative_path: str, content: str) -> None:
+        path = os.path.join(root, relative_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(content)
+
+    def test_keyword_extraction_uses_boundary_matching(self):
+        from generator.agent.retrievers.code_search_snippet_retriever import _extract_keywords
+
+        self.assertIn("matmul", _extract_keywords("matmul example"))
+        self.assertIn("mul", _extract_keywords("mul example"))
+        self.assertNotIn("mul", _extract_keywords("matmul example"))
+
+    def test_host_tiling_query_prefers_host_slice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/02_features/00_compilation/custom_op/op_host/add_custom/add_custom_tiling.asc",
+                """
+class AddCustomTiling {
+public:
+    void InferShape() {
+        auto xShape = context->GetInputShape(0);
+        context->SetBlockDim(8);
+        (void)xShape;
+    }
+};
+""",
+            )
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/02_features/00_compilation/custom_op/op_kernel/add_custom/add_custom_kernel.asc",
+                """
+class AddCustomKernel {
+public:
+    __aicore__ inline void Process() {
+        AscendC::TPipe pipe;
+        AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueue;
+        AscendC::DataCopy(xLocal, xGm, 128);
+    }
+};
+""",
+            )
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root="",
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+            )
+            with mock.patch.object(retriever, "_compute_dense_scores", return_value={}):
+                matches = retriever.search(
+                    query="host tiling GetInputShape InferShape example",
+                    source="asc_devkit",
+                    top_k=2,
+                )
+
+        self.assertTrue(matches)
+        self.assertIn("op_host", matches[0].relative_path)
+
+    def test_dense_branch_can_recall_semantic_match_without_lexical_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/00_matrix/pointwise_conv1x1/pointwise_conv1x1.asc",
+                """
+class PointwiseConvKernel {
+public:
+    __aicore__ inline void Process() {
+        // pointwise conv 1x1 reduction over Cin
+        AscendC::TPipe pipe;
+    }
+};
+""",
+            )
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/00_matrix/matmul_example/matmul_example.asc",
+                """
+class MatmulKernel {
+public:
+    __aicore__ inline void Process() {
+        // constant tiling matmul example
+        AscendC::TPipe pipe;
+    }
+};
+""",
+            )
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root="",
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+            )
+
+            def _fake_dense_scores(query: str, records, candidate_indices):
+                del query
+                scores = {}
+                for index in candidate_indices:
+                    rel = records[index].relative_path
+                    if "pointwise_conv1x1" in rel:
+                        scores[index] = 0.95
+                    elif "matmul_example" in rel:
+                        scores[index] = 0.15
+                return scores
+
+            with mock.patch.object(retriever, "_compute_dense_scores", side_effect=_fake_dense_scores):
+                matches = retriever.search(
+                    query="channel projection mixer",
+                    source="asc_devkit",
+                    top_k=2,
+                )
+
+        self.assertTrue(matches)
+        self.assertIn("pointwise_conv1x1", matches[0].relative_path)
+
+    def test_dense_encoding_falls_back_to_cpu_after_npu_oom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/01_activation/gelu/gelu.asc",
+                """
+class GeluKernel {
+public:
+    __aicore__ inline void Compute() {
+        AscendC::Gelu(dstLocal, srcLocal, 128);
+    }
+};
+""",
+            )
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root="",
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+                dense_devices=["npu:0", "cpu"],
+            )
+
+            seen_devices = []
+
+            class _FakeModel:
+                def __init__(self, device: str):
+                    self.device = device
+
+                def encode(self, texts, **kwargs):
+                    del kwargs
+                    seen_devices.append(self.device)
+                    if self.device == "npu:0":
+                        raise RuntimeError("NPU out of memory")
+                    return np.asarray([[1.0, 0.0] for _ in texts], dtype=np.float32)
+
+            with mock.patch.object(retriever, "_load_dense_model", side_effect=lambda device=None: _FakeModel(device or "cpu")), \
+                 mock.patch.object(retriever, "_release_dense_model"):
+                embeddings = retriever._encode_dense_inputs(["dense example"], stage="encoding")
+
+        self.assertIsNotNone(embeddings)
+        self.assertEqual(seen_devices, ["npu:0", "cpu"])
+
+    def test_load_records_only_indexes_asc_devkit_examples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skills_root = os.path.join(tmp, "skills")
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+
+            self._write_file(
+                skills_root,
+                "toy_skill/references/environment-setup.md",
+                """
+```bash
+export CANN_PATH=/home/developer/Ascend/cann
+ls $CANN_PATH/include/kernel_operator.h
+ls $CANN_PATH/lib64/libregister.so
+```
+""",
+            )
+            self._write_file(
+                skills_root,
+                "toy_skill/references/phase1-design.md",
+                """
+```cpp
+task(description = \"phase design\", prompt = \"do review\")
+```
+""",
+            )
+            self._write_file(
+                skills_root,
+                "toy_skill/references/op_kernel.md",
+                """
+```cpp
+class ToyKernel {
+public:
+    __aicore__ inline void Process(GM_ADDR x, GM_ADDR y) {
+        AscendC::TPipe pipe;
+        AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueue;
+        AscendC::DataCopy(localX, globalX, 128);
+    }
+};
+```
+""",
+            )
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/01_activation/gelu/gelu.asc",
+                """
+/*
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ */
+class GeluKernel {
+public:
+    __aicore__ inline void Compute() {
+        AscendC::LocalTensor<float> srcLocal;
+        AscendC::LocalTensor<float> dstLocal;
+        AscendC::Gelu(dstLocal, srcLocal, 128);
+    }
+};
+""",
+            )
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root=skills_root,
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+            )
+
+            records = retriever._load_records()
+
+        self.assertTrue(records)
+        self.assertTrue(all(record.source == "asc_devkit" for record in records))
+        self.assertTrue(any("gelu/gelu.asc" in record.relative_path for record in records))
+        self.assertFalse(any("toy_skill" in record.relative_path for record in records))
+
+    def test_load_records_drops_non_asc_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/00_matrix/matmul_fused/matmul_fused.asc",
+                """
+class MatmulFusedKernel {
+public:
+    __aicore__ inline void Process() {
+        AscendC::TPipe pipe;
+    }
+};
+""",
+            )
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/00_matrix/matmul_fused/l2_cache_optimizer.h",
+                """
+class L2CacheOptimizer {};
+""",
+            )
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root="",
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+            )
+
+            records = retriever._load_records()
+
+        self.assertTrue(records)
+        self.assertTrue(all(record.relative_path.endswith(".asc") for record in records))
+        self.assertFalse(any(record.relative_path.endswith(".h") for record in records))
+
+    def test_metadata_ignores_license_comment_words(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/01_activation/gelu/gelu.asc",
+                """
+/*
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software under the CANN Open Software License Agreement.
+ */
+class GeluKernel {
+public:
+    __aicore__ inline void Compute() {
+        AscendC::LocalTensor<float> srcLocal;
+        AscendC::Gelu(dstLocal, srcLocal, 128);
+    }
+};
+""",
+            )
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root="",
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+            )
+
+            matches = retriever.search(
+                query="gelu activation kernel example",
+                source="asc_devkit",
+                top_k=1,
+            )
+
+        self.assertTrue(matches)
+        self.assertIn("AscendC::Gelu", matches[0].metadata.api_symbols)
+        self.assertNotIn("Copyright", matches[0].metadata.api_symbols)
+
+    def test_exact_api_symbol_query_prefers_reducemax_example(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/04_reduce/reducemax/reducemax.asc",
+                """
+class KernelReduceMax {
+public:
+    __aicore__ inline void Compute() {
+        AscendC::ReduceMax(dstLocal, srcLocal, tmpLocal, 128, true);
+    }
+};
+""",
+            )
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/02_features/03_basic_api/02_memory_vector_compute/block_reduce_min_max_sum/block_reduce_min_max_sum.asc",
+                """
+class BlockReduceKernel {
+public:
+    __aicore__ inline void Compute() {
+        AscendC::BlockReduceMax(dstLocal, srcLocal, 2, mask, 1, 1, 8);
+    }
+};
+""",
+            )
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root="",
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+            )
+
+            with mock.patch.object(retriever, "_compute_dense_scores", return_value={}):
+                matches = retriever.search(
+                    query="AscendC ReduceMax Vmax Max elementwise example",
+                    source="asc_devkit",
+                    top_k=2,
+                )
+
+        self.assertTrue(matches)
+        self.assertIn("reducemax/reducemax.asc", matches[0].relative_path)
+
+    def test_retrieve_returns_single_full_file_with_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/01_activation/gelu/gelu.asc",
+                """
+class GeluKernel {
+public:
+    __aicore__ inline void Compute() {
+        AscendC::TPipe pipe;
+        AscendC::LocalTensor<float> srcLocal;
+        AscendC::LocalTensor<float> dstLocal;
+        AscendC::Gelu(dstLocal, srcLocal, 128);
+    }
+};
+""",
+            )
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root="",
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+            )
+
+            with mock.patch.object(retriever, "_compute_dense_scores", return_value={}):
+                results = retriever.retrieve(
+                    query="gelu activation kernel example",
+                    source="asc_devkit",
+                )
+
+        self.assertEqual(len(results), 1)
+        self.assertIn("Top1 Example", results[0])
+        self.assertIn("score_note: score is RRF rank fusion", results[0])
+        self.assertIn("confidence:", results[0])
+        self.assertIn("matched_branches: metadata, bm25", results[0])
+        self.assertIn("branch_scores:", results[0])
+        self.assertIn("path: 01_simd_cpp_api/03_libraries/01_activation/gelu/gelu.asc", results[0])
+        self.assertIn("artifact_type: kernel", results[0])
+        self.assertIn("AscendC::Gelu", results[0])
+        self.assertIn("class GeluKernel", results[0])
+
+    def test_search_result_exposes_confidence_and_explanations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/02_normalization/layernorm/layernorm.asc",
+                """
+class LayerNormKernel {
+public:
+    __aicore__ inline void Compute() {
+        AscendC::LayerNorm(dstLocal, srcLocal, gammaLocal, betaLocal, 128);
+    }
+};
+""",
+            )
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/00_matrix/matmul/matmul.asc",
+                """
+class MatmulKernel {
+public:
+    __aicore__ inline void Process() {
+        AscendC::Matmul<int, int, int, int> mm;
+    }
+};
+""",
+            )
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root="",
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+            )
+
+            with mock.patch.object(retriever, "_compute_dense_scores", return_value={}):
+                matches = retriever.search(
+                    query="layernorm kernel tiling example",
+                    source="asc_devkit",
+                    top_k=1,
+                )
+
+        self.assertEqual(len(matches), 1)
+        self.assertGreater(matches[0].confidence, 0.0)
+        self.assertIn(matches[0].confidence_label, {"medium", "high"})
+        self.assertEqual(matches[0].matched_branches, ("metadata", "bm25"))
+        self.assertGreater(matches[0].candidate_score, 0.0)
+        self.assertTrue(matches[0].explanation)
+        self.assertTrue(any("operator_families matched" in item for item in matches[0].explanation))
+
+    def test_candidate_prefilter_reduces_large_candidate_pool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+            for index in range(80):
+                if index < 8:
+                    content = f"""
+class ReduceKernel{index} {{
+public:
+    __aicore__ inline void Compute() {{
+        AscendC::ReduceMax(dstLocal, srcLocal, tmpLocal, 128, true);
+    }}
+}};
+"""
+                    relative_path = (
+                        f"01_simd_cpp_api/02_features/03_basic_api/02_memory_vector_compute/"
+                        f"reduce_family_{index}/reduce_family_{index}.asc"
+                    )
+                else:
+                    content = f"""
+class GenericKernel{index} {{
+public:
+    __aicore__ inline void Process() {{
+        AscendC::TPipe pipe;
+        AscendC::DataCopy(dstLocal, srcLocal, 128);
+    }}
+}};
+"""
+                    relative_path = (
+                        f"01_simd_cpp_api/02_features/00_compilation/custom_op/op_kernel/"
+                        f"generic_{index}/generic_{index}.asc"
+                    )
+                self._write_file(asc_root, relative_path, content)
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root="",
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+            )
+
+            records = retriever._load_records()
+            intent = _build_query_intent("max pooling 1d sliding window reduce max kernel")
+            candidates = retriever._candidate_indices(
+                records,
+                "asc_devkit",
+                intent,
+                result_k=3,
+            )
+            metadata_scores = retriever._metadata_scores(records, intent, candidates)
+
+        self.assertEqual(len(records), 80)
+        self.assertLess(len(candidates), len(records))
+        self.assertLessEqual(len(candidates), 64)
+        self.assertEqual(len(metadata_scores), len(candidates))
+
+    def test_activation_family_filter_keeps_gelu_query_out_of_matrix_examples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/01_activation/gelu/gelu.asc",
+                """
+class GeluKernel {
+public:
+    __aicore__ inline void Compute() {
+        AscendC::LocalTensor<float> srcLocal;
+        AscendC::LocalTensor<float> dstLocal;
+        AscendC::Gelu(dstLocal, srcLocal, 128);
+    }
+};
+""",
+            )
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/00_matrix/matmul/matmul.asc",
+                """
+class MatmulKernel {
+public:
+    __aicore__ inline void Process(AscendC::TPipe* pipe) {
+        AscendC::Matmul<int, int, int, int> mm;
+    }
+};
+""",
+            )
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root="",
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+            )
+
+            with mock.patch.object(retriever, "_compute_dense_scores", return_value={}):
+                matches = retriever.search(
+                    query="AscendC::Gelu tiling kernel_operator TPipe example gelu",
+                    source="asc_devkit",
+                    top_k=2,
+                    operator_families=["activation"],
+                )
+
+        self.assertTrue(matches)
+        self.assertIn("gelu/gelu.asc", matches[0].relative_path)
+
+    def test_source_group_filter_prefers_custom_op_host_examples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asc_root = os.path.join(tmp, "examples")
+            knowledge_root = os.path.join(tmp, "knowledge")
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/02_features/00_compilation/custom_op/op_host/add_custom/add_custom_host.asc",
+                """
+static graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *xShape = context->GetInputShape(0);
+    gert::Shape *yShape = context->GetOutputShape(0);
+    *yShape = *xShape;
+    return GRAPH_SUCCESS;
+}
+""",
+            )
+            self._write_file(
+                asc_root,
+                "01_simd_cpp_api/03_libraries/00_matrix/matmul/matmul.asc",
+                """
+class MatmulKernel {
+public:
+    __aicore__ inline void Process(AscendC::TPipe* pipe) {
+        AscendC::Matmul<int, int, int, int> mm;
+    }
+};
+""",
+            )
+
+            retriever = CodeSearchSnippetRetriever(
+                cann_skills_root="",
+                asc_devkit_examples_root=asc_root,
+                knowledge_root=knowledge_root,
+            )
+
+            with mock.patch.object(retriever, "_compute_dense_scores", return_value={}):
+                matches = retriever.search(
+                    query="custom operator op_def_registry tiling InferShape kernel_operator example",
+                    source="asc_devkit",
+                    top_k=2,
+                    artifact_types=["host", "tiling"],
+                    source_groups=["asc_devkit_custom_op_host"],
+                )
+
+        self.assertTrue(matches)
+        self.assertIn("op_host", matches[0].relative_path)
 
 
 class TestParseToolModePlugins(unittest.TestCase):
@@ -488,6 +1224,7 @@ class TestAgentReportFields(unittest.TestCase):
                     "round": 1,
                     "parsed_ok": True,
                     "selected_tool": "ascend_search",
+                    "args": {"lang": "zh"},
                     "thinking": {
                         "goal": "find docs",
                         "why_tool": "need official reference",
@@ -500,6 +1237,7 @@ class TestAgentReportFields(unittest.TestCase):
                     "round": 1,
                     "tool": "ascend_search",
                     "query": "AscendC 激活函数",
+                    "args": {"lang": "zh"},
                     "response": "ok",
                 }
             ],
@@ -508,5 +1246,236 @@ class TestAgentReportFields(unittest.TestCase):
         calls = report.get("tool_calls", [])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].get("tool"), "ascend_search")
+        self.assertEqual(calls[0].get("args"), {"lang": "zh"})
         self.assertEqual(calls[0].get("tool_choice", {}).get("selected_tool"), "ascend_search")
         self.assertEqual(calls[0].get("tool_choice", {}).get("thinking", {}).get("goal"), "find docs")
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("langchain_core") is not None,
+    "langchain_core not installed",
+)
+class TestChooseToolArgsNormalization(unittest.TestCase):
+    def test_normalizes_api_args_from_query(self):
+        from generator.agent.builtin_tools import register_builtin_tools_for_mode
+        from generator.agent.nodes.choose_tool import choose_tool_node
+        from langchain_core.messages import HumanMessage
+
+        class _Msg:
+            content = '{"tool":"env_check_api","query":"check if AscendC::DataCopy exists","args":null}'
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        class _Completions:
+            @staticmethod
+            def create(**kwargs):
+                return _Resp()
+
+        class _Chat:
+            completions = _Completions()
+
+        class _Client:
+            chat = _Chat()
+
+        client = _Client()
+        try:
+            register_builtin_tools_for_mode(
+                frozenset({"env_check_api"}),
+                client=client,
+                model="dummy",
+                kb_retriever=None,
+                web_retriever=None,
+                code_retriever=None,
+                env_retriever=None,
+                npu_arch_retriever=None,
+                tiling_retriever=None,
+                api_retriever=None,
+                code_quality_retriever=None,
+                kb_shell_retriever=None,
+                ascend_search_retriever=None,
+                ascend_fetch_retriever=None,
+                plugin_snapshot=None,
+            )
+            out = choose_tool_node(
+                {"messages": [HumanMessage(content="check if AscendC::DataCopy exists")], "query_round_count": 0},
+                client,
+                "dummy",
+                frozenset({"env_check_api"}),
+            )
+        finally:
+            get_tool_registry().clear()
+
+        self.assertEqual(out["tool_choice_json"]["args"], {"api_name": "AscendC::DataCopy"})
+
+    def test_drops_spurious_device_id_for_generic_info_queries(self):
+        from generator.agent.builtin_tools import register_builtin_tools_for_mode
+        from generator.agent.nodes.choose_tool import choose_tool_node
+        from langchain_core.messages import HumanMessage
+
+        class _Msg:
+            content = '{"tool":"env_check_npu","query":"summarize available NPUs","args":{"query_type":"info","device_id":0}}'
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        class _Completions:
+            @staticmethod
+            def create(**kwargs):
+                return _Resp()
+
+        class _Chat:
+            completions = _Completions()
+
+        class _Client:
+            chat = _Chat()
+
+        client = _Client()
+        try:
+            register_builtin_tools_for_mode(
+                frozenset({"env_check_npu"}),
+                client=client,
+                model="dummy",
+                kb_retriever=None,
+                web_retriever=None,
+                code_retriever=None,
+                env_retriever=None,
+                npu_arch_retriever=None,
+                tiling_retriever=None,
+                api_retriever=None,
+                code_quality_retriever=None,
+                kb_shell_retriever=None,
+                ascend_search_retriever=None,
+                ascend_fetch_retriever=None,
+                plugin_snapshot=None,
+            )
+            out = choose_tool_node(
+                {"messages": [HumanMessage(content="summarize available NPUs")], "query_round_count": 0},
+                client,
+                "dummy",
+                frozenset({"env_check_npu"}),
+            )
+        finally:
+            get_tool_registry().clear()
+
+        self.assertEqual(out["tool_choice_json"]["args"], {"query_type": "info"})
+
+    def test_infers_code_search_snippet_structured_args(self):
+        from generator.agent.builtin_tools import register_builtin_tools_for_mode
+        from generator.agent.nodes.choose_tool import choose_tool_node
+        from langchain_core.messages import HumanMessage
+
+        class _Msg:
+            content = '{"tool":"code_search_snippet","query":"Gelu custom operator op_def_registry tiling InferShape AscendC::Gelu kernel_operator example","args":null}'
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        class _Completions:
+            @staticmethod
+            def create(**kwargs):
+                return _Resp()
+
+        class _Chat:
+            completions = _Completions()
+
+        class _Client:
+            chat = _Chat()
+
+        client = _Client()
+        try:
+            register_builtin_tools_for_mode(
+                frozenset({"code_search_snippet"}),
+                client=client,
+                model="dummy",
+                kb_retriever=None,
+                web_retriever=None,
+                code_retriever=None,
+                env_retriever=None,
+                npu_arch_retriever=None,
+                tiling_retriever=None,
+                api_retriever=None,
+                code_quality_retriever=None,
+                kb_shell_retriever=None,
+                ascend_search_retriever=None,
+                ascend_fetch_retriever=None,
+                plugin_snapshot=None,
+            )
+            out = choose_tool_node(
+                {"messages": [HumanMessage(content="need gelu host and tiling examples")], "query_round_count": 0},
+                client,
+                "dummy",
+                frozenset({"code_search_snippet"}),
+            )
+        finally:
+            get_tool_registry().clear()
+
+        self.assertEqual(out["tool_choice_json"]["args"]["source"], "asc_devkit")
+        self.assertIn("host", out["tool_choice_json"]["args"]["artifact_types"])
+        self.assertIn("tiling", out["tool_choice_json"]["args"]["artifact_types"])
+        self.assertIn("activation", out["tool_choice_json"]["args"]["operator_families"])
+        self.assertIn("asc_devkit_custom_op_host", out["tool_choice_json"]["args"]["source_groups"])
+
+    def test_infers_npu_arch_chip_name_arg(self):
+        from generator.agent.builtin_tools import register_builtin_tools_for_mode
+        from generator.agent.nodes.choose_tool import choose_tool_node
+        from langchain_core.messages import HumanMessage
+
+        class _Msg:
+            content = '{"tool":"npu_arch","query":"Ascend910B2 chip specs","args":null}'
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        class _Completions:
+            @staticmethod
+            def create(**kwargs):
+                return _Resp()
+
+        class _Chat:
+            completions = _Completions()
+
+        class _Client:
+            chat = _Chat()
+
+        client = _Client()
+        try:
+            register_builtin_tools_for_mode(
+                frozenset({"npu_arch"}),
+                client=client,
+                model="dummy",
+                kb_retriever=None,
+                web_retriever=None,
+                code_retriever=None,
+                env_retriever=None,
+                npu_arch_retriever=None,
+                tiling_retriever=None,
+                api_retriever=None,
+                code_quality_retriever=None,
+                kb_shell_retriever=None,
+                ascend_search_retriever=None,
+                ascend_fetch_retriever=None,
+                plugin_snapshot=None,
+            )
+            out = choose_tool_node(
+                {"messages": [HumanMessage(content="need 910B2 ub and macros")], "query_round_count": 0},
+                client,
+                "dummy",
+                frozenset({"npu_arch"}),
+            )
+        finally:
+            get_tool_registry().clear()
+
+        self.assertEqual(out["tool_choice_json"]["args"]["chip_name"], "Ascend910B2")

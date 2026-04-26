@@ -1,39 +1,10 @@
-"""
-NPU Architecture query node for generator agent.
-
-Queries chip specifications from the built-in database.
-"""
-import re
+"""NPU Architecture query node for generator agent."""
 import dataclasses
 from typing import Dict, Any
 
-from langchain_core.messages import HumanMessage
-
 from ..agent_state import GeneratorAgentState
+from ..query_utils import extract_chip_name, get_tool_args
 from ..retrievers.npu_arch_retriever import NpuArchRetriever
-
-
-def _extract_chip_name(query: str) -> str:
-    """Extract chip name from query string."""
-    # Pattern: "query XXX chip" / "chip: XXX" / "Ascend910B2"
-    match = re.search(r"(?:chip[:：]?\s*|芯片[:：]?\s*)(\w+)", query, re.IGNORECASE)
-    if match:
-        return match.group(1)
-
-    # Check for known chip names
-    chip_patterns = [
-        r"(Ascend910B2?)", r"(Ascend910_93)", r"(Ascend910C)",
-        r"(Ascend910)\b", r"(Ascend310[PB])", r"(Ascend950[DP]T)",
-        r"(910B2?)", r"(910_93)", r"(910C)", r"(910)\b",
-        r"(310[PB])", r"(950[DP]T)",
-    ]
-    for pat in chip_patterns:
-        match = re.search(pat, query, re.IGNORECASE)
-        if match:
-            return match.group(1)
-
-    # Default
-    return "Ascend910B2"
 
 
 def _format_for_display(result) -> str:
@@ -72,12 +43,23 @@ def npu_arch_node(
         npu_arch_retriever = NpuArchRetriever()
 
     query = state.get("current_query", "")
-    chip_name = _extract_chip_name(query)
+    args = get_tool_args(state)
+    chip_name = extract_chip_name(
+        query,
+        args=args,
+        known_names=npu_arch_retriever.list_chips(),
+    )
     result = npu_arch_retriever.lookup_chip_spec(chip_name)
 
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "npu_arch", "query": query, "response": display_text}
+    log_entry = {
+        "round": round_num,
+        "tool": "npu_arch",
+        "query": query,
+        "args": args if isinstance(args, dict) else {},
+        "response": display_text,
+    }
 
     print(f"[Round {round_num}] 工具=NPU架构查询(NPU_ARCH), chip=\"{chip_name}\"")
 

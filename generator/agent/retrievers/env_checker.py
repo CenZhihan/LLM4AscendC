@@ -72,6 +72,36 @@ class ApiCheckResult:
     summary: str                    # human-readable summary
 
 
+_NPU_INFO_SCOPED_TYPES = {"memory", "temp", "power", "usages"}
+
+
+def _parse_npu_mapping(raw_output: str) -> Dict[int, int]:
+    """Map chip logic ids to npu-smi card ids from `npu-smi info -m`."""
+    mapping: Dict[int, int] = {}
+    for raw_line in (raw_output or "").splitlines():
+        line = raw_line.strip()
+        if not line or not re.match(r"^\d+\s+\d+\s+[-\d]+\s+", line):
+            continue
+        parts = re.split(r"\s{2,}", line)
+        if len(parts) < 4:
+            continue
+        npu_id, _chip_id, logic_id, _chip_name = parts[:4]
+        if logic_id == "-":
+            continue
+        try:
+            mapping[int(logic_id)] = int(npu_id)
+        except ValueError:
+            continue
+    return mapping
+
+
+def _resolve_npu_card_id(npu_smi_cmd: str, device_id: int) -> Optional[int]:
+    """Resolve a logical device id to the card id expected by `npu-smi -i`."""
+    mapping_output = _run_cmd(f"{npu_smi_cmd} info -m", timeout=15.0)
+    mapping = _parse_npu_mapping(mapping_output)
+    return mapping.get(device_id)
+
+
 # ============================================================
 # Internal helpers (reused from original implementation)
 # ============================================================
@@ -123,11 +153,57 @@ def _get_cann_version(cann_home: Optional[str]) -> str:
     return "未知 (version.info 未找到)"
 
 
+def _normalize_api_parts(api_name: str) -> List[str]:
+    name = (api_name or "").strip()
+    for prefix in ("AscendC::", "ascendc::"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    return [part for part in re.split(r"\s*::\s*", name) if part]
+
+
+def _line_matches_api_symbol(api_name: str, line: str, *, context: str = "") -> bool:
+    """Return True when a header line contains an exact symbol-like API match."""
+    code = line.split("//", 1)[0].strip()
+    if not code:
+        return False
+
+    parts = _normalize_api_parts(api_name)
+    if not parts:
+        return False
+    short = parts[-1]
+    escaped_short = re.escape(short)
+
+    type_decl_re = re.compile(
+        rf"\b(?:using|typedef|class|struct|enum(?:\s+class)?)\s+[^;={{}}]*\b{escaped_short}\b"
+    )
+    macro_re = re.compile(rf"^\s*#\s*define\s+{escaped_short}\b")
+    token_follow_re = re.compile(
+        rf"(?<![A-Za-z0-9_]){escaped_short}(?![A-Za-z0-9_])\s*(?:<|\()"
+    )
+
+    if type_decl_re.search(code) or macro_re.search(code):
+        return True
+
+    if len(parts) == 1:
+        return bool(token_follow_re.search(code))
+
+    qualified = r"\s*::\s*".join(re.escape(part) for part in parts)
+    qualified_re = re.compile(
+        rf"(?<![A-Za-z0-9_])(?:AscendC\s*::\s*)?{qualified}(?![A-Za-z0-9_])\s*(?:<|\()"
+    )
+    if qualified_re.search(code):
+        return True
+
+    owner = parts[-2]
+    owner_context_re = re.compile(rf"\b(?:class|struct)\s+{re.escape(owner)}\b")
+    return bool(token_follow_re.search(code) and owner_context_re.search(context))
+
+
 def _search_api_in_headers(
     cann_home: Optional[str],
     api_name: str,
 ) -> List[str]:
-    """Search for API in CANN header files. Returns list of 'file:line:content' strings."""
+    """Search headers for exact API-symbol matches. Returns 'file:line:content' strings."""
     if not cann_home:
         return []
 
@@ -149,20 +225,24 @@ def _search_api_in_headers(
         return []
 
     results: List[str] = []
-    api_name_stripped = api_name.strip().lstrip("AscendC::").lstrip("ascendc::")
 
     for search_dir in search_dirs:
-        try:
-            grep_cmd = (
-                f"grep -rn --include='*.h' --include='*.hpp' "
-                f"-i '{api_name_stripped}' '{search_dir}' 2>/dev/null || true"
-            )
-            output = _run_cmd(grep_cmd, timeout=15.0)
-            if output:
-                for line in output.splitlines():
-                    results.append(line)
-        except Exception:
-            pass
+        for path in Path(search_dir).rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in {".h", ".hpp"}:
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                continue
+
+            recent_context: List[str] = []
+            for line_num, raw_line in enumerate(lines, start=1):
+                context = "\n".join(recent_context[-8:])
+                if _line_matches_api_symbol(api_name, raw_line, context=context):
+                    results.append(f"{path}:{line_num}:{raw_line.strip()}")
+                stripped = raw_line.strip()
+                if stripped:
+                    recent_context.append(stripped)
 
     return results
 
@@ -303,19 +383,31 @@ def query_npu_devices(
         NpuDeviceResult with raw output
     """
     query_type = query_type.lower().strip()
-    base_cmd = _NPU_QUERY_MAP.get(query_type, _NPU_QUERY_MAP["info"])
-
-    # Append device ID if specified
-    if device_id is not None:
-        base_cmd += f" -i {device_id}"
-
     npu_smi_path = _check_tool("npu-smi")
     if npu_smi_path:
-        cmd = base_cmd.replace("npu-smi", npu_smi_path, 1)
+        npu_smi_cmd = npu_smi_path
     else:
-        cmd = base_cmd
+        npu_smi_cmd = "npu-smi"
+
+    base_cmd = _NPU_QUERY_MAP.get(query_type, _NPU_QUERY_MAP["info"]).replace(
+        "npu-smi", npu_smi_cmd, 1
+    )
+    cmd = base_cmd
+
+    # `npu-smi info` and `npu-smi list` do not accept a bare `-i <card>`.
+    # Only append scoped card ids for typed info queries after resolving the logical id.
+    if device_id is not None and query_type in _NPU_INFO_SCOPED_TYPES:
+        resolved_card_id = _resolve_npu_card_id(npu_smi_cmd, device_id)
+        if resolved_card_id is not None:
+            cmd = f"{base_cmd} -i {resolved_card_id}"
 
     output = _run_cmd(cmd, timeout=15.0)
+
+    # If scoped lookup failed because the requested logical device could not be resolved,
+    # fall back to the unscoped query instead of returning a deterministic CLI error.
+    if not output and cmd != base_cmd:
+        output = _run_cmd(base_cmd, timeout=15.0)
+
     available = bool(output) and "error" not in output.lower()
 
     return NpuDeviceResult(

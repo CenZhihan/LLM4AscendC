@@ -1,0 +1,391 @@
+project_json_src='''
+[
+  {
+    "op": "ConvPointwise2dCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": []
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvPointwise2dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, co);
+  TILING_DATA_FIELD_DEF(uint32_t, tileHW);
+  TILING_DATA_FIELD_DEF(uint32_t, tilesPerBatch);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint32_t, ntile);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvPointwise2dCustom, ConvPointwise2dCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "conv_pointwise_2d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+}
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    ConvPointwise2dCustomTilingData tiling;
+
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+
+    if (x_shape->GetDimNum() != 4 || w_shape->GetDimNum() != 4) {
+        return ge::GRAPH_FAILED;
+    }
+
+    const uint32_t N  = static_cast<uint32_t>(x_shape->GetDim(0));
+    const uint32_t C  = static_cast<uint32_t>(x_shape->GetDim(1));
+    const uint32_t H  = static_cast<uint32_t>(x_shape->GetDim(2));
+    const uint32_t W  = static_cast<uint32_t>(x_shape->GetDim(3));
+    const uint32_t Co = static_cast<uint32_t>(w_shape->GetDim(0));
+    const uint32_t Ci = static_cast<uint32_t>(w_shape->GetDim(1));
+    const uint32_t Kh = static_cast<uint32_t>(w_shape->GetDim(2));
+    const uint32_t Kw = static_cast<uint32_t>(w_shape->GetDim(3));
+
+    if (Kh != 1 || Kw != 1 || Ci != C) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // UB model:
+    //   Per block we operate on a spatial tile (tileHW) for one batch n.
+    //   Buffers:
+    //     - yAcc: ntile * tileHW floats
+    //     - xVec: 1 * tileHW floats
+    //     - wTile: ntile * C floats
+    //     - tmp: 1 * tileHW floats
+    // UB usage (bytes) ~= 4 * (ntile*tileHW + tileHW + ntile*C + tileHW)
+    // Choose ntile=32 (or Co if smaller) and tileHW up to 1024 safely in 192KB.
+    const uint32_t UB_BUDGET_BYTES = 192 * 1024;
+    uint32_t ntile = (Co >= 32u) ? 32u : ((Co >= 16u) ? 16u : Co);
+    if (ntile == 0) ntile = 1;
+
+    // Conservative tileHW selection: 1024 or less to respect UB
+    uint32_t tileHW = H * W;
+    if (tileHW > 1024u) tileHW = 1024u;
+    // Align tileHW down to 256 for better DMA efficiency
+    tileHW = AlignDown(tileHW, 256u);
+    if (tileHW == 0u) tileHW = (H * W); // for very small H*W
+
+    // Verify UB usage fits, adjust tileHW as needed
+    auto FitsUB = [&](uint32_t thw, uint32_t nt) -> bool {
+        uint64_t floats = static_cast<uint64_t>(nt) * thw + thw + static_cast<uint64_t>(nt) * C + thw;
+        uint64_t bytes = floats * sizeof(float);
+        return bytes <= UB_BUDGET_BYTES;
+    };
+    while (!FitsUB(tileHW, ntile)) {
+        if (tileHW > 256u) {
+            tileHW = AlignDown(tileHW / 2u, 128u);
+            if (tileHW == 0u) tileHW = 128u;
+        } else if (ntile > 1u) {
+            ntile /= 2u;
+        } else {
+            break;
+        }
+    }
+
+    const uint32_t tilesPerBatch = CeilDiv(H * W, tileHW);
+    uint32_t blockDim = N * tilesPerBatch;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_n(N);
+    tiling.set_c(C);
+    tiling.set_h(H);
+    tiling.set_w(W);
+    tiling.set_co(Co);
+    tiling.set_tileHW(tileHW);
+    tiling.set_tilesPerBatch(tilesPerBatch);
+    tiling.set_blockDim(blockDim);
+    tiling.set_ntile(ntile);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0; // no extra workspace
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x = context->GetInputShape(0);
+    const gert::Shape *w = context->GetInputShape(1);
+    if (x->GetDimNum() != 4 || w->GetDimNum() != 4) return GRAPH_FAILED;
+
+    const int64_t N  = x->GetDim(0);
+    const int64_t H  = x->GetDim(2);
+    const int64_t W  = x->GetDim(3);
+    const int64_t Co = w->GetDim(0);
+
+    gert::Shape *y = context->GetOutputShape(0);
+    y->SetDimNum(4);
+    y->SetDim(0, N);
+    y->SetDim(1, Co);
+    y->SetDim(2, H);
+    y->SetDim(3, W);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    const ge::DataType w_dtype = context->GetInputDataType(1);
+    if (x_dtype != ge::DT_FLOAT || w_dtype != ge::DT_FLOAT) {
+        return GRAPH_FAILED;
+    }
+    context->SetOutputDataType(0, ge::DT_FLOAT);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class ConvPointwise2dCustom : public OpDef {
+public:
+    explicit ConvPointwise2dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvPointwise2dCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t MAX_NTILE = 32;
+
+class KernelConvPointwise2dCustom {
+public:
+    __aicore__ inline KernelConvPointwise2dCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t h, uint32_t wdim,
+                                uint32_t co, uint32_t tileHW,
+                                uint32_t tilesPerBatch, uint32_t ntile)
+    {
+        n_ = n; c_ = c; h_ = h; w_ = wdim; co_ = co;
+        tileHW_ = tileHW;
+        tilesPerBatch_ = tilesPerBatch;
+        ntile_ = ntile > MAX_NTILE ? MAX_NTILE : ntile;
+
+        const uint32_t xSize = n_ * c_ * h_ * w_;
+        const uint32_t wSize = co_ * c_;
+        const uint32_t ySize = n_ * co_ * h_ * w_;
+        xGm_.SetGlobalBuffer((__gm__ float*)x, xSize);
+        wGm_.SetGlobalBuffer((__gm__ float*)w, wSize);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, ySize);
+
+        pipe_.InitBuffer(xQ_, 1, tileHW_ * sizeof(float));
+        pipe_.InitBuffer(tmpQ_, 1, tileHW_ * sizeof(float));
+        pipe_.InitBuffer(yQ_, ntile_, tileHW_ * sizeof(float));
+        pipe_.InitBuffer(wQ_, 1, ntile_ * c_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        const uint32_t nIdx = blockIdx / tilesPerBatch_;
+        if (nIdx >= n_) return;
+        const uint32_t tileIdx = blockIdx % tilesPerBatch_;
+
+        const uint32_t HW = h_ * w_;
+        uint32_t startPos = tileIdx * tileHW_;
+        if (startPos >= HW) return;
+        uint32_t curLen = HW - startPos;
+        if (curLen > tileHW_) curLen = tileHW_;
+
+        // Iterate over output channels in tiles
+        for (uint32_t o0 = 0; o0 < co_; o0 += ntile_) {
+            const uint32_t tileOut = AscendC::Min(static_cast<uint32_t>(ntile_), co_ - o0);
+
+            // Load weight tile [tileOut, C] into UB, row-major by output channel
+            AscendC::LocalTensor<float> wLocal = wQ_.AllocTensor<float>();
+            for (uint32_t o = 0; o < tileOut; ++o) {
+                const uint32_t wOff = (o0 + o) * c_;
+                AscendC::DataCopyPad(wLocal[o * c_], wGm_[wOff], c_);
+            }
+            wQ_.EnQue(wLocal);
+            wLocal = wQ_.DeQue<float>();
+
+            // Allocate accumulators for each output channel column in UB
+            AscendC::LocalTensor<float> yCols[MAX_NTILE];
+            for (uint32_t o = 0; o < tileOut; ++o) {
+                yCols[o] = yQ_.AllocTensor<float>();
+            }
+
+            // Accumulate across input channels
+            for (uint32_t kk = 0; kk < c_; ++kk) {
+                // Load x vector for this input channel kk over current tile
+                const uint32_t xOff = nIdx * (c_ * HW) + kk * HW + startPos;
+                AscendC::LocalTensor<float> xVec = xQ_.AllocTensor<float>();
+                AscendC::DataCopyPad(xVec, xGm_[xOff], curLen);
+                xQ_.EnQue(xVec);
+                xVec = xQ_.DeQue<float>();
+
+                AscendC::LocalTensor<float> tmp = tmpQ_.AllocTensor<float>();
+
+                // For each output channel in tileOut: y[:,o] += xVec * w[o, kk]
+                for (uint32_t o = 0; o < tileOut; ++o) {
+                    // Fetch scalar weight from UB
+                    float wk = wLocal.GetValue(o * c_ + kk);
+                    if (kk == 0) {
+                        // First accumulation initializes yCols[o] = xVec * wk
+                        AscendC::Muls(yCols[o], xVec, wk, curLen);
+                    } else {
+                        AscendC::Muls(tmp, xVec, wk, curLen);
+                        AscendC::Add(yCols[o], yCols[o], tmp, curLen);
+                    }
+                }
+
+                tmpQ_.FreeTensor(tmp);
+                xQ_.FreeTensor(xVec);
+            }
+
+            // Store results to GM
+            for (uint32_t o = 0; o < tileOut; ++o) {
+                const uint32_t yOff = nIdx * (co_ * HW) + (o0 + o) * HW + startPos;
+                AscendC::DataCopyPad(yGm_[yOff], yCols[o], curLen);
+                yQ_.FreeTensor(yCols[o]);
+            }
+
+            wQ_.FreeTensor(wLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> xQ_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, MAX_NTILE> yQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQ_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> wQ_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t n_{0}, c_{0}, h_{0}, w_{0}, co_{0};
+    uint32_t tileHW_{0}, tilesPerBatch_{0}, ntile_{0};
+};
+
+extern "C" __global__ __aicore__ void conv_pointwise_2d_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+
+    KernelConvPointwise2dCustom op;
+    op.Init(x, weight, y,
+            tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w,
+            tiling_data.co, tiling_data.tileHW,
+            tiling_data.tilesPerBatch, tiling_data.ntile);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor conv_pointwise_2d_impl_npu(const at::Tensor& x, const at::Tensor& weight) {
+    // x: [N, C, H, W], weight: [Co, C, 1, 1]
+    TORCH_CHECK(x.dim() == 4, \"x must be 4D\");
+    TORCH_CHECK(weight.dim() == 4, \"weight must be 4D\");
+    at::Tensor y = at::empty({x.size(0), weight.size(0), x.size(2), x.size(3)}, x.options());
+    EXEC_NPU_CMD(aclnnConvPointwise2dCustom, x, weight, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"conv_pointwise_2d_custom\", &conv_pointwise_2d_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"conv_pointwise_2d_custom\", &conv_pointwise_2d_impl_npu, \"Pointwise 1x1 Conv2D (ConvPointwise2dCustom on NPU)\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'conv_pointwise_2d_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''

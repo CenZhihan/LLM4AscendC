@@ -102,11 +102,13 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
         if len(reasoning) > 2000:
             reasoning = reasoning[:2000] + "...(truncated)"
         thinking = e.get("thinking") if isinstance(e.get("thinking"), dict) else {}
+        args = e.get("args") if isinstance(e.get("args"), dict) else {}
         return {
             "round": e.get("round"),
             "parsed_ok": e.get("parsed_ok"),
             "selected_tool": e.get("selected_tool", ""),
             "parse_error": e.get("parse_error", ""),
+            "args": args,
             "thinking": thinking,
             "reasoning_content": reasoning,
             "ts": e.get("ts"),
@@ -117,6 +119,7 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
             "round": t.get("round"),
             "tool": t.get("tool", ""),
             "query": t.get("query", ""),
+            "args": t.get("args") if isinstance(t.get("args"), dict) else {},
             "response": t.get("response", "")[:500] + "..."
             if len(t.get("response", "")) > 500
             else t.get("response", ""),
@@ -132,6 +135,9 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
         r = item.get("round")
         if isinstance(r, int):
             item["tool_choice"] = reasoning_by_round.get(r, {})
+            if not item.get("args"):
+                choice_args = item["tool_choice"].get("args") if isinstance(item["tool_choice"], dict) else {}
+                item["args"] = choice_args if isinstance(choice_args, dict) else {}
 
     return {
         "reasoning_content": final_state.get("reasoning_content", ""),

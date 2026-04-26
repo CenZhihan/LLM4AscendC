@@ -83,8 +83,8 @@ agent_code_rag_top_k = rag_top_k
 agent_code_rag_max_chars = rag_max_chars
 
 # Code snippet search configuration: restricted local corpus, no embedding index.
-agent_code_search_snippet_top_k = 4
-agent_code_search_snippet_max_chars = 10000
+agent_code_search_snippet_top_k = 3
+agent_code_search_snippet_max_chars = 30000
 agent_code_search_snippet_knowledge_root = os.path.join(
     _project_root, 'agent', 'Knowledge', 'code_search_snippet'
 )

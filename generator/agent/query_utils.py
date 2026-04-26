@@ -47,6 +47,25 @@ _NPU_QUERY_KEYWORDS = (
     ("info", ("info", "status", "状态", "概览", "overview")),
 )
 
+_NPU_ARCH_META_WORDS = {
+    "arch",
+    "architecture",
+    "chip",
+    "chips",
+    "detail",
+    "details",
+    "feature",
+    "features",
+    "flag",
+    "flags",
+    "info",
+    "macro",
+    "macros",
+    "spec",
+    "specs",
+    "ub",
+}
+
 
 def get_tool_args(state: Dict[str, Any]) -> Dict[str, Any]:
     """Return parsed tool args from the last tool choice JSON."""
@@ -181,3 +200,73 @@ def extract_npu_query_params(
             device_id = int(match.group(1))
 
     return query_type, device_id
+
+
+def extract_chip_name(
+    query: str,
+    *,
+    args: Optional[Dict[str, Any]] = None,
+    known_names: Optional[Iterable[str]] = None,
+) -> str:
+    """Extract the most likely chip id from tool input."""
+    if args:
+        for key in ("chip_name", "chip", "soc_version", "name"):
+            value = args.get(key)
+            if isinstance(value, str):
+                cleaned = _clean_symbol(value)
+                if cleaned and cleaned.lower() not in _NPU_ARCH_META_WORDS:
+                    return cleaned
+
+    text = (query or "").strip()
+    if not text:
+        return "Ascend910B2"
+
+    known = set()
+    if known_names:
+        for name in known_names:
+            cleaned = _clean_symbol(name)
+            if cleaned:
+                known.add(cleaned)
+                known.add(cleaned.lower())
+
+    candidates = []
+    explicit_patterns = [
+        r"(Ascend\d+(?:_[0-9]+|[A-Z]+\d*)?)",
+        r"\b(\d{3}(?:_[0-9]+|[A-Z]+\d*)?)\b",
+        r"(?:chip(?:\s+(?:id|name))?\s*[:=]\s*|芯片\s*[:=]\s*)([A-Za-z0-9_]+)",
+    ]
+    for pattern in explicit_patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            candidates.append(match.group(1))
+
+    for token in re.findall(r"\b[A-Za-z0-9_]+\b", text):
+        if any(ch.isdigit() for ch in token):
+            candidates.append(token)
+
+    scored = []
+    seen = set()
+    for raw in candidates:
+        candidate = _clean_symbol(raw)
+        if not candidate:
+            continue
+        lowered = candidate.lower()
+        if lowered in seen or lowered in _NPU_ARCH_META_WORDS:
+            continue
+        seen.add(lowered)
+
+        score = 0
+        if candidate in known or lowered in known:
+            score += 100
+        if lowered.startswith("ascend"):
+            score += 50
+        if re.search(r"\d", candidate):
+            score += 25
+        if re.search(r"(?:b|c|dt|pr|p)$", lowered) or re.search(r"\d$", lowered):
+            score += 10
+        scored.append((score, candidate))
+
+    if scored:
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return scored[0][1]
+
+    return "Ascend910B2"

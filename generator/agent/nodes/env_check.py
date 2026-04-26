@@ -53,6 +53,8 @@ def env_check_env_node(
     if env_retriever is None:
         env_retriever = EnvCheckRetriever()
 
+    args = get_tool_args(state)
+
     if not env_retriever.is_available():
         print("[WARN] CANN environment not found, env check unavailable")
         result_data = {"all_passed": False, "cann_version": "未知", "cann_home": None}
@@ -67,7 +69,7 @@ def env_check_env_node(
     round_num = state.get("query_round_count", 0) + 1
     query = state.get("current_query", "check environment")
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "env_check_env", "query": query, "response": display_text}
+    log_entry = {"round": round_num, "tool": "env_check_env", "query": query, "args": args if isinstance(args, dict) else {}, "response": display_text}
 
     print(f"[Round {round_num}] 工具=环境检查(ENV_CHECK_ENV), 查询=\"{query[:100]}\"")
 
@@ -109,7 +111,7 @@ def env_check_npu_node(
     result = env_retriever.query_npu_devices(device_id=device_id, query_type=query_type)
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
-    log_entry = {"round": round_num, "tool": "env_check_npu", "query": query, "response": display_text}
+    log_entry = {"round": round_num, "tool": "env_check_npu", "query": query, "args": args if isinstance(args, dict) else {}, "response": display_text}
 
     print(f"[Round {round_num}] 工具=NPU查询(ENV_CHECK_NPU), 查询=\"{query[:100]}\"")
 
@@ -155,6 +157,7 @@ def env_check_api_node(
         "round": round_num,
         "tool": "env_check_api",
         "query": f"API: {api_name}",
+        "args": args if isinstance(args, dict) else {},
         "response": display_text,
     }
 

@@ -13,6 +13,8 @@ def _format_for_display(result) -> str:
         lines = [f"API 签名查询: {result.api_name}"]
         if result.signature:
             lines.append(f"  签名: {result.signature}")
+        if getattr(result, "header_files", None):
+            lines.append(f"  头文件: {', '.join(result.header_files)}")
         if result.supported_dtypes:
             lines.append(f"  支持类型: {', '.join(result.supported_dtypes)}")
         if result.repeat_times_limit is not None:
@@ -20,6 +22,10 @@ def _format_for_display(result) -> str:
         if result.example_call:
             lines.append(f"  调用示例: {result.example_call}")
         lines.append(f"  来源: {result.source_doc}")
+        if getattr(result, "doc_metadata", None):
+            lines.append("  文档元数据: " + "; ".join(
+                f"{item['path']}|{item['section'] or item['title']}" for item in result.doc_metadata[:3]
+            ))
         if result.details:
             lines.append(f"  详情: {result.details}")
         return "\n".join(lines)
@@ -64,6 +70,7 @@ def api_lookup_node(
         "round": round_num,
         "tool": "api_lookup",
         "query": query or f"API: {api_name}",
+        "args": args if isinstance(args, dict) else {},
         "response": display_text,
     }
 

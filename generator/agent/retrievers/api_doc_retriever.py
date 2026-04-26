@@ -33,6 +33,8 @@ class ApiSignatureResult:
     example_call: str                       # Example usage
     source_doc: str                         # Source document path
     details: str                            # Human-readable summary
+    header_files: List[str] = field(default_factory=list)
+    doc_metadata: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -52,6 +54,14 @@ class ApiAlternativeResult:
     alternatives: List[dict]                # [{api, steps, performance_impact, precision_impact}]
     recommended: str                        # Recommended approach
     reason: str                             # Why alternatives are needed
+
+
+@dataclass
+class _HeaderSearchResult:
+    header_files: List[str] = field(default_factory=list)
+    matches: List[str] = field(default_factory=list)
+    signature: str = ""
+    summary: str = ""
 
 
 # ============================================================
@@ -425,8 +435,9 @@ class ApiDocRetriever:
     3. find_alternatives() — API alternative finding
     """
 
-    def __init__(self):
-        self._knowledge_path = _get_knowledge_path()
+    def __init__(self, knowledge_path: Optional[str] = None):
+        self._knowledge_path = knowledge_path or _get_knowledge_path()
+        self._include_root = Path(self._knowledge_path) / "include" if self._knowledge_path else None
 
     def known_api_names(self) -> List[str]:
         names = set(_API_KNOWLEDGE.keys())
@@ -438,6 +449,145 @@ class ApiDocRetriever:
     def is_available(self) -> bool:
         """Check if API docs are available."""
         return self._knowledge_path is not None
+
+    @staticmethod
+    def _normalize_api_name(api_name: str) -> str:
+        name = (api_name or "").strip()
+        for prefix in ("AscendC::", "ascendc::"):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+        if name in _API_ALIASES:
+            name = _API_ALIASES[name]
+        return name
+
+    def _iter_doc_paths(self) -> List[Path]:
+        if not self._knowledge_path:
+            return []
+        return sorted(Path(self._knowledge_path).glob("*.md"))
+
+    def _collect_doc_metadata(
+        self,
+        api_name: str,
+        *,
+        preferred_docs: Optional[List[str]] = None,
+        limit: int = 4,
+    ) -> List[dict]:
+        if not self._knowledge_path:
+            return []
+
+        pattern = re.compile(rf"\b{re.escape(api_name)}\b", re.IGNORECASE)
+        preferred = {item for item in (preferred_docs or []) if item}
+        entries: List[dict] = []
+        seen = set()
+
+        def nearest_heading(lines: List[str], line_no: int) -> str:
+            for index in range(line_no - 1, -1, -1):
+                line = lines[index].strip()
+                if line.startswith("#"):
+                    return line.lstrip("#").strip()
+            return ""
+
+        doc_paths = self._iter_doc_paths()
+        doc_paths.sort(key=lambda path: (path.name not in preferred, path.name))
+
+        for path in doc_paths:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            lines = text.splitlines()
+            title = next((line.lstrip("#").strip() for line in lines if line.strip().startswith("#")), path.name)
+            match_lines = [index + 1 for index, line in enumerate(lines) if pattern.search(line)]
+
+            if not match_lines and path.name not in preferred:
+                continue
+
+            if not match_lines:
+                key = (path.name, title)
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append({
+                    "path": path.name,
+                    "title": title,
+                    "section": "",
+                    "excerpt": "",
+                })
+                if len(entries) >= limit:
+                    break
+                continue
+
+            for line_no in match_lines[:2]:
+                section = nearest_heading(lines, line_no)
+                excerpt = lines[line_no - 1].strip()
+                key = (path.name, section)
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append({
+                    "path": path.name,
+                    "title": title,
+                    "section": section,
+                    "excerpt": excerpt[:240],
+                })
+                if len(entries) >= limit:
+                    break
+            if len(entries) >= limit:
+                break
+        return entries
+
+    def _search_local_headers(self, api_name: str) -> _HeaderSearchResult:
+        include_root = self._include_root
+        if include_root is None or not include_root.is_dir():
+            return _HeaderSearchResult()
+
+        try:
+            from .env_checker import _line_matches_api_symbol
+        except Exception:
+            _line_matches_api_symbol = None
+
+        header_files = set()
+        matches: List[str] = []
+        fallback_pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(api_name.split('::')[-1])}(?![A-Za-z0-9_])")
+
+        for path in sorted(include_root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in {".h", ".hpp"}:
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                continue
+
+            context = ""
+            rel = path.relative_to(include_root).as_posix()
+            for line_no, line in enumerate(lines, start=1):
+                stripped = line.strip()
+                if stripped.startswith(("class ", "struct ", "enum ", "enum class ")):
+                    context = stripped
+                is_match = False
+                if _line_matches_api_symbol is not None:
+                    is_match = _line_matches_api_symbol(api_name, line, context=context)
+                else:
+                    is_match = bool(fallback_pattern.search(line))
+                if not is_match:
+                    continue
+                header_files.add(rel)
+                matches.append(f"{rel}:{line_no}:{stripped}")
+                if len(matches) >= 16:
+                    break
+            if len(matches) >= 16:
+                break
+
+        signature = self._extract_header_signature(api_name, matches)
+        summary = ""
+        if header_files:
+            summary = f"在本地 Knowledge/api/include 中找到 {len(header_files)} 个头文件匹配"
+        return _HeaderSearchResult(
+            header_files=sorted(header_files),
+            matches=matches,
+            signature=signature,
+            summary=summary,
+        )
 
     def lookup_signature(
         self,
@@ -454,18 +604,27 @@ class ApiDocRetriever:
         Returns:
             ApiSignatureResult with signature details
         """
-        # Normalize: strip AscendC:: prefix
-        name = api_name.strip()
-        for prefix in ("AscendC::", "ascendc::"):
-            if name.startswith(prefix):
-                name = name[len(prefix):]
-
-        # Try alias
-        if name in _API_ALIASES:
-            name = _API_ALIASES[name]
+        del chip
+        name = self._normalize_api_name(api_name)
+        local_header_hit = self._search_local_headers(name)
+        preferred_docs: List[str] = []
 
         if name in _API_KNOWLEDGE:
             info = _API_KNOWLEDGE[name]
+            if info.get("source"):
+                preferred_docs.append(info["source"])
+            doc_metadata = self._collect_doc_metadata(name, preferred_docs=preferred_docs)
+            details_lines = [
+                f"API {name}: {info['signature']}",
+                f"支持数据类型: {', '.join(info['dtypes'])}",
+                f"repeatTimes 限制: {info.get('repeat_limit', 'N/A')}",
+            ]
+            if local_header_hit.header_files:
+                details_lines.append("头文件: " + ", ".join(local_header_hit.header_files[:4]))
+            if doc_metadata:
+                details_lines.append("文档元数据: " + "; ".join(
+                    f"{item['path']}|{item['section'] or item['title']}" for item in doc_metadata[:3]
+                ))
             return ApiSignatureResult(
                 api_name=name,
                 signature=info["signature"],
@@ -474,9 +633,32 @@ class ApiDocRetriever:
                 params=info.get("params", []),
                 example_call=info.get("example", ""),
                 source_doc=info.get("source", "unknown"),
-                details=f"API {name}: {info['signature']}\n"
-                        f"支持数据类型: {', '.join(info['dtypes'])}\n"
-                        f"repeatTimes 限制: {info.get('repeat_limit', 'N/A')}",
+                details="\n".join(details_lines),
+                header_files=local_header_hit.header_files,
+                doc_metadata=doc_metadata,
+            )
+
+        if local_header_hit.header_files:
+            doc_metadata = self._collect_doc_metadata(name)
+            details = [local_header_hit.summary]
+            if local_header_hit.matches:
+                details.append("匹配示例:")
+                details.extend(local_header_hit.matches[:3])
+            if doc_metadata:
+                details.append("文档元数据: " + "; ".join(
+                    f"{item['path']}|{item['section'] or item['title']}" for item in doc_metadata[:3]
+                ))
+            return ApiSignatureResult(
+                api_name=name,
+                signature=local_header_hit.signature,
+                supported_dtypes=[],
+                repeat_times_limit=None,
+                params=[],
+                example_call="",
+                source_doc=", ".join(local_header_hit.header_files[:3]),
+                details="\n".join(details),
+                header_files=local_header_hit.header_files,
+                doc_metadata=doc_metadata,
             )
 
         doc_hit = self._search_docs(name)
@@ -498,23 +680,19 @@ class ApiDocRetriever:
             details=f"未找到 API '{api_name}' 的签名信息。\n"
                     f"可能原因: API 名称不正确、或该 API 未在知识库中收录。\n"
                     f"建议: 查阅 asc-devkit/docs/api/context/ 下的官方 API 文档。",
+            header_files=[],
+            doc_metadata=[],
         )
 
     def _search_docs(self, api_name: str) -> Optional[ApiSignatureResult]:
         if not self._knowledge_path:
             return None
-        pattern = re.compile(rf"\b{re.escape(api_name)}\b", re.IGNORECASE)
-        for path in sorted(Path(self._knowledge_path).glob("*.md")):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            match = pattern.search(text)
-            if not match:
-                continue
-            start = max(0, match.start() - 160)
-            end = min(len(text), match.end() + 240)
-            snippet = " ".join(text[start:end].split())
+        doc_metadata = self._collect_doc_metadata(api_name)
+        if doc_metadata:
+            primary = doc_metadata[0]
+            details = f"在文档 {primary['path']} 中检索到 {api_name} 的相关信息"
+            if primary.get("excerpt"):
+                details += f": {primary['excerpt']}"
             return ApiSignatureResult(
                 api_name=api_name,
                 signature="",
@@ -522,8 +700,10 @@ class ApiDocRetriever:
                 repeat_times_limit=None,
                 params=[],
                 example_call="",
-                source_doc=path.name,
-                details=f"在文档 {path.name} 中检索到 {api_name} 的相关片段: {snippet}",
+                source_doc=primary["path"],
+                details=details,
+                header_files=[],
+                doc_metadata=doc_metadata,
             )
         return None
 
@@ -537,10 +717,9 @@ class ApiDocRetriever:
         if not header_result.found:
             return None
 
-        signature = ""
-        if header_result.matches:
-            parts = header_result.matches[0].split(":", 2)
-            signature = parts[2].strip() if len(parts) >= 3 else header_result.matches[0].strip()
+        signature = self._extract_header_signature(api_name, header_result.matches)
+        if not signature:
+            return None
 
         details = [header_result.summary]
         if header_result.matches:
@@ -556,7 +735,47 @@ class ApiDocRetriever:
             example_call="",
             source_doc=", ".join(header_result.header_files[:3]),
             details="\n".join(details),
+            header_files=header_result.header_files,
+            doc_metadata=self._collect_doc_metadata(api_name),
         )
+
+    @staticmethod
+    def _extract_header_signature(api_name: str, matches: List[str]) -> str:
+        parts = [part for part in re.split(r"\s*::\s*", (api_name or "").strip()) if part]
+        if parts and parts[0].lower() == "ascendc":
+            parts = parts[1:]
+        if not parts:
+            return ""
+        short = re.escape(parts[-1])
+
+        type_decl_re = re.compile(
+            rf"\b(?:using|typedef|class|struct|enum(?:\s+class)?)\s+[^;={{}}]*\b{short}\b"
+        )
+        macro_re = re.compile(rf"^\s*#\s*define\s+{short}\b")
+        tail_call_re = re.compile(rf"(?<![A-Za-z0-9_]){short}(?![A-Za-z0-9_])\s*(?:<|\()")
+        decl_cue_re = re.compile(
+            r"\b(?:inline|constexpr|static|extern|virtual|friend|template|__aicore__|__host__|__device__|void|bool|char|short|int|long|float|double|size_t|uint\d+_t|int\d+_t)\b"
+        )
+
+        for match in matches:
+            line = match.split(":", 2)[2].strip() if ":" in match else match.strip()
+            code = line.split("//", 1)[0].strip()
+            if not code:
+                continue
+            if type_decl_re.search(code) or macro_re.search(code):
+                return code
+            token_match = tail_call_re.search(code)
+            if not token_match:
+                continue
+            prefix = code[:token_match.start()].rstrip()
+            if prefix.endswith("::"):
+                qualifier = prefix[:-2].rstrip()
+                if decl_cue_re.search(qualifier) or " " in qualifier:
+                    return code
+                continue
+            if decl_cue_re.search(prefix) or re.search(r"[&*>]\s*$", prefix):
+                return code
+        return ""
 
     def check_constraints(
         self,

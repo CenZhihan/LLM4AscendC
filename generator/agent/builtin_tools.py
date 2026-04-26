@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .agent_config import AgentToolMode, BUILTIN_TOOL_NAMES
 from .tool_registry import RegisteredToolSpec, get_tool_registry
 from .nodes import (
+    ascend_search_node,
     api_alternative_node,
     api_constraint_node,
     api_lookup_node,
@@ -22,7 +23,6 @@ from .nodes import (
     env_check_npu_node,
     kb_query_node,
     kb_shell_search_node,
-    ascend_search_node,
     ascend_fetch_node,
     npu_arch_node,
     security_check_node,
@@ -67,14 +67,20 @@ def _meta() -> Dict[str, Dict[str, Any]]:
             ),
         },
         "code_search_snippet": {
-            "display_name": "Code Search Snippect",
-            "description": "Search curated local snippets from CANN skills and asc-devkit/examples without using the general code RAG corpus.",
-            "parameter_docs": 'Use "query" for the concrete pattern, API, or operator structure you want to find. Optional args may include {"source":"cann_skills|asc_devkit|all"}.',
-            "examples": ['{"tool":"code_search_snippet","query":"host tiling GetInputShape InferShape example","args":{"source":"all"}}'],
+            "display_name": "Code Search Snippet",
+            "description": "Retrieve top-3 structural code blocks (e.g. TilingFunc, InferShape, kernel class/entry) from curated asc-devkit examples, filtered by development phase.",
+            "parameter_docs": 'Use "query" for the concrete pattern, API, or operator structure. Required args: {"context_type":"kernel_src|host_tiling_src|host_infer_shape|host_infer_dtype|host_op_registration|tiling_src"}. Optional args: {"operator_family":"activation|convolution|matrix|normalization|elementwise|reduce|pooling","api_patterns":["set_block_dim","queue_api","datacopy_api",...],"source":"asc_devkit"}. The tool returns up to 3 code blocks with metadata, not full files.',
+            "examples": [
+                '{"tool":"code_search_snippet","query":"TilingFunc for elementwise add with SetBlockDim","args":{"context_type":"host_tiling_src","operator_family":"elementwise","api_patterns":["set_block_dim","tiling_storage_shape"]}}',
+                '{"tool":"code_search_snippet","query":"InferShape that copies input dims to output","args":{"context_type":"host_infer_shape","operator_family":"activation","api_patterns":["infer_shape_copy_input_to_output"]}}',
+                '{"tool":"code_search_snippet","query":"Kernel class with TPipe DataCopy for matrix multiply","args":{"context_type":"kernel_src","operator_family":"matrix","api_patterns":["queue_api","datacopy_api"]}}',
+            ],
             "usage_guidance": (
-                "Use this when you need high-precision local examples from curated sources only. Mention the "
-                "operator pattern, host/kernel area, and API names in `query`; prefer this over `code_rag` when "
-                "you want to avoid polluted repo examples."
+                "ALWAYS set `args.context_type` to the phase you are generating: `kernel_src` for kernel code, "
+                "`host_tiling_src` for TilingFunc, `host_infer_shape` for InferShape, `host_infer_dtype` for InferDataType, "
+                "`host_op_registration` for OpDef/registration. Mention the operator family and specific API patterns in `query`. "
+                "This tool prevents cross-context confusion (e.g. TilingContext shape API vs InferShapeContext shape API). "
+                "Prefer this over `code_rag` when you need curated, phase-specific reference blocks."
             ),
         },
         "env_check_env": {
@@ -90,12 +96,13 @@ def _meta() -> Dict[str, Dict[str, Any]]:
         "env_check_npu": {
             "display_name": "NPU device",
             "description": "Query NPU device status and resource usage via the env checker.",
-            "parameter_docs": 'Use "query" for the device query intent. Prefer args like {"query_type":"memory|temp|power|usages|list|info","device_id":0}.',
-            "examples": ['{"tool":"env_check_npu","query":"NPU memory for device 0","args":{"query_type":"memory","device_id":0}}'],
+            "parameter_docs": 'Use "query" for the device query intent. Optional args may include {"query_type":"memory|temp|power|usages|list|info","device_id":0}, but only set device_id when the user explicitly asks for a specific logical device.',
+            "examples": ['{"tool":"env_check_npu","query":"NPU memory for device 0","args":{"query_type":"memory","device_id":0}}', '{"tool":"env_check_npu","query":"summarize available NPUs","args":{"query_type":"info"}}'],
             "usage_guidance": (
                 "Prefer structured `args`: `{\"query_type\":\"memory|temp|power|usages|list|info\","
-                "\"device_id\":0}`. Put a short natural-language intent in `query` that matches "
-                "`query_type` and device."
+                "\"device_id\":0}`. Omit `device_id` for generic inventory or overview queries; "
+                "only include it when the request names a specific logical device. Put a short "
+                "natural-language intent in `query` that matches `query_type` and device."
             ),
         },
         "env_check_api": {
@@ -122,14 +129,15 @@ def _meta() -> Dict[str, Dict[str, Any]]:
         },
         "api_lookup": {
             "display_name": "API signature lookup",
-            "description": "Look up API signatures, dtypes, and repeatTimes limits from structured docs.",
-            "parameter_docs": 'Use an exact API symbol in query or args.api_name, e.g. AscendC::DataCopy or MatmulType. Do not pass generic meta words like "signatures".',
+            "description": "Look up an API symbol and return matching local header files plus markdown document metadata, with signature/details when available.",
+            "parameter_docs": 'Use an exact API symbol in query or args.api_name, e.g. AscendC::DataCopy or MatmulType. The tool searches Knowledge/api/include for matching headers and attaches markdown doc metadata. Do not pass generic meta words like "signatures".',
             "examples": ['{"tool":"api_lookup","query":"AscendC::DataCopy","args":{"api_name":"AscendC::DataCopy"}}'],
             "usage_guidance": (
                 "Identify **one concrete API symbol** first. Good symbols: `AscendC::DataCopy`, `Muls`, "
                 "`DataCopyPad`, `MatmulType`, `GlobalTensor::SetValue`. Bad placeholders: `api`, `signature`, "
                 "`signatures`, `constraints`, `alternative`, `details`, `docs`. If useful, put the exact "
-                "symbol in `args`, e.g. `{\"api_name\":\"AscendC::DataCopy\"}`."
+                'symbol in `args`, e.g. `{"api_name":"AscendC::DataCopy"}`. Use this when the model needs the '
+                "actual include header and which markdown doc to read next."
             ),
         },
         "api_constraint": {
@@ -183,11 +191,11 @@ def _meta() -> Dict[str, Dict[str, Any]]:
         "npu_arch": {
             "display_name": "NPU architecture",
             "description": "Return UB size, compile macros, and feature flags for a chip name.",
-            "parameter_docs": 'Use "query" with chip id, e.g. Ascend910B2.',
-            "examples": ['{"tool":"npu_arch","query":"Ascend910B2 chip specs","args":null}'],
+            "parameter_docs": 'Use "query" with a chip id, or pass args like {"chip_name":"Ascend910B2"}. Avoid generic queries without a chip id.',
+            "examples": ['{"tool":"npu_arch","query":"Ascend910B2 chip specs","args":{"chip_name":"Ascend910B2"}}'],
             "usage_guidance": (
-                "Put the **chip id** (e.g. Ascend910B2) in `query`; ask for UB, macros, or feature flags as "
-                "needed."
+                "Put the **chip id** (e.g. Ascend910B2) in `query` or `args.chip_name`; ask for UB, macros, "
+                "or feature flags as needed. Prefer structured `args` when the request is short or ambiguous."
             ),
         },
         "code_style": {
