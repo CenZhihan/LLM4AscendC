@@ -8,7 +8,7 @@ if _project_root not in sys.path:
 
 from generator.utils.utils import get_client, get_default_model_from_config, underscore_to_pascalcase
 from generator.config import temperature, num_completions, max_tokens, top_p, project_root_path
-from generator.dataset import dataset, category2exampleop
+from generator.dataset import dataset
 from generator.prompt_generators.prompt_registry import PROMPT_REGISTRY
 import importlib
 import argparse

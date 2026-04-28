@@ -68,7 +68,7 @@ def _meta() -> Dict[str, Dict[str, Any]]:
         },
         "code_search_snippet": {
             "display_name": "Code Search Snippet",
-            "description": "Retrieve top-3 structural code blocks (e.g. TilingFunc, InferShape, kernel class/entry) from curated asc-devkit examples, filtered by development phase.",
+            "description": "Retrieve top-3 design-relevant code blocks from curated asc-devkit examples. Automatically falls back to semantic retrieval from the code RAG index when structured recall is weak (e.g. convolution, pooling, sliding-window patterns).",
             "parameter_docs": 'Use "query" for the concrete pattern, API, or operator structure. Required args: {"context_type":"kernel_src|host_tiling_src|host_infer_shape|host_infer_dtype|host_op_registration|tiling_src"}. Optional args: {"operator_family":"activation|convolution|matrix|normalization|elementwise|reduce|pooling","api_patterns":["set_block_dim","queue_api","datacopy_api",...],"source":"asc_devkit"}. The tool returns up to 3 code blocks with metadata, not full files.',
             "examples": [
                 '{"tool":"code_search_snippet","query":"TilingFunc for elementwise add with SetBlockDim","args":{"context_type":"host_tiling_src","operator_family":"elementwise","api_patterns":["set_block_dim","tiling_storage_shape"]}}',
@@ -79,8 +79,9 @@ def _meta() -> Dict[str, Dict[str, Any]]:
                 "ALWAYS set `args.context_type` to the phase you are generating: `kernel_src` for kernel code, "
                 "`host_tiling_src` for TilingFunc, `host_infer_shape` for InferShape, `host_infer_dtype` for InferDataType, "
                 "`host_op_registration` for OpDef/registration. Mention the operator family and specific API patterns in `query`. "
-                "This tool prevents cross-context confusion (e.g. TilingContext shape API vs InferShapeContext shape API). "
-                "Prefer this over `code_rag` when you need curated, phase-specific reference blocks."
+                "This tool is the unified code-design retrieval tool: it first searches curated structural blocks, "
+                "and automatically runs semantic fallback when structured results are too generic or mismatched. "
+                "Use this as the default code retrieval tool."
             ),
         },
         "env_check_env": {

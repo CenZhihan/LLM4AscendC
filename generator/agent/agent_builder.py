@@ -113,8 +113,11 @@ def build_agent_app(
     _kb_retriever = kb_retriever or (KBRetriever() if has_kb(tool_mode) else None)
     _web_retriever = web_retriever or (WebRetriever() if has_web(tool_mode) else None)
     _code_retriever = code_retriever or (CodeRetriever() if has_code_rag(tool_mode) else None)
+    _code_retriever = code_retriever or (CodeRetriever() if has_code_rag(tool_mode) or has_code_search_snippet(tool_mode) else None)
     _code_search_snippet_retriever = (
-        CodeSearchSnippetRetriever() if has_code_search_snippet(tool_mode) else None
+        CodeSearchSnippetRetriever(code_rag_retriever=_code_retriever)
+        if has_code_search_snippet(tool_mode)
+        else None
     )
     _env_retriever = (
         EnvCheckRetriever()

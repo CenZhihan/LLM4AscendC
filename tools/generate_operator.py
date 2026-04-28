@@ -22,7 +22,7 @@ if _project_root not in sys.path:
 
 # Import generator module
 from generator import (
-    dataset, category2exampleop,
+    dataset,
     rag_index_path, rag_embedding_model, rag_top_k, rag_max_chars,
     rag_code_dir, rag_file_extensions, ref_impl_base_path,
     temperature, top_p

@@ -12,6 +12,6 @@ if vendor_path not in sys.path:
     sys.path.insert(0, vendor_path)
 
 # Import from authoritative source
-from mkb.dataset import dataset, category2exampleop
+from mkb.dataset import dataset
 
-__all__ = ['dataset', 'category2exampleop']
+__all__ = ['dataset']

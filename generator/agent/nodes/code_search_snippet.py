@@ -1,6 +1,9 @@
-"""Structural block retrieval node for curated asc-devkit Ascend C sources."""
+"""Structural block retrieval node for curated asc-devkit Ascend C sources.
+
+Now unified with semantic fallback via code_rag (Plan Phase 2).
+"""
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ..agent_state import GeneratorAgentState
 from ..retrievers.code_search_snippet_retriever import CodeSearchSnippetRetriever
@@ -9,9 +12,10 @@ from ..retrievers.code_search_snippet_retriever import CodeSearchSnippetRetrieve
 def code_search_snippet_node(
     state: GeneratorAgentState,
     retriever: CodeSearchSnippetRetriever = None,
+    code_rag_retriever: Optional[Any] = None,
 ) -> Dict[str, Any]:
     if retriever is None:
-        retriever = CodeSearchSnippetRetriever()
+        retriever = CodeSearchSnippetRetriever(code_rag_retriever=code_rag_retriever)
 
     op_name = state.get("op_name", "")
     category = state.get("category", "")
@@ -21,6 +25,8 @@ def code_search_snippet_node(
     source = str(args.get("source") or "asc_devkit")
     artifact_types = args.get("artifact_types") or []
     operator_families = args.get("operator_families") or []
+    if not operator_families and args.get("operator_family"):
+        operator_families = [args.get("operator_family")]
     source_groups = args.get("source_groups") or []
     context_type = args.get("context_type") or None
     api_patterns = args.get("api_patterns") or []

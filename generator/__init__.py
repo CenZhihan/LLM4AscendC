@@ -8,7 +8,7 @@ This module provides:
 - LangGraph-based intelligent agent for kernel generation
 """
 
-from .dataset import dataset, category2exampleop
+from .dataset import dataset
 from .config import (
     max_tokens, temperature, top_p, num_completions, seed_num,
     rag_index_path, rag_embedding_model, rag_top_k, rag_max_chars,
@@ -35,7 +35,7 @@ except Exception:
     _agent_available = False
 
 __all__ = [
-    'dataset', 'category2exampleop',
+    'dataset',
     'max_tokens', 'temperature', 'top_p', 'num_completions', 'seed_num',
     'rag_index_path', 'rag_embedding_model', 'rag_top_k', 'rag_max_chars',
     'rag_code_dir', 'rag_file_extensions', 'ref_impl_base_path',

@@ -189,6 +189,8 @@ def answer_node(
             "and tool outputs gathered for the user task.\n"
             "Use them faithfully and produce the full Ascend C kernel / host / project artifacts "
             "the user asked for.\n\n"
+            "Evidence priority: explicit local rules and constraints from KB shell / API lookup / API constraint "
+            "override fuzzy analogies from code snippets. Use code_search_snippet mainly for structure when it does not conflict with those rules.\n\n"
             f"Retrieved context:\n{ref_text}\n\n"
             f"Original user instruction:\n{base_prompt}\n\n"
             "Generate the complete solution as instructed (code only where the task demands code)."

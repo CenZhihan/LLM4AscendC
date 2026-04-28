@@ -256,6 +256,15 @@ class BlockRecord:
     sibling_blocks: Tuple[str, ...]
     tokens: Tuple[str, ...]
 
+    @property
+    def relative_path(self) -> str:
+        return self.path
+
+    @property
+    def source(self) -> str:
+        """Backward-compatible alias for source_root."""
+        return self.source_root
+
 
 @dataclass(frozen=True)
 class QueryIntent:
@@ -282,6 +291,60 @@ class SearchResult:
 
 
 # ---------------------------------------------------------------------------
+# Unified retrieval schema (Phase 1 / Phase 2)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class RetrievalUnit:
+    """Common retrieval unit for the unified code_search_snippet tool."""
+
+    retrieval_id: str
+    source_scope: str  # asc_devkit, rag_index, etc.
+    granularity: str  # block, chunk, file
+    path: str
+    block_kind: str
+    context_type: str
+    symbol_name: str
+    operator_family: Tuple[str, ...]
+    design_patterns: Tuple[str, ...]
+    api_pattern: Tuple[str, ...]
+    api_symbols: Tuple[str, ...]
+    text: str
+    start_line: int
+    end_line: int
+    retrieval_branch: str  # structured, semantic, expanded
+    branch_scores: Dict[str, float]
+    fusion_score: float
+    why_matched: str
+
+
+@dataclass(frozen=True)
+class UnifiedSearchResult:
+    """Design-aware unified result combining any retrieval branch."""
+
+    unit: RetrievalUnit
+    score: float
+    confidence: float
+    confidence_label: str
+    matched_branches: Tuple[str, ...]
+    explanation: Tuple[str, ...]
+
+
+# Design-pattern inference hints (Phase 3+ enrichment)
+_DESIGN_PATTERN_HINTS = {
+    "sliding_window": ("slide", "sliding", "window", "stride", "dilation"),
+    "pointwise_conv": ("pointwise", "1x1", "channel projection", "channel mixer"),
+    "im2col": ("im2col", "img2col", "unroll", "unfold"),
+    "reduce_window": ("reducewindow", "reduce_window", "window reduce", "pool reduce"),
+    "matmul_fused": ("fused matmul", "matmul_add", "matmul_relu", "biasadd"),
+    "double_buffer": ("double_buffer", "double buff", "ping pong", "ping-pong"),
+    "tile_over_spatial": ("tile_over", "spatial tile", "tiling spatial", "h_tiling", "w_tiling"),
+}
+
+# Generic-only signals that should be penalized in fusion ranking
+_GENERIC_API_PATTERNS = frozenset({"queue_api", "datacopy_api", "vector_compute_api"})
+
+
+# ---------------------------------------------------------------------------
 # Retriever
 # ---------------------------------------------------------------------------
 class CodeSearchSnippetRetriever:
@@ -295,6 +358,9 @@ class CodeSearchSnippetRetriever:
         dense_model_name: Optional[str] = None,
         dense_devices: Optional[Sequence[str]] = None,
         enable_dense: Optional[bool] = None,
+        code_rag_retriever: Optional[Any] = None,
+        enable_semantic_fallback: bool = True,
+        **kwargs,  # absorb legacy args (cann_skills_root, asc_devkit_examples_root, knowledge_root) for test compat
     ):
         self.top_k = top_k or agent_code_search_snippet_top_k
         self.max_chars = max_chars or agent_code_search_snippet_max_chars
@@ -305,6 +371,11 @@ class CodeSearchSnippetRetriever:
             if enable_dense is not None
             else os.environ.get(_ENABLE_DENSE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
         )
+
+        # Semantic fallback branch (wraps code_rag)
+        self._code_rag_retriever = code_rag_retriever
+        self.enable_semantic_fallback = enable_semantic_fallback
+        self._semantic_fallback_log: List[Dict[str, Any]] = []
 
         # Load manifest
         if manifest_path is None:
@@ -516,6 +587,10 @@ class CodeSearchSnippetRetriever:
             if score > 0:
                 scores[idx] = score
         return scores
+
+    def _candidate_indices(self, *args, **kwargs):
+        """Backward-compatible alias for _select_candidates."""
+        return self._select_candidates(*args, **kwargs)
 
     def _candidate_limit(self, result_k: int) -> int:
         requested = max(1, result_k) * _CANDIDATE_PREFILTER_MULTIPLIER
@@ -863,6 +938,395 @@ class CodeSearchSnippetRetriever:
             explanations.append(f"symbol_name matched: {record.symbol_name}")
         return tuple(explanations)
 
+    # ------------------------------------------------------------------
+    # Unified retrieval helpers (Phase 1-2)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _infer_design_patterns(text: str) -> Tuple[str, ...]:
+        haystack = (text or "").lower()
+        return _unique_strings(
+            pattern for pattern, hints in _DESIGN_PATTERN_HINTS.items()
+            if any(hint in haystack for hint in hints)
+        )
+
+    def _block_record_to_retrieval_unit(
+        self,
+        block: BlockRecord,
+        search_result: SearchResult,
+    ) -> RetrievalUnit:
+        design_patterns = self._infer_design_patterns(block.text)
+        # Merge any explicit design-pattern-like api_patterns
+        dp_from_api = tuple(
+            p for p in block.api_pattern
+            if p in _DESIGN_PATTERN_HINTS
+        )
+        if dp_from_api:
+            design_patterns = _unique_strings(list(design_patterns) + list(dp_from_api))
+        branch_scores: Dict[str, float] = {}
+        if search_result.metadata_score > 0:
+            branch_scores["metadata"] = search_result.metadata_score
+        if search_result.bm25_score > 0:
+            branch_scores["bm25"] = search_result.bm25_score
+        if search_result.dense_score > 0:
+            branch_scores["dense"] = search_result.dense_score
+        if search_result.prior_score > 0:
+            branch_scores["prior"] = search_result.prior_score
+        why = "; ".join(search_result.explanation) if search_result.explanation else "structured match"
+        return RetrievalUnit(
+            retrieval_id=block.block_id,
+            source_scope=block.source_root,
+            granularity="block",
+            path=block.path,
+            block_kind=block.block_kind,
+            context_type=block.context_type,
+            symbol_name=block.symbol_name,
+            operator_family=block.operator_family,
+            design_patterns=design_patterns,
+            api_pattern=block.api_pattern,
+            api_symbols=block.api_symbols,
+            text=block.text,
+            start_line=block.start_line,
+            end_line=block.end_line,
+            retrieval_branch="structured",
+            branch_scores=branch_scores,
+            fusion_score=search_result.score,
+            why_matched=why,
+        )
+
+    def _rag_chunk_to_retrieval_unit(
+        self,
+        chunk: Dict[str, Any],
+        score: float,
+        idx: int,
+        query: str,
+    ) -> RetrievalUnit:
+        code = chunk.get("code", "")
+        file_path = chunk.get("file", "unknown")
+        op_family = _infer_operator_family(code)
+        api_patterns = _infer_api_patterns(code)
+        api_symbols = _extract_api_symbols(code)
+        design_patterns = self._infer_design_patterns(code)
+        # Attempt to infer context_type from file path / code content
+        context_type = "kernel_src"
+        lowered_path = file_path.lower()
+        if any(s in lowered_path for s in ("op_host", "tiling", "infer_shape", "infer_dtype")):
+            if "tiling" in lowered_path:
+                context_type = "host_tiling_src"
+            elif "infer_shape" in lowered_path:
+                context_type = "host_infer_shape"
+            elif "infer_dtype" in lowered_path:
+                context_type = "host_infer_dtype"
+            else:
+                context_type = "host_op_registration"
+        return RetrievalUnit(
+            retrieval_id=f"rag:{file_path}:{idx}",
+            source_scope="rag_index",
+            granularity="chunk",
+            path=file_path,
+            block_kind="",
+            context_type=context_type,
+            symbol_name="",
+            operator_family=op_family,
+            design_patterns=design_patterns,
+            api_pattern=api_patterns,
+            api_symbols=api_symbols,
+            text=code,
+            start_line=1,
+            end_line=1,
+            retrieval_branch="semantic",
+            branch_scores={"semantic": score},
+            fusion_score=score,
+            why_matched="semantic similarity",
+        )
+
+    def _should_run_semantic_fallback(
+        self,
+        structured_results: List[SearchResult],
+        intent: QueryIntent,
+        k: int,
+    ) -> bool:
+        """Heuristics for weak structured recall (Plan Phase 2)."""
+        if not self.enable_semantic_fallback:
+            return False
+        if self._code_rag_retriever is None:
+            return False
+        if not structured_results:
+            return True
+
+        # Heuristic 1: top results are all generic elementwise for non-elementwise query
+        explicit_family = intent.operator_family
+        if explicit_family and explicit_family != "elementwise":
+            all_generic = True
+            for r in structured_results[:min(3, len(structured_results))]:
+                families = {f.lower() for f in r.block.operator_family}
+                if families and "elementwise" not in families:
+                    all_generic = False
+                    break
+            if all_generic:
+                return True
+
+        # Heuristic 2: top results repeat the same file archetype multiple times
+        file_stems = Counter()
+        for r in structured_results[:k]:
+            stem = Path(r.block.path).stem
+            file_stems[stem] += 1
+        if any(v >= 3 for v in file_stems.values()):
+            return True
+
+        # Heuristic 3: top results match only generic APIs and miss family-specific symbols
+        generic_only_count = 0
+        for r in structured_results[:min(3, len(structured_results))]:
+            apis = {p.lower() for p in r.block.api_pattern}
+            if apis and apis.issubset(_GENERIC_API_PATTERNS):
+                generic_only_count += 1
+        if generic_only_count >= min(2, len(structured_results)):
+            return True
+
+        # Heuristic 4: query mentions a pattern not covered in the block corpus
+        query_lower = " ".join(intent.tokens).lower()
+        for pattern, hints in _DESIGN_PATTERN_HINTS.items():
+            if any(hint in query_lower for hint in hints):
+                # Check if any top result already mentions this pattern
+                found_in_results = False
+                for r in structured_results[:k]:
+                    result_patterns = self._infer_design_patterns(r.block.text)
+                    if pattern in result_patterns:
+                        found_in_results = True
+                        break
+                if not found_in_results:
+                    return True
+
+        return False
+
+    def _semantic_recall(
+        self,
+        query: str,
+        intent: QueryIntent,
+        k: int,
+    ) -> List[RetrievalUnit]:
+        """Run semantic fallback via code_rag and convert to unified units."""
+        if self._code_rag_retriever is None:
+            return []
+        try:
+            if not self._code_rag_retriever.is_available():
+                return []
+        except Exception:
+            return []
+
+        # Build a design-focused query for semantic branch
+        semantic_query_parts = [query]
+        if intent.operator_family:
+            semantic_query_parts.append(f"{intent.operator_family} kernel implementation")
+        if intent.context_type:
+            semantic_query_parts.append(intent.context_type.replace("_", " "))
+        semantic_query = " | ".join(semantic_query_parts)
+
+        try:
+            rag_results = self._code_rag_retriever.retrieve(semantic_query, top_k=max(k, 5))
+        except Exception as exc:
+            self._semantic_fallback_log.append({"event": "semantic_recall_error", "error": str(exc)})
+            return []
+
+        units: List[RetrievalUnit] = []
+        # rag_results is List[str] from CodeRetriever.retrieve(); need to access raw results.
+        # CodeRetriever.retrieve() formats into strings. We need raw chunks for unified ranking.
+        # Fallback: try internal _retriever directly.
+        try:
+            raw_results = self._code_rag_retriever._retriever.retrieve(semantic_query, top_k=max(k, 5))
+        except Exception:
+            raw_results = []
+
+        if not raw_results:
+            # If raw retrieval failed but formatted results exist, parse them heuristically
+            self._semantic_fallback_log.append({"event": "semantic_raw_empty", "formatted_count": len(rag_results)})
+            return []
+
+        for i, r in enumerate(raw_results):
+            score = float(r.get("score", 0.0))
+            unit = self._rag_chunk_to_retrieval_unit(r, score, i, query)
+            units.append(unit)
+
+        self._semantic_fallback_log.append({
+            "event": "semantic_recall",
+            "query": semantic_query,
+            "units_returned": len(units),
+        })
+        return units
+
+    def _compute_design_aware_scores(
+        self,
+        units: List[RetrievalUnit],
+        intent: QueryIntent,
+        explicit_operator_family: Optional[str] = None,
+        explicit_api_patterns: Optional[Sequence[str]] = None,
+    ) -> Dict[str, float]:
+        """Design-aware re-ranking signals (Phase 4)."""
+        scores: Dict[str, float] = {}
+        explicit_op_family = (explicit_operator_family or "").strip().lower()
+        explicit_apis = {p.lower() for p in (explicit_api_patterns or ())}
+
+        # Track source diversity per family
+        family_sources: Dict[str, set] = {}
+        for u in units:
+            for fam in u.operator_family:
+                family_sources.setdefault(fam, set()).add(u.path)
+
+        for u in units:
+            score = u.fusion_score  # start with base score
+
+            # Positive: family alignment
+            if explicit_op_family:
+                if explicit_op_family in {f.lower() for f in u.operator_family}:
+                    score += 0.25
+                else:
+                    score -= 0.10
+                    if explicit_op_family in {"pooling", "reduce"} and u.operator_family:
+                        score -= 0.10
+                    if explicit_op_family == "pooling" and any(f.lower() in {"activation", "elementwise"} for f in u.operator_family):
+                        score -= 0.08
+
+            # Positive: context alignment
+            if intent.context_type and u.context_type == intent.context_type:
+                score += 0.15
+
+            # Positive: design pattern alignment
+            query_lower = " ".join(intent.tokens).lower()
+            for dp in u.design_patterns:
+                if dp.lower() in query_lower:
+                    score += 0.15
+
+            # Positive: API specificity (non-generic APIs are stronger signals)
+            non_generic_apis = {p.lower() for p in u.api_pattern} - _GENERIC_API_PATTERNS
+            if non_generic_apis:
+                score += 0.05 * len(non_generic_apis)
+            if explicit_apis:
+                overlap = len(explicit_apis & {p.lower() for p in u.api_pattern})
+                score += 0.10 * overlap
+
+            # Positive: symbol-level hits
+            sym_overlap = _overlap_size(u.api_symbols, intent.api_symbols)
+            if sym_overlap:
+                score += 0.05 * sym_overlap
+
+            # Positive: source diversity bonus (complementary design evidence)
+            for fam in u.operator_family:
+                if fam in family_sources and len(family_sources[fam]) > 1:
+                    score += 0.03
+
+            # Negative: generic-only penalty
+            apis_lower = {p.lower() for p in u.api_pattern}
+            if apis_lower and apis_lower.issubset(_GENERIC_API_PATTERNS):
+                score -= 0.10
+
+            # Negative: family mismatch when explicit family is set
+            if explicit_op_family and u.operator_family and explicit_op_family not in {f.lower() for f in u.operator_family}:
+                # Only penalize if there are better family matches elsewhere
+                better_exists = any(
+                    explicit_op_family in {f.lower() for f in other_u.operator_family}
+                    for other_u in units
+                )
+                if better_exists:
+                    score -= 0.12
+
+            scores[u.retrieval_id] = score
+
+        return scores
+
+    def _fuse_results(
+        self,
+        structured_results: List[SearchResult],
+        semantic_units: List[RetrievalUnit],
+        intent: QueryIntent,
+        k: int,
+        operator_family: Optional[str] = None,
+        api_patterns: Optional[Sequence[str]] = None,
+    ) -> List[UnifiedSearchResult]:
+        """Fuse structured and semantic results into a single design-aware ranked list."""
+        units: List[RetrievalUnit] = []
+        seen_ids: set = set()
+
+        # Convert structured results to unified units
+        for sr in structured_results:
+            unit = self._block_record_to_retrieval_unit(sr.block, sr)
+            if unit.retrieval_id not in seen_ids:
+                units.append(unit)
+                seen_ids.add(unit.retrieval_id)
+
+        # Add semantic units, deduplicating by path + first-200-chars hash
+        for su in semantic_units:
+            dup_key = f"{su.path}:{hash(su.text[:200])}"
+            if dup_key not in seen_ids:
+                units.append(su)
+                seen_ids.add(dup_key)
+
+        if not units:
+            return []
+
+        # Design-aware re-scoring
+        design_scores = self._compute_design_aware_scores(
+            units, intent,
+            explicit_operator_family=operator_family or intent.operator_family,
+            explicit_api_patterns=api_patterns or intent.api_patterns,
+        )
+
+        # Apply duplicate-archetype penalty (same file stem gets penalized after first)
+        stem_counts: Dict[str, int] = {}
+        for u in units:
+            stem = Path(u.path).stem
+            stem_counts[stem] = stem_counts.get(stem, 0) + 1
+
+        final_scores: Dict[str, float] = {}
+        for u in units:
+            score = design_scores.get(u.retrieval_id, u.fusion_score)
+            stem = Path(u.path).stem
+            if stem_counts.get(stem, 0) > 1:
+                # Penalize repeated archetypes beyond the first
+                penalty = 0.03 * (stem_counts[stem] - 1)
+                score -= penalty
+            final_scores[u.retrieval_id] = score
+
+        # Sort by final score
+        ranked = sorted(units, key=lambda u: (-final_scores.get(u.retrieval_id, 0.0), u.path, u.start_line))
+
+        # Build UnifiedSearchResult list
+        results: List[UnifiedSearchResult] = []
+        for position, u in enumerate(ranked[:k]):
+            score = final_scores.get(u.retrieval_id, 0.0)
+            next_score = final_scores.get(ranked[position + 1].retrieval_id, 0.0) if position + 1 < len(ranked) else 0.0
+            margin = score - next_score
+            # Confidence
+            matched = list(u.branch_scores.keys())
+            available = max(1, len(matched))
+            confidence_components = [
+                min(1.0, score / 0.5),
+                min(1.0, len(matched) / available),
+                min(1.0, max(0.0, margin) / 0.1),
+            ]
+            confidence = sum(confidence_components) / len(confidence_components)
+
+            # Build explanation from unit metadata
+            explanations = [u.why_matched]
+            if intent.context_type and u.context_type == intent.context_type:
+                explanations.append(f"context_type matched: {u.context_type}")
+            if operator_family or intent.operator_family:
+                ef = (operator_family or intent.operator_family or "").lower()
+                if ef in {f.lower() for f in u.operator_family}:
+                    explanations.append(f"operator_family matched: {ef}")
+            if u.design_patterns:
+                explanations.append(f"design_patterns: {', '.join(u.design_patterns[:3])}")
+            if u.retrieval_branch:
+                explanations.append(f"branch: {u.retrieval_branch}")
+
+            results.append(UnifiedSearchResult(
+                unit=u,
+                score=score,
+                confidence=confidence,
+                confidence_label=_confidence_label(confidence),
+                matched_branches=tuple(matched),
+                explanation=tuple(explanations),
+            ))
+        return results
+
     def search(
         self,
         query: str,
@@ -872,22 +1336,21 @@ class CodeSearchSnippetRetriever:
         api_patterns: Optional[Sequence[str]] = None,
         source: str = "asc_devkit",
         allowed_tiers: Optional[Sequence[str]] = None,
+        **kwargs,  # absorb legacy args for backward compat (operator_families, source_groups, artifact_types)
     ) -> List[SearchResult]:
+        # Keep signature for backward compat, but delegate to unified search internally.
+        # This returns Legacy SearchResult for callers that expect it.
         records = self._get_records()
         if not records:
             return []
 
         k = top_k or self.top_k
         intent = self._build_query_intent(query)
-
-        # If caller explicitly provides context_type, use it; otherwise fall back to intent
         effective_context_type = context_type or intent.context_type
 
         # Phase 1: hard filter
         base_indices = self._hard_filter_indices(records, effective_context_type, allowed_tiers)
         if not base_indices:
-            # Fallback: if strict context_type yields nothing, DO NOT relax context_type per Plan.
-            # But allow hidden/fallback_only tiers if explicitly requested
             if allowed_tiers is None:
                 base_indices = self._hard_filter_indices(records, effective_context_type, allowed_tiers=("preferred", "default", "fallback_only", "hidden"))
             if not base_indices:
@@ -902,7 +1365,7 @@ class CodeSearchSnippetRetriever:
         if not candidate_indices:
             return []
 
-        # Phase 3: multi-branch scoring
+        # Phase 3: structured multi-branch scoring
         metadata_scores = self._metadata_scores(
             records, intent, candidate_indices,
             operator_family=operator_family or intent.operator_family,
@@ -912,7 +1375,6 @@ class CodeSearchSnippetRetriever:
         dense_scores = self._compute_dense_scores(query, records, candidate_indices)
         prior_scores = self._prior_scores(records, candidate_indices)
 
-        # Normalize each branch to [0, 1] using softmax-ish or rank-based scaling
         def _normalize_branch(scores: Dict[int, float]) -> Dict[int, float]:
             if not scores:
                 return {}
@@ -926,7 +1388,6 @@ class CodeSearchSnippetRetriever:
         norm_dense = _normalize_branch(dense_scores)
         norm_prior = _normalize_branch(prior_scores)
 
-        # Combine
         combined: Dict[int, float] = {}
         for idx in candidate_indices:
             score = (
@@ -947,7 +1408,7 @@ class CodeSearchSnippetRetriever:
         )
 
         available_branches = sum(1 for b in (metadata_scores, bm25_scores, dense_scores) if b)
-        results: List[SearchResult] = []
+        structured_results: List[SearchResult] = []
         for position, (idx, score) in enumerate(ranked[:k]):
             matched_branches = tuple(
                 name for name, branch in (
@@ -959,7 +1420,6 @@ class CodeSearchSnippetRetriever:
             )
             next_score = ranked[position + 1][1] if position + 1 < len(ranked) else 0.0
             margin = score - next_score
-            # Confidence heuristic
             confidence_components = [
                 min(1.0, score / 0.5),
                 min(1.0, len(matched_branches) / max(1, available_branches)),
@@ -967,7 +1427,7 @@ class CodeSearchSnippetRetriever:
             ]
             confidence = sum(confidence_components) / len(confidence_components)
 
-            results.append(SearchResult(
+            structured_results.append(SearchResult(
                 block=records[idx],
                 score=score,
                 metadata_score=norm_metadata.get(idx, 0.0),
@@ -983,7 +1443,90 @@ class CodeSearchSnippetRetriever:
                     api_patterns=api_patterns or intent.api_patterns,
                 ),
             ))
-        return results
+
+        # Phase 4: optional semantic fallback + fusion (unified)
+        if self._should_run_semantic_fallback(structured_results, intent, k):
+            semantic_units = self._semantic_recall(query, intent, k)
+            if semantic_units:
+                unified = self._fuse_results(
+                    structured_results, semantic_units, intent, k,
+                    operator_family=operator_family or intent.operator_family,
+                    api_patterns=api_patterns or intent.api_patterns,
+                )
+                # Convert UnifiedSearchResult back to SearchResult for backward compatibility
+                converted: List[SearchResult] = []
+                for u in unified:
+                    # For semantic branch units, create a synthetic BlockRecord
+                    unit = u.unit
+                    if unit.retrieval_branch == "semantic":
+                        synthetic_block = BlockRecord(
+                            index=-1,
+                            doc_id=unit.retrieval_id,
+                            block_id=unit.retrieval_id,
+                            path=unit.path,
+                            source_root=unit.source_scope,
+                            block_kind=unit.block_kind or "semantic_chunk",
+                            context_type=unit.context_type,
+                            symbol_name=unit.symbol_name,
+                            operator_family=unit.operator_family,
+                            api_pattern=unit.api_pattern,
+                            api_symbols=unit.api_symbols,
+                            block_summary="[semantic_chunk] retrieved via code_rag",
+                            keywords=(),
+                            curation_tier="default",
+                            retrieval_enabled=True,
+                            risk_tags=(),
+                            text=unit.text,
+                            start_line=unit.start_line,
+                            end_line=unit.end_line,
+                            sibling_blocks=(),
+                            tokens=(),
+                        )
+                    else:
+                        # Find original block record
+                        synthetic_block = next(
+                            (s.block for s in structured_results if s.block.block_id == unit.retrieval_id),
+                            None,
+                        )
+                        if synthetic_block is None:
+                            synthetic_block = BlockRecord(
+                                index=-1,
+                                doc_id=unit.retrieval_id,
+                                block_id=unit.retrieval_id,
+                                path=unit.path,
+                                source_root=unit.source_scope,
+                                block_kind=unit.block_kind,
+                                context_type=unit.context_type,
+                                symbol_name=unit.symbol_name,
+                                operator_family=unit.operator_family,
+                                api_pattern=unit.api_pattern,
+                                api_symbols=unit.api_symbols,
+                                block_summary="",
+                                keywords=(),
+                                curation_tier="default",
+                                retrieval_enabled=True,
+                                risk_tags=(),
+                                text=unit.text,
+                                start_line=unit.start_line,
+                                end_line=unit.end_line,
+                                sibling_blocks=(),
+                                tokens=(),
+                            )
+                    converted.append(SearchResult(
+                        block=synthetic_block,
+                        score=u.score,
+                        metadata_score=unit.branch_scores.get("metadata", 0.0),
+                        bm25_score=unit.branch_scores.get("bm25", 0.0),
+                        dense_score=unit.branch_scores.get("dense", 0.0),
+                        prior_score=unit.branch_scores.get("prior", 0.0),
+                        confidence=u.confidence,
+                        confidence_label=u.confidence_label,
+                        matched_branches=u.matched_branches,
+                        explanation=u.explanation,
+                    ))
+                return converted
+
+        return structured_results
 
     # ------------------------------------------------------------------
     # Legacy-compatible retrieve
@@ -998,14 +1541,13 @@ class CodeSearchSnippetRetriever:
         source_groups: Optional[Sequence[str]] = None,
         context_type: Optional[str] = None,
         api_patterns: Optional[Sequence[str]] = None,
+        operator_family: Optional[str] = None,
     ) -> List[str]:
-        """Return formatted text for top-k blocks."""
-        # Map legacy parameters where possible
-        op_family = None
-        if operator_families:
+        """Return formatted text for top-k blocks (unified retriever interface)."""
+        op_family = operator_family
+        if op_family is None and operator_families:
             op_family = operator_families[0]
         if context_type is None and artifact_types:
-            # Heuristic mapping from old artifact_types to new context_type
             at = {a.lower() for a in artifact_types}
             if "host" in at or "tiling" in at:
                 context_type = "host_tiling_src"
@@ -1037,7 +1579,10 @@ class CodeSearchSnippetRetriever:
         for i, r in enumerate(results, 1):
             b = r.block
             lines.append(f"--- Block {i} ---")
-            lines.append(f"- score: {r.score:.3f} (metadata={r.metadata_score:.2f} bm25={r.bm25_score:.2f} dense={r.dense_score:.2f} prior={r.prior_score:.2f})")
+            if r.matched_branches == ("semantic",) or "semantic" in r.matched_branches:
+                lines.append(f"- score: {r.score:.3f} (semantic={r.score:.2f})")
+            else:
+                lines.append(f"- score: {r.score:.3f} (metadata={r.metadata_score:.2f} bm25={r.bm25_score:.2f} dense={r.dense_score:.2f} prior={r.prior_score:.2f})")
             lines.append(f"- confidence: {r.confidence:.2f} ({r.confidence_label})")
             lines.append(f"- matched_branches: {', '.join(r.matched_branches) if r.matched_branches else 'none'}")
             lines.append(f"- block_id: {b.block_id}")
@@ -1055,7 +1600,6 @@ class CodeSearchSnippetRetriever:
                 lines.append(f"- sibling_blocks: {', '.join(b.sibling_blocks[:3])}")
             lines.append("")
             lines.append(f"```cpp")
-            # Truncate if needed
             code = b.text
             if len(code) > self.max_chars:
                 code = code[: self.max_chars] + "\n// ... truncated"
@@ -1065,5 +1609,15 @@ class CodeSearchSnippetRetriever:
         return ["\n".join(lines)]
 
 
-# Backward-compatible alias for external imports
+# Backward-compatible aliases for external imports / tests
 CodeSearchSnippetResult = SearchResult
+
+# Some tests import this at module level; alias via a no-op wrapper for backward compat.
+def _build_query_intent(query: str) -> QueryIntent:
+    """Backward-compatible module-level alias for CodeSearchSnippetRetriever._build_query_intent."""
+    return CodeSearchSnippetRetriever()._build_query_intent(query)
+
+
+def _extract_keywords(text: str) -> Tuple[str, ...]:
+    """Backward-compatible module-level alias."""
+    return _unique_strings(_tokenize(text))

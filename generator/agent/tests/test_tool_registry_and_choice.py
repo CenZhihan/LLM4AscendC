@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import numpy as np
+from langchain_core.messages import HumanMessage
 
 from generator.agent.retrievers import env_checker as env_checker_mod
 from generator.agent.agent_config import (
@@ -19,9 +20,11 @@ from generator.agent.agent_config import (
 from generator.agent.nodes.ascend_fetch import ascend_fetch_node
 from generator.agent.nodes.ascend_search import ascend_search_node
 from generator.agent.query_utils import extract_api_name, extract_chip_name, extract_npu_query_params
-from generator.agent.retrievers.api_doc_retriever import ApiDocRetriever, ApiSignatureResult
+from generator.agent.nodes.choose_tool import _normalize_choice_args, _stable_choice_signature, _tool_choice_already_seen, choose_tool_node
+from generator.agent.retrievers.api_doc_retriever import ApiConstraintResult, ApiDocRetriever, ApiSignatureResult
 from generator.agent.retrievers.code_search_snippet_retriever import CodeSearchSnippetRetriever, _build_query_intent
 from generator.agent.retrievers.env_checker import ApiCheckResult, NpuDeviceResult
+from generator.agent.retrievers.kb_shell_search import _extract_search_terms
 from generator.agent.tool_choice import parse_tool_choice_json
 from generator.agent.tool_registry import RegisteredToolSpec, get_tool_registry, register_tool
 
@@ -136,6 +139,73 @@ class TestQueryUtils(unittest.TestCase):
             "Ascend950DT",
         )
 
+    def test_normalize_choice_args_keeps_pooling_family_for_code_search(self):
+        args = _normalize_choice_args(
+            "code_search_snippet",
+            "max pooling 1d sliding window kernel",
+            {"operator_family": "pooling", "context_type": "kernel_src", "source": "asc_devkit"},
+        )
+        self.assertIn("pooling", args["operator_families"])
+
+    def test_tool_choice_signature_tracks_api_name(self):
+        sig = _stable_choice_signature("api_lookup", "signature for DataCopy", {"api_name": "AscendC::DataCopy"})
+        self.assertIn("DataCopy", sig)
+
+    def test_tool_choice_seen_detects_same_api_lookup(self):
+        state = {
+            "tool_calls_log": [
+                {"tool": "api_lookup", "query": "AscendC::DataCopy", "args": {"api_name": "AscendC::DataCopy"}},
+            ]
+        }
+        self.assertTrue(_tool_choice_already_seen(state, "api_lookup", "DataCopy", {"api_name": "DataCopy"}))
+
+    def test_kb_shell_search_extracts_terms_from_freeform_query(self):
+        terms = _extract_search_terms("search vector math functions AscendC Knowledge/api/ or kernel_operator.h Muls Adds Erf Tanh Exp Madd")
+        self.assertIn("kernel_operator.h", terms)
+        self.assertIn("Muls", terms)
+        self.assertIn("Erf", terms)
+
+
+class TestChooseToolRouting(unittest.TestCase):
+    def test_single_tool_mode_answers_after_nonempty_result(self):
+        class _FakeMessage:
+            def __init__(self, content):
+                self.content = content
+                self.reasoning_content = ""
+                self.model_extra = {}
+
+        class _FakeChoice:
+            def __init__(self, content):
+                self.message = _FakeMessage(content)
+
+        class _FakeResponse:
+            def __init__(self, content):
+                self.choices = [_FakeChoice(content)]
+
+        class _FakeCompletions:
+            def create(self, **kwargs):
+                return _FakeResponse('{"tool":"kb_shell_search","query":"search Erf in api/","args":null}')
+
+        class _FakeChat:
+            def __init__(self):
+                self.completions = _FakeCompletions()
+
+        class _FakeClient:
+            def __init__(self):
+                self.chat = _FakeChat()
+
+        state = {
+            "messages": [HumanMessage(content="implement gelu")],
+            "query_round_count": 1,
+            "kb_shell_search_results": ["知识库搜索: category='api'\n  匹配结果: 1 条\n  可直接利用的规则片段:\n  1. api/api-restrictions.md:83\n     - **Host 侧**（`.cpp`）：禁止包含 `kernel_operator.h`"],
+            "tool_calls_log": [{"tool": "kb_shell_search", "query": "search kernel_operator.h in api/", "response": "non-empty"}],
+            "tool_choice_reasoning_log": [],
+        }
+
+        out = choose_tool_node(state, _FakeClient(), "fake-model", {"kb_shell_search"})
+        self.assertEqual(out["next_action"], "ANSWER")
+        self.assertEqual(out["tool_choice_json"]["tool"], "ANSWER")
+
 
 class TestApiRetrieverFallback(unittest.TestCase):
     def test_lookup_signature_uses_local_headers_and_doc_metadata(self):
@@ -169,6 +239,27 @@ class TestApiRetrieverFallback(unittest.TestCase):
         self.assertEqual(result.signature, "")
         self.assertIn("未找到 API 'Tanh'", result.details)
 
+    def test_lookup_signature_prefers_function_declaration_over_formula_comment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            include_root = os.path.join(tmp, "include", "adv_api", "math")
+            os.makedirs(include_root, exist_ok=True)
+            with open(os.path.join(include_root, "erf.h"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    "* Erf(x) = P(Clip(x)) / Q(Clip(x))\n"
+                    "__aicore__ inline void Erf(\n"
+                    "    const LocalTensor<float>& dstTensor,\n"
+                    "    const LocalTensor<float>& srcTensor,\n"
+                    "    int32_t count);\n"
+                )
+
+            retriever = ApiDocRetriever(knowledge_path=tmp)
+            result = retriever.lookup_signature("Erf")
+
+        self.assertIn("inline void Erf(", result.signature)
+        self.assertEqual(result.match_kind, "header_decl")
+        self.assertEqual(result.confidence, "high")
+        self.assertTrue(result.is_actionable)
+
 
 class TestApiAndEnvNodes(unittest.TestCase):
     def test_api_lookup_node_uses_structured_args(self):
@@ -187,12 +278,15 @@ class TestApiAndEnvNodes(unittest.TestCase):
                     signature="sig",
                     supported_dtypes=[],
                     repeat_times_limit=None,
-                    params=[],
+                    params=[{"name": "dst", "type": "LocalTensor<float>&", "dir": "out"}],
                     example_call="",
                     source_doc="doc.md",
                     details="ok",
                     header_files=["kernel_operator_data_copy_intf.h"],
                     doc_metadata=[{"path": "api-datacopy.md", "title": "DataCopy", "section": "选择规则", "excerpt": "DataCopyPad"}],
+                    match_kind="header_decl",
+                    confidence="high",
+                    is_actionable=True,
                 )
 
         out = api_lookup_node(
@@ -205,6 +299,141 @@ class TestApiAndEnvNodes(unittest.TestCase):
         )
         self.assertEqual(out["api_lookup_result"]["api_name"], "DataCopy")
         self.assertIn("kernel_operator_data_copy_intf.h", out["api_lookup_results"][0])
+        self.assertIn("参数:", out["api_lookup_results"][0])
+        self.assertIn("DataCopyPad", out["api_lookup_results"][0])
+        self.assertIn("置信度: high", out["api_lookup_results"][0])
+
+    def test_api_lookup_node_reuses_cached_result_for_same_api(self):
+        from generator.agent.nodes.api_lookup import api_lookup_node
+
+        class _Retriever:
+            def is_available(self):
+                return True
+
+            def known_api_names(self):
+                return ["DataCopy"]
+
+            def lookup_signature(self, api_name):
+                raise AssertionError(f"lookup_signature should not be called for cached API {api_name}")
+
+        out = api_lookup_node(
+            {
+                "current_query": "DataCopy details",
+                "tool_choice_json": {"tool": "api_lookup", "query": "DataCopy details", "args": {"api_name": "DataCopy"}},
+                "query_round_count": 1,
+                "tool_calls_log": [{
+                    "round": 1,
+                    "tool": "api_lookup",
+                    "query": "DataCopy",
+                    "args": {"api_name": "DataCopy"},
+                    "response": "cached response",
+                    "result": {"api_name": "DataCopy", "signature": "sig"},
+                    "cache_key": "DataCopy",
+                }],
+            },
+            _Retriever(),
+        )
+        self.assertEqual(out["query_round_count"], 2)
+        self.assertEqual(out["api_lookup_result"]["api_name"], "DataCopy")
+        self.assertEqual(out["api_lookup_results"], [])
+        self.assertEqual(out["tool_calls_log"], [])
+
+    def test_api_constraint_node_formats_checked_context_and_checks(self):
+        from generator.agent.nodes.api_constraint import api_constraint_node
+
+        class _Retriever:
+            def is_available(self):
+                return True
+
+            def check_constraints(self, api_name, context):
+                return ApiConstraintResult(
+                    api_name=api_name,
+                    constraints=[{"severity": "error", "desc": "GM->UB 搬运应使用 DataCopyPad"}],
+                    violations=["DataCopy(GM->UB) 无法处理非对齐数据。"],
+                    suggestion="使用 DataCopyPad。",
+                    is_compliant=False,
+                    checked_context={"is_gm_to_ub": True, "dtype": "half"},
+                    checks_performed=[{"name": "gm_to_ub_alignment", "status": "fail", "detail": "当前上下文为 GM->UB。"}],
+                    unknowns=["未提供 count，未校验搬运长度。"],
+                    source_doc="api-datacopy.md",
+                    compliance_status="fail",
+                )
+
+        out = api_constraint_node(
+            {
+                "current_query": "check DataCopy constraints",
+                "tool_choice_json": {"tool": "api_constraint", "query": "check DataCopy constraints", "args": {"api_name": "DataCopy", "is_gm_to_ub": True, "dtype": "half"}},
+                "query_round_count": 0,
+            },
+            _Retriever(),
+        )
+        display = out["api_constraint_results"][0]
+        self.assertIn("检查结论: fail", display)
+        self.assertIn("调用上下文", display)
+        self.assertIn("已检查项", display)
+        self.assertIn("未校验项", display)
+        self.assertIn("api-datacopy.md", display)
+
+    def test_api_constraint_node_reuses_cached_result_for_same_context(self):
+        from generator.agent.nodes.api_constraint import api_constraint_node
+
+        class _Retriever:
+            def is_available(self):
+                return True
+
+            def check_constraints(self, api_name, context):
+                raise AssertionError(f"check_constraints should not be called for cached API {api_name}")
+
+        cache_key = '{"api_name": "DataCopy", "context": {"dtype": "half", "is_gm_to_ub": true}}'
+        out = api_constraint_node(
+            {
+                "current_query": "check DataCopy constraints",
+                "tool_choice_json": {"tool": "api_constraint", "query": "check DataCopy constraints", "args": {"api_name": "DataCopy", "is_gm_to_ub": True, "dtype": "half"}},
+                "query_round_count": 2,
+                "tool_calls_log": [{
+                    "round": 2,
+                    "tool": "api_constraint",
+                    "query": "check DataCopy constraints",
+                    "args": {"api_name": "DataCopy", "is_gm_to_ub": True, "dtype": "half"},
+                    "response": "cached response",
+                    "result": {"api_name": "DataCopy", "is_compliant": False},
+                    "cache_key": cache_key,
+                }],
+            },
+            _Retriever(),
+        )
+        self.assertEqual(out["query_round_count"], 3)
+        self.assertEqual(out["api_constraint_result"]["api_name"], "DataCopy")
+        self.assertEqual(out["api_constraint_results"], [])
+        self.assertEqual(out["tool_calls_log"], [])
+
+    def test_api_retriever_constraint_result_includes_checked_and_unknown_items(self):
+        retriever = ApiDocRetriever()
+        result = retriever.check_constraints("Compare", {"count": 31, "dtype": "half"})
+        self.assertFalse(result.is_compliant)
+        self.assertEqual(result.compliance_status, "fail")
+        self.assertEqual(result.checked_context["count"], 31)
+        self.assertTrue(any(item["name"] == "compare_256b_alignment" for item in result.checks_performed))
+        self.assertTrue(any("repeat_times" in item for item in result.unknowns))
+
+    def test_api_retriever_constraint_returns_insufficient_context_for_reduce_sum(self):
+        retriever = ApiDocRetriever()
+        result = retriever.check_constraints("ReduceSum", {"count": 128, "dtype": "float"})
+
+        self.assertFalse(result.is_compliant)
+        self.assertEqual(result.compliance_status, "insufficient_context")
+        self.assertTrue(any("workspace_alias" in item for item in result.unknowns))
+        self.assertTrue(any("workspace_size_bytes" in item for item in result.unknowns))
+
+    def test_api_retriever_constraint_validates_reduce_sum_alias(self):
+        retriever = ApiDocRetriever()
+        result = retriever.check_constraints(
+            "ReduceSum",
+            {"count": 128, "dtype": "float", "workspace_alias": True, "workspace_size_bytes": 512},
+        )
+
+        self.assertEqual(result.compliance_status, "fail")
+        self.assertTrue(any("不能复用同一 buffer" in item for item in result.violations))
 
     def test_env_check_api_node_uses_structured_args(self):
         from generator.agent.nodes.env_check import env_check_api_node
@@ -411,7 +640,7 @@ public:
                 )
 
         self.assertTrue(matches)
-        self.assertIn("op_host", matches[0].relative_path)
+        self.assertIn("op_host", matches[0].block.relative_path)
 
     def test_dense_branch_can_recall_semantic_match_without_lexical_overlap(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -469,7 +698,7 @@ public:
                 )
 
         self.assertTrue(matches)
-        self.assertIn("pointwise_conv1x1", matches[0].relative_path)
+        self.assertIn("pointwise_conv1x1", matches[0].block.relative_path)
 
     def test_dense_encoding_falls_back_to_cpu_after_npu_oom(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -581,7 +810,7 @@ public:
                 knowledge_root=knowledge_root,
             )
 
-            records = retriever._load_records()
+            records = retriever._get_records()
 
         self.assertTrue(records)
         self.assertTrue(all(record.source == "asc_devkit" for record in records))
@@ -618,7 +847,7 @@ class L2CacheOptimizer {};
                 knowledge_root=knowledge_root,
             )
 
-            records = retriever._load_records()
+            records = retriever._get_records()
 
         self.assertTrue(records)
         self.assertTrue(all(record.relative_path.endswith(".asc") for record in records))
@@ -659,7 +888,7 @@ public:
             )
 
         self.assertTrue(matches)
-        self.assertIn("AscendC::Gelu", matches[0].metadata.api_symbols)
+        self.assertIn("AscendC::Gelu", matches[0].block.api_symbols)
         self.assertNotIn("Copyright", matches[0].metadata.api_symbols)
 
     def test_exact_api_symbol_query_prefers_reducemax_example(self):
@@ -705,7 +934,7 @@ public:
                 )
 
         self.assertTrue(matches)
-        self.assertIn("reducemax/reducemax.asc", matches[0].relative_path)
+        self.assertIn("reducemax/reducemax.asc", matches[0].block.relative_path)
 
     def test_retrieve_returns_single_full_file_with_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -740,13 +969,13 @@ public:
                 )
 
         self.assertEqual(len(results), 1)
-        self.assertIn("Top1 Example", results[0])
-        self.assertIn("score_note: score is RRF rank fusion", results[0])
+        self.assertIn("### Top", results[0])
+        self.assertIn("score:", results[0])
         self.assertIn("confidence:", results[0])
         self.assertIn("matched_branches: metadata, bm25", results[0])
         self.assertIn("branch_scores:", results[0])
         self.assertIn("path: 01_simd_cpp_api/03_libraries/01_activation/gelu/gelu.asc", results[0])
-        self.assertIn("artifact_type: kernel", results[0])
+        self.assertIn("context_type: kernel_src", results[0])
         self.assertIn("AscendC::Gelu", results[0])
         self.assertIn("class GeluKernel", results[0])
 
@@ -796,7 +1025,7 @@ public:
         self.assertGreater(matches[0].confidence, 0.0)
         self.assertIn(matches[0].confidence_label, {"medium", "high"})
         self.assertEqual(matches[0].matched_branches, ("metadata", "bm25"))
-        self.assertGreater(matches[0].candidate_score, 0.0)
+        self.assertGreater(matches[0].score, 0.0)
         self.assertTrue(matches[0].explanation)
         self.assertTrue(any("operator_families matched" in item for item in matches[0].explanation))
 
@@ -840,11 +1069,12 @@ public:
                 knowledge_root=knowledge_root,
             )
 
-            records = retriever._load_records()
+            records = retriever._get_records()
             intent = _build_query_intent("max pooling 1d sliding window reduce max kernel")
-            candidates = retriever._candidate_indices(
+            base_indices = retriever._hard_filter_indices(records, None)
+            candidates = retriever._select_candidates(
                 records,
-                "asc_devkit",
+                base_indices,
                 intent,
                 result_k=3,
             )
@@ -901,7 +1131,7 @@ public:
                 )
 
         self.assertTrue(matches)
-        self.assertIn("gelu/gelu.asc", matches[0].relative_path)
+        self.assertIn("gelu/gelu.asc", matches[0].block.relative_path)
 
     def test_source_group_filter_prefers_custom_op_host_examples(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -949,7 +1179,7 @@ public:
                 )
 
         self.assertTrue(matches)
-        self.assertIn("op_host", matches[0].relative_path)
+        self.assertIn("op_host", matches[0].block.relative_path)
 
 
 class TestParseToolModePlugins(unittest.TestCase):

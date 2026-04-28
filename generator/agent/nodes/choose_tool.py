@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 import re
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -27,7 +28,7 @@ from ..tool_registry import get_tool_registry
 
 _CODE_SEARCH_SOURCES = {"all", "cann_skills", "asc_devkit"}
 _CODE_SEARCH_ARTIFACT_TYPES = {"kernel", "host", "tiling", "opdef", "pybind"}
-_CODE_SEARCH_OPERATOR_FAMILIES = {"activation", "convolution", "matrix", "normalization", "elementwise"}
+_CODE_SEARCH_OPERATOR_FAMILIES = {"activation", "convolution", "matrix", "normalization", "elementwise", "pooling", "reduce"}
 _CODE_SEARCH_SOURCE_GROUPS = {
     "asc_devkit_custom_op_host",
     "asc_devkit_custom_op_kernel",
@@ -195,6 +196,97 @@ def _summarize_called_tools(state: GeneratorAgentState) -> str:
     return ", ".join(called) if called else ""
 
 
+def _normalize_freeform_query(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _canonical_api_name(api_name: str) -> str:
+    value = str(api_name or "").strip()
+    for prefix in ("AscendC::", "ascendc::"):
+        if value.startswith(prefix):
+            return value[len(prefix):]
+    return value
+
+
+def _stable_choice_signature(tool_name: str, query: str, args: Dict[str, Any] | None) -> str:
+    normalized_args = dict(args or {})
+    if tool_name in {"env_check_api", "api_lookup", "api_constraint", "api_alternative"}:
+        api_name = _canonical_api_name(extract_api_name(query, args=normalized_args))
+        normalized_args["api_name"] = api_name
+        if tool_name in {"env_check_api", "api_lookup", "api_alternative"}:
+            payload = {
+                "tool": tool_name,
+                "api_name": api_name,
+                "args": {"api_name": api_name},
+            }
+            return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        normalized_args = {
+            key: value
+            for key, value in normalized_args.items()
+            if value is not None and value != ""
+        }
+        payload = {
+            "tool": tool_name,
+            "api_name": api_name,
+            "args": normalized_args,
+        }
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    payload = {
+        "tool": tool_name,
+        "query": _normalize_freeform_query(query),
+        "args": normalized_args,
+    }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+
+_RESULT_LIST_KEYS = {
+    "kb": "kb_results",
+    "web": "web_results",
+    "code_rag": "code_rag_results",
+    "code_search_snippet": "code_search_snippet_results",
+    "env_check_env": "env_check_results",
+    "env_check_npu": "env_check_results",
+    "env_check_api": "env_check_results",
+    "kb_shell_search": "kb_shell_search_results",
+    "api_lookup": "api_lookup_results",
+    "api_constraint": "api_constraint_results",
+    "api_alternative": "api_alternative_results",
+    "tiling_calc": "tiling_calc_results",
+    "tiling_validate": "tiling_validate_results",
+    "npu_arch": "npu_arch_results",
+    "code_style": "code_style_results",
+    "security_check": "security_check_results",
+    "ascend_search": "ascend_search_results",
+    "ascend_fetch": "ascend_fetch_results",
+}
+
+
+def _tool_has_nonempty_result(state: GeneratorAgentState, tool_name: str) -> bool:
+    result_key = _RESULT_LIST_KEYS.get(tool_name)
+    if not result_key:
+        return False
+    results = state.get(result_key) or []
+    return any(str(item or "").strip() for item in results)
+
+
+def _tool_choice_already_seen(
+    state: GeneratorAgentState,
+    tool_name: str,
+    query: str,
+    args: Dict[str, Any] | None,
+) -> bool:
+    target = _stable_choice_signature(tool_name, query, args)
+    for entry in reversed(state.get("tool_calls_log") or []):
+        prev_tool = str(entry.get("tool") or "").strip()
+        if prev_tool != tool_name:
+            continue
+        prev_query = str(entry.get("query") or "")
+        prev_args = entry.get("args") if isinstance(entry.get("args"), dict) else {}
+        if _stable_choice_signature(prev_tool, prev_query, prev_args) == target:
+            return True
+    return False
+
+
 def _registry_tools_for_prompt(tool_mode: AgentToolMode) -> List[Any]:
     reg = get_tool_registry()
     out: List[Any] = []
@@ -257,18 +349,19 @@ def _build_tool_selection_prompt(
         "You are a **tool orchestrator**. Your only job is to pick the next tool to call. "
         "You are NOT the model that writes code — a separate agent does that after all tools finish.\n\n"
         f"**Rounds remaining: {rounds_left} of {MAX_QUERY_ROUNDS}.**\n"
-        "You need to make **one or more tool calls** to gather evidence before the downstream "
-        "code-generation agent can produce a correct Ascend C kernel. "
-        "**Chain tool calls continuously** — use every remaining round to retrieve more information "
-        "from a different source.\n\n"
+        "You need to make **only the minimum tool calls needed** to gather evidence before the downstream "
+        "code-generation agent can produce a correct Ascend C kernel. Stop calling tools once the retrieved "
+        "evidence is already actionable for code generation.\n\n"
         "**You MUST call a tool** unless the \"Already retrieved\" section already contains "
         "comprehensive, task-specific evidence that covers API signatures, usage patterns, AND "
         "hardware constraints. If that section is empty, thin, or covers only one aspect, call a tool.\n\n"
         "Across rounds, combine different **enabled** information sources (docs, code, runtime checks, "
         "online references as available) until the downstream agent has enough complementary evidence.\n\n"
         f"{called_note}\n"
-        f"If number of tools is larger than or equal to {MAX_QUERY_ROUNDS}, **Do NOT repeat a tool that already returned results** — pick a different tool to "
-        f"broaden coverage. Only repeat if the previous result was empty or failed or the number of tools is less than {MAX_QUERY_ROUNDS}.\n\n"
+        f"**Do NOT repeat the same tool for the same API symbol or near-identical query** after it already returned non-empty evidence. "
+        f"Repeat only when you are adding genuinely new structure (for example, `api_constraint` after `api_lookup`, or a narrower `kb_shell_search` after an empty broad search).\n\n"
+        "If only one tool is enabled for this session and it already returned a non-empty, task-relevant result, prefer `ANSWER` instead of burning more rounds on paraphrased repeats.\n\n"
+        "When `api_lookup` returns a concrete API and constraints still matter, prefer `api_constraint` next instead of asking `api_lookup` again.\n\n"
         "**ANSWER is a last resort.** Output ANSWER only when:\n"
         "  (a) the retrieved content already comprehensively covers the task, OR\n"
         "  (b) you have no rounds left.\n\n"
@@ -375,6 +468,10 @@ def _infer_code_search_operator_families(query: str) -> List[str]:
         inferred.append("matrix")
     if any(token in lowered for token in ("layernorm", "rmsnorm", "normalization")):
         inferred.append("normalization")
+    if any(token in lowered for token in ("pool", "pooling", "maxpool", "avgpool")):
+        inferred.append("pooling")
+    if any(token in lowered for token in ("reduce", "reduction", "reducesum", "reducemax", "reducemin")):
+        inferred.append("reduce")
     if any(token in lowered for token in ("elementwise", "broadcast", "add", "sub", "mul", "div")):
         inferred.append("elementwise")
     return _normalize_string_list(inferred, _CODE_SEARCH_OPERATOR_FAMILIES)
@@ -404,6 +501,16 @@ def _normalize_choice_args(tool_name: str, query: str, args: Dict[str, Any] | No
         if source == "cann_skills":
             source = "asc_devkit"
         current["source"] = source if source in _CODE_SEARCH_SOURCES else "asc_devkit"
+        singular_family = str(current.get("operator_family") or "").strip().lower().replace("-", "_")
+        if singular_family and singular_family in _CODE_SEARCH_OPERATOR_FAMILIES:
+            existing = current.get("operator_families")
+            merged = []
+            if isinstance(existing, (list, tuple, set)):
+                merged.extend(str(item) for item in existing)
+            elif isinstance(existing, str):
+                merged.append(existing)
+            merged.append(singular_family)
+            current["operator_families"] = merged
         artifact_types = _normalize_string_list(current.get("artifact_types"), _CODE_SEARCH_ARTIFACT_TYPES)
         if not artifact_types:
             artifact_types = _infer_code_search_artifact_types(query)
@@ -430,6 +537,7 @@ def _normalize_choice_args(tool_name: str, query: str, args: Dict[str, Any] | No
 
         if current["source"] == "all" and source_groups and all(group.startswith("asc_devkit_") for group in source_groups):
             current["source"] = "asc_devkit"
+        current.pop("operator_family", None)
         return current
 
     if tool_name == "npu_arch":
@@ -663,6 +771,34 @@ def choose_tool_node(
         }
 
     next_action, current_query, tjson = _resolve_json_choice(choice, tool_mode, user_question)
+    normalized_args = tjson.get("args") if isinstance(tjson.get("args"), dict) else None
+    enabled_tools = list(tool_mode)
+    repeated_choice = next_action != "ANSWER" and _tool_choice_already_seen(state, next_action, current_query, normalized_args)
+    single_tool_repeat = (
+        next_action != "ANSWER"
+        and len(enabled_tools) == 1
+        and enabled_tools[0] == next_action
+        and _tool_has_nonempty_result(state, next_action)
+    )
+    if next_action != "ANSWER" and (repeated_choice or single_tool_repeat):
+        api_name = extract_api_name(current_query, args=normalized_args)
+        if (
+            next_action == "api_lookup"
+            and "api_constraint" in tool_mode
+            and api_name != "unknown"
+            and not _tool_has_nonempty_result(state, "api_constraint")
+        ):
+            next_action = "api_constraint"
+            current_query = f"check constraints for {api_name}"
+            tjson = {
+                "tool": "api_constraint",
+                "query": current_query,
+                "args": {"api_name": api_name},
+            }
+        else:
+            next_action = "ANSWER"
+            current_query = ""
+            tjson = {"tool": "ANSWER", "query": "", "args": None}
     reasoning_entry = _reasoning_log_entry(
         round_num=round_count + 1,
         prompt=prompt,

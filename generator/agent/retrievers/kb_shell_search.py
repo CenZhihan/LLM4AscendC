@@ -29,6 +29,7 @@ class KBShellSearchResult:
     total_matches: int
     files_searched: int
     details: str                    # Human-readable summary
+    search_terms: List[str] = field(default_factory=list)
 
 
 # ============================================================
@@ -64,6 +65,73 @@ def _get_knowledge_root() -> Optional[str]:
     if knowledge.is_dir():
         return str(knowledge)
     return None
+
+
+_SEARCH_META_WORDS = {
+    "search", "grep", "find", "look", "lookup", "query", "queries", "for", "in", "under",
+    "knowledge", "knowledge/", "api", "tiling", "arch", "architecture", "docs", "doc", "and",
+    "or", "the", "a", "an", "ascendc", "ascend", "kernel", "functions", "function", "usage",
+}
+
+
+def _extract_search_terms(query: str, operator_name: str = "") -> List[str]:
+    terms: List[str] = []
+    if operator_name:
+        terms.append(operator_name)
+
+    text = (query or "").strip()
+    if not text:
+        return terms
+
+    for quoted in re.findall(r"['\"]([^'\"]+)['\"]", text):
+        if quoted.strip():
+            terms.append(quoted.strip())
+
+    if "|" in text:
+        for group in re.findall(r"[A-Za-z_][A-Za-z0-9_:.|]+", text):
+            if "|" in group:
+                terms.append(group.strip())
+
+    symbol_matches = re.findall(r"(?:[A-Za-z_][A-Za-z0-9_:]*\.h|AscendC::[A-Za-z_][A-Za-z0-9_:]*|[A-Z][A-Za-z0-9_]{2,})", text)
+    terms.extend(symbol_matches)
+
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_./:-]+", text):
+        lowered = token.lower().strip("/:")
+        if lowered in _SEARCH_META_WORDS:
+            continue
+        if lowered.startswith("knowledge/") or lowered in {"api/", "arch/", "tiling/"}:
+            continue
+        if len(token) >= 4:
+            terms.append(token)
+
+    unique: List[str] = []
+    seen = set()
+    for term in terms:
+        normalized = term.strip().strip(",.;:")
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(normalized)
+    return unique[:8]
+
+
+def _match_priority(match: dict) -> tuple:
+    content = str(match.get("content") or "")
+    lowered = content.lower()
+    score = 0
+    for needle, weight in (
+        ("禁止", 8), ("必须", 8), ("应", 5), ("推荐", 5), ("允许", 4),
+        ("限制", 6), ("对齐", 6), ("blacklist", 7), ("warning", 4), ("error", 4),
+        ("datacopypad", 6), ("kernel_operator.h", 6),
+    ):
+        if needle in content or needle in lowered:
+            score += weight
+    if content.startswith("#"):
+        score += 1
+    return (-score, match.get("file", ""), match.get("line", 0))
 
 
 # ============================================================
@@ -116,12 +184,8 @@ def search_kb(
             details=f"知识库分类目录 '{category}' 未找到: {search_dir}",
         )
 
-    # Build search terms
-    search_terms = []
-    if operator_name:
-        search_terms.append(operator_name)
-    if query:
-        search_terms.append(query)
+    # Build focused search terms from the free-form query.
+    search_terms = _extract_search_terms(query, operator_name)
 
     if not search_terms:
         return KBShellSearchResult(
@@ -132,6 +196,7 @@ def search_kb(
             total_matches=0,
             files_searched=0,
             details="请提供 operator_name 或 query 参数以执行搜索。",
+            search_terms=[],
         )
 
     # Search using grep
@@ -140,8 +205,8 @@ def search_kb(
 
     for term in search_terms:
         try:
-            # grep -rn --include='*.md' -i 'term' search_dir
-            cmd = ["grep", "-rn", "--include=*.md", "-i", "-C", "1", term, search_dir]
+            grep_mode = "-E" if any(ch in term for ch in "|()[]?+*") else "-F"
+            cmd = ["grep", "-rn", "--include=*.md", grep_mode, "-i", "-C", "1", term, search_dir]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
 
             if result.stdout:
@@ -183,8 +248,11 @@ def search_kb(
             seen.add(key)
             unique_matches.append(m)
 
+    unique_matches.sort(key=_match_priority)
+
     details = (
         f"搜索完成: category='{category}', operator='{operator_name}', query='{query}'\n"
+        f"搜索词: {', '.join(search_terms)}\n"
         f"搜索目录: {os.path.relpath(search_dir, knowledge_root) or 'Knowledge/'}\n"
         f"匹配结果: {len(unique_matches)} 条\n"
         f"涉及文件: {len(set(m['file'] for m in unique_matches))} 个"
@@ -198,6 +266,7 @@ def search_kb(
         total_matches=len(unique_matches),
         files_searched=files_searched,
         details=details,
+        search_terms=search_terms,
     )
 
 

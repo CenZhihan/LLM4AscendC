@@ -44,8 +44,11 @@ def _format_for_display(result) -> str:
     """Format KBShellSearchResult for display."""
     if hasattr(result, "matches"):
         lines = [f"知识库搜索: category='{result.category}', operator='{result.operator_name}'"]
+        if getattr(result, "search_terms", None):
+            lines.append("  搜索词: " + ", ".join(result.search_terms[:8]))
         lines.append(f"  匹配结果: {result.total_matches} 条")
         if result.matches:
+            lines.append("  可直接利用的规则片段:")
             for i, m in enumerate(result.matches[:10], 1):
                 file = m.get("file", "")
                 line_num = m.get("line", "")

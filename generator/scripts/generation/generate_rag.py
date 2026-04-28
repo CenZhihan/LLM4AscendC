@@ -18,7 +18,7 @@ from generator.config import (
 from generator.prompt_generators.prompt_utils import read_relavant_files, ascendc_template
 from generator.scripts.generation.generate_and_write import generate_and_write_single
 from generator.rag import EmbeddingRetriever
-from generator.dataset import dataset, category2exampleop
+from generator.dataset import dataset
 
 
 def _load_code_rag_retriever():
@@ -147,8 +147,8 @@ def generate_prompt_rag_code(op: str, category: str, retriever: EmbeddingRetriev
     key_info = _extract_key_info_from_code(op, category)
 
     # 获取基础的 ascendc prompt
-    arc_src, example_arch_src, example_new_arch_src = read_relavant_files("ascendc", op, "add")
-    base_prompt = ascendc_template(arc_src, example_arch_src, example_new_arch_src, op, "add")
+    arc_src, example_arch_src, example_new_arch_src = read_relavant_files("ascendc", op, "leaky_relu")
+    base_prompt = ascendc_template(arc_src, example_arch_src, example_new_arch_src, op, "leaky_relu")
 
     # 构建查询并检索相关代码
     query = _build_rag_query(op, category, key_info)
