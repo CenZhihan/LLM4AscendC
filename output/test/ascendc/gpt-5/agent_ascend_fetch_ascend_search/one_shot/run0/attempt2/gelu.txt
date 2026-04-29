@@ -1,7 +1,7 @@
 project_json_src='''
 [
   {
-    "op": "ReluCustom",
+    "op": "GeluCustom",
     "language": "cpp",
     "input_desc": [
       {
@@ -29,69 +29,73 @@ host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
-BEGIN_TILING_DATA_DEF(ReluCustomTilingData)
+BEGIN_TILING_DATA_DEF(GeluCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileLength);
   TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint32_t, tmpErfBytesPerTile);
 END_TILING_DATA_DEF;
 
-REGISTER_TILING_DATA_CLASS(ReluCustom, ReluCustomTilingData)
+REGISTER_TILING_DATA_CLASS(GeluCustom, GeluCustomTilingData)
 }  // namespace optiling
 """
 
 host_operator_src="""
 
-#include "relu_custom_tiling.h"
+#include "gelu_custom_tiling.h"
 #include "register/op_def_registry.h"
 
 namespace optiling {
 
-// UB model for this kernel:
-//   inQueueX: 2 * tile
-//   outQueueY: 2 * tile
-// Total floats = 4 * tile => bytes = 16 * tile
+// UB model (approx):
+//   inQueueX:  2 * tileLen * 4
+//   outQueueY: 2 * tileLen * 4
+//   tmpFloat:  1 * tileLen * 4
+// Total bytes ≈ 5 * tileLen * 4 = 20 * tileLen
 static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
-static constexpr uint32_t ALIGN_ELEMS = 2048;            // favor larger DMA bursts
-static constexpr uint32_t HARD_CAP_ELEMS = 32768;        // avoid too-large per-iter latency
+static constexpr uint32_t ALIGN_ELEMS = 2048;            // prefer aligned DMA
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;        // cap per-iter length
 
 static inline uint32_t AlignDown(uint32_t x, uint32_t a)
 {
-    return (x / a) * a;
+    return (a == 0u) ? x : (x / a) * a;
 }
 
 static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
 {
-    return (a + b - 1u) / b;
+    return (b == 0u) ? 0u : (a + b - 1u) / b;
 }
 
 static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
-    ReluCustomTilingData tiling;
+    GeluCustomTilingData tiling;
     const uint32_t totalLength =
         static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
 
-    // tileLen from UB budget: bytes = 16 * tileLen
-    uint32_t maxTile = UB_BUDGET_BYTES / 16;  // elements
-    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
-    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
-    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+    // Tile length from UB budget
+    uint32_t maxTile = UB_BUDGET_BYTES / 20;  // elements
+    if (maxTile == 0u) maxTile = 1u;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = HARD_CAP_ELEMS;
+    if (maxTile >= ALIGN_ELEMS) maxTile = AlignDown(maxTile, ALIGN_ELEMS);
 
     uint32_t tileLen = maxTile;
     if (totalLength < tileLen) {
-        const uint32_t aligned = AlignDown(totalLength, ALIGN_ELEMS);
+        const uint32_t aligned = AlignDown(totalLength, (tileLen >= ALIGN_ELEMS) ? ALIGN_ELEMS : 1u);
         tileLen = (aligned > 0) ? aligned : totalLength;
     }
+    if (tileLen == 0) tileLen = 1;
 
+    // Block dim selection
     const uint32_t numTiles = (tileLen == 0) ? 1u : CeilDiv(totalLength, tileLen);
     uint32_t blockDim = numTiles;
     if (blockDim < 8u) blockDim = 8u;
     if (blockDim > 24u) blockDim = 24u;
-
     context->SetBlockDim(blockDim);
 
     tiling.set_totalLength(totalLength);
     tiling.set_tileLength(tileLen);
     tiling.set_blockDim(blockDim);
+    tiling.set_tmpErfBytesPerTile(0); // not used in kernel
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
@@ -122,9 +126,9 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 } // namespace ge
 
 namespace ops {
-class ReluCustom : public OpDef {
+class GeluCustom : public OpDef {
 public:
-    explicit ReluCustom(const char* name) : OpDef(name)
+    explicit GeluCustom(const char* name) : OpDef(name)
     {
         this->Input("x")
             .ParamType(REQUIRED)
@@ -145,7 +149,7 @@ public:
     }
 };
 
-OP_ADD(ReluCustom);
+OP_ADD(GeluCustom);
 } // namespace ops
 """
 
@@ -154,13 +158,17 @@ kernel_src="""
 #include "kernel_operator.h"
 
 constexpr int32_t BUFFER_NUM = 2;
+constexpr float INV_SQRT2PI = 0.7978845608028654f; // sqrt(2/pi)
+constexpr float TANH_PADE_A = 27.0f;               // Pade coeffs for tanh approx
+constexpr float TANH_PADE_B = 9.0f;                // tanh(z) ≈ z*(A + z^2)/(A + B*z^2)
 
-class KernelReluCustom {
+class KernelGeluCustom {
 public:
-    __aicore__ inline KernelReluCustom() {}
+    __aicore__ inline KernelGeluCustom() {}
 
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t totalLength, uint32_t tileLength)
+                                uint32_t totalLength, uint32_t tileLength,
+                                uint32_t /*tmpErfBytesPerTile*/)
     {
         totalLen_ = totalLength;
         tileLen_ = tileLength;
@@ -170,6 +178,7 @@ public:
 
         pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
         pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpFloatQueue_, 1, tileLen_ * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -217,10 +226,76 @@ private:
     {
         AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+        AscendC::LocalTensor<float> tFloat = tmpFloatQueue_.AllocTensor<float>();
 
-        // y = max(x, 0)
-        AscendC::Maxs(yLocal, xLocal, 0.0f, len);
+        // Approximate GELU using tanh-based formula with Pade approx for tanh:
+        // z = sqrt(2/pi) * (x + 0.044715 * x^3)
+        // tanh(z) ≈ z * (A + z^2) / (A + B * z^2), A=27, B=9
+        // y = 0.5 * x * (1 + tanh(z))
 
+        // tFloat = x^2
+        AscendC::Mul(tFloat, xLocal, xLocal, len);
+        // tFloat = x^3
+        AscendC::Mul(tFloat, tFloat, xLocal, len);
+        // tFloat = 0.044715 * x^3
+        AscendC::Muls(tFloat, tFloat, 0.044715f, len);
+        // tFloat = x + 0.044715 * x^3
+        AscendC::Add(tFloat, tFloat, xLocal, len);
+        // tFloat = z = sqrt(2/pi) * (x + 0.044715 * x^3)
+        AscendC::Muls(tFloat, tFloat, INV_SQRT2PI, len);
+
+        // yLocal = z^2
+        AscendC::Mul(yLocal, tFloat, tFloat, len);
+        // yLocal = (A + z^2)
+        AscendC::Adds(yLocal, yLocal, TANH_PADE_A, len);
+        // tFloat = numerator = z * (A + z^2)
+        AscendC::Mul(tFloat, tFloat, yLocal, len);
+
+        // yLocal = z^2
+        AscendC::Mul(yLocal, yLocal, yLocal, 0); // dummy to avoid warnings, will overwrite next
+        AscendC::Mul(yLocal, tFloat, tFloat, 0); // no-op when len==0
+        // recompute yLocal = z^2
+        AscendC::Mul(yLocal, outQueueY_.GetLocalBuffer<float>(), outQueueY_.GetLocalBuffer<float>(), 0); // safeguard
+        AscendC::Mul(yLocal, tFloat, tFloat, 0); // safeguard
+
+        // Recompute z^2 into yLocal properly (tFloat currently holds numerator)
+        // We still have z in numerator's left operand lost; recalc z^2 by:
+        // Get z back by dividing numerator by (A + z^2) is expensive; easier: recalc z^2:
+        // We can recompute z into yLocal via following steps:
+        // Use tFloat as temp holder: restore z by dividing numerator by (A + z^2),
+        // but we already overwrote (A + z^2). To avoid this, compute denom directly from z:
+        // Instead, compute denom via z reusing the fact that we still have z in numerator is not accessible.
+        // Simpler approach: recompute z2 = (sqrt(2/pi) * (x + 0.044715 x^3))^2.
+        // Recompute (x + 0.044715 x^3) into yLocal:
+
+        // yLocal = x^2
+        AscendC::Mul(yLocal, xLocal, xLocal, len);
+        // yLocal = x^3
+        AscendC::Mul(yLocal, yLocal, xLocal, len);
+        // yLocal = 0.044715 * x^3
+        AscendC::Muls(yLocal, yLocal, 0.044715f, len);
+        // yLocal = x + 0.044715 * x^3
+        AscendC::Add(yLocal, yLocal, xLocal, len);
+        // yLocal = z^2 = (sqrt(2/pi) * yLocal)^2 = (2/pi) * yLocal^2
+        AscendC::Mul(yLocal, yLocal, yLocal, len);
+        AscendC::Muls(yLocal, yLocal, (INV_SQRT2PI * INV_SQRT2PI), len);
+
+        // denom = A + B * z^2
+        AscendC::Muls(yLocal, yLocal, TANH_PADE_B, len);
+        AscendC::Adds(yLocal, yLocal, TANH_PADE_A, len);
+
+        // tFloat currently holds numerator = z * (A + z^2)
+        // tFloat = tanh_approx(z) = numerator / denom
+        AscendC::Div(tFloat, tFloat, yLocal, len);
+
+        // tFloat = 1 + tanh_approx(z)
+        AscendC::Adds(tFloat, tFloat, 1.0f, len);
+        // yLocal = 0.5 * x
+        AscendC::Muls(yLocal, xLocal, 0.5f, len);
+        // yLocal = y = (0.5 * x) * (1 + tanh_approx(z))
+        AscendC::Mul(yLocal, yLocal, tFloat, len);
+
+        tmpFloatQueue_.FreeTensor(tFloat);
         outQueueY_.EnQue<float>(yLocal);
         inQueueX_.FreeTensor(xLocal);
     }
@@ -236,6 +311,7 @@ private:
     AscendC::TPipe pipe_;
     AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpFloatQueue_;
 
     AscendC::GlobalTensor<float> xGm_;
     AscendC::GlobalTensor<float> yGm_;
@@ -244,11 +320,11 @@ private:
     uint32_t tileLen_ {0};
 };
 
-extern "C" __global__ __aicore__ void relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelReluCustom op;
-    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength);
+    KernelGeluCustom op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength, tiling_data.tmpErfBytesPerTile);
     op.Process();
 }
 """
@@ -259,18 +335,18 @@ python_bind_src="""
 #include <torch/extension.h>
 #include "pytorch_npu_helper.hpp"
 
-at::Tensor relu_impl_npu(const at::Tensor& self) {
+at::Tensor gelu_impl_npu(const at::Tensor& self) {
     at::Tensor result = at::empty_like(self);
-    EXEC_NPU_CMD(aclnnReluCustom, self, result);
+    EXEC_NPU_CMD(aclnnGeluCustom, self, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("relu_custom", &relu_impl_npu);
+    m.impl("gelu_custom", &gelu_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("relu_custom", &relu_impl_npu, "ReLU activation (ReluCustom on NPU)");
+    m.def("gelu_custom", &gelu_impl_npu, "GELU activation (GeluCustom on NPU)");
 }
 """
 
@@ -279,7 +355,7 @@ import torch
 import torch_npu
 import custom_ops_lib
 
-_FN = 'relu_custom'
+_FN = 'gelu_custom'
 
 class ModelNew(torch.nn.Module):
     def __init__(self, *init_inputs):

@@ -178,12 +178,32 @@ def answer_node(
 
     # Get base prompt if available
     base_prompt = state.get("base_prompt", user_question)
+    attempt_id = int(state.get("attempt_id") or 1)
+    repair_logs = (state.get("repair_error_logs_raw") or "").strip()
+    previous_code = (state.get("previous_attempt_code") or "").strip()
 
     # Format retrieved content
     ref_text = _format_retrieved_content(state)
 
     # Build prompt payload
-    if ref_text:
+    if attempt_id > 1:
+        retrieved_block = ref_text if ref_text else "(no tool results in this attempt)"
+        logs_block = repair_logs if repair_logs else "(no prior error logs provided)"
+        previous_code_block = previous_code if previous_code else "(no previous code provided)"
+        user_prompt = (
+            "You are an expert Ascend C kernel engineer.\n"
+            "This is a repair attempt. Fix the previous attempt with minimal and targeted changes.\n\n"
+            "Repair constraints:\n"
+            "- Prioritize resolving the concrete errors shown in logs.\n"
+            "- Keep behavior unchanged where not required by the fix.\n"
+            "- Keep naming/contracts consistent with project_json/host/kernel/python bindings.\n\n"
+            f"Original user instruction:\n{base_prompt}\n\n"
+            f"Previous attempt error logs (raw text):\n{logs_block}\n\n"
+            f"Previous attempt full generated code:\n{previous_code_block}\n\n"
+            f"Retrieved context from current attempt tools:\n{retrieved_block}\n\n"
+            "Generate the complete corrected solution as instructed (code only where the task demands code)."
+        )
+    elif ref_text:
         user_prompt = (
             "You are an expert Ascend C kernel engineer. The following blocks are retrieval results "
             "and tool outputs gathered for the user task.\n"

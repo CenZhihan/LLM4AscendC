@@ -1,7 +1,7 @@
 project_json_src='''
 [
   {
-    "op": "SwishCustom",
+    "op": "EluCustom",
     "language": "cpp",
     "input_desc": [
       {
@@ -19,7 +19,14 @@ project_json_src='''
         "type": ["float"]
       }
     ],
-    "attr": []
+    "attr": [
+      {
+        "name": "alpha",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "1.0"
+      }
+    ]
   }
 ]
 '''
@@ -29,48 +36,37 @@ host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
-BEGIN_TILING_DATA_DEF(SwishCustomTilingData)
+BEGIN_TILING_DATA_DEF(EluCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileLength);
   TILING_DATA_FIELD_DEF(uint32_t, blockDim);
-  TILING_DATA_FIELD_DEF(uint32_t, sigmoidTmpBytes);
+  TILING_DATA_FIELD_DEF(float, alpha);
 END_TILING_DATA_DEF;
 
-REGISTER_TILING_DATA_CLASS(SwishCustom, SwishCustomTilingData)
+REGISTER_TILING_DATA_CLASS(EluCustom, EluCustomTilingData)
 }  // namespace optiling
 """
 
 host_operator_src="""
 
-#include <vector>
-#include <cstdint>
-#include "swish_custom_tiling.h"
+#include "elu_custom_tiling.h"
 #include "register/op_def_registry.h"
-
-// Sigmoid tmp size helper
-#include "graph/shape.h"
-// Use AscendC high-level API query for sigmoid tmp size
-namespace AscendC {
-void GetSigmoidMaxMinTmpSize(const ge::Shape &srcShape, const uint32_t typeSize, bool isReuseSource,
-                             uint32_t &maxValue, uint32_t &minValue);
-}
 
 namespace optiling {
 
-// UB model per core for this kernel (float):
-//   inQueueX:     2 * tile
-//   outQueueY:    2 * tile
-//   sigLocal:     1 * tile
-//   sigmoidTmp:   variable (queried via GetSigmoidMaxMinTmpSize)
-// Total float bytes (without sigmoidTmp) = (2 + 2 + 1) * 4 * tile = 20 * tile
-static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core UB budget
-static constexpr uint32_t ALIGN_ELEMS = 2048;            // favor large DMA alignment
-static constexpr uint32_t HARD_CAP_ELEMS = 32768;        // avoid excessive per-iter latency
-static constexpr uint32_t SAFETY_MARGIN = 1024;          // small cushion
+// UB model for this kernel:
+//   inQueueX: 2 * tile
+//   outQueueY: 2 * tile
+//   calcFloatQueue: 2 * tile
+//   tmpByteQueue: large tmp for Exp
+// For simplicity, we budget tile from float queues and keep tmpByteQueue conservative per-core.
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
+static constexpr uint32_t ALIGN_ELEMS = 2048;            // favor larger DMA bursts
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;        // avoid too-large per-iter latency
 
 static inline uint32_t AlignDown(uint32_t x, uint32_t a)
 {
-    return (a == 0u) ? x : (x / a) * a;
+    return (x / a) * a;
 }
 
 static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
@@ -80,67 +76,37 @@ static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
 
 static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
-    SwishCustomTilingData tiling;
-
+    EluCustomTilingData tiling;
     const uint32_t totalLength =
         static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
 
-    // Initial tile length estimate ignoring sigmoid temp
-    uint32_t maxTile = (UB_BUDGET_BYTES > SAFETY_MARGIN) ? (UB_BUDGET_BYTES - SAFETY_MARGIN) / 20u : 1024u;
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const float *alpha = attrs->GetAttrPointer<float>(0);
+
+    // tileLen from UB budget: approximate bytes = (in 2 + out 2 + calc 2) * 4 * tileLen = 24 * tileLen
+    uint32_t maxTile = UB_BUDGET_BYTES / 24;  // elements
     maxTile = AlignDown(maxTile, ALIGN_ELEMS);
     if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
     if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
 
-    // Fit considering Sigmoid temporary UB requirement (choose minValue for correctness)
     uint32_t tileLen = maxTile;
     if (totalLength < tileLen) {
         const uint32_t aligned = AlignDown(totalLength, ALIGN_ELEMS);
-        tileLen = (aligned > 0u) ? aligned : totalLength;
+        tileLen = (aligned > 0) ? aligned : totalLength;
     }
 
-    // Iteratively adjust tileLen to fit UB budget with Sigmoid tmp
-    uint32_t chosenTmpBytes = 0;
-    for (int iter = 0; iter < 8; ++iter) {
-        if (tileLen == 0) { tileLen = 1; }
-        std::vector<int64_t> shape_vec = { static_cast<int64_t>(tileLen) };
-        ge::Shape shape(shape_vec);
-        uint32_t maxV = 0, minV = 0;
-        AscendC::GetSigmoidMaxMinTmpSize(shape, /*float32*/4, /*isReuseSource*/false, maxV, minV);
-        // Use minimal required tmp for correctness
-        const uint32_t tmpBytes = minV;
-        const uint64_t bytesNoTmp = static_cast<uint64_t>(20u) * static_cast<uint64_t>(tileLen);
-        const uint64_t totalBytes = bytesNoTmp + static_cast<uint64_t>(tmpBytes) + SAFETY_MARGIN;
-        if (totalBytes <= UB_BUDGET_BYTES) {
-            chosenTmpBytes = tmpBytes;
-            break;
-        }
-        // Reduce tileLen and retry
-        uint32_t next = AlignDown(tileLen / 2u, ALIGN_ELEMS);
-        if (next == 0u && tileLen > 1u) next = 1u;  // allow very small tails
-        tileLen = next;
-    }
-
-    if (tileLen == 0u) {
-        tileLen = (totalLength == 0u) ? 0u : (totalLength < ALIGN_ELEMS ? totalLength : ALIGN_ELEMS);
-        // Recompute tmpBytes for final fallback
-        std::vector<int64_t> shape_vec = { static_cast<int64_t>(tileLen) };
-        ge::Shape shape(shape_vec);
-        uint32_t maxV = 0, minV = 0;
-        AscendC::GetSigmoidMaxMinTmpSize(shape, 4, false, maxV, minV);
-        chosenTmpBytes = minV;
-    }
-
-    // Determine blockDim based on number of tiles
-    const uint32_t numTiles = (tileLen == 0u) ? 1u : CeilDiv(totalLength, tileLen);
+    // Adaptive blockDim based on number of tiles; keep conservative for stability.
+    const uint32_t numTiles = (tileLen == 0) ? 1u : CeilDiv(totalLength, tileLen);
     uint32_t blockDim = numTiles;
     if (blockDim < 8u) blockDim = 8u;
     if (blockDim > 24u) blockDim = 24u;
+
     context->SetBlockDim(blockDim);
 
     tiling.set_totalLength(totalLength);
     tiling.set_tileLength(tileLen);
     tiling.set_blockDim(blockDim);
-    tiling.set_sigmoidTmpBytes(chosenTmpBytes);
+    tiling.set_alpha(*alpha);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
@@ -171,9 +137,9 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 } // namespace ge
 
 namespace ops {
-class SwishCustom : public OpDef {
+class EluCustom : public OpDef {
 public:
-    explicit SwishCustom(const char* name) : OpDef(name)
+    explicit EluCustom(const char* name) : OpDef(name)
     {
         this->Input("x")
             .ParamType(REQUIRED)
@@ -187,6 +153,8 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
+        this->Attr("alpha").AttrType(OPTIONAL).Float(1.0);
+
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
         this->AICore().SetTiling(optiling::TilingFunc);
@@ -194,7 +162,7 @@ public:
     }
 };
 
-OP_ADD(SwishCustom);
+OP_ADD(EluCustom);
 } // namespace ops
 """
 
@@ -202,29 +170,27 @@ kernel_src="""
 
 #include "kernel_operator.h"
 
-constexpr int32_t INOUT_BUFFER_NUM = 2;
+constexpr int32_t BUFFER_NUM = 2;
 
-class KernelSwishCustom {
+class KernelEluCustom {
 public:
-    __aicore__ inline KernelSwishCustom() {}
+    __aicore__ inline KernelEluCustom() {}
 
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
                                 uint32_t totalLength, uint32_t tileLength,
-                                uint32_t sigmoidTmpBytes)
+                                float alpha)
     {
         totalLen_ = totalLength;
         tileLen_ = tileLength;
-        sigmoidTmpBytes_ = sigmoidTmpBytes;
+        alpha_ = alpha;
 
         xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
         yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
 
-        pipe_.InitBuffer(inQueueX_, INOUT_BUFFER_NUM, tileLen_ * sizeof(float));
-        pipe_.InitBuffer(outQueueY_, INOUT_BUFFER_NUM, tileLen_ * sizeof(float));
-        pipe_.InitBuffer(sigLocalQueue_, 1, tileLen_ * sizeof(float));
-        if (sigmoidTmpBytes_ > 0) {
-            pipe_.InitBuffer(sigmoidTmpQueue_, 1, sigmoidTmpBytes_);
-        }
+        // Init UB queues
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(calcFloatQueue_, BUFFER_NUM, tileLen_ * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -234,15 +200,18 @@ public:
         const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
         const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
 
+        // Tile-granularity grid-stride to improve load balance and occupancy.
         const uint32_t strideElems = blockNum * tileLen_;
         uint32_t base = blockIdx * tileLen_;
         if (base >= totalLen_) return;
 
+        // Prefetch first tile
         uint32_t curLen = totalLen_ - base;
         if (curLen > tileLen_) curLen = tileLen_;
         CopyIn(base, curLen);
 
         while (true) {
+            // Prefetch next tile early for overlap
             const uint32_t nextBase = base + strideElems;
             uint32_t nextLen = 0;
             if (nextBase < totalLen_) {
@@ -272,19 +241,25 @@ private:
     {
         AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
-        AscendC::LocalTensor<float> sigLocal = sigLocalQueue_.AllocTensor<float>();
+        AscendC::LocalTensor<float> negLocal = calcFloatQueue_.AllocTensor<float>();
+        AscendC::LocalTensor<float> tmpFloatLocal = calcFloatQueue_.AllocTensor<float>();
 
-        if (sigmoidTmpBytes_ > 0) {
-            AscendC::LocalTensor<uint8_t> tmpBuf = sigmoidTmpQueue_.AllocTensor<uint8_t>();
-            AscendC::Sigmoid<float>(sigLocal, xLocal, tmpBuf, len);
-            sigmoidTmpQueue_.FreeTensor(tmpBuf);
-        } else {
-            AscendC::Sigmoid<float>(sigLocal, xLocal, len);
-        }
+        // Positive part: yLocal = max(x, 0)
+        AscendC::Maxs(yLocal, xLocal, 0.0f, len);
+        // Negative part: negLocal = min(x, 0)
+        AscendC::Mins(negLocal, xLocal, 0.0f, len);
 
-        AscendC::Mul(yLocal, xLocal, sigLocal, len);
+        // Compute exp(negLocal)
+        AscendC::Exp(tmpFloatLocal, negLocal, len);
+        // tmpFloatLocal = exp(negLocal) - 1
+        AscendC::Adds(tmpFloatLocal, tmpFloatLocal, -1.0f, len);
+        // tmpFloatLocal = alpha * (exp(negLocal) - 1)
+        AscendC::Muls(tmpFloatLocal, tmpFloatLocal, alpha_, len);
+        // yLocal += tmpFloatLocal
+        AscendC::Add(yLocal, yLocal, tmpFloatLocal, len);
 
-        sigLocalQueue_.FreeTensor(sigLocal);
+        calcFloatQueue_.FreeTensor(tmpFloatLocal);
+        calcFloatQueue_.FreeTensor(negLocal);
         outQueueY_.EnQue<float>(yLocal);
         inQueueX_.FreeTensor(xLocal);
     }
@@ -298,24 +273,23 @@ private:
 
 private:
     AscendC::TPipe pipe_;
-    AscendC::TQue<AscendC::TPosition::VECIN, INOUT_BUFFER_NUM> inQueueX_;
-    AscendC::TQue<AscendC::TPosition::VECOUT, INOUT_BUFFER_NUM> outQueueY_;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> sigLocalQueue_;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> sigmoidTmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> calcFloatQueue_;
 
     AscendC::GlobalTensor<float> xGm_;
     AscendC::GlobalTensor<float> yGm_;
 
     uint32_t totalLen_ {0};
     uint32_t tileLen_ {0};
-    uint32_t sigmoidTmpBytes_ {0};
+    float alpha_ {1.0f};
 };
 
-extern "C" __global__ __aicore__ void swish_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void elu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelSwishCustom op;
-    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength, tiling_data.sigmoidTmpBytes);
+    KernelEluCustom op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength, tiling_data.alpha);
     op.Process();
 }
 """
@@ -326,18 +300,18 @@ python_bind_src="""
 #include <torch/extension.h>
 #include "pytorch_npu_helper.hpp"
 
-at::Tensor swish_impl_npu(const at::Tensor& self) {
+at::Tensor elu_impl_npu(const at::Tensor& self, double alpha) {
     at::Tensor result = at::empty_like(self);
-    EXEC_NPU_CMD(aclnnSwishCustom, self, result);
+    EXEC_NPU_CMD(aclnnEluCustom, self, alpha, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("swish_custom", &swish_impl_npu);
+    m.impl("elu_custom", &elu_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("swish_custom", &swish_impl_npu, "Swish activation (SwishCustom on NPU)");
+    m.def("elu_custom", &elu_impl_npu, "ELU activation (EluCustom on NPU)");
 }
 """
 
@@ -346,7 +320,7 @@ import torch
 import torch_npu
 import custom_ops_lib
 
-_FN = 'swish_custom'
+_FN = 'elu_custom'
 
 class ModelNew(torch.nn.Module):
     def __init__(self, *init_inputs):

@@ -134,6 +134,7 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
             item["tool_choice"] = reasoning_by_round.get(r, {})
 
     return {
+        "attempt_id": int(final_state.get("attempt_id") or 1),
         "reasoning_content": final_state.get("reasoning_content", ""),
         "final_generation_reasoning_content": final_state.get("reasoning_content", ""),
         "answer": _extract_final_answer(final_state),
@@ -154,6 +155,9 @@ def generate_kernel_with_agent(
     tool_mode: Union[AgentToolMode, str] = NO_TOOL,
     retriever: Optional[CodeRetriever] = None,
     llm_config: Optional[Dict[str, Any]] = None,
+    attempt_id: int = 1,
+    repair_error_logs_raw: str = "",
+    previous_attempt_code: str = "",
 ) -> AgentGenerationResult:
     """
     Generate kernel code using the integrated agent with KB, WEB, and Code RAG.
@@ -197,11 +201,17 @@ def generate_kernel_with_agent(
         category=task.category,
         language=task.language,
         strategy_name=task.strategy_name,
+        attempt_id=attempt_id,
+        repair_error_logs_raw=repair_error_logs_raw,
+        previous_attempt_code=previous_attempt_code,
     )
 
     # 4. Invoke agent
     mode_str = tool_mode_to_string(parsed_mode)
-    print(f"[INFO] Starting agent for op={task.op}, tool_mode={mode_str}")
+    print(
+        f"[INFO] Starting agent for op={task.op}, tool_mode={mode_str}, "
+        f"attempt={attempt_id}"
+    )
     final_state = app.invoke(initial_state)
 
     # 5. Extract results

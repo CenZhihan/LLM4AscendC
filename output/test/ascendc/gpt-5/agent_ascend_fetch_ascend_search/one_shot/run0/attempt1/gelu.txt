@@ -1,7 +1,7 @@
 project_json_src='''
 [
   {
-    "op": "HardtanhCustom",
+    "op": "GeluCustom",
     "language": "cpp",
     "input_desc": [
       {
@@ -19,20 +19,7 @@ project_json_src='''
         "type": ["float"]
       }
     ],
-    "attr": [
-      {
-        "name": "min_val",
-        "param_type": "optional",
-        "type": "float",
-        "default_value": "-1.0"
-      },
-      {
-        "name": "max_val",
-        "param_type": "optional",
-        "type": "float",
-        "default_value": "1.0"
-      }
-    ]
+    "attr": []
   }
 ]
 '''
@@ -42,79 +29,99 @@ host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
-BEGIN_TILING_DATA_DEF(HardtanhCustomTilingData)
+BEGIN_TILING_DATA_DEF(GeluCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileLength);
   TILING_DATA_FIELD_DEF(uint32_t, blockDim);
-  TILING_DATA_FIELD_DEF(float, minVal);
-  TILING_DATA_FIELD_DEF(float, maxVal);
+  TILING_DATA_FIELD_DEF(uint32_t, tmpErfBytesPerTile);
 END_TILING_DATA_DEF;
 
-REGISTER_TILING_DATA_CLASS(HardtanhCustom, HardtanhCustomTilingData)
+REGISTER_TILING_DATA_CLASS(GeluCustom, GeluCustomTilingData)
 }  // namespace optiling
 """
 
 host_operator_src="""
 
-#include "hardtanh_custom_tiling.h"
+#include "gelu_custom_tiling.h"
 #include "register/op_def_registry.h"
 
 namespace optiling {
 
 // UB model for this kernel:
-//   inQueueX: 2 * tile
-//   outQueueY: 2 * tile
-//   tmpQueue: 1 * tile
-// Total floats = 5 * tile => bytes = 20 * tile
+//   inQueueX:    2 * tileLen * typeSize
+//   outQueueY:   2 * tileLen * typeSize
+//   tmpFloat:    1 * tileLen * typeSize
+//   tmpErfU8:    1 * (tileLen * typeSize * maxLiveNodeCount + extraBuf)
+// Total bytes = (5 + maxLiveNodeCount) * tileLen * typeSize + extraBuf
 static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
-static constexpr uint32_t ALIGN_ELEMS = 2048;            // favor larger DMA bursts
-static constexpr uint32_t HARD_CAP_ELEMS = 32768;        // avoid too-large per-iter latency
+static constexpr uint32_t ALIGN_ELEMS = 2048;            // prefer aligned DMA
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;        // avoid long per-iter latency
 
 static inline uint32_t AlignDown(uint32_t x, uint32_t a)
 {
-    return (x / a) * a;
+    return (a == 0u) ? x : (x / a) * a;
 }
 
 static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
 {
-    return (a + b - 1u) / b;
+    return (b == 0u) ? 0u : (a + b - 1u) / b;
 }
 
 static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
-    HardtanhCustomTilingData tiling;
+    GeluCustomTilingData tiling;
     const uint32_t totalLength =
         static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
 
-    const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    const float *minVal = attrs->GetAttrPointer<float>(0);
-    const float *maxVal = attrs->GetAttrPointer<float>(1);
+    // Erf tmp buffer factor: size = tileLen * typeSize * maxLiveNodeCount + extraBuf
+    // type is float32 => typeSize = 4
+    uint32_t maxLiveNodeCount = 0;
+    uint32_t extraBuf = 0;
+    AscendC::GetErfTmpBufferFactorSize(4, maxLiveNodeCount, extraBuf);
 
-    // tileLen from UB budget: bytes = 20 * tileLen
-    uint32_t maxTile = UB_BUDGET_BYTES / 20;  // elements
-    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
-    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
-    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+    // Solve for tileLen within UB budget
+    uint64_t usable = (UB_BUDGET_BYTES > extraBuf) ? (UB_BUDGET_BYTES - extraBuf) : 0u;
+    uint64_t denom = static_cast<uint64_t>(4u) * static_cast<uint64_t>(5u + maxLiveNodeCount);
+    uint32_t maxTile = (denom == 0 || usable == 0) ? ALIGN_ELEMS
+                                                   : static_cast<uint32_t>(usable / denom);
+
+    if (maxTile == 0u) maxTile = 1u;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = HARD_CAP_ELEMS;
+    // Prefer alignment when possible
+    if (maxTile >= ALIGN_ELEMS) {
+        maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    }
 
     uint32_t tileLen = maxTile;
     if (totalLength < tileLen) {
-        const uint32_t aligned = AlignDown(totalLength, ALIGN_ELEMS);
+        const uint32_t aligned = AlignDown(totalLength, (tileLen >= ALIGN_ELEMS) ? ALIGN_ELEMS : 1u);
         tileLen = (aligned > 0) ? aligned : totalLength;
     }
+    if (tileLen == 0) tileLen = 1;
 
-    // Adaptive blockDim based on number of tiles; keep conservative for stability.
+    // Compute tmpErfBytesPerTile from chosen tileLen
+    uint64_t tmpErfBytes = static_cast<uint64_t>(tileLen) * 4u * maxLiveNodeCount + extraBuf;
+    if (tmpErfBytes > UB_BUDGET_BYTES) {
+        // Fallback: shrink tileLen to fit within UB (safety guard)
+        uint64_t fitUsable = (UB_BUDGET_BYTES > extraBuf) ? (UB_BUDGET_BYTES - extraBuf) : 0u;
+        uint64_t fitTile = (denom == 0 || fitUsable == 0) ? 1u : (fitUsable / denom);
+        if (fitTile == 0) fitTile = 1;
+        tileLen = static_cast<uint32_t>(fitTile);
+        if (tileLen >= ALIGN_ELEMS) tileLen = AlignDown(tileLen, ALIGN_ELEMS);
+        tmpErfBytes = static_cast<uint64_t>(tileLen) * 4u * maxLiveNodeCount + extraBuf;
+    }
+
+    // Block dim selection
     const uint32_t numTiles = (tileLen == 0) ? 1u : CeilDiv(totalLength, tileLen);
     uint32_t blockDim = numTiles;
     if (blockDim < 8u) blockDim = 8u;
     if (blockDim > 24u) blockDim = 24u;
-
     context->SetBlockDim(blockDim);
 
     tiling.set_totalLength(totalLength);
     tiling.set_tileLength(tileLen);
     tiling.set_blockDim(blockDim);
-    tiling.set_minVal(*minVal);
-    tiling.set_maxVal(*maxVal);
+    tiling.set_tmpErfBytesPerTile(static_cast<uint32_t>(tmpErfBytes));
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
@@ -145,9 +152,9 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 } // namespace ge
 
 namespace ops {
-class HardtanhCustom : public OpDef {
+class GeluCustom : public OpDef {
 public:
-    explicit HardtanhCustom(const char* name) : OpDef(name)
+    explicit GeluCustom(const char* name) : OpDef(name)
     {
         this->Input("x")
             .ParamType(REQUIRED)
@@ -161,9 +168,6 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        this->Attr("min_val").AttrType(OPTIONAL).Float(-1.0);
-        this->Attr("max_val").AttrType(OPTIONAL).Float(1.0);
-
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
         this->AICore().SetTiling(optiling::TilingFunc);
@@ -171,7 +175,7 @@ public:
     }
 };
 
-OP_ADD(HardtanhCustom);
+OP_ADD(GeluCustom);
 } // namespace ops
 """
 
@@ -180,26 +184,27 @@ kernel_src="""
 #include "kernel_operator.h"
 
 constexpr int32_t BUFFER_NUM = 2;
+constexpr float INV_SQRT2 = 0.7071067811865475244008443621048490f;  // 1/sqrt(2)
 
-class KernelHardtanhCustom {
+class KernelGeluCustom {
 public:
-    __aicore__ inline KernelHardtanhCustom() {}
+    __aicore__ inline KernelGeluCustom() {}
 
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
                                 uint32_t totalLength, uint32_t tileLength,
-                                float minVal, float maxVal)
+                                uint32_t tmpErfBytesPerTile)
     {
         totalLen_ = totalLength;
         tileLen_ = tileLength;
-        minVal_ = minVal;
-        maxVal_ = maxVal;
+        tmpErfBytesPerTile_ = tmpErfBytesPerTile;
 
         xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
         yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
 
         pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
         pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
-        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpFloatQueue_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpErfU8Queue_, 1, tmpErfBytesPerTile_);
     }
 
     __aicore__ inline void Process()
@@ -209,18 +214,15 @@ public:
         const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
         const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
 
-        // Tile-granularity grid-stride to improve load balance and occupancy.
         const uint32_t strideElems = blockNum * tileLen_;
         uint32_t base = blockIdx * tileLen_;
         if (base >= totalLen_) return;
 
-        // Prefetch first tile
         uint32_t curLen = totalLen_ - base;
         if (curLen > tileLen_) curLen = tileLen_;
         CopyIn(base, curLen);
 
         while (true) {
-            // Prefetch next tile early for overlap
             const uint32_t nextBase = base + strideElems;
             uint32_t nextLen = 0;
             if (nextBase < totalLen_) {
@@ -250,13 +252,24 @@ private:
     {
         AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
-        AscendC::LocalTensor<float> tLocal = tmpQueue_.AllocTensor<float>();
+        AscendC::LocalTensor<float> tFloat = tmpFloatQueue_.AllocTensor<float>();
+        AscendC::LocalTensor<uint8_t> tmpBuf = tmpErfU8Queue_.AllocTensor<uint8_t>(tmpErfBytesPerTile_);
 
-        // HardTanh: y = max(min(x, maxVal), minVal)
-        AscendC::Mins(tLocal, xLocal, maxVal_, len);
-        AscendC::Maxs(yLocal, tLocal, minVal_, len);
+        // tFloat = x / sqrt(2)
+        AscendC::Muls(tFloat, xLocal, INV_SQRT2, len);
 
-        tmpQueue_.FreeTensor(tLocal);
+        // tFloat = erf(tFloat), using shared tmp buffer
+        AscendC::Erf(tFloat, tFloat, tmpBuf, len);
+
+        // tFloat = 0.5 * (1 + tFloat)
+        AscendC::Adds(tFloat, tFloat, 1.0f, len);
+        AscendC::Muls(tFloat, tFloat, 0.5f, len);
+
+        // y = x * tFloat
+        AscendC::Mul(yLocal, xLocal, tFloat, len);
+
+        tmpErfU8Queue_.FreeTensor(tmpBuf);
+        tmpFloatQueue_.FreeTensor(tFloat);
         outQueueY_.EnQue<float>(yLocal);
         inQueueX_.FreeTensor(xLocal);
     }
@@ -272,22 +285,22 @@ private:
     AscendC::TPipe pipe_;
     AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpFloatQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpErfU8Queue_;
 
     AscendC::GlobalTensor<float> xGm_;
     AscendC::GlobalTensor<float> yGm_;
 
     uint32_t totalLen_ {0};
     uint32_t tileLen_ {0};
-    float minVal_ {-1.0f};
-    float maxVal_ {1.0f};
+    uint32_t tmpErfBytesPerTile_ {0};
 };
 
-extern "C" __global__ __aicore__ void hardtanh_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelHardtanhCustom op;
-    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength, tiling_data.minVal, tiling_data.maxVal);
+    KernelGeluCustom op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength, tiling_data.tmpErfBytesPerTile);
     op.Process();
 }
 """
@@ -298,20 +311,18 @@ python_bind_src="""
 #include <torch/extension.h>
 #include "pytorch_npu_helper.hpp"
 
-at::Tensor hardtanh_impl_npu(const at::Tensor& self) {
+at::Tensor gelu_impl_npu(const at::Tensor& self) {
     at::Tensor result = at::empty_like(self);
-    const double min_val = -1.0;
-    const double max_val = 1.0;
-    EXEC_NPU_CMD(aclnnHardtanhCustom, self, min_val, max_val, result);
+    EXEC_NPU_CMD(aclnnGeluCustom, self, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("hardtanh_custom", &hardtanh_impl_npu);
+    m.impl("gelu_custom", &gelu_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("hardtanh_custom", &hardtanh_impl_npu, "HardTanh activation (HardtanhCustom on NPU)");
+    m.def("gelu_custom", &gelu_impl_npu, "GELU activation (GeluCustom on NPU)");
 }
 """
 
@@ -320,7 +331,7 @@ import torch
 import torch_npu
 import custom_ops_lib
 
-_FN = 'hardtanh_custom'
+_FN = 'gelu_custom'
 
 class ModelNew(torch.nn.Module):
     def __init__(self, *init_inputs):

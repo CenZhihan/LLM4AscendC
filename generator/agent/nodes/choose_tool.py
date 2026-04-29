@@ -72,9 +72,30 @@ def _extract_user_question(state: GeneratorAgentState) -> str:
     user_msgs = [m for m in state["messages"] if isinstance(m, HumanMessage)]
     base = user_msgs[0].content if user_msgs else state["messages"][-1].content
     ref_block = _load_pytorch_reference_block(state)
-    if not ref_block:
+    if ref_block:
+        base = f"{base}\n\n{ref_block}"
+
+    attempt_id = int(state.get("attempt_id") or 1)
+    if attempt_id <= 1:
         return base
-    return f"{base}\n\n{ref_block}"
+
+    repair_logs = (state.get("repair_error_logs_raw") or "").strip()
+    previous_code = (state.get("previous_attempt_code") or "").strip()
+    sections: List[str] = [base, f"Current attempt: {attempt_id} (repair mode)."]
+    if repair_logs:
+        sections.append(
+            "Previous attempt error logs (raw text):\n"
+            f"{repair_logs}"
+        )
+    if previous_code:
+        preview = previous_code[:1200]
+        if len(previous_code) > 1200:
+            preview += "\n...(truncated preview)..."
+        sections.append(
+            "Previous attempt generated code preview (for routing context only):\n"
+            f"{preview}"
+        )
+    return "\n\n".join(sections)
 
 
 def _load_pytorch_reference_block(state: GeneratorAgentState) -> str:
