@@ -119,6 +119,9 @@ class GeneratorAgentState(MessagesState):
     language: NotRequired[str]               # Target language (e.g., "ascendc")
     strategy_name: NotRequired[str]          # Prompt strategy name (e.g., "add_shot")
     base_prompt: NotRequired[str]            # Base prompt from prompt_generators
+    attempt_id: NotRequired[int]             # Attempt index, e.g., 1 or 2
+    repair_error_logs_raw: NotRequired[str]  # Raw error context for repair attempt
+    previous_attempt_code: NotRequired[str]  # Full previous attempt code for repair attempt
 
 
 def create_initial_state(
@@ -127,6 +130,9 @@ def create_initial_state(
     category: str,
     language: str = "ascendc",
     strategy_name: str = "add_shot",
+    attempt_id: int = 1,
+    repair_error_logs_raw: str = "",
+    previous_attempt_code: str = "",
 ) -> Dict[str, Any]:
     """
     Create initial state for agent invocation.
@@ -150,6 +156,9 @@ def create_initial_state(
         "language": language,
         "strategy_name": strategy_name,
         "base_prompt": base_prompt,
+        "attempt_id": attempt_id,
+        "repair_error_logs_raw": repair_error_logs_raw,
+        "previous_attempt_code": previous_attempt_code,
         "kb_results": [],
         "web_results": [],
         "code_rag_results": [],

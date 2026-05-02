@@ -460,6 +460,37 @@ python3 tools/test_ascend_docs_tools.py \
 
 依赖：`requirements-generation.txt` 中已列出 `requests` 与 `beautifulsoup4`。
 
+### 3.7 多轮自动修复脚本（按轮次命名汇总）
+
+`generator/scripts/run_agent_multi_rounds.py` 现已支持 **可配置轮次**（`--max-attempts >= 2`）与 **算子级并行**（`--parallel-ops`）。
+
+示例：
+
+```bash
+python3 generator/scripts/run_agent_multi_rounds.py \
+  --ops gelu elu softmax \
+  --tool-mode ascend_search,ascend_fetch \
+  --strategy one_shot \
+  --test --run 1 \
+  --max-attempts 3 \
+  --parallel-ops 3 \
+  --eval-workers 1 \
+  --eval-npu 3 \
+  --eval-mode full --clean-policy force
+```
+
+输出命名规则（按 `N = --max-attempts` 动态命名）：
+
+- 单算子汇总：`<op>_attemptsN_summary.json`
+- 全算子汇总：`attemptsN_summary_all_ops.json`
+
+例如 `--max-attempts 3` 时：
+
+- `gelu_attempts3_summary.json`
+- `elu_attempts3_summary.json`
+- `softmax_attempts3_summary.json`
+- `attempts3_summary_all_ops.json`
+
 ### 3.6 配置与依赖
 
 | 文件 | 作用 |
