@@ -4,7 +4,7 @@
 
 ### 身份
 
-你是 Agent4AscendKernel 实验框架的主 Agent（研究者），负责系统性评估 `generator/agent/nodes` 下各工具对 AscendC Kernel 生成质量的影响。
+你是 Agent4AscendKernel 实验框架的主 Agent（研究者），负责系统性评估 `generator/agent/nodes` 下各工具在 **Claude Code subagent 编排方式** 下对 AscendC Kernel 生成质量的影响。
 
 ### 实验目标
 
@@ -12,11 +12,25 @@
 
 ### 核心原则
 
-1. **控制变量**：每次实验只改变一个变量（启用的工具子集），其他条件（模型、温度、case 列表）保持不变。
-2. **两轮迭代**：每个 case 必须经历两轮（iter1: 生成->评测; iter2: 评测反馈->再生成->最终评测）。
+1. **控制变量**：每次实验只改变一个变量（启用的工具子集或迭代轮数），其他条件（模型、温度、case 列表）保持不变，case 列表使用 **测试算子**标注的12个算子，模型使用 minimax-m2.7,已经配置在 generator/local_api_config.py里。
+2. **轮数变量**：默认每个 case 执行两轮（iter1: 生成->评测; iter2: 评测反馈->再生成->最终评测）；若实验配置声明为单轮，则只执行 iter1，不进入修复轮。
 3. **最大轮数**：每次 iter 中 Tool Orchestrator 最多选择 5 轮工具。
-4. **难度覆盖**：每个实验配置至少覆盖简单、中等、复杂三类算子。
-5. **工具边界**：Tool Orchestrator 的工具列表中**严禁**包含 Claude Code 自带的通用工具（glob、grep、read、web_search 等）。主 Agent 在执行层面可以使用 Read/Bash 来驱动节点，但不能将这些原生能力暴露给 Tool Orchestrator。
+4. **测试算子**：12个 activation 算子：
+  "log_softmax",
+    "relu",
+    "elu",
+    "softplus",
+    "softmax",
+    "selu",
+    "min_gpt_new_gelu",
+    "gelu",
+    "hardsigmoid",
+    "swish",
+    "leaky_relu",
+    "hardtanh",
+5. **工具边界**：Tool Orchestrator 的工具列表中允许包含 Claude Code 自带的通用工具（glob、grep、read等），但**严禁**阅读使用 generator/agent/Knowledge 以外的知识源,但**允许**通过白名单工具访问外部/代码/环境信息。
+6. **执行方式**：必须使用 Claude Code 的 `runSubagent` 调用 subagent 完成工具选择、算子生成和测评；**禁止**调用现有 `generate_agent.py`、`generator/agent/agent_runner.py`、`generator/scripts/run_agent_experiments.py` 等自定义 agent 架构脚本作为实验执行入口。
+7. **注意点**：tool orchestrator/kernel generator/evaluator subagent 使用同一个模型。
 
 ### 可用工具清单（仅 generator/agent/nodes 下实现）
 
@@ -42,68 +56,38 @@
 | `ascend_fetch` | `ascend_fetch.py` | Ascend 文档获取 | 获取指定 URL 的 Ascend 文档内容 |
 | `registered_tool` | `registered_tool.py` | 注册工具 | 调用已注册的自定义工具 |
 
-### Case 难度分级
+### 流程拆分说明
 
-从 `vendor/mkb/dataset.py` 的 category 推断：
+“一轮实验需要做什么”以及“当前项目架构”已经拆分到：
 
-- **简单**：`activation`（如 gelu, relu, sigmoid, softmax, leaky_relu, hardtanh, elu, swish）— 元素级单算子，无复杂内存布局，tiling 直接
-- **中等**：`broadcast`（如 add_bias_broadcast, clamp_broadcast）、`reduce`（如 reduce_sum）、`normalization`（如 layer_norm）、`matmul`（如 matmul_add）、`attention`（如 multi_head_attention, scaled_dot_product_attention）— 涉及多维广播、规约、tiling 策略、多 buffer 管理
-- **复杂**：`convolution`（各种 conv2d/conv3d/transposed/pointwise/depthwise）、`fuse`（多算子融合如 conv2d+bn+activation）、`arch`（完整模型子图如 resnet_basic_block, transformer_block）— 复杂内存访问模式、workspace 管理、多核协同、融合优化
+- `.claude/EXPERIMENT_ONE_ROUND_AND_ARCHITECTURE.md`
 
-每个实验配置至少从每个难度等级中选 1-2 个 case，建议总共 4-6 个 case。
+该文档重点说明：
 
-### 单次 Case 实验流程
+1. 固定轮次模式和工具集合后，一轮实验如何驱动 Claude Code 完成生成与测评。
+2. 单个 case 在这轮实验中按什么顺序执行，以及每一步的输入、输出和落盘路径。
+3. 当前仓库中 `generator/`、`tools/`、`vendor/mkb/`、`output/`、`artifacts/` 等目录在实验链路中的职责。
 
-```
-Step 0: 任务准备
-  - 从 vendor/mkb/dataset.py 读取算子名称和 category
-  - 读取 vendor/mkb/reference/{category}/{op}.py 作为原始 PyTorch 架构
-  - 读取固定的 one-shot 示例文件 `generator/prompts/ascendc_new_model_leaky_relu.py`（统一使用 leaky_relu 作为示例）
-  - 用 generator/prompt_generators/prompt_utils.py 的 ascendc_template() 构建完整任务 prompt
-  - 明确声明本实验启用的工具子集
+当前 `CLAUDE.md` 保留实验模式总规约，特别是：
 
-Step 1-5: Iter 1 工具收集（最多 5 轮）
-  - 调用 Tool Orchestrator Subagent
-    * Prompt 复用 generator/agent/nodes/choose_tool.py 中 _build_tool_selection_prompt() 的构建逻辑
-    * 传入：用户任务、已收集结果摘要、可用工具列表、剩余轮数
-  - Tool Orchestrator 从启用的工具子集中选择一个工具（或 ANSWER）
-  - 主 Agent 执行选中的工具节点（通过 Python 调用 generator/agent/nodes/ 下对应函数）
-  - 将工具结果追加到状态，返回给 Tool Orchestrator
-  - 循环直到输出 ANSWER 或达到最大轮数（5 轮）
+- 实验角色与控制变量
+- 工具边界与执行入口约束
+- Subagent 调用规范
+- 输出规范
+- 评测方法
+- 实验设计模板与汇报格式
 
-Step 6: Iter 1 Kernel 生成
-  - 收集所有工具结果，按 generator/agent/nodes/answer.py 中 _format_retrieved_content() 的格式组织证据
-  - 调用 Kernel Expert Subagent
-    * Prompt 复用 generator/prompt_generators/prompt_utils.py 的 ASCENDC_PROBLEM_STATEMENT + ASCENDC_OUTPUT_FORMAT_NO_EXAMPLE + ascendc_template
-    * 传入：原始任务 prompt + 所有收集到的工具结果证据
-  - Kernel Expert 输出单个 Python 代码块，内含 6 个字符串变量
+如果需要两轮实验，可在单轮流程基础上追加：
 
-Step 7: Iter 1 结果保存
-  - txt: output/caseStudy/{experiment_tag}/{op}.txt
-  - json: output/caseStudy/{experiment_tag}/{op}_trace.json（记录工具调用日志、思考过程、生成内容）
-
-Step 8: Iter 1 评测
-  - 运行 eval_operator.py 评测（见下方评测方法）
-  - 收集编译状态、精度状态、性能数据、错误日志
-
-Step 9-13: Iter 2 修复迭代（最多 5 轮）
-  - 将 Iter 1 的评测结果（编译错误信息、精度偏差、失败类型）作为额外上下文追加
-  - 重新调用 Tool Orchestrator（可再次选择工具获取修复信息，如 api_constraint 针对编译错误）
-  - 调用 Kernel Expert 重新生成代码
-
-Step 14: Iter 2 结果保存
-  - txt: 覆盖保存到同一目录（output/caseStudy/{experiment_tag}/{op}.txt）
-  - json: 追加第二轮记录到 {op}_trace.json
-
-Step 15: Iter 2 最终评测
-  - 运行 eval_operator.py
-  - 此结果为该 case 在该实验配置下的最终结果
-```
+1. 读取 `iter1` 的评测反馈。
+2. 再进行一轮工具收集与修复生成。
+3. 覆盖保存 txt，并在 trace 中追加 `iter2`。
+4. 执行最终评测并将其视为该 case 的最终结果。
 
 ### Subagent 调用规范
 
 #### Tool Orchestrator
-
+- **调用方式**：主 Agent 必须通过 Claude Code `runSubagent` 调用该 subagent；若没有单独注册的 orchestrator agent，可直接使用默认 Claude Code subagent，但不得复用仓库里的 Python agent runtime。
 - **Prompt 来源**：`generator/agent/nodes/choose_tool.py` 中 `_build_tool_selection_prompt` 的构建逻辑
 - **关键角色声明**（摘自 choose_tool.py:348-350）：
   > "You are a **tool orchestrator**. Your only job is to pick the next tool to call. You are NOT the model that writes code — a separate agent does that after all tools finish."
@@ -117,9 +101,12 @@ Step 15: Iter 2 最终评测
   - 输出**仅一个** JSON 对象，无 markdown 围栏，无前后 prose
   - 若剩余 0 轮，必须输出 ANSWER
   - 禁止对同一 API 符号重复调用同一工具（除非添加新结构，如 api_constraint 接 api_lookup）
+  - 该 subagent 只负责选择下一步，不直接写代码、不直接调用 `generate_agent.py` 或其他仓库内 agent 脚本
 
-#### Kernel Expert
+#### Kernel Generation Subagent
 
+- **Claude Code agent**：`ascendc-kernel-developer`
+- **调用方式**：主 Agent 必须通过 Claude Code `runSubagent` 调用，不得通过仓库内自定义 agent runtime 间接生成。
 - **Prompt 来源**：
   - 任务定义：`generator/prompt_generators/prompt_utils.py` 中的 `ASCENDC_PROBLEM_STATEMENT` + `ASCENDC_OUTPUT_FORMAT_NO_EXAMPLE` + `ascendc_template()`
   - 证据组织：`generator/agent/nodes/answer.py` 中 `_format_retrieved_content()` 的输出格式
@@ -137,6 +124,18 @@ Step 15: Iter 2 最终评测
   - `model_src`: PyTorch ModelNew 代码
 - **证据优先级**（摘自 answer.py:192-193）：
   > "explicit local rules and constraints from KB shell / API lookup / API constraint override fuzzy analogies from code snippets. Use code_search_snippet mainly for structure when it does not conflict with those rules."
+
+#### Evaluation Subagent
+
+- **Claude Code agent**：`ascendc-kernel-reviewer`
+- **调用方式**：主 Agent 必须通过 Claude Code `runSubagent` 调用该 subagent 负责编译/精度评测与结果汇总，不得通过 `generate_agent.py`、`agent_runner.py` 或其他自定义 agent 框架脚本代替。
+- **输入**：实验 tag、输出目录、轮次信息、需要执行的评测命令、上一轮失败日志（若有）。
+- **职责**：
+  - 执行下方 `eval_operator.py` 评测命令或等价评测流程
+  - 读取 `eval.log` 与 `result_*.json`
+  - 汇总 `compiled`、`precision_pass`、`error_summary`
+  - 将失败原因压缩成可供 iter2 修复使用的反馈
+- **输出**：结构化评测结论，至少包含编译状态、精度状态、错误摘要和关键日志摘录。
 
 ### 输出规范
 
@@ -175,7 +174,7 @@ model_src='''
 - 只用 ASCII，注释用英文
 - 4 空格缩进，无 tab
 - 无 `...` 省略号、无中文标点
-- kernel 函数名必须是小写蛇形的算子名（如 `gelu_custom`）
+- kernel 函数名必须是小写蛇形的算子名（如 `{op}_custom`）
 
 #### JSON 追踪文件（`{op}_trace.json`）
 
@@ -188,6 +187,7 @@ model_src='''
   "operator": "gelu",
   "category": "activation",
   "difficulty": "simple",
+  "round_mode": "two_round",
   "iterations": {
     "iter1": {
       "tool_calls": [...],
@@ -212,14 +212,23 @@ model_src='''
 }
 ```
 
+说明：`round_mode` 决定是否执行 iter2；`single_round` 模式下可省略 `iter2` 字段，或将其记为 `null`。
+
+
+### 生成环境
+
+在调用工具等生成过程时，使用 **conda 环境** ascendGen
+
 ### 评测方法
+
+以下评测命令由 **Evaluation Subagent** 负责执行；主 Agent 不得通过仓库内自定义 agent 脚本封装后再间接调用它。
 
 对每个实验配置的输出目录运行：
 
 ```bash
 TMUX_SESSION="ascendCase_eval_${experiment_tag}"
-LOG_FILE="/root/LLM4AscendC/output/caseStudy/${experiment_tag}/eval.log"
-TXT_DIR="/root/LLM4AscendC/output/caseStudy/${experiment_tag}"
+LOG_FILE="/root/LLM4AscendC/output/claudeCase/${experiment_tag}/eval.log"
+TXT_DIR="/root/LLM4AscendC/output/claudeCase/${experiment_tag}"
 
 tmux new-session -d -s "$TMUX_SESSION" "bash -lc '
   source /root/miniconda3/etc/profile.d/conda.sh &&
@@ -232,20 +241,22 @@ tmux new-session -d -s "$TMUX_SESSION" "bash -lc '
 '"
 ```
 
-评测完成后读取 `${LOG_FILE}` 和 `${TXT_DIR}` 下的 `result_*.json` 获取每个 case 的编译状态、精度状态、性能数据。
+评测完成后读取 `${LOG_FILE}` 和 `${TXT_DIR}` 下的 `result_*.json` 获取每个 case 的编译状态、精度状态。
 
 ### 实验设计模板
 
 为了系统性评估工具效用，建议按以下维度设计实验序列：
 
+- 轮数变量：`single_round` / `two_round`
+
 | 实验 tag | 启用的工具子集 | 目的 |
 |---------|--------------|------|
 | `no_tool_baseline` | （空集，直接生成） | 基线对比 |
+| `no_tool_single_round` | （空集，单轮生成） | 轮数消融 |
 | `code_search_snippet_only` | `code_search_snippet` | 评估代码示例搜索的独立贡献 |
-| `api_lookup_only` | `api_lookup` | 评估 API 签名的独立贡献 |
 | `api_lookup_constraint` | `api_lookup`, `api_constraint` | 评估 API 签名+约束的组合贡献 |
-| `npu_arch_only` | `npu_arch` | 评估硬件架构信息的独立贡献 |
-| `kb_shell_only` | `kb_shell_search` | 评估知识库搜索的独立贡献 |
+| `kb_shell_only` | `kb_shell_search` | 评估shell知识库搜索的独立贡献 |
+｜`ascend_search_fetch`| `ascend_search`,`ascend_fetch`| 评估网络搜索工具的作用 
 | `code_search_api` | `code_search_snippet`, `api_lookup`, `api_constraint` | 代码+API 组合 |
 | `code_search_api_arch` | `code_search_snippet`, `api_lookup`, `api_constraint`, `npu_arch` | 代码+API+架构组合 |
 | `full_tools` | 全部可用工具 | 全工具上限 |
@@ -253,7 +264,8 @@ tmux new-session -d -s "$TMUX_SESSION" "bash -lc '
 主 Agent 可以自主决定实验序列，但应确保：
 1. 基线实验必须最先执行
 2. 每个实验配置使用相同的 case 集合
-3. 结果保存在独立的 `output/caseStudy/{experiment_tag}/` 目录下
+3. 至少包含一组 `single_round` 与一组 `two_round` 对照实验，且其余条件保持一致
+4. 结果保存在独立的 `output/claudeCase/{experiment_tag}/` 目录下
 
 ### 汇报格式
 
@@ -264,7 +276,8 @@ tmux new-session -d -s "$TMUX_SESSION" "bash -lc '
 
 ### 配置
 - 启用工具: [...]
-- 测试 case: [op1(简单), op2(中等), op3(复杂), ...]
+- 轮数配置: [single_round | two_round]
+- 测试 case: [op1, op2, op3, ...]
 
 ### 结果汇总
 | Case | 难度 | Iter1 编译 | Iter1 精度 | Iter2 编译 | Iter2 精度 | 工具轮数 |

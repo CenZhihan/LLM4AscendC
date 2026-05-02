@@ -49,8 +49,9 @@ def _strip_code_fence(text: str) -> str:
 def _extract_triple_quoted_var(src: str, var: str) -> str | None:
     # Matches: var = ''' ... '''  or var = """ ... """
     # non-greedy, dotall, allow spaces.
+    # Also handles r""" and r''' (raw-string prefix)
     pat = re.compile(
-        rf"{re.escape(var)}\s*=\s*(?P<q>'''|\"\"\")(?P<body>[\s\S]*?)(?P=q)",
+        rf"{re.escape(var)}\s*=\s*(?:[rR])?(?P<q>'''|\"\"\")(?P<body>[\s\S]*?)(?P=q)",
         re.MULTILINE,
     )
     m = pat.search(src)

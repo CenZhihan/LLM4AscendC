@@ -1,0 +1,320 @@
+project_json_src = '''
+[
+  {
+    "op": "SoftmaxCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": []
+  }
+]
+'''
+
+host_tiling_src = """
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(SoftmaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalRows);
+  TILING_DATA_FIELD_DEF(uint32_t, colLen);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLen);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(SoftmaxCustom, SoftmaxCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src = """
+#include "softmax_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  
+static constexpr uint32_t ALIGN_ELEMS = 2048;            
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;        
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    SoftmaxCustomTilingData tiling;
+    const gert::Shape *inShape = context->GetInputShape(0);
+    const auto &origin = inShape->GetOriginShape();
+    uint32_t totalRows = static_cast<uint32_t>(origin.GetDim(0));
+    uint32_t colLen   = static_cast<uint32_t>(origin.GetDim(1));
+
+    // UB budget: 2 tiles (in/out) each of tileLen floats -> 8 * tileLen bytes
+    uint32_t maxTile = UB_BUDGET_BYTES / 8; 
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t tileLen = maxTile;
+    if (colLen < tileLen) {
+        uint32_t aligned = AlignDown(colLen, ALIGN_ELEMS);
+        tileLen = (aligned > 0) ? aligned : colLen;
+    }
+
+    uint32_t blockDim = totalRows;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_totalRows(totalRows);
+    tiling.set_colLen(colLen);
+    tiling.set_tileLen(tileLen);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class SoftmaxCustom : public OpDef {
+public:
+    explicit SoftmaxCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(SoftmaxCustom);
+} // namespace ops
+"""
+
+kernel_src = """
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelSoftmaxCustom {
+public:
+    __aicore__ inline KernelSoftmaxCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalRows, uint32_t colLen,
+                                uint32_t tileLen, uint32_t blockDim)
+    {
+        totalRows_ = totalRows;
+        colLen_ = colLen;
+        tileLen_ = tileLen;
+        blockDim_ = blockDim;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalRows_ * colLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalRows_ * colLen_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(redQueue_, 1, sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalRows_ == 0 || colLen_ == 0 || tileLen_ == 0) return;
+
+        uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        uint32_t rowsPerBlock = (totalRows_ + blockDim_ - 1) / blockDim_;
+        uint32_t startRow = blockIdx * rowsPerBlock;
+        if (startRow >= totalRows_) return;
+        uint32_t endRow = startRow + rowsPerBlock;
+        if (endRow > totalRows_) endRow = totalRows_;
+
+        for (uint32_t r = startRow; r < endRow; ++r) {
+            ProcessRow(r);
+        }
+    }
+
+private:
+    __aicore__ inline void ProcessRow(uint32_t rowIdx)
+    {
+        // local tensors for row max and row sum (size 1)
+        AscendC::LocalTensor<float> rowMax = redQueue_.AllocTensor<float>();
+        AscendC::LocalTensor<float> rowSum = redQueue_.AllocTensor<float>();
+
+        // --- First pass: compute max of the row ---
+        AscendC::Dup(rowMax, -FLT_MAX, 1);
+        uint32_t offset = rowIdx * colLen_;
+        uint32_t remaining = colLen_;
+        while (remaining > 0) {
+            uint32_t curLen = (remaining > tileLen_) ? tileLen_ : remaining;
+            AscendC::LocalTensor<float> xTile = inQueueX_.AllocTensor<float>();
+            AscendC::DataCopy(xTile, xGm_[offset], curLen);
+            inQueueX_.EnQue(xTile);
+
+            xTile = inQueueX_.DeQue<float>();
+            AscendC::LocalTensor<float> tmpMax = tmpQueue_.AllocTensor<float>();  // size 1
+            AscendC::ReduceMax(tmpMax, xTile, curLen);
+            AscendC::Max(rowMax, rowMax, tmpMax, 1);  // elementwise max on size 1
+            tmpQueue_.FreeTensor(tmpMax);
+            inQueueX_.FreeTensor(xTile);
+
+            offset += curLen;
+            remaining -= curLen;
+        }
+
+        // --- Second pass: compute exp(x - max) and accumulate sum ---
+        AscendC::Dup(rowSum, 0.0f, 1);
+        offset = rowIdx * colLen_;
+        remaining = colLen_;
+        while (remaining > 0) {
+            uint32_t curLen = (remaining > tileLen_) ? tileLen_ : remaining;
+            AscendC::LocalTensor<float> xTile = inQueueX_.AllocTensor<float>();
+            AscendC::DataCopy(xTile, xGm_[offset], curLen);
+            inQueueX_.EnQue(xTile);
+
+            xTile = inQueueX_.DeQue<float>();
+            AscendC::LocalTensor<float> yTile = outQueueY_.AllocTensor<float>();
+            // y = x - rowMax (broadcast)
+            AscendC::Sub(yTile, xTile, rowMax, curLen);  // rowMax is 1-element, auto-broadcast
+            AscendC::Exp(yTile, yTile, curLen);           // exp(y)
+            // accumulate sum
+            AscendC::LocalTensor<float> tmpSum = tmpQueue_.AllocTensor<float>();  // size 1
+            AscendC::ReduceSum(tmpSum, yTile, curLen);
+            AscendC::Add(rowSum, rowSum, tmpSum, 1);
+            tmpQueue_.FreeTensor(tmpSum);
+            // enqueue yTile for output
+            outQueueY_.EnQue<float>(yTile);
+            inQueueX_.FreeTensor(xTile);
+
+            offset += curLen;
+            remaining -= curLen;
+        }
+
+        // --- Third pass: normalize each output tile by rowSum ---
+        offset = rowIdx * colLen_;
+        remaining = colLen_;
+        while (remaining > 0) {
+            uint32_t curLen = (remaining > tileLen_) ? tileLen_ : remaining;
+            AscendC::LocalTensor<float> yTile = outQueueY_.DeQue<float>();
+            AscendC::Div(yTile, yTile, rowSum, curLen);  // broadcast rowSum
+            AscendC::DataCopy(yGm_[offset], yTile, curLen);
+            outQueueY_.FreeTensor(yTile);
+            offset += curLen;
+            remaining -= curLen;
+        }
+
+        redQueue_.FreeTensor(rowMax);
+        redQueue_.FreeTensor(rowSum);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> redQueue_;  // for 1-element tensors
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalRows_ {0};
+    uint32_t colLen_ {0};
+    uint32_t tileLen_ {0};
+    uint32_t blockDim_ {0};
+};
+
+extern "C" __global__ __aicore__ void softmax_custom(GM_ADDR x, GM_ADDR y,
+                                                      GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelSoftmaxCustom op;
+    op.Init(x, y,
+            tiling_data.totalRows, tiling_data.colLen,
+            tiling_data.tileLen, tiling_data.blockDim);
+    op.Process();
+}
+"""
+
+python_bind_src = """
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor softmax_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnSoftmaxCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("softmax_custom", &softmax_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("softmax_custom", &softmax_impl_npu, "Softmax activation (SoftmaxCustom on NPU)");
+}
+"""
+
+model_src = '''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'softmax_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''

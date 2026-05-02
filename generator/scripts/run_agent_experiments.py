@@ -21,10 +21,18 @@ from generator.agent.agent_runner import KernelGenerationTask, generate_kernel_w
 
 
 CASE_STUDY_OPS = [
+    "log_softmax",
+    "relu",
+    "elu",
+    "softplus",
+    "softmax",
+    "selu",
+    "min_gpt_new_gelu",
     "gelu",
-    "conv_pointwise_2d",
-    "gemm_add_relu",
-    "max_pooling_1d",
+    "hardsigmoid",
+    "swish",
+    "leaky_relu",
+    "hardtanh",
 ]
 
 
