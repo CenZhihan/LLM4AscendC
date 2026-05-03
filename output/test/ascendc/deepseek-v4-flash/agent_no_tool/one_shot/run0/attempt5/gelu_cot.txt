@@ -1,0 +1,134 @@
+We need to fix the vector core execution error. The error log says: "VEC instruction error: the ub address out of bounds". This indicates that the kernel is accessing memory beyond allocated local buffer (UB). In the previous kernel, we used 2 tmp buffers (t1, t2) from tmpQueue_ with 2 buffers. But the Compute function allocates two tensors (t1, t2) from tmpQueue_ and frees them in reverse order. That seems okay. However, the error might be due to the tile size being too large or misaligned, or the CopyIn/Compute/CopyOut pipeline causing data corruption.
+
+Looking at the kernel, we use a grid-stride loop with prefetching: CopyIn for current tile, then prefetch next tile, compute current, copy out current, then move to next. But note that the prefetch (CopyIn) for next tile happens before Compute of current tile. That means we are using 2 BUFFER_NUM=2 for inQueueX_. So we have two slots. That's fine. But we also have outQueueY_ with 2 slots. And tmpQueue_ with 2 slots.
+
+The UB budget per tile: 6 * tileLen floats = 24 * tileLen bytes. The tiling code computes maxTile as UB_BUDGET_BYTES / 24 = 192*1024/24 = 8192 elements? Actually 196608/24 = 8192. Then aligned down to 2048 -> 8192? 8192 is multiple of 2048, so maxTile=8192. That is less than HARD_CAP=32768. So tileLen=8192. That seems okay.
+
+But the error "ub address out of bounds" might be because the sum of all local buffers exceeds UB size? Let's check: inQueueX_ uses 2 * tileLen floats = 2*8192 = 16384 floats = 65536 bytes. outQueueY_ same = 65536 bytes. tmpQueue_ 2 * tileLen = 16384 floats = 65536 bytes. Total = 196608 bytes. UB_BUDGET_BYTES is 192*1024 = 196608 bytes. So exactly fits. But we also have some overhead from pipe buffer management, maybe the actual usable UB is slightly less. Also, the alignment might cause issues.
+
+Another issue: In the kernel, we use `AscendC::Muls` etc. with `len` parameter. But we pass `len` which is the number of elements. That should be fine.
+
+But look at the error: all cores (id 12 to 35) had the same error. That suggests a systematic issue. Possibly the tile length is not honored correctly when doing DataCopy? The DataCopy expects a length in number of elements, but the global tensor offset is based on gmOffset (in elements). That seems fine.
+
+However, note that in CopyIn, we do `AscendC::DataCopy(xLocal, xGm_[gmOffset], len);` where xGm_ is set with totalLen_ size. The gmOffset might exceed totalLen_? We have guard: base = blockIdx * tileLen_; if base >= totalLen_ return. So base is valid. And we cap curLen to min(tileLen_, totalLen_ - base). So should be safe.
+
+But the prefetch could have nextBase = base + strideElems, which could be >= totalLen_, we check and set nextLen=0. So that's fine.
+
+Maybe the issue is that the tmpQueue_ has only 2 buffers, but we allocate two tensors (t1, t2) and free them before using again. That is okay. But we free t2 first, then t1. The order matches allocation (first t1, then t2). So stack-like usage is correct.
+
+Another potential bug: In Compute, we do `AscendC::Tanh(t1, t1, len);` This overwrites t1. That's fine. Then we do `AscendC::Adds(t1, t1, one, len);` then `AscendC::Mul(yLocal, xLocal, t1, len);` then `AscendC::Muls(yLocal, yLocal, half, len);`. All good.
+
+But the error "ub address out of bounds" might occur because the temporary tensors t1 and t2 are allocated from tmpQueue_ which has two slots, each of size tileLen_ * sizeof(float). When we allocate t1 and t2, they take both slots. Then we free t2 and t1. That is fine. However, note that after freeing, we EnQue yLocal. But yLocal is from outQueueY_, not tmpQueue_. So no conflict.
+
+Wait: In the pipeline, we have inQueueX_ with 2 buffers, outQueueY_ with 2 buffers, and tmpQueue_ with 2 buffers. In each iteration, we allocate one from inQueueX_, allocate one from outQueueY_, allocate two from tmpQueue_. That's total of 1+1+2 = 4 local tensors alive. But the total UB usage: inQueueX_ has 2 slots, so one is used for current, the other for prefetch. That's fine.
+
+But the issue might be that we are using the same tmpQueue_ for t1 and t2, but we free them after use. However, note that the tmpQueue_ is a TQue with VECCALC position. In AscendC, the queue is used for passing tensors between stages. But we are allocating and freeing inside the same stage (compute). That is allowed, but the queue mechanism might have some constraints. Actually, using TQue for temporary buffers inside a single stage is not typical. Usually, you use LocalTensor directly from pipe's allocated memory, but using TQue is possible. However, the issue might be that the tmpQueue_ is initialized with 2 buffers, and we allocate both t1 and t2. Then we free them. That should work. But the error suggests memory corruption.
+
+Another possibility: The floating point constant `0.79788456f` might be causing issues? No.
+
+Maybe the blockDim is too high? We set blockDim=numTiles, clamped to [8,24]. But if numTiles > 24, we cap at 24. That might cause some blocks to have nothing to do? But that's fine.
+
+Actually, looking at the error log: core id from 12 to 35. That's 24 cores. So blockDim=24. That matches.
+
+But all cores had the same error, meaning they all had UB out-of-bounds. That suggests a common problem: maybe the tile length is not properly aligned for DataCopy? DataCopy requires 32-byte alignment? Typically, AscendC DataCopy expects the local buffer to be aligned and the length to be a multiple of 32 bytes (8 floats). We have ALIGN_ELEMS=2048, which is multiple of 8. So tileLen should be aligned. But in the tiling code, we align down to 2048. That's fine.
+
+However, what about the global memory addresses? The input x and output y are provided by the runtime. They should be aligned.
+
+Maybe the issue is that the kernel uses a grid-stride loop with prefetch, but the pipeline assumes that the inQueueX_ will have two slots. In the Process loop, we do:
+- CopyIn for current (first tile) -> enqueues one tensor.
+- Then while true:
+  - CopyIn for next (if exists) -> enqueues second tensor.
+  - Compute current -> dequeues one tensor (the one from current), uses it, frees it.
+  - CopyOut current -> dequeues y tensor, frees it.
+  - if nextLen==0 break; else base=nextBase, curLen=nextLen.
+
+This uses both buffers correctly. But note: after the first iteration, the second buffer (prefetched) becomes the current for the next iteration. That is correct.
+
+But what about initial state? First iteration: we have only one tensor in inQueueX_ after CopyIn. Then we prefetch next, so now two tensors. Then Compute uses the first one, frees it. Then copyout uses the first y. Then next iteration: the prefetched tensor is now the only one in the queue (since first freed). Then we prefetch next again, so two again. So it works.
+
+However, is there a risk that the Compute function uses both t1 and t2 from tmpQueue_ simultaneously, but the tmpQueue_ has only 2 buffers. In each iteration, we allocate both, use them, free them. That's fine. But note that the pipeline stage for compute might need to wait for the tensor to be available? Actually, we are doing everything inside one kernel process, not truly pipelined across stages. So we are manually managing the queues but using them like a simple allocator. That is acceptable.
+
+But maybe the issue is that the tmpQueue_ is a TQue with VECCALC, but we are using it inside compute as a simple cache. The AscendC API might not support allocating and freeing multiple tensors from the same queue in the same stage? Actually, it is supported; many examples allocate multiple temporaries from the same queue.
+
+Another potential issue: The number of buffers for tmpQueue_ is 2, but we allocate two tensors (t1, t2) and then free them. That is all within one iteration. But in the next iteration, we allocate again. That's fine because we freed them. However, the queue depth is 2, so we have space for two tensors. We allocate both at once, so we fill the queue. Then we free both, so queue becomes empty. That's correct.
+
+Maybe the error is due to using `AscendC::Tanh(t1, t1, len)` where t1 is a VECCALC tensor. That should be fine.
+
+I suspect the UB budget calculation might be slightly off. The pipe buffer initialization for inQueueX_ and outQueueY_ each allocate BUFFER_NUM * tileLen_ * sizeof(float). That's 2*8192*4 = 65536 bytes each. tmpQueue_ allocates 2 * tileLen_ * sizeof(float) = 65536 bytes. Total = 196608 bytes = 192KB exactly. But the UB is typically 192KB per core? Actually, for 910B, UB is 192KB? I think it's 192KB per core. So we are using all of it. There might be some additional overhead for the pipe itself (internal bookkeeping). The error might be due to exceeding UB.
+
+To be safe, we should reduce the UB budget in tiling code to leave some headroom. For example, use 180*1024 bytes as budget. Also, ensure that the tileLen is aligned properly and that we don't overallocate.
+
+But the error says "VEC instruction error: the ub address out of bounds". That can happen if a local tensor's pointer is outside the allocated range. Possibly the DataCopy or arithmetic operations are given a buffer that is not properly allocated or too small.
+
+Another thing: In the kernel, we use `AscendC::DataCopy(xLocal, xGm_[gmOffset], len);` The DataCopy function expects the length in number of elements, and the source is a global tensor slice. But xGm_[gmOffset] creates a local view of the global tensor starting at gmOffset. The view's length is totalLen_ - gmOffset? Actually, the GlobalTensor::operator[] returns a LocalTensor of the slice? I think in AscendC, when you do `xGm_[gmOffset]`, it returns a SubTensor or something, but it's not a full view. Typically, DataCopy expects a GlobalTensor and a LocalTensor, and the length. But the syntax `xGm_[gmOffset]` might be incorrect. In many examples, they use `xGm_[gmOffset]` to get a sub-tensor, but the DataCopy function might expect the base address and then you add offset separately? Actually, in the AscendC documentation, DataCopy is called like: `DataCopy(local, global[offset], len);` That is valid. So it's fine.
+
+But maybe the global tensor's size must be large enough to accommodate the offset + len. We set xGm_ with totalLen_ and then access offset. That's fine.
+
+I think the most likely cause is the UB budget being exactly full and some overhead causing overflow. To fix, reduce the UB budget in the tiling code from 192*1024 to, say, 180*1024. Also, ensure that the tileLen is aligned to a multiple of 64 (for vector operations) but 2048 is fine. Additionally, we can reduce the number of temporary buffers? But we need two for the computation.
+
+Another potential issue: The `AscendC::Tanh` function might require additional internal buffers? Possibly, but not likely.
+
+Let's also check the Python bindings: The user's model expects `gelu_custom(Tensor x)` only, no extra args. The kernel signature has workspace and tiling, but that's standard.
+
+Given the error "ub address out of bounds" across all cores, it's a systematic memory allocation issue. I'll modify the tiling to use a smaller UB budget (e.g., 180*1024) and ensure tileLen is aligned to 32-byte (8 floats) which it already is. Also, I'll add a safety check that tileLen is at least 64 to avoid very small tiles.
+
+But the error also shows "CCU instruction address check error". That might be instruction cache? Not sure.
+
+Let's also inspect the kernel's use of tmpQueue_ with 2 buffers. In Compute, we allocate two tensors from tmpQueue_. But note that tmpQueue_ is a TQue with TPosition::VECCALC. That is the same position as the local tensors used for computation. It should be fine.
+
+I will propose a minimal fix: reduce the UB_BUDGET_BYTES to 180*1024 to leave slack. Also, ensure that the tileLen is at most 8192 but maybe reduce to 4096 to be safer. But that might change performance.
+
+However, the previous attempt had success? Actually, the error is from attempt4. So we need to fix the kernel.
+
+Another observation: The kernel uses `AscendC::Muls(t1, t2, coeff, len);` but t2 is x^3, which might be a large number. But that's fine.
+
+I think the problem is the UB overallocation. Let's adjust tiling to compute tileLen as UB_BUDGET_BYTES / 24 (for 6 floats) but with a lower budget. Also, we can reduce the number of temporary buffers? Actually, we could compute GELU with fewer temporaries by reusing t1 for intermediate steps. For example, we could do: t1 = x; then t2 = x^2; then t1 = x * x^2 = x^3; then t1 = coeff * t1; then t1 = x + t1; then t1 = sqrt2/pi * t1; then t1 = tanh(t1); then t1 = 1 + t1; then y = x * t1; then y = 0.5 * y. That uses only two temporaries (t1 and t2) plus y. So still need t1 and t2.
+
+We could use only one additional temporary if we compute in-place on xLocal, but xLocal is used later for multiplication, so we need to keep it. So we need at least 2 additional temporaries.
+
+But we could reduce the buffer count from 2 to 1 for tmpQueue_? No, we need two separate tensors because we need to hold x^2 while computing x^3.
+
+Maybe we can avoid tmpQueue_ and use separate local tensors from pipe_ directly? That might be cleaner but similar.
+
+Given the time, I'll adjust the UB budget to 170*1024 to be extra safe, and ensure tileLen is aligned to 64 bytes (16 floats) maybe. But 2048 is fine.
+
+Also, I'll add a small constant (say 512) to the UB_BUDGET_BYTES to account for overhead. Actually, I'll change to 180*1024.
+
+Additionally, I'll check the Init: pipe_.InitBuffer(tmpQueue_, 2, tileLen_ * sizeof(float)); That allocates 2 * tileLen_ * sizeof(float). That's correct.
+
+But maybe the issue is that the tmpQueue_ buffer count is 2, but we allocate 2 tensors and free them in reverse order, but the free function might not properly free the memory for reuse? It should.
+
+Let's think about the pipeline: In each iteration of while, we call Compute and then CopyOut. In Compute, we allocate t1 and t2 from tmpQueue_, use them, free them. Then in the next iteration, we allocate again. That is fine. But what about the outQueueY_? We allocate yLocal in compute and enque it. Then in CopyOut, we deque and free. So outQueueY_ is emptied each iteration.
+
+I think the most straightforward fix is to reduce the UB utilization. I'll also add a check to ensure that the total allocated bytes (inQueueX_ + outQueueY_ + tmpQueue_) <= UB_BUDGET_BYTES, but we already compute tileLen based on that.
+
+Let's implement the fix by reducing the UB_BUDGET_BYTES to 180*1024 in the tiling code and also in the kernel comments? Actually, the kernel doesn't know UB budget; it just uses tileLen passed from tiling. So just change tiling.
+
+Thus, in host_operator_src, change:
+static constexpr uint32_t UB_BUDGET_BYTES = 180 * 1024;
+
+And recompute: 180*1024/24 = 180*1024/24 = 7680? Actually 180*1024 = 184320, /24 = 7680. Then AlignDown(7680, 2048) = 6144? 7680/2048 = 3.75, AlignDown = 3*2048 = 6144. So tileLen becomes 6144. That should be safe.
+
+Also, ensure HARD_CAP_ELEMS is large enough but not needed.
+
+That should reduce the memory pressure and likely fix the UB out-of-bounds.
+
+But we also need to ensure that the kernel's temporary buffer size matches the tiling data's tileLength. Since we reduce tileLen, it should be fine.
+
+Now, also check if there is any other issue: In the kernel, we use `AscendC::Tanh(t1, t1, len);` This might require the input and output to be different tensors? Actually, Tanh supports in-place? In AscendC, many math functions support in-place operation, but it's better to check. The documentation for Tanh says it can overwrite input. It should be fine.
+
+Another potential: The constants used: `sqrt_2_over_pi = 0.79788456f` is approximate. But that's fine.
+
+I think the fix is mainly adjusting the UB budget. However, the error log also shows "CCU instruction address check error" which might indicate instruction cache miss or something else. But the primary error is VEC instruction UB out of bounds.
+
+Let's also double-check the kernel's grid-stride loop: strideElems = blockNum * tileLen_. If blockNum=24, tileLen=6144, strideElems=147456. totalLen= batch_size*dim = 256*65536 = 16,777,216. That's fine.
+
+But note: we do CopyIn for next tile before Compute for current. That means we are using both buffers simultaneously. That's fine.
+
+I'll now rewrite the six strings with the tiling budget change. Also, keep the one buffer for tmpQueue? Actually, we still need 2 for the two temporaries. So no change in kernel.
+
+Also, I need to ensure the python_bind_src and model_src are correct. They look fine.
+
+One more thing: In the kernel, we have signature `gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)`. The workspace is ignored. That's fine.
+
+Now, produce the final answer.

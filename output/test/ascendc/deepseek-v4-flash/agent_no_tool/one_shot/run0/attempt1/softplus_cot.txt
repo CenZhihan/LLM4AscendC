@@ -1,0 +1,80 @@
+We need to generate the six embedded Python strings for the softplus_custom kernel. The original model uses torch.nn.functional.softplus. The custom kernel should implement softplus: y = ln(1 + exp(x)), but numerically stable. We'll use the formula: softplus(x) = log(1 + exp(x)) which can be computed as max(x,0) + log(1 + exp(-abs(x))). However, in AscendC we can use built-in functions like Exp, Log, Add, etc. But to be efficient, we might use a tiling approach similar to the leaky_relu example. The kernel name is softplus_custom, PascalCase SoftplusCustom.
+
+We need to produce:
+- project_json_src: operator definition with input x (float, ND), output y (float, ND), no attributes (or maybe beta? Softplus has beta and threshold, but default beta=1, threshold=20. The original model uses default softplus. We can include optional attributes beta and threshold with defaults.)
+- host_tiling_src: tiling data structure with totalLength, tileLength, blockDim, and possibly beta/threshold.
+- host_operator_src: tiling function, infer shape, operator registration.
+- kernel_src: kernel implementation using AscendC primitives. Use the same double-buffer pattern.
+- python_bind_src: pybind11 and torch library impl. Note: The example used EXEC_NPU_CMD(aclnnLeakyReluCustom, ...). We need a custom aclnn function for SoftplusCustom. We can assume aclnnSoftplusCustom exists. We'll generate the pybind accordingly.
+- model_src: ModelNew that imports custom_ops_lib and calls the function.
+
+We must ensure exact names: kernel function name in kernel_src is softplus_custom. Operator name in JSON and host_operator_src is SoftplusCustom. Tiling data class SoftplusCustomTilingData.
+
+We'll follow the same pattern as leaky_relu but with softplus logic. For the kernel, we can compute using the formula: 
+Let absX = abs(x), then softplus = max(x,0) + log(1 + exp(-absX)). This avoids overflow for large positive x. But we also need to handle x negative large: exp(-absX) is small but log(1+small) ~ small. Alternatively, we can use the direct formula with a threshold: if x > 20, softplus ~ x. We can implement a conditional but vectorized approach: use AscendC's Sub, Add, Exp, Log, Max, Min, etc. Since we have to do element-wise operations, we can do it in tiles.
+
+We'll use the same tiling and double-buffer pattern. For simplicity, we'll implement without attributes (beta=1, threshold=20). But we can add optional attributes in the JSON and host code, and pass them to kernel via tiling data. The original model doesn't pass beta or threshold, so we can set defaults.
+
+Let's design:
+
+project_json_src: input x, output y, optional attr "beta" (float, default 1.0) and "threshold" (float, default 20.0). But the kernel may ignore them for simplicity in first version; we can still pass them.
+
+host_tiling_src: include totalLength, tileLength, blockDim, and beta, threshold.
+
+host_operator_src: similar to leaky_relu but compute tiling based on UB budget. We need to adjust UB budget for softplus: we have inQueueX, outQueueY, tmpQueue maybe more locals. For softplus we need one temp for maybe exp and log temporary? We can use a single tmpQueue like leaky_relu, but we need more locals for intermediate results. However, we can do in-place: compute softplus in three steps using fewer temps. For example:
+  tmp = exp(x)
+  tmp = add(tmp, 1.0)
+  y = log(tmp)
+But this exp may overflow for large x. Better to use the stable formula:
+  tmp = max(x, 0)
+  tmp2 = -abs(x) -> exp(tmp2) -> log1p(exp(tmp2))? Actually log(1+exp(-abs(x))) = softplus(x) - max(x,0). We can compute:
+  neg = -abs(x)
+  expNeg = exp(neg)
+  log1pExpNeg = log(1 + expNeg)   // log1p is not directly available, we can use log(1+expNeg)
+  y = max(x,0) + log1pExpNeg
+But we still need two temps: one for max, one for exp. We can reuse. Alternatively, use built-in AscendC Softplus? There is no direct vector intrinsic. We'll implement with multiple steps.
+
+We'll allocate two temporary buffers: tmpQueue for intermediate, and maybe we can reuse inQueueX after dequeue? Better to have separate tmp buffers. To keep similar structure, we can define pipe_ with inQueueX, outQueueY, tmpQueue1, tmpQueue2. But UB budget might be tighter. Let's compute: For each tile, we need: input (tile floats), output (tile floats), and two temps (tiles). That's 4 * tile floats = 16 * tile bytes. UB budget 192KB = 49152 floats => max tile 12288 floats. But we also have alignment constraints. We can set UB_BUDGET_BYTES = 192*1024, but the chip may have less. We'll use the same conservative approach.
+
+Alternatively, we can use three temps: one for max, one for abs+exp, one for log. But we can reuse. For simplicity, we'll have two tmp queues: tmpQueue1 and tmpQueue2. Then we need 4 buffers: inX, outY, tmp1, tmp2. UB_BUDGET_BYTES / (4*4) = 192*1024/16 = 12288 elements. We'll set ALIGN_ELEMS=2048, HARD_CAP=16384.
+
+Now implement kernel:
+
+// Stable softplus: y = log(1 + exp(x)) 
+// Compute as: 
+//   maxX = max(x,0)
+//   negAbsX = -abs(x)    // using a Sub to get -abs(x)
+//   expNegAbsX = exp(negAbsX)
+//   log1pExp = log(1 + expNegAbsX)   // but we need Add first
+//   y = maxX + log1pExp
+
+We'll need to compute abs(x). AscendC has Abs. Then we need to get negative: use Muls with -1.0. Then Exp, then Add(1.0), then Log, then Add with maxX.
+
+So steps:
+1. Copy x from global to local.
+2. Compute maxX = max(x, 0)
+3. Compute absX = abs(x)
+4. Compute negAbsX = -absX  (Muls)
+5. Compute expNeg = Exp(negAbsX)
+6. Compute onePlusExp = Add(expNeg, 1.0)
+7. Compute logVal = Log(onePlusExp)
+8. Compute y = Add(maxX, logVal)
+9. Copy y to global.
+
+We need temporary locals: we can reuse after each step. We'll use two tmp locals: tmp1 and tmp2. For example, after we compute maxX, we can store in tmp1. Then compute absX in tmp2 (or reuse xLocal after enque? but we need x for later? We need x again for abs and also for max? Actually max already used. So we can free xLocal after computing maxX and absX? But we need x for abs. We can compute maxX and then use xLocal again for abs? But xLocal is still valid until we free it. So we can do:
+- Deque xLocal.
+- Compute maxX using xLocal and store in tmp1 (overwrites? We need to keep xLocal for abs. So better to copy x to tmp1 first? We'll compute maxX directly into tmp1 using Max(x,0) and store. Then compute absX into tmp2 using Abs(xLocal). Then free xLocal. Then compute negAbsX = Muls(tmp2, -1.0) and store back to tmp2. Then compute expNeg = Exp(tmp2) into tmp2 again. Then compute onePlusExp = Add(tmp2, 1.0) into tmp2. Then compute logVal = Log(tmp2) into tmp2. Then compute y = Add(tmp1, tmp2) into output queue. Then free tmp1 and tmp2 (or reuse). That uses only two tmp buffers. So UB budget: inQueueX (tile), outQueueY (tile), tmpQueue1 (tile), tmpQueue2 (tile). Total 4*tile*4 bytes = 16*tile. So tile size max = 192*1024/16 = 12288 elements. We'll use ALIGN_ELEMS 2048, HARD_CAP 16384.
+
+In the tiling function, we compute tileLen accordingly. We'll also include beta and threshold attributes but not use them in kernel for simplicity; they are optional.
+
+Now generate the code.
+
+For host_operator_src, we need to set blockDim similarly. We'll use the same logic.
+
+For python_bind_src, we need to define the function that calls the custom operator. We'll assume aclnnSoftplusCustom exists (or we can use the same pattern with EXEC_NPU_CMD). We'll write the same structure.
+
+Note: The model_src should import custom_ops_lib and call the function. The function name is softplus_custom.
+
+We must ensure that the kernel function is exactly "softplus_custom" in the kernel_src.
+
+Now write the answer with the six strings.

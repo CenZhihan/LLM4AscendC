@@ -1,0 +1,102 @@
+We need to generate six strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src for the softmax_custom kernel (PascalCase: SoftmaxCustom). The kernel is softmax along dim=1 (features dimension). For a 2D tensor (batch_size, num_features), softmax along dim=1 means compute over each row independently. The input shape is (4096, 393216) - large. We need an efficient Ascend C kernel.
+
+Key considerations: Use UB buffer with tiling. Softmax requires computing max, subtract, exp, sum, divide. We need to do row-wise softmax. Since rows are large (393216 elements), but batch size is 4096, total elements ~1.6B. We must tile along rows and handle block distribution.
+
+We'll adopt a similar structure as leaky_relu but with softmax operations. We'll need two passes: one to find max per row, then compute exp and sum, then normalize. However, Ascend C has intrinsic functions like AscendC::Exp, AscendC::ReduceMax, AscendC::ReduceSum, AscendC::Div, etc. We can do it in one pass using a two-step approach with tiling. Since rows are independent, each block can process a chunk of rows. But rows are large, so each row may be split into tiles. We need to accumulate per-row max and sum across tiles within a row. That requires per-row state. We can process each row fully before moving to next row. Alternatively, we can process in a fused kernel with two passes: first compute max, then in second pass compute sum and divide. But we can do within one kernel by using local memory to store per-row results if tiles within row are processed sequentially. However, we need to be careful with UB size.
+
+Simpler: For each block, process a set of rows. For each row, tile across columns. For each tile, compute local max, then later compute sum of exp(x - max). But we need global max per row. We can first do a reduction across tiles to get row max, then store it in local memory (UB) and then recompute exp and sum. That requires two iterations over each row's tiles. That's fine: we can process each row in a loop: first pass compute row max, second pass compute sum and output. Since we have many rows, we can interleave.
+
+Given the large sizes, we'll assume each row is split into tiles. Tiling data will include tile length and number of rows per block, etc. For simplicity, we can let each block handle a contiguous chunk of rows, and within each row, tile across columns. The tiling function should compute blockDim and tileLength based on UB budget. For softmax, we need to store x_local, and also temporary arrays for max, sum, etc. We'll need at least three buffers: input, output, and a temp for max/sum. But we can reuse. We'll design with two pass: first pass compute max, store in a separate local array (size tileLen). Second pass compute exp_diff, sum, then normalize. We'll need a buffer for row max (scalar) but we can compute tile max and accumulate by scalar. Actually, we need per-row max, not per-tile. So for each row, we compute max over all tiles. We can use a local scalar variable to keep running max across tiles within a row. Similarly, we need sum of exp(x - max) across tiles. We can compute that in second pass. However, we need to store max for the entire row before second pass. We can store it in a local scalar (register) or in UB. Since we process row by row, we can store row max in a scalar variable and reuse.
+
+Implementation plan per block:
+- Get startRow, numRows (set by tiling).
+- For each row from startRow to startRow+numRows:
+   - Initialize rowMax = -inf (very negative)
+   - For each tile in that row:
+        - Load input tile
+        - Compute local tile max (AscendC::ReduceMax)
+        - Update rowMax = max(rowMax, localMax)
+        - (Optionally store tile in a queue for reuse? But we need to reload for second pass. We can store in local buffer if UB permits, but reload from GM is okay if we have double buffering.)
+   - After first pass over row, we have rowMax.
+   - Then second pass over row:
+        - For each tile:
+            - Load input tile (again)
+            - Compute exp(x - rowMax)
+            - Accumulate sum (using scalar variable)
+            - Store exp^something in temp? Actually we need to output y = exp(x - max) / sum. So we need to compute sum first, then divide. But we can compute sum in second pass, then immediately divide in same pass if we have both values. However, we need sum across entire row before dividing. So we need to store the exp values or recompute. Simpler: store the exp values in a local buffer (tile size) during second pass, then after computing sum from that tile, we can divide and write out. But we need to accumulate sum across tiles before dividing. So we need two substeps: (a) for each tile, compute exp values and accumulate sum, but we can't write output yet because we don't have total sum. (b) after second pass over all tiles, we have total sum for the row. Then we need a third pass to divide? That's too many passes. Alternative: store exp values in GM? Not efficient.
+
+Better: Use a two-pass within each tile: For each tile, we can first compute exp values into a temporary buffer and accumulate sum. Then we can divide that tile's exp values by the sum (but this sum is only partial tile sum, not full row). That's wrong for softmax.
+
+Thus we need global sum per row. We can either store the exp values to a temporary global buffer (extra memory) or use two kernels: one to compute max and sum, then another to normalize. But that's more complex. Given the constraints, we could implement a custom kernel that does softmax using the textbook approach: compute max, then exp and sum in one pass by storing exp values to a local buffer (tile size) and after computing sum, divide and write. We can do this per row: we load a tile, compute max, store exp values in a local buffer, accumulate sum, then after all tiles for row are processed, we have total sum, then we need to go back and divide each tile's exp values. Since we have double buffering, we could store the exp values in a global temporary buffer, but that's extra memory and bandwidth.
+
+Another approach: Compute softmax using the "log-sum-exp" trick but that still needs sum. Ascend C provides vector operations for softmax? Possibly there is a built-in? But we need custom kernel.
+
+Given that this is a replacement for PyTorch's softmax, and the kernel must be custom, we can implement a straightforward approach: For each row, we compute max (first pass), then compute exp(x - max) and sum (second pass), then compute output (third pass) where we load exp values from the second pass's stored data. If we store the exp values in a local buffer of size row length? That's too large for UB. So we need to store to global memory temporary. That is acceptable: we can allocate a temporary global tensor of the same size as input (or per block). We can use the workspace GM_ADDR for temporary storage. The kernel signature has GM_ADDR workspace. So we can use workspace to store intermediate exp values. Then the kernel can do:
+
+- For each row:
+   - Pass1: compute rowMax, store in scalar.
+   - Pass2: compute exp(x - rowMax) and store in workspace (temporary global memory). Also accumulate sum.
+   - Pass3: load from workspace, divide by sum, and write to output.
+
+But that's three GM reads/writes per element (input twice, workspace twice? Actually: read input for pass1 and pass2, write workspace for pass2, then read workspace for pass3, write output). That's still okay. However, we can combine pass1 and pass2: we can compute max on the fly while storing exp values? No, we need max before computing exp. So we need two passes over input rows anyway.
+
+Given the task, we can adopt a simpler but still efficient implementation: For each block, process a chunk of rows. For each row, we have two inner passes over tiles. We'll use double buffering to overlap transfers.
+
+The tiling function must compute blockDim and tileLen. For softmax, we need to store input tiles in UB, plus temporary for exp values? We can use workspace as temporary global. The UB budget for input and output queues: we need inQueueX (BUFFER_NUM * tileLen floats), outQueueY (BUFFER_NUM * tileLen floats), and maybe tempCalc for intermediate. Since we need to compute exp etc., we'll need a temp buffer of tileLen floats. So total UB needed: (2*2 + 1) * tileLen floats? Actually for double buffering: inQueueX: 2 * tileLen floats, outQueueY: 2 * tileLen floats, plus one temp for calculations? We also might use tmpQueue for intermediate results. That's similar to leaky_relu. But for softmax, we need additional temp for exp values if we store them in UB. But we'll use workspace, so no extra UB for that.
+
+Thus we can use the same UB budget calculation: 5 * tileLen floats = 20 * tileLen bytes. We'll reuse the same constants from leaky_relu.
+
+We also need to handle the attribute? Softmax has no attribute like negative_slope. The op takes only tensor x. So no attributes in operator definition. In tiling data, we may just have totalLength, tileLength, blockDim. Also we need the shape info: dim=1 means we treat rows independently. The totalLength is the total number of elements. The tiling should also know the number of rows? But we can compute rows from shape: batch_size = totalLength // num_features. However, to avoid passing extra, we can pass numFeatures in tiling data. Since the dim is fixed to 1 (row-wise), we need the row size. The kernel needs to iterate over rows. So tiling data should include rowSize. We'll add rowSize field.
+
+Thus tiling data: totalLength, tileLength, blockDim, rowSize (uint32_t). no negativeSlope.
+
+Host tiling: compute tileLen from UB budget, same formula. blockDim adaptive as before. rowSize = shape[1] (num_features). For 2D tensor, shape[1] is the number of columns. In the example, dim=393216. So rowSize = 393216.
+
+For distributing rows among blocks: we can assign each block a contiguous set of rows. Number of rows = batch_size = totalLength / rowSize. blockDim = number of blocks. Then each block processes rows: startRow = blockIdx * (rows_per_block), where rows_per_block = ceil(num_rows / blockDim). However, to handle uneven distribution, we can use grid-stride over rows as well. But simpler: set blockDim to number of rows? That could be huge. Instead, we set blockDim to some moderate number (e.g., 8-24) and each block processes multiple rows. We'll use grid-stride over rows: each block loops over rows with stride blockDim, starting at blockIdx.
+
+That's similar to tile-level grid-stride but over rows. For each row, we then tile over columns within that row. This ensures load balance.
+
+Thus kernel process:
+- For each row from blockIdx to numRows, step blockDim:
+   - rowOffset = row * rowSize
+   - Process row: first pass over tiles to find max, second pass to compute exp and sum, third pass to normalize.
+   - Use double buffering for input and output, but we have two passes over input. We'll manage with separate loops. For efficiency, we could combine first and second passes by storing input tiles in UB and reusing them, but that would require more UB. Given large row size, we'll simply reload from GM for each pass. We'll use double buffering for each pass independently. That means we may have up to 6 GM accesses per element (input: 2 reads for pass1 and pass2, workspace: 1 write for exp, 1 read for exp, output: 1 write). Total 5 accesses, which is acceptable.
+
+We'll implement:
+- First loop over row tiles: read input, compute max, update row max.
+- Second loop over row tiles: read input, compute exp(x - rowMax), write to workspace, accumulate sum.
+- Third loop over row tiles: read workspace, divide by sum, write output.
+
+We can combine first and second loops into one if we compute max first for the entire row (first pass) and then second loop does both exp and sum. That's fine.
+
+Now, write the code.
+
+We must follow the exact same structure as leaky_relu example: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+Let's craft each.
+
+project_json_src: op name "SoftmaxCustom". Input: x, format ND, type float. Output: y. No attr (softmax has no trainable parameters). But we could include dim as attribute? The original PyTorch uses dim=1. Since we are replacing that specific usage, we can hardcode dim=1 or pass as attribute. In the kernel, we will assume dim=1 and pass rowSize. In operator definition, we don't need an attribute for dim because the tiling calculates rowSize from input shape. So we can omit attr. However, the user might want dim as attribute for generality? The task says "softmax along dim=1". We'll keep it as is: no attr.
+
+But the tiling data includes rowSize derived from shape, not from attribute. So operation definition: no attr.
+
+host_tiling_src: define SoftmaxCustomTilingData with fields: totalLength, tileLength, blockDim, rowSize.
+
+host_operator_src: includes the tiling function, infer shape, infer datatype, op registration. We'll follow pattern.
+
+kernel_src: KernelSoftmaxCustom class with Init and Process. Use double buffering for input and output. For simplicity, we can allocate workspace as temporary global. But we need GM_ADDR workspace in kernel signature. The workspace will be used to store intermediate exp values. We need to know its size. In tiling, we can set workspace to be totalLength * sizeof(float) because we will write exp for each element. That's large but okay. We'll compute workspace size in tiling and return in workspaceSizes.
+
+Actually, in the leaky_relu example, workspace size was set to 0. For softmax, we need workspace. We'll set workspace[0] = totalLength * sizeof(float) (or aligned). So host_operator_src must allocate workspace.
+
+We need to modify host tiling data to include workspace size? The TilingFunc should set context->GetWorkspaceSizes(1) and set currentWorkspace[0] = totalLength * sizeof(float). We'll do that.
+
+In kernel, we will use `__gm__ float* workspace` as a pointer to temporary buffer. We'll store exp values there.
+
+Now, write kernel code.
+
+We'll use the same UB budget constants as leaky_relu for consistency.
+
+Let's produce each string.
+
+Important: The kernel function name in kernel_src must be "softmax_custom". The operator name in host_operator_src is "SoftmaxCustom". The passcal case.
+
+Now output.

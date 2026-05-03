@@ -1,0 +1,167 @@
+We are asked to fix the previous attempt for the GELU custom AscendC kernel. The error logs indicate a vector core exception: "VEC instruction error: the ub address out of bounds." This suggests that the kernel is accessing local memory (UB) beyond the allocated buffer. The error occurs in the `Compute` function where we allocate multiple temporary tensors from `tmpQueue_`. The queue was initialized with 4 buffers, but we allocate 4 separate tensors (t1, t2, t3, t4) simultaneously. However, the queue depth is 4, meaning we can allocate up to 4 tensors at once. But note: the `TQue` with depth 4 means 4 slots, each of size `tileLen_ * sizeof(float)`. When we allocate t1, t2, t3, t4, we are taking 4 slots. That should be fine. But the error says "ub address out of bounds", possibly because the `Mins` or `Adds` operations are writing beyond the bounds due to misalignment or incorrect length.
+
+Looking at the `Compute` function: We use `AscendC::Mul`, `AscendC::Muls`, `AscendC::Add`, `AscendC::Adds`, `AscendC::Tanh`. These operations work on local tensors with length `len`. But `len` is the number of elements in the tile. The buffer size is `tileLen_ * sizeof(float)`, and `len` could be less than `tileLen_` for the last tile. That's fine.
+
+However, there is a subtle issue: In the `Compute` function, we are reusing the same temporary tensors for multiple operations, which is fine. But the `AscendC::Tanh` function may require the output tensor to be distinct from input? Usually yes. We have `AscendC::Tanh(t1, t4, len)`, so output is t1, input is t4. That's okay.
+
+But the error "ub address out of bounds" might be due to the fact that we are using a single queue with depth 4, but we allocate 4 tensors from it, and then later free them in reverse order. This is standard practice. However, the `TQue` with `VECCALC` position is for temporary calculations. Could it be that the queue is not designed for multiple simultaneous allocations? Actually, `TQue` with depth 4 means you can have up to 4 tensors allocated at once. So allocating 4 is okay.
+
+Maybe the issue is that we are using `tmpQueue_.FreeTensor()` but we are not using the correct order? We free t4, t3, t2, t1. That's fine because we allocated in order t1, t2, t3, t4. The queue is LIFO, so freeing in reverse order is correct.
+
+Another possibility: The `AscendC::Tanh` might have a requirement that the output tensor must be in a certain memory region? Or maybe the `tmpQueue_` buffers are not large enough? We initialized `tmpQueue_` with `4` buffers each of size `tileLen_ * sizeof(float)`. That's 4 * tileLen_ floats. Our compute uses t1, t2, t3, t4 as separate tensors, each of length `len` (which is <= tileLen_). So each is within its buffer. But the operations might be writing to all elements of the buffer, not just the first `len`? No, the AscendC vector intrinsics take a length parameter, so they should only operate on the first `len` elements.
+
+However, the error is on all cores (multiple blocks). The tiling sets `blockDim` based on number of tiles, but the kernel uses grid-stride loop with `blockNum * tileLen_` stride. The blockDim is set adaptively (8 to 24). But the kernel expects the number of blocks to be exactly `GetBlockNum()` which is set by tiling. That should match.
+
+Maybe the issue is that `tileLen_` is too large for the UB budget? In host_operator_src, we computed maxTile = UB_BUDGET_BYTES / 32 = 192*1024/32 = 6144 elements. AlignDown to 2048 gives 4096. But we also have a hard cap of 32768. So tileLen could be 4096. Then the buffers: inQueueX: 2 * 4096 * 4 = 32KB; outQueueY: same = 32KB; tmpQueue: 4 * 4096 * 4 = 64KB; total = 128KB. UB budget is 192KB, so it fits. But note: The UB budget is per core, and we might have multiple blocks per core? Actually, each core runs one block, so the total UB per core is 192KB. 128KB is okay.
+
+But the error says "ub address out of bounds". Could be a misalignment issue. The AscendC `DataCopy` may require 32-byte alignment? Possibly. The `tileLen_` is aligned to 2048, which is 8KB, so that should be fine.
+
+Another issue: In the `Init` function, we set `pipe_.InitBuffer(tmpQueue_, 4, tileLen_ * sizeof(float));` The depth is 4. But in `Compute`, we allocate 4 tensors, use them, then free them. That's fine. However, the `AscendC::Tanh` might internally use additional temporary space? Possibly. But we have only 4 temporary slots. If Tanh uses extra local memory, it might overflow. The AscendC API documentation might indicate that some operations require extra workspace. But we don't have that information.
+
+A safer approach: Reduce the number of temporary buffers by reusing the same tensors for multiple steps. But we already do some reuse. Alternatively, we can increase the tmpQueue depth to a higher number, say 6 or 8, to provide margin. Also, we should ensure that the `tileLen_` is not too large for the available UB after accounting for other overheads. But the budget calculation seems conservative.
+
+Given the error is "VEC instruction error: the ub address out of bounds", it's likely that some intrinsic is writing beyond the allocated local tensor. This could happen if the length `len` is not a multiple of the vectorization width? AscendC vector intrinsics usually handle arbitrary lengths, but performance may degrade. However, errors due to alignment are possible. The `AlignedDown` to 2048 ensures alignment to 2048 elements, which is 8KB, well above 32-byte alignment.
+
+Another potential issue: In the `Compute` function, we use `AscendC::Adds(t1, t1, one, len);` where `one` is a scalar. But `Adds` adds a scalar to each element. That should be fine. But note that `t1` is reused from previous `Tanh` result. That's okay.
+
+Wait, I see a possible problem: In the step 6, we do `AscendC::Adds(t1, t1, one, len);` to compute 1+tanh. But `t1` currently holds tanh(inner). This is correct. However, step 7 does `AscendC::Mul(yLocal, xLocal, t1, len);` then `AscendC::Muls(yLocal, yLocal, half, len);`. But note: `xLocal` was used earlier and is still valid? We haven't freed it yet. Yes, we still have it from the DeQue. That's fine.
+
+Another thought: The `AscendC::Tanh` may have a specific requirement that the input and output tensors must be in different queues? Not sure.
+
+Given the error is widespread (all cores), it's likely a systematic issue with tile length or buffer size.
+
+Maybe the problem is that we used `tmpQueue_.FreeTensor(t4);` before using `t4` in the Tanh? No, we used t4 as input to Tanh, then later free it after all uses.
+
+Let's look at the error location: "pc start: 0x12c049600000, current: 0x12c049600d24". That's the program counter. The error code indicates "VEC instruction error: the ub address out of bounds", which suggests that a vector instruction tried to access an address outside the allocated local memory. This could happen if the tensor size is not correctly set in the intrinsic.
+
+Maybe the issue is that we used `AscendC::Muls(t3, t2, coeff, len);` where `coeff` is a float, but the intrinsic expects a scalar of type float. That should be fine.
+
+Another possibility: In the `Init`, we set `pipe_.InitBuffer(tmpQueue_, 4, tileLen_ * sizeof(float));` but then in `Compute` we allocate `yLocal` from `outQueueY_`. That's separate. But the `tmpQueue_` is used only for temporaries. However, we allocate 4 temporaries, but the depth is 4, so we are using all slots. That's okay.
+
+Maybe the problem is that we are not ensuring that the tensor pointers are aligned. But AscendC API handles that.
+
+Let's check the kernel entry point: `extern "C" __global__ __aicore__ void gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)`. The parameter order matches the expected signature. The `GET_TILING_DATA` macro reads tiling data.
+
+In the previous attempt logs, the build succeeded and the kernel was executed. The error occurred at runtime. So the code compiles but crashes.
+
+Given the error pattern, I suspect the issue is with the `tmpQueue_` depth. We have 4 buffers, but we allocate 4 temporaries. However, the `AscendC::Tanh` might internally allocate additional temporary storage from the same queue? If so, we run out of slots. To be safe, we should increase the depth to a larger number, say 8 or 12. But then the UB budget calculation must be adjusted accordingly because the queue size increases. Currently we allocated 4 * tileLen_ floats for tmpQueue. If we increase depth to 8, we need 8 * tileLen_ floats, which is 32KB per tile, total 96KB for tmpQueue, plus 32KB each for in and out, total 160KB, still under 192KB. But we need to update the UB budget calculation in host_operator_src: it should use 2 + 2 + new_depth floats per tile. The comment says "tmpQueue: 4 * tile". So we need to adjust to "tmpQueue: 8 * tile" etc. But we can't just increase depth arbitrarily; we need to ensure the total fits.
+
+Alternatively, we can rewrite the GELU computation using fewer temporary tensors. For example, we can reuse the same tensor for multiple steps. Let's see if we can reduce to 3 temporaries plus output. The GELU formula: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))). Steps:
+- t1 = x^2
+- t2 = x^3 (using t1 and x)
+- t3 = x + 0.044715 * t2
+- t4 = sqrt(2/pi) * t3
+- t1 = tanh(t4) (reuse t1)
+- t2 = 1 + t1 (reuse t2)
+- y = 0.5 * x * t2
+So we need 3 temporaries (t1, t2, t3) plus output. That's 4 buffers total (y included). But y is from outQueueY_. So temporaries: t1, t2, t3 from tmpQueue_. That's 3, so depth 3 would be enough. But we also need to ensure that operations like `Mul` and `Add` can operate on the same tensor as input and output? Usually they can be in-place if the output tensor is the same as one input. In AscendC, many operations support in-place if the tensor is the same. For example, `AscendC::Muls(t1, t1, coeff, len)` is fine. So we can reduce temporary usage.
+
+Let's redesign the compute with fewer temps:
+
+1. t1 = xLocal (input) -> we need to keep xLocal for later multiplication. So we cannot overwrite xLocal until after we compute y.
+2. Compute t2 = x^2 (from xLocal)
+3. Compute t3 = t2 * xLocal = x^3 (use t2 and xLocal)
+4. Compute t1 = 0.044715 * t3 (use t3, store in t1)
+5. Compute t1 = xLocal + t1 (use xLocal and t1, store in t1)
+6. Compute t1 = sqrt(2/pi) * t1 (store in t1)
+7. Compute t1 = tanh(t1) (store in t1)
+8. Compute t1 = 1 + t1 (store in t1)
+9. Compute yLocal = xLocal * t1 (use xLocal and t1, store in yLocal)
+10. Compute yLocal = 0.5 * yLocal
+
+We need temporary for t2, t3, and t1 (which we reuse). So that's 2 temporaries (t2 and t3) plus t1 (which can be a separate one). But t2 and t3 can be the same tensor if we reuse. Actually, we can do:
+
+- t1 = x^2
+- t2 = x^3 (reuse t1? no, need t1 for x^2 later? Not needed after computing x^3. So we can overwrite t1 with x^3. But then we need t2 for the coefficient. So we can use one tensor for x^2 then x^3, then another for the inner term. Let's plan:
+
+Allocate t1, t2 from tmpQueue_.
+Allocate yLocal from outQueueY_.
+Steps:
+1. t1 = x^2 (Mul)
+2. t2 = x^3 = t1 * x (Mul)
+3. t1 = 0.044715 * t2 (Muls) -> now t1 holds 0.044715*x^3
+4. t1 = x + t1 (Add) -> t1 holds x + 0.044715*x^3
+5. t1 = sqrt(2/pi) * t1 (Muls)
+6. t1 = tanh(t1)
+7. t1 = 1 + t1 (Adds)
+8. yLocal = x * t1 (Mul)
+9. yLocal = 0.5 * yLocal (Muls)
+
+We used only two temporaries (t1, t2) and yLocal. That's depth 2 for tmpQueue. This is much safer.
+
+Thus, we modify the kernel to use only 2 temporary buffers instead of 4. Also adjust the UB budget calculation: tmpQueue 2 * tile, so total floats = 2 (in) + 2 (out) + 2 (tmp) = 6 per tile? Actually we have inQueueX with 2 buffers, outQueueY with 2, tmpQueue with 2. So total elements = (2+2+2)*tileLen = 6*tileLen, bytes = 24*tileLen. Update the host_operator_src accordingly.
+
+Also, we need to change the `tmpQueue_` depth to 2 and initialize with 2 buffers.
+
+Additionally, ensure the `tileLen_` is properly aligned. The previous alignment to 2048 seems fine.
+
+Now, update the code.
+
+Also, check the `Init` signature: currently `Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileLength)`. It doesn't take negative_slope because GELU has no extra attributes. That's correct.
+
+We'll modify the kernel_src accordingly.
+
+In the host_operator_src, we need to update the comment about UB model and the calculation: `uint32_t maxTile = UB_BUDGET_BYTES / 24;` and adjust the comment. Also, the tiling data structure only has totalLength, tileLength, blockDim. No negativeSlope. That's fine.
+
+Also, in the Compute function, ensure we free temporaries correctly: t1 and t2 are allocated and freed after use. Since we reuse t1 for multiple steps, we only free at the end.
+
+We'll rewrite the Compute:
+
+```cpp
+__aicore__ inline void Compute(uint32_t len)
+{
+    AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+    AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+    AscendC::LocalTensor<float> t1 = tmpQueue_.AllocTensor<float>();
+    AscendC::LocalTensor<float> t2 = tmpQueue_.AllocTensor<float>();
+
+    const float sqrt_2_over_pi = 0.79788456f;
+    const float coeff = 0.044715f;
+    const float half = 0.5f;
+    const float one = 1.0f;
+
+    // t1 = x^2
+    AscendC::Mul(t1, xLocal, xLocal, len);
+    // t2 = x^3 = x^2 * x
+    AscendC::Mul(t2, t1, xLocal, len);
+    // t1 = 0.044715 * x^3
+    AscendC::Muls(t1, t2, coeff, len);
+    // t1 = x + 0.044715*x^3
+    AscendC::Add(t1, xLocal, t1, len);
+    // t1 = sqrt(2/pi) * t1
+    AscendC::Muls(t1, t1, sqrt_2_over_pi, len);
+    // t1 = tanh(t1)
+    AscendC::Tanh(t1, t1, len);
+    // t1 = 1 + tanh
+    AscendC::Adds(t1, t1, one, len);
+    // yLocal = x * t1
+    AscendC::Mul(yLocal, xLocal, t1, len);
+    // yLocal = 0.5 * yLocal
+    AscendC::Muls(yLocal, yLocal, half, len);
+
+    tmpQueue_.FreeTensor(t2);
+    tmpQueue_.FreeTensor(t1);
+    outQueueY_.EnQue<float>(yLocal);
+    inQueueX_.FreeTensor(xLocal);
+}
+```
+
+Note: In step 5, we did `AscendC::Muls(t1, t1, sqrt_2_over_pi, len);` which is fine.
+
+Now, update the kernel_src accordingly.
+
+Also, update the host_operator_src's UB budget: `bytes = 24 * tileLen` (since 6 floats * 4 bytes). And adjust the comment.
+
+Also, ensure the `tmpQueue_` initialization in Init: `pipe_.InitBuffer(tmpQueue_, 2, tileLen_ * sizeof(float));`
+
+Now, check the correctness of the tiling: The `totalLength` from shape size is number of elements. That's fine.
+
+One more thing: The error logs mention "core id 15" etc. That means multiple cores.
+
+Now, produce the corrected code.
+
+We need to output the six Python strings. We'll reproduce them with the changes.
+
+Also, the model_src and python_bind_src remain unchanged.
+
+Let's write the final answer.

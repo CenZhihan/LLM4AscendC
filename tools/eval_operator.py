@@ -10,6 +10,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass
 from typing import Any
 
@@ -125,6 +126,37 @@ def write_result_json(
     payload: dict[str, Any] = {"result": out, "meta": meta}
     out_path = art_dir / f"result_{op_key}.json"
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out_path
+
+
+def _write_txt_materialize_failure_json(
+    *,
+    art_root: pathlib.Path,
+    op_key: str,
+    mode: str,
+    exc: BaseException,
+) -> pathlib.Path:
+    """
+    When materialize_operator_from_txt fails, _execute_pipeline never runs and no result JSON
+    is produced. Write the same schema as _execute_pipeline's failure path so runners can
+    load correctness_info and continue multi-attempt repair.
+    """
+    art_dir = art_root / op_key
+    art_dir.mkdir(parents=True, exist_ok=True)
+    tb_text = traceback.format_exc()
+    core = _extract_core_error(tb_text)
+    correctness_info = core or f"{type(exc).__name__}: {exc}"
+    out_path = write_result_json(
+        art_dir=art_dir,
+        op_key=op_key,
+        compiled=False,
+        correctness=False,
+        correctness_info=correctness_info,
+        logs={},
+        fingerprint=None,
+        mode=mode,
+    )
+    print(f"[done] FAILED. summary: {out_path}")
     return out_path
 
 
@@ -609,6 +641,14 @@ def _parallel_worker_main(
             result_q.put((txt_path.name, True, None))
         except Exception as e:
             print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
+            rp = art_root / txt_path.stem / f"result_{txt_path.stem}.json"
+            if not rp.exists():
+                _write_txt_materialize_failure_json(
+                    art_root=art_root,
+                    op_key=txt_path.stem,
+                    mode=mode,
+                    exc=e,
+                )
             result_q.put((txt_path.name, False, str(e)))
 
 
@@ -688,15 +728,23 @@ def main() -> int:
                 if staging_root.exists():
                     shutil.rmtree(staging_root)
                 staging_root.mkdir(parents=True, exist_ok=True)
-                op_dir = materialize_operator_from_txt(
-                    out_dir=staging_root / "operator",
-                    txt_path=txt_path,
-                    soc="ai_core-Ascend910B2",
-                )
                 try:
+                    op_dir = materialize_operator_from_txt(
+                        out_dir=staging_root / "operator",
+                        txt_path=txt_path,
+                        soc="ai_core-Ascend910B2",
+                    )
                     _execute_pipeline(op_dir, art_root=art_root, mode=args.mode, clean_policy=args.clean_policy)
                 except Exception as e:
                     print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
+                    rp = art_root / txt_path.stem / f"result_{txt_path.stem}.json"
+                    if not rp.exists():
+                        _write_txt_materialize_failure_json(
+                            art_root=art_root,
+                            op_key=txt_path.stem,
+                            mode=args.mode,
+                            exc=e,
+                        )
                     rc = 1
             return rc
 
@@ -764,11 +812,20 @@ def main() -> int:
         if staging_root.exists():
             shutil.rmtree(staging_root)
         staging_root.mkdir(parents=True, exist_ok=True)
-        op_dir = materialize_operator_from_txt(
-            out_dir=staging_root / "operator",
-            txt_path=txt_path,
-            soc="ai_core-Ascend910B2",
-        )
+        try:
+            op_dir = materialize_operator_from_txt(
+                out_dir=staging_root / "operator",
+                txt_path=txt_path,
+                soc="ai_core-Ascend910B2",
+            )
+        except Exception as exc:
+            _write_txt_materialize_failure_json(
+                art_root=art_root,
+                op_key=txt_path.stem,
+                mode=args.mode,
+                exc=exc,
+            )
+            raise SystemExit(1)
 
     if args.op:
         art_root = ART_ROOT

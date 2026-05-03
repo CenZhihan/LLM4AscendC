@@ -93,6 +93,35 @@ def _load_result_payload(path: pathlib.Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _synthetic_result_payload_when_eval_json_missing(
+    *,
+    op: str,
+    eval_mode: str,
+    eval_rc: int,
+    result_path: pathlib.Path,
+) -> Dict[str, Any]:
+    """
+    eval_operator normally writes result_<op>.json even on failure; if the subprocess exits
+    without creating the file (crash, pre-pipeline bug), synthesize the same top-level shape
+    so repair rounds still get correctness_info and a written json for debugging.
+    """
+    msg = (
+        f"eval_operator did not emit result json (subprocess rc={eval_rc}). "
+        f"Expected path: {result_path}"
+    )
+    return {
+        "result": {
+            op: {
+                "compiled": False,
+                "correctness": False,
+                "performance": None,
+                "correctness_info": msg,
+            }
+        },
+        "meta": {"mode": eval_mode, "fingerprint": None, "logs": {}},
+    }
+
+
 def _extract_eval_core(payload: Dict[str, Any], op: str) -> Dict[str, Any]:
     result = (payload.get("result") or {}).get(op) or {}
     meta = payload.get("meta") or {}
@@ -310,11 +339,17 @@ def run_multi_attempt_for_op(
             outcome.eval_ran = True
             result_path = _eval_result_json_path(gen["txt_path"], op)
             if not result_path.exists():
-                raise RuntimeError(
-                    f"eval finished (rc={eval_rc}) but result json not found: {result_path}"
+                payload = _synthetic_result_payload_when_eval_json_missing(
+                    op=op,
+                    eval_mode=eval_mode,
+                    eval_rc=eval_rc,
+                    result_path=result_path,
                 )
+                result_path.parent.mkdir(parents=True, exist_ok=True)
+                _write_json(result_path, payload)
+            else:
+                payload = _load_result_payload(result_path)
             outcome.eval_result_path = str(result_path)
-            payload = _load_result_payload(result_path)
             core = _extract_eval_core(payload, op)
             outcome.compiled = core["compiled"]
             outcome.correctness = core["correctness"]
