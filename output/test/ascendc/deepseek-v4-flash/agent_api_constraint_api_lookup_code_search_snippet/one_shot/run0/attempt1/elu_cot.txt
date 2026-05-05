@@ -1,0 +1,58 @@
+We need to generate six Python strings for the elu_custom operator. The structure follows the leaky_relu_custom example, but for ELU activation. ELU: f(x) = x if x >= 0 else alpha * (exp(x) - 1). We need to implement similar tiling and kernel logic using AscendC vector APIs (exp, max, min, mul, add, etc.). Also need tiling data struct, host operator, kernel code, Python bindings, and model.
+
+Key differences from leaky_relu: use exponential and conditional. In AscendC, we can use Exp, then perhaps use Maxs and Mins to separate positive/negative parts? Actually ELU is: if x >= 0: x; else: alpha*(exp(x)-1). We can compute exp, then multiply, then subtract alpha? Wait: alpha*(exp(x)-1) = alpha*exp(x) - alpha. So for negative x: y = alpha * (exp(x) - 1). Positive: y = x. So we need a conditional merge: use Maxs and Mins? For example: y = max(x, 0) + min(x, 0) * something? But min(x,0) * (alpha*(exp(x)-1)/x?) Not straightforward.
+
+Better: use a mask approach: compute exp_val = exp(x), then compute neg_part = alpha*(exp_val - 1.0), then select based on sign. AscendC has a Select operation: Select(cond, x, y, len). cond is a LocalTensor of int8 or bool? Use Float to compare? There's Cmp* operations. Alternatively, we can compute y = (x >= 0) * x + (x < 0) * alpha*(exp(x)-1). But that requires multiplication and addition. Use Cmp to produce mask of 1.0 or 0.0, then multiply.
+
+Simpler: use AscendC's Sel (Select) function? In the documentation (though not in provided snippets), there is a Select operation: Select(cond, src1, src2, len). But we need to generate cond as a float tensor of 1.0/0.0. We can use CmpGt or CmpLt to produce int8? Actually AscendC provides Cmp... operations that output a compare mask (int8). Then we can use the ReadCmpMask? Not sure.
+
+Another approach: use the fact that ELU can be computed as: y = max(x, 0) + alpha * (exp(min(x, 0)) - 1)? Actually exp(min(x,0)) is exp(x) for negative x, and exp(0)=1 for positive x, so for positive x: alpha*(1-1)=0, so y = x. That works! Let's verify:
+- For x>=0: min(x,0)=0 => exp(0)=1 => alpha*(1-1)=0 => y = max(x,0)+0 = x.
+- For x<0: max(x,0)=0, min(x,0)=x => exp(x)-1 => alpha*(exp(x)-1) = y.
+So formula: y = max(x, 0) + alpha * (exp(min(x, 0)) - 1.0). We can compute:
+  1. pos = max(x, 0)
+  2. neg = min(x, 0)
+  3. exp_neg = exp(neg)
+  4. term = alpha * (exp_neg - 1.0) = alpha*exp_neg - alpha
+  5. y = pos + term
+That works using only vector operations: Maxs, Mins, Exp, Muls (alpha*exp_neg), Sub (or Muls for -alpha), Add. Need to ensure exp is supported for negative numbers (yes, exp is defined for all floats).
+
+We'll need a tmp buffer for exp result. We can compute in place or use tmpQueue.
+
+We'll adapt the kernel from the leaky_relu example but change Compute accordingly.
+
+Tiling: same as leaky_relu but UB budget: we need to store xLocal, yLocal, tmp for exp, pos, neg? Actually we can reuse variables: we can allocate one tmp for exp_neg, then compute term and accumulate. But we also need max and min results. We can compute pos and neg directly into yLocal and tmp, then exp into tmp2, then combine. Let's think: we need 3 temporaries max? But we have double buffer for input and output, and one extra tmpQueue. We can use the outQueue buffer as workspace? Better to keep separate.
+
+In leaky_relu example they used tmpBuffer1 and tmpBuffer2 for max, min intermediates. For ELU we might need more. But we have one tmpQueue of size tileLen. We can reuse. Strategy: 
+- Copy input to xLocal.
+- Compute pos = Maxs(xLocal, 0) and neg = Mins(xLocal, 0). We can compute Maxs and Mins in place? No, Maxs returns result in dst, not in-place. We need two dst tensors. We have yLocal from outQueue, and tmp from tmpQueue. So do:
+   AscendC::Maxs(yLocal, xLocal, 0.0f, len); // yLocal = pos
+   AscendC::Mins(tmp, xLocal, 0.0f, len);    // tmp = neg
+- Compute exp_neg: but Exp takes src and dst. We can do AscendC::Exp(tmp, tmp, len); // overwrite neg with exp(neg)
+- Compute term = alpha * (exp_neg - 1). We have another tmp? Not enough. We could compute term into xLocal after we're done with it? xLocal can be freed after reading? Actually xLocal is already used for pos and neg, but we can reuse it. Let's see: after Maxs and Mins, xLocal not needed. We can free it? But we already dequeued xLocal and will free later. In current loop, xLocal is freed after Compute. We can keep xLocal and use it as scratch for term. But we also need exp_neg result. We have tmp. So:
+   AscendC::Sub(tmp, tmp, 1.0f, len); // tmp = exp(neg)-1
+   AscendC::Muls(tmp, tmp, alpha, len); // tmp = alpha*(exp(neg)-1)
+- Then Add yLocal, yLocal, tmp, len => y = pos + term.
+- Then free xLocal, outQueueY.EnQue(yLocal), free tmp (if it's from tmpQueue, we need to free after use). But tmpQueue has depth 1, we allocate then free after Compute.
+
+But careful: tmpQueue is used in Compute, need to allocate and free within Compute. In the leaky_relu example, tmpQueue was allocated at beginning of Compute and freed before EnQue yLocal. That's fine.
+
+Also, we need to handle case where alpha=0? ELU with alpha=0 would be ReLU? Actually alpha=0 gives 0 for negative. Our formula: y = max(x,0) + 0*(exp(min(x,0))-1) = max(x,0). So fine.
+
+We'll modify the kernel code accordingly.
+
+Now generate the six strings. We need:
+- project_json_src: op name "EluCustom", input x (float ND), output y, attr alpha with default 1.0.
+- host_tiling_src: TilingData struct with totalLength, tileLength, blockDim, alpha. REGISTER_TILING_DATA_CLASS(EluCustom, ...).
+- host_operator_src: TilingFunc using UB budget (similar, but compute needed bytes: from example leaky_relu used 5*tile floats? Actually they used inQueueX, outQueueY (2 each) + tmpBuffer1/2 (2) = 6? In our case we have inQueueX (2), outQueueY (2), tmpQueue (1) = 5, so same. So UB budget bytes = 20 * tileLen (since sizeof(float)=4, 5*4*tile=20*tile). So same formula. Block dim calculation same. InferShape/InferDataType same. OpDef class: EluCustom, Input "x", Output "y", Attr "alpha" Float 1.0. SetInferShape etc.
+- kernel_src: class KernelEluCustom, with Init receiving totalLength, tileLength, alpha. Compute as derived. Use grid-stride loop similar to example but with simpler double buffering? In the provided kernel_src for leaky_relu_custom (the answer example) they used a grid-stride loop without explicit double buffer loop; they used a while loop with prefetch. That is acceptable. We'll follow that pattern but modify Compute.
+- python_bind_src: includes aclnnEluCustom call. In the leaky_relu example they used EXEC_NPU_CMD with aclnnLeakyReluCustom. For ELU we need aclnnEluCustom. We'll assume it exists. Also TORCH_LIBRARY_IMPL and PYBIND11_MODULE.
+- model_src: same as example but call custom_ops_lib.elu_custom.
+
+Make sure kernel entry function name is exactly "elu_custom". The kernel class name is KernelEluCustom.
+
+Note: The provided example for kernel used a single while loop with double buffering but not strictly double buffered (they only have one in-flight per block?). Actually they prefetch next tile while processing current, but they only have one queue? They have BUFFER_NUM=2 but they only allocate one tensor at a time? Their CopyIn does Alloc, DataCopy, EnQue; then in Compute, DeQue, etc. So they have two buffers for inQueueX, outQueueY. That's double buffering. Good.
+
+We'll adopt that pattern.
+
+Now, write the code.

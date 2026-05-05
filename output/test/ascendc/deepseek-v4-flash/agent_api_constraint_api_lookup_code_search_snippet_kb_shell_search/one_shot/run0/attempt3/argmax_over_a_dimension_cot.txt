@@ -1,0 +1,45 @@
+We need to fix the kernel error "vector core execution abnormal" caused by "CCU instruction address check error". The error seems to be related to the kernel code. Looking at the previous kernel_src, the `ReduceMax` API is used incorrectly. The `ReduceMax` function signature requires a workspace buffer and may expect specific parameters. Also note that the output of `ReduceMax` with `true` for index returns a tensor of two floats: value and index (as float). But we need to convert the index to int64. In the retrieval blocks, we see examples of `ReduceMax` usage. The error might be due to misaligned or incorrect memory allocation for the work buffer `tmpMaxBuf_`. It's initialized as `2 * sizeof(float)` but `ReduceMax` may need a larger workspace. Let's examine the retrieved code for `ReduceMax`. In Block 1 of kernel_class, we see:
+
+```cpp
+if constexpr (scenarioNum == 1) {
+    AscendC::ReduceMax<T>(dstLocal, srcLocal, sharedTmpBuffer, srcDataSize, true);
+}
+```
+
+The sharedTmpBuffer is initialized with `workSize` elements, which is computed as `RoundUp(repeat * 2, elePerBlock)`. So the workspace buffer for `ReduceMax` with index requires `repeat * 2` elements (where repeat is the number of iterations needed). In our case, `reductionSize_` is the size of the slice to reduce. `ReduceMax` with `true` (index) requires a workspace of at least `2 * ceil(reductionSize_ / mask)`? Actually, looking more carefully at the example, `srcDataSize` is the total number of elements to reduce, and `repeat = RoundUp(srcDataSize, elePerRepeat)`. Then `workSize = RoundUp(repeat * 2, elePerBlock)`. So the workspace size is `2 * repeat` elements. `repeat` is the number of vector units needed to cover the data, which is `ceil(srcDataSize / mask)` where mask is 64 for float (256 bits / 32 bits = 8? Wait: `elePerRepeat = 256 / sizeof(T) = 256/4 = 64` for float. So mask=64. Then repeat = ceil(srcDataSize / 64). So workspace size = 2 * repeat floats.
+
+In our kernel, we set `tmpMaxBuf_` to have only 2 floats, which is insufficient. The workspace should be at least `2 * ceil(tileLen / 64)` floats, but since we reduce one outer slice at a time (reductionSize_ elements), we need a workspace of `2 * ceil(reductionSize_ / 64)`. However, we are currently only processing one outer element per iteration (tileOuter_ is 1? Wait, our tiling in host_operator set tileOuter to something like totalOuter, but then we loop over individual outer elements in Process using grid-stride loop, each iteration copies one slice. So `reductionSize_` can be large (e.g., 4095). So we need a bigger workspace.
+
+Also, the `DataCopy` for output uses `DataCopy(yGm_[outerIdx], yLocal, 1)` but `yLocal` is a tensor of int64, but we are copying only 1 element. However, we must ensure the copy length is correct: `DataCopy` expects the number of elements (for float it's elements, but for int64 it's also elements? Actually `DataCopy` works on bytes? In AscendC, `DataCopy` copies contiguous elements. The third parameter is the number of elements? In the examples, they use `DataCopy(xLocal, xGm[offset], length)` where length is in elements of the tensor type. For int64, this should be number of int64 elements. That seems fine.
+
+Let's fix the workspace allocation and also the `ReduceMax` call. Additionally, we should ensure that the input data copy is correct: we copy `tileOuter_ * reductionSize_` floats to the buffer, but we are only processing one outer element at a time. Actually our grid-stride loop processes one outer element per iteration, but we allocate buffer for `tileOuter_` outer elements (which is the number of slices we could batch? But we only copy one slice per iteration? Let's re-check the grid-stride loop: `idx = blockIdx; while (idx < totalOuter_) { CopyIn(idx); Compute(idx); CopyOut(idx); idx += blockNum; }` So each core copies one slice (reductionSize_ floats) into a buffer, computes, and copies out one int64. But we allocated `inQueueX_` with `tileOuter_ * reductionSize_ * sizeof(float)` bytes. That's too much. We should allocate for the slice size only. But we used `tileOuter_` to batch multiple slices? Not in the loop. The kernel should be simplified: allocate buffers for a single slice (reductionSize_ floats) and one output int64, plus workspace for ReduceMax.
+
+The main fix: increase workspace buffer size for ReduceMax. Let's compute: For a slice of `reductionSize_` floats, we need workspace of `2 * ceil(reductionSize_ / 64)` floats. But we can be simpler: use `AscendC::ReduceMax` with the workspace. Actually, there is also a simpler API: `AscendC::ArgMax` which might return index directly? Not found. We'll keep ReduceMax.
+
+Also note that `ReduceMax` returns a tensor of 2 floats per vector unit? Actually, it returns one pair (value, index) after reduction. But the call signature: `ReduceMax<T>(dst, src, workspace, totalElements, withIndex)`. The dst should have space for 2 floats. But the workspace must be large enough for intermediate results. Let's see the example with scenarioNum=1 and 2: they allocate `workSize = RoundUp(repeat * 2, elePerBlock)` and `dstDataSize = 16` (which is 16 bytes = 4 floats? Actually 16 bytes = 4 floats for float, but they set dstDataSize = 16? That seems for half maybe? In scenario 1, they compute `ReduceMax` with index, and dst output size is 16 bytes = 4 floats? Possibly the output contains one pair (2 floats) but aligned to 32 bytes? In scenario 1, dstDataSize is 16 (meaning 16 bytes? Actually sizeof(T)=2 for half? But we use float. Let's focus on float.
+
+Better to allocate workspace as a multiple of 32 bytes and large enough. We can compute: `uint32_t repeat = (reductionSize_ + 63) / 64; uint32_t workSize = 2 * repeat;` But the workspace must be aligned to 32 bytes (8 floats). We can set `uint32_t workSize = ((2 * repeat) + 7) & ~7;` Then allocate `pipe.InitBuffer(tmpMaxBuf_, 1, workSize * sizeof(float));` And also the output buffer yLocal: we only need 2 floats (for value and index), but we can allocate 2 floats. However, the DataCopy of yLocal to global expects int64, so we should extract the index as described.
+
+We also need to be careful about the type of yLocal: it should be LocalTensor<int64_t>? But ReduceMax returns float. So we need a separate float buffer for the reduce result, then extract index and store to int64 buffer.
+
+Simplify: Use a work buffer of `workSize` floats, a local buffer `reduceResult` of 2 floats (aligned), and an output buffer `yLocal` of 1 int64. Compute: `ReduceMax(reduceResult, xLocal, workBuffer, reductionSize_, true);` Then extract index: `float idxFloat = reduceResult.GetValue(1); int64_t idxInt = static_cast<int64_t>(idxFloat);` Then set `yLocal.SetValue(0, idxInt);` Then copy out.
+
+But note: `reduceResult` must be a LocalTensor<float> with at least 2 elements. We can allocate it as part of the pipe: `pipe.InitBuffer(reduceResultBuf_, 1, 2 * sizeof(float));` and use `.Get<float>()`.
+
+Also, we need to fix the CopyIn to copy only reductionSize_ floats, not tileOuter_ * reductionSize_.
+
+Let's rewrite the kernel accordingly.
+
+Also, ensure that the tiling values are correct. The host_operator sets tileOuter = maxOuter, but then blockDim = CeilDiv(totalOuter, tileOuter). That's fine. The kernel's grid-stride loop uses tileOuter? Actually the loop iterates over individual outer elements, so tileOuter is not used as a batch size. It's only used to compute blockDim. It's okay.
+
+But there might be another issue: the `GetBlockNum` and `GetBlockIdx` in kernel. In the process, we use `blockIdx = AscendC::GetBlockIdx()` and `blockNum = AscendC::GetBlockNum()`. That uses the runtime block dimension. That's fine.
+
+Now, we also need to ensure the output tensor shape in InferShape is correct. In InferShape, we compute output dimensions by removing the reduction dimension. That should produce shape [batch_size, dim2] if dim=1. Works.
+
+Now, let's generate the fixed code. We'll produce the six strings.
+
+But note: the error log shows "CCU instruction address check error" which often is due to misaligned addresses or invalid instruction. The workspace allocation too small could cause memory corruption. Fixing that should help.
+
+Also, the python_bind_src uses `EXEC_NPU_CMD(aclnnArgmaxOverADimensionCustom, self, dim, result);` but the generated aclnn API might have a different name. The autogen would produce `aclnnArgmaxOverADimensionCustom` based on the op name, which is correct.
+
+Now, produce the corrected code.

@@ -1,0 +1,161 @@
+We need to fix the compilation errors. The errors are:
+1. In TilingFunc: `const gert::Shape *inputShape = context->GetInputShape(0)->GetOriginShape();` – GetOriginShape() returns a const gert::Shape&, not a pointer. Need to take address: `&context->GetInputShape(0)->GetOriginShape()`
+2. In InferShape: `gert::Shape y_shape(outDims);` – no constructor from std::vector<int64_t>. Use gert::Shape constructor from initializer list or set dims manually. The simplest is to use SetDim/SetDimNum or construct with initializer list. Since outDims is a vector, we can't use initializer list. Use `gert::Shape y_shape;` then loop to set dims using `y_shape.SetDim(i, outDims[i])` after setting dim_num. Or use `y_shape = gert::Shape({...})` if we know the sizes. But outDims is dynamic. Better to use the shape's SetDimNum and SetDim methods.
+
+Also check kernel_src: The kernel uses AscendC::ReduceMax with index flag, but the API usage may be incorrect. The code `AscendC::LocalTensor<float> slice = xLocal[i * reductionSize_];` is not valid; can't index a LocalTensor like that. Need to use a sub-tensor or pointer arithmetic. This is a more complex issue. We'll need to rewrite the kernel to properly handle per-element reduction. However, the immediate build error is only in host code. The kernel may compile later but we should fix the kernel logic as well to ensure correctness.
+
+Given the repair constraints: "Prioritize resolving the concrete errors shown in logs." So we focus on the compilation errors in host_operator_src. Also note the kernel_src has other issues but we might not need to fix if not shown in logs. But the kernel may have runtime issues. However, the instruction says "Keep behavior unchanged where not required by the fix." So we should only fix the compilation errors.
+
+But the kernel also has a bug: using `xLocal[i * reductionSize_]` is invalid. Also using `AscendC::ReduceMax` with a single element slice? That API expects a contiguous tensor. We'll need to rewrite the kernel to process multiple outer elements correctly. The previous attempt's kernel is too complex and likely wrong. However, we can simplify: since the operation is argmax over a dimension, we can treat the input as a 2D matrix (outer dims x reduction dim) and perform argmax along axis 1. The kernel can use AscendC::ArgMax or manually compute. But AscendC's ArgMax API? There is no direct ArgMax in AscendC? The reduce API provides ReduceMax with index. But it works on a single contiguous buffer. So we can process one outer element at a time: for each outer index, copy the reduction slice, call ReduceMax with index, extract index, store.
+
+That is what the kernel attempted, but the indexing is wrong. We should rewrite the kernel properly.
+
+Given the time, I'll produce a corrected host code that compiles, and a corrected kernel that properly computes argmax using a per-element loop with proper tensor indexing. I'll also fix the python_bind_src and model_src if needed.
+
+Let's fix step by step.
+
+**Fix 1: TilingFunc**
+Change:
+```cpp
+const gert::Shape *inputShape = context->GetInputShape(0)->GetOriginShape();
+```
+to:
+```cpp
+const gert::Shape &inputShapeRef = context->GetInputShape(0)->GetOriginShape();
+const gert::Shape *inputShape = &inputShapeRef;
+```
+Or directly use reference.
+
+**Fix 2: InferShape**
+Change:
+```cpp
+std::vector<int64_t> outDims;
+for (int64_t i = 0; i < ndim; ++i) {
+    if (i != dim) {
+        outDims.push_back(x_shape->GetDim(i));
+    }
+}
+gert::Shape y_shape(outDims);
+```
+to:
+```cpp
+gert::Shape y_shape;
+y_shape.SetDimNum(outDims.size());
+for (size_t i = 0; i < outDims.size(); ++i) {
+    y_shape.SetDim(i, outDims[i]);
+}
+```
+But note: `outDims` is defined later. We need to move the vector definition before using it. Also need to include <vector> header already present.
+
+**Fix 3: Kernel (not shown in errors but will fail at runtime)**
+The kernel uses invalid indexing. We'll rewrite the Compute method to iterate correctly. Use AscendC's DataCopy to copy a slice? But we can't easily slice a LocalTensor. Better to copy the entire tile of outer elements, then compute argmax per outer element using a loop that uses pointer arithmetic on the local tensor? Since LocalTensor can be indexed with `[offset]` to get a scalar? Actually, you can use `xLocal.GetValue(offset)` to get a scalar, but that's inefficient. Instead, we can use a second local tensor for the slice and call ReduceMax on it. But copying each slice individually would be heavy. Since the reduction size might be large, we can pipeline: for each outer element, we copy its slice to a temporary buffer (maybe from global directly). However, a simpler approach: treat the whole input as a flat array, and compute argmax over blocks of size reductionSize. But we need to output per outer element. The current kernel attempts to use a double buffer for the whole tile of input, then loops over outer elements. But the loop body is wrong.
+
+A more practical approach: we can use the AscendC ArgMax API? There is no direct ArgMax. We can use ReduceMax with index flag on each slice. But we need to extract the index. The correct approach: For each outer element, we have reductionSize floats. We can call `AscendC::ReduceMax(result, slice, work, reductionSize, true)`. The result is a local tensor of 2 elements: [max, index]. Then we get index via `result.GetValue(1)`.
+
+To get the slice, we can use `SetLocalBuffer` if we allocate properly. The input tensor is stored in a local buffer with size tileOuter * reductionSize. We can create a sub-tensor view using `xLocal[i*reductionSize]`? The AscendC LocalTensor does support operator[] that returns a reference to the element? Actually, you can do `xLocal(i)` to get element, but not a sub-tensor. To get a sub-tensor, you need to use `AscendC::LocalTensor<T> slice = xLocal.Slice(i*reductionSize, reductionSize);` if Slice is available. Alternatively, we can copy the slice to a temporary buffer and call ReduceMax on that. But that's inefficient.
+
+Given the complexity, maybe we can simplify: since the kernel is expected to run on a single block? The original architecture uses argmax over a dimension, which reduces the dimension. The kernel should handle arbitrary shapes. But for the purpose of this exercise, we can assume the reduction size is manageable and each block handles a contiguous chunk of outer elements. The previous attempt's kernel is flawed but the compilation error is only in host code. However, to ensure correctness, we must fix the kernel. Let's consult the retrieved code snippets: there are examples of ReduceMax with index. In Block 1 (reduce_computation.asc), they use `AscendC::ReduceMax<T>(dstLocal, srcLocal, sharedTmpBuffer, srcDataSize, true);` on a contiguous tensor. That's what we want, but per outer element.
+
+We can redesign: Each block processes a range of outer elements. For each outer element, we need to compute argmax over the reduction axis. We can do it in a loop: for each outer index i, we copy the slice from global to a local buffer (size reductionSize), then call ReduceMax, extract index, write to output global. But that would involve many small copies, inefficient. Better: copy a batch of outer elements (tileOuter) into local, then for each outer element in that batch, call ReduceMax on the corresponding slice in the local tensor. To get a sub-tensor, we can use `AscendC::LocalTensor<T> slice = xLocal.Slice(i*reductionSize, reductionSize);` but Slice might not exist. The AscendC API might have `SubTensor`? I think we can use `AscendC::LocalTensor<T> slice = xLocal.SubTensor(i*reductionSize, reductionSize);`? Not sure.
+
+Given the constraints, I think the safest is to keep the same overall structure but fix the indexing to use proper API. From the error logs, only host compilation errors are shown. The kernel might compile but will fail at runtime. However, the user instruction says "Prioritize resolving the concrete errors shown in logs." So we can leave kernel as is if it compiles? But the kernel_src in the previous attempt also had syntax errors: `AscendC::LocalTensor<float> slice = xLocal[i * reductionSize_];` is invalid. That will cause a compilation error as well. But the build log only shows errors from host code because the build stopped before kernel compilation. So once host is fixed, kernel will be compiled and will fail. So we need to fix kernel too.
+
+Let's fix kernel to be correct. Use simple approach: For each outer element, copy from global to a local buffer of size reductionSize, call ReduceMax, extract index, store. Use double buffering for input tiles, but process outer elements sequentially within a tile. To avoid copying each slice individually, we can load a larger tile (tileOuter * reductionSize) and then for each outer element, create a sub-tensor view using pointer arithmetic? Actually, in AscendC, you can use `SetLocalBuffer` to set a pointer? Or use `AscendC::LocalTensor<T> slice = xLocal.SubTensor(i*reductionSize, reductionSize);`? I think the correct API is `AscendC::LocalTensor<T> slice = xLocal[i*reductionSize];` would assign the element at that index, not a sub-tensor. So we need another method.
+
+Looking at the AscendC documentation, there is `AscendC::LocalTensor<T> slice = xLocal[offset];` returns a single element of type T (lvalue). That's not a tensor. So we cannot slice that way. We must copy each slice to a separate buffer. That's inefficient but acceptable for a simple kernel. We can allocate a single-element buffer for the slice? No, we need reductionSize elements.
+
+Alternative: Use a double buffer for input tile, and for each outer element, we call ReduceMax on the sub-region of the same tensor by using the tensor address with offset? ReduceMax function takes a LocalTensor, not a pointer. So we need a LocalTensor that represents the slice. To create such a tensor, we can use `AscendC::LocalTensor<T> slice = xLocal.SubTensor(i*reductionSize, reductionSize);` but SubTensor is not standard. The correct API is `AscendC::LocalTensor<T> slice = xLocal.Slice(i*reductionSize, reductionSize);`? I need to check. The example code in Block 1 uses a single contiguous tensor. They don't slice.
+
+Given the difficulty, perhaps we can implement argmax differently: use a scalar loop with GetValue/SetValue. That would be extremely slow but functional. Not ideal.
+
+Better approach: Since the reduction is over a dimension, we can transpose the tensor in global memory? Too complex.
+
+Given the constraints of this repair, I think we should simplify the kernel to process only one outer element at a time, copying from global directly to a small local buffer, compute, write. Use a loop over outer elements, but with small tile length. The tiling can set tileOuter to 1. That would be very simple but extremely slow. But the user expects performance gains? The original task is to replace PyTorch operators for performance, but the immediate goal is to fix the build.
+
+I'll propose a corrected kernel that uses a straightforward approach: For each outer element, copy reductionSize floats to a local buffer, call ReduceMax with index, extract index, store to global. Use a simple double-buffer scheme to overlap copy and compute. This will work but may not be optimal.
+
+Also, note that the output type is int64. The kernel uses int64 for output. ReduceMax returns float elements (value and index as float for index). So we need to cast.
+
+Let's rewrite the kernel class:
+
+```cpp
+class KernelArgmaxOverADimensionCustom {
+public:
+    __aicore__ inline KernelArgmaxOverADimensionCustom() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalOuter, uint32_t reductionSize, uint32_t tileOuter, int32_t dim) {
+        totalOuter_ = totalOuter;
+        reductionSize_ = reductionSize;
+        tileOuter_ = tileOuter;
+        // Global buffers
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalOuter_ * reductionSize_);
+        yGm_.SetGlobalBuffer((__gm__ int64_t*)y, totalOuter_);
+        // Pipelines: input buffers for one tile of outer elements (each outer element has reductionSize floats)
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileOuter_ * reductionSize_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileOuter_ * sizeof(int64_t));
+        // Temporary buffer for ReduceMax intermediate (2 floats per call, but we call per outer element, so we can reuse)
+        pipe_.InitBuffer(tmpQueue_, 1, reductionSize_ * sizeof(float)); // work buffer for ReduceMax
+        // Additionally, we need a buffer for the single-element result per outer element? We'll reuse tmpQueue_ for result as well.
+    }
+
+    __aicore__ inline void Process() {
+        if (totalOuter_ == 0 || reductionSize_ == 0) return;
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t start = blockIdx * tileOuter_;
+        uint32_t end = (start + tileOuter_ > totalOuter_) ? totalOuter_ : start + tileOuter_;
+        uint32_t cur = start;
+        while (cur < end) {
+            uint32_t remaining = end - cur;
+            uint32_t len = (remaining > tileOuter_) ? tileOuter_ : remaining;
+            // Copy in a batch of outer elements
+            CopyIn(cur, len);
+            // Compute argmax for each outer element in the batch
+            Compute(len);
+            // Copy out results
+            CopyOut(cur, len);
+            cur += len;
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t outerOffset, uint32_t len) {
+        AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+        uint32_t offset = outerOffset * reductionSize_;
+        AscendC::DataCopy(xLocal, xGm_[offset], len * reductionSize_);
+        inQueueX_.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t len) {
+        AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+        AscendC::LocalTensor<int64_t> yLocal = outQueueY_.AllocTensor<int64_t>();
+        AscendC::LocalTensor<float> tmpWork = tmpQueue_.AllocTensor<float>();
+        // For each outer element, compute argmax over reductionSize_ elements
+        for (uint32_t i = 0; i < len; ++i) {
+            // Create a sub-tensor for this outer element by copying? Actually we can use pointer arithmetic on local tensor.
+            // AscendC provides GetPointer()? Let's use DataCopy from the xLocal buffer to a work area if needed.
+            // But we can call ReduceMax on a slice of xLocal by using DataCopy to a separate small buffer? That's inefficient.
+            // Alternative: Use a single-element result tensor and call ReduceMax on the whole xLocal? No, because we need per-outer.
+            // We'll use xLocal's pointer: AscendC::LocalTensor<float> slice = xLocal.Slice(i*reductionSize_, reductionSize_); -- not available.
+            // Workaround: Use a loop to copy the slice to a temporary buffer (work area) and then call ReduceMax.
+            AscendC::LocalTensor<float> slice = tmpWork; // reuse tmpWork as slice buffer
+            // Copy from xLocal offset to slice
+            AscendC::DataCopy(slice, xLocal[i * reductionSize_], reductionSize_); // This copies reductionSize_ floats from global-like? But xLocal is local, can we copy from local to local? DataCopy works between global and local, not local-local. So this fails.
+            // Actually DataCopy is only for global<->local. For local<->local, we need to use a different approach.
+            // This is problematic.
+        }
+        // ... Need a different design
+    }
+};
+```
+
+Given the complexity, I think the simplest fix to make the kernel compile and run correctly is to process each outer element individually with a direct global copy (no double buffering for outer elements within a tile). That is, set tileOuter=1, and for each outer element, copy from global to a local buffer of size reductionSize, compute, write. This will be slow but correct. We can still use double buffering for the copy/compute overlap on the reduction size? No, each outer element is independent.
+
+Given the time, I'll adopt that approach: treat tileOuter as 1 effectively. The TilingFunc can set tileOuter = 1 for simplicity. But the user may want performance. But for now, to fix build and correctness, we can do that.
+
+Alternatively, we can use a simpler algorithm: use AscendC's `ReduceMax` with index on the entire tensor? No, because we need per-row (outer) argmax. We could reshape the tensor into a 2D matrix and use a pattern-based reduction? The reduce pattern API (ReduceMax with Pattern::RA) might help, but it's complex.
+
+Given the repair constraints, I'll produce a minimal fix that makes the host code compile and the kernel compile and work correctly for the given test case (batch_size=128, dim1=4096, dim2=4095, dim=1). The input shape is [128, 4096, 4095]. Argmax over dim=1 gives shape [128, 4095]. totalOuter = 128*4095 = 523,840. reductionSize = 4096. That's large but manageable. We can set tileOuter to a small number like 32 to keep UB usage low. But the kernel must handle arbitrary outer indexing.
+
+I'll rewrite the kernel to use a simple per-outer-element approach with a small local buffer for the reduction slice. We'll use a double buffer for input slice (size reductionSize) and output element. This avoids the complex indexing.
+
+Let's write the corrected code now.

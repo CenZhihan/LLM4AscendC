@@ -1,0 +1,314 @@
+We need to generate the six embedded Python strings for the triplet margin loss custom operator. The architecture uses F.triplet_margin_loss with anchor, positive, negative, and margin (as tensor). We need to replace it with a custom AscendC kernel named `triplet_margin_loss_custom` (PascalCase: TripletMarginLossCustom). The original PyTorch operator computes triplet margin loss: max(d(anchor, positive) - d(anchor, negative) + margin, 0). We need to implement this with AscendC.
+
+First, understand the computation: For each element (sample), we have anchor, positive, negative vectors of dimension d. The loss is per sample: loss = max( ||anchor-positive||^2 - ||anchor-negative||^2 + margin, 0). Actually, F.triplet_margin_loss uses squared distances by default, and reduction is 'mean' by default. But the kernel should compute per-sample loss and then reduce? The original model returns a scalar (mean). The kernel should handle the reduction? Usually the custom kernel will output a scalar loss. However, the typical pattern is to compute per-element distances and then reduce. We need to decide on the kernel signature.
+
+Looking at the leacky_relu example, the kernel operates on a flat tensor element-wise. For triplet margin loss, we have three inputs (anchor, positive, negative) all of shape (n, d) and a scalar margin. The output is a scalar (mean loss). So the kernel needs to handle batch dimension.
+
+We can design the kernel to:
+- Input: anchor, positive, negative (each flattened to n*d floats), margin (float), output: a single float (mean loss).
+- Use ReduceSum to sum over the batch after computing per-sample losses.
+
+But the kernel needs to be efficient: we can compute per-sample distance, then loss, then reduce sum over samples, then divide by n.
+
+We'll use tiling approach: tile along the batch dimension, compute partial sums, and finally reduce to single value.
+
+We need to produce project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+Important: The kernel name in kernel_src must be `triplet_margin_loss_custom`. Operator definition in project_json and host_operator use PascalCase: `TripletMarginLossCustom`.
+
+Follow the structure of the leaky_relu example closely.
+
+Let's design tiling data:
+- totalElements: total number of float elements in anchor (n*d)
+- tileElements: number of elements per tile (some aligned multiple)
+- batchSize: n
+- dim: d
+- margin: float
+
+We'll compute per-sample distances: first compute squared Euclidean distance between anchor and positive, and between anchor and negative. Then per-sample loss = max(pos_dist - neg_dist + margin, 0). Then sum all losses, then divide by n.
+
+In kernel, we can use vec compute API: Sub, Mul, Add, Max, etc.
+
+We'll need a workspace for intermediate results.
+
+Tiling budget: we need to hold three tiles (anchor, positive, negative) plus workspace for distance calculations. That's 5 * tileElements floats. UB budget 192KB -> 192*1024/4 = 49152 floats. So tileElements ~ 9830. Align to 2048 => 8192. That's fine.
+
+Let's produce the code.
+
+Note: The input tensors have shape (n, d). We'll treat as 1D contiguous (row-major). We'll have batch loops.
+
+We'll also need to handle reduction: after computing per-sample losses, we need to sum them. We can use ReduceSum API.
+
+Let's write host_tiling_src with fields: totalLen, tileLen, batchSize, dim, margin.
+
+Host operator: similar to leaky_relu but with three inputs and one output. Input shapes: three same shape, output shape scalar.
+
+InferShape: output is scalar (1 element). But we can also keep as shape (1) or just a single value. In AscendC tensor representation, we can output a 1D tensor of size 1.
+
+Actually, for mean loss, output is a scalar. We'll define output shape as (1,).
+
+InferDataType: all float.
+
+Now, kernel_src: We'll create class KernelTripletMarginLossCustom.
+
+Process: 
+- Get blockIdx and blockNum.
+- Compute tile-based grid stride over batch: each tile processes a set of samples (batchSize may be large). We'll tile over samples, not over dimensions. Because each sample requires computing distances over d dimensions. So we need to process d elements per tile for each sample? Better to process one sample at a time, using double buffer for the three vectors.
+
+We can design: For each sample (i), load anchor[i*d : (i+1)*d], positive, negative. Compute pos_dist = sum((a-p)^2), neg_dist = sum((a-n)^2). Then loss = max(pos_dist - neg_dist + margin, 0). Then accumulate sum_loss. Finally, after all samples, use ReduceSum to sum over all blocks? But blocks handle different samples. We need to reduce across blocks. Typically, kernel outputs a per-block partial sum, and then host does final reduction? But in AscendC kernel, we can use workspace or atomic? Usually, custom kernel outputs a tensor of size blockNum with partial sums, and then host does reduction. Or we can use a single output and use atomic add? Atomic on NPU is not straightforward. Simpler: kernel outputs a tensor of shape (blockNum,) containing partial sum and count (or just sum) and then host reads and reduces. But the example leaky_relu outputs the whole tensor. For reduction to scalar, we need a two-stage approach: maybe the host operator handles reduction after kernel? Or we can use a single kernel that does cross-block reduction using AllReduce? Not available.
+
+Alternative: Use a single block (blockDim=1) and iterate over all samples sequentially. That simplifies reduction. The tiling function can set blockDim=1. For large batch, the tile length can be set to total elements to process in one go? But we need UB buffer size limit. We'll tile over samples: process a subset of samples per iteration, accumulate in local variable, then after all iterations, output sum to global buffer. Then host does division? Actually, kernel can output the sum, and host divides by batchSize.
+
+But if blockDim=1, then only one core runs. That may be acceptable if kernel is not the bottleneck. But for performance, we could use multiple cores, each processing a chunk of samples, and then use a separate reduction kernel. However, the instruction says "Replace relevant PyTorch operators" and produce the six strings. Simpler to use one block. The host tiling can set blockDim=1.
+
+Let's choose single block approach for simplicity.
+
+Tiling: total elements = batchSize * dim * 3? Actually anchor, positive, negative each have batchSize*dim elements. We'll tile over the total float elements? Better to tile over samples: we process a certain number of samples per iteration. For each sample, we need to load d floats from each of three tensors. So per sample we need 3*d floats. UB buffer: we need to hold tileSize samples' worth of anchor, positive, negative (each tileSize*d floats). That's 3 * tileSize*d floats. Plus workspace for distances: we can compute distances in place. Let's set tileSize = how many samples per iteration. UB budget: 192KB = 49152 floats. So 3*tileSize*d <= 49152/2? We need also workspace. Let's assume d=128 (given in get_inputs). Then per sample we need 3*128=384 floats. UB budget for 5 tiles (anchor, pos, neg, workspace1, workspace2) = 5*tileSize*128? Actually we need two workspaces: one for pos_dist (tileSize floats) and one for neg_dist. So total = 3*tileSize*d + 2*tileSize = tileSize*(3*d+2). For d=128, that's tileSize*386. UB budget 49152 => tileSize <= 127. So we can set tileSize to 64 for alignment. That's fine.
+
+But the kernel should be generic for any d. So tiling function computes tileSize based on UB budget and d.
+
+We'll store totalLength = batchSize * dim (total floats in one tensor). Actually we need dim separate.
+
+Better tiling fields: totalLength (batchSize*dim), dim, batchSize, margin. Then tileElements = tileSize * dim (number of floats per tile per input). We'll align to 2048 elements.
+
+But careful: we need to load exactly tileSize*d floats for each input per tile. That may not align to 2048 if tileSize*d not multiple of 2048. We can align tileSize*d to 2048, then adjust tileSize accordingly.
+
+Let's implement.
+
+We'll write kernel_src:
+
+class KernelTripletMarginLossCustom {
+public:
+    __aicore__ inline KernelTripletMarginLossCustom() {}
+    __aicore__ inline void Init(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR y,
+                                uint32_t totalLen, uint32_t batchSize, uint32_t dim, float margin)
+    {
+        totalLen_ = totalLen; // batchSize*dim
+        batchSize_ = batchSize;
+        dim_ = dim;
+        margin_ = margin;
+        anchorGm_.SetGlobalBuffer((__gm__ float*)anchor, totalLen_);
+        positiveGm_.SetGlobalBuffer((__gm__ float*)positive, totalLen_);
+        negativeGm_.SetGlobalBuffer((__gm__ float*)negative, totalLen_);
+        // output: single float (sum of losses)
+        yGm_.SetGlobalBuffer((__gm__ float*)y, 1);
+        // Buffer sizes: we'll process tileSize samples per iteration
+        // tileSize = tileLen / dim
+        tileLen_ = ... // will be set from tiling, in elements (per-input)
+        tileSize_ = tileLen_ / dim_;
+        // Init pipes
+        pipe_.InitBuffer(inQueueA_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueP_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueN_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, 1, sizeof(float)); // output scalar? Actually we store sum, then copy out.
+        // Workspace for distances
+        pipe_.InitBuffer(tmpQueuePos_, 1, tileSize_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueueNeg_, 1, tileSize_ * sizeof(float));
+        // also need workspace for reduction? We'll keep sum as float variable.
+    }
+    __aicore__ inline void Process()
+    {
+        // One block only (blockIdx = 0)
+        float sumLoss = 0.0f;
+        uint32_t offset = 0;
+        while (offset < batchSize_) {
+            uint32_t samples = batchSize_ - offset;
+            if (samples > tileSize_) samples = tileSize_;
+            uint32_t elemCount = samples * dim_;
+            // Load tiles
+            CopyIn(offset * dim_, elemCount, inQueueA_, anchorGm_);
+            CopyIn(offset * dim_, elemCount, inQueueP_, positiveGm_);
+            CopyIn(offset * dim_, elemCount, inQueueN_, negativeGm_);
+            // Compute distances and losses for these samples
+            Compute(samples, elemCount);
+            // Dequeue and add to sum
+            AscendC::LocalTensor<float> lossLocal = outQueueY_.DeQue<float>();
+            sumLoss += lossLocal(0); // lossLocal is tensor of size 1? Actually we can store per-sample losses and reduce.
+            // Easier: store per-sample losses in a temporary and then reduce? But we have tileSize_ losses.
+            // We can compute sum inside Compute and store sum partial.
+            // Let's redesign: Compute returns sum loss for the tile.
+        }
+        // Write final sum to output
+        AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+        yLocal(0) = sumLoss;
+        AscendC::DataCopy(yGm_, yLocal, 1);
+        outQueueY_.FreeTensor(yLocal);
+    }
+
+But we need to handle the reduction more cleanly. Let's design Compute to compute per-sample losses and store them as a vector, then sum them using ReduceSum. That requires workspace. Alternatively, we can accumulate in a local variable inside Compute and then enqueue a single float. Simpler: Compute function returns the partial sum via output queue. We can have a queue for partial sums. Or we can use a scalar variable directly. Since we are single block, we can just accumulate in a float variable.
+
+Let's write Compute that takes the three input tensors (each with samples*dim floats) and produces a single float (sum of losses for those samples). We'll need to compute squared distances: For each sample, compute sum of squares of differences. We can do this by: sub, mul, reduceSum over dim. But reduceSum only works on a contiguous tensor. We can reshape? For each sample, we have a block of dim floats. We can use PairReduceSum or BlockReduceSum? PairReduceSum reduces pairs to half, not sum over all. BlockReduceSum reduces each data block of 32 bytes to one value. For half, 32 bytes = 16 half, for float 32 bytes = 8 float. So BlockReduceSum reduces each block of 8 floats to one sum. That's not what we want (we want sum over whole dim). Better to use ReduceSum with workspace: we can do for each sample: (a-p)^2, then RepeatReduce? Actually, we can compute the squared differences for all samples at once: (anchor - positive) element-wise, then square, then sum over dim axis. But the reduction over dim is not contiguous because data is interleaved? Since we have all samples concatenated, (anchor - positive) results in a contiguous tensor of batchSize*dim. Then we need to sum over dim for each sample, resulting in batchSize values. That's a classic reduce operation with axis=1. AscendC does not have a direct ReduceSum with axis parameter. We need to implement manually: we can compute per-sample sum by using multiple ReduceSum calls or by using a loop? Alternatively, we can process sample by sample: for each sample, extract the dim elements, compute squared distance, sum. That's simpler.
+
+Given the complexity, perhaps we should use the multi-block approach with separate reduction kernel. But the instruction expects a single kernel. Let's try to implement per-sample loop.
+
+We'll process sample by sample within a tile. For each sample:
+- Load one float from anchor, positive, negative (since we need to access across dim). Actually we need vector of dim floats. So we need to load dim floats for each sample. That's fine if we have them in local tensor.
+
+We can load tile of samples (tileSize samples, each dim floats) into three local tensors. Then for each sample, we compute squared distance using a helper that does element-wise sub, mul, and then reduce sum over the dim elements. The reduction over dim can be done with ReduceSum using workspace of size dim (or we can use a loop). But ReduceSum works on a contiguous tensor, so we can copy the dim elements into a temporary and reduce. That would be inefficient.
+
+Better: Use vector API to compute (anchor - positive)^2 for all elements, then use a custom reduction: we can sum over blocks of 8 floats using BlockReduceSum to get partial sums, then accumulate. But that is messy.
+
+Given time, I think the single-block approach with per-sample loop is acceptable for correctness, even if not optimal. We'll compute squared distance using:
+- For each sample i:
+  - Use a loop to compute sum over j: (anchor[i*d+j] - positive[i*d+j])^2.
+  - This is slow but works for small dimensions.
+
+But for d=128, it's 128 iterations per sample, and batchSize=32 (given). That's fine.
+
+We'll implement Compute that processes one sample at a time using local tensors of size dim.
+
+We'll allocate a local tensor for one sample's anchor, one for positive, one for negative, and temporary for diff and square. But we have tiled large chunks. We'll do double buffering: load all three tiles, then process sample by sample.
+
+Given the complexity, I'll simplify further: use a single block and process each sample individually, loading from global each time. That would be very slow. So we need to implement proper vectorized computation.
+
+Let's design a more efficient approach: compute (anchor-positive) and (anchor-negative) element-wise for the whole tile, then square, then use a custom reduction to sum over dimensions per sample. We can use the PairReduceSum? No, it reduces pairs.
+
+Observation: We can compute the squared distances as: for each sample i, we want sum_{j} (a[i*d+j] - p[i*d+j])^2. This is equivalent to: sum_{j} a^2 + p^2 - 2*a*p. But we have pairs across samples. We can precompute a^2, p^2, then sum over dim per sample using ReduceSum with workspace? Actually, we can compute a^2, p^2 for all elements, then for each sample we need sum of a^2 over its dim, sum of p^2, and sum of a*p. We can compute these sums using parallel reduction: For each sample, we need to sum over contiguous block of dim elements. The data is laid out as batchSize rows of dim columns. We can treat it as a 2D array. To sum each row, we can use the ReduceSum API with a stride? There is no built-in row sum. We may need to transpose? Too complex.
+
+Given the constraints, I'll implement a straightforward per-sample loop using scalar operations, but with vectorized loads and stores. For each sample, we'll load dim floats from each tensor into local arrays, compute squared distance using AscendC vector ops (Sub, Mul, then ReduceSum). Since ReduceSum requires a contiguous tensor, we can copy the diff into a temporary tensor and reduce it. That requires workspace of size dim. We'll allocate a workspace tensor of size dim_ for each sample? That would be too large if we process tileSize samples simultaneously. Instead, we can process one sample at a time, using static workspaces.
+
+We'll allocate:
+- inQueueA, inQueueP, inQueueN for double buffering of tileSize*dim elements.
+- tmpQueue A for one sample (dim floats)
+- tmpQueue B for diffPos (dim floats)
+- tmpQueue C for diffNeg (dim floats)
+- tmpQueue D for workspace for ReduceSum (dim floats) but ReduceSum needs workspace of same size? Actually ReduceSum(LocalTensor<T>& dst, LocalTensor<T>& src, LocalTensor<T>& workspace, int32_t count) – workspace must be a tensor of the same size as src? I think workspace can be smaller? The documentation says workspace should be of size count. So we need workspace of size count. So for each sample, we need a workspace of dim. That's too much if we pre-allocate for tileSize. Instead, we can reuse the same workspace for all samples.
+
+We'll allocate a single workspace tensor of size dim_ (max dimension). Then for each sample, we copy the diff into a temporary tensor of size dim, then call ReduceSum to get a single float distance. That's okay if dim is not huge (e.g., 128). For each sample, we will do three ReduceSum calls (pos_dist, neg_dist). That's fine.
+
+Thus, we need three temporary tensors of size dim: diffPos, diffNeg, and a workspace for each? Actually ReduceSum needs a workspace of same size. We can use the same workspace for both ReduceSum calls if we reuse after each. So we need one workspace of size dim.
+
+Plus we need a temporary to copy the diff for each sample? Actually we can compute diff directly into a local tensor of size dim, then use that as src for ReduceSum. So we need one diff tensor of size dim (for pos) and one for neg, plus workspace of size dim.
+
+Additionally, we need to load a sample's anchor, positive, negative into three local tensors of size dim. So total per-sample local buffers: 5 * dim floats. For dim=128, that's 640 floats, well within UB budget. Since we process tileSize samples sequentially, we can reuse these buffers.
+
+But we also need to load tileSize samples into the double buffers for efficient memory access. Actually, we can load one sample at a time from global to local tensors. That would avoid double buffering and simplify. For a batch of 32, it's fine. Let's go with single sample processing to keep kernel simple.
+
+We'll set tileLength in tiling to be dim (since we process one sample per iteration). Actually, we can set tileLength = dim (number of floats per input per iteration). Then we process a fixed number of samples using a loop over batch, each iteration loading exactly one sample's dim floats for anchor, positive, negative.
+
+That is simple and correct.
+
+So tiling fields:
+- totalLength = batchSize * dim (not directly used; we use batchSize and dim separately)
+- batchSize
+- dim
+- margin
+
+We'll set tileLength = dim, and tileSize = 1 (samples per tile). That works.
+
+Now, kernel implementation:
+
+class KernelTripletMarginLossCustom {
+public:
+    __aicore__ inline KernelTripletMarginLossCustom() {}
+    __aicore__ inline void Init(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR y,
+                                uint32_t batchSize, uint32_t dim, float margin)
+    {
+        batchSize_ = batchSize;
+        dim_ = dim;
+        margin_ = margin;
+        anchorGm_.SetGlobalBuffer((__gm__ float*)anchor, batchSize*dim);
+        positiveGm_.SetGlobalBuffer((__gm__ float*)positive, batchSize*dim);
+        negativeGm_.SetGlobalBuffer((__gm__ float*)negative, batchSize*dim);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, 1);
+        // Init buffers for one sample (dim floats each)
+        pipe_.InitBuffer(inQueueA_, 1, dim_ * sizeof(float));
+        pipe_.InitBuffer(inQueueP_, 1, dim_ * sizeof(float));
+        pipe_.InitBuffer(inQueueN_, 1, dim_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueueDiffPos_, 1, dim_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueueDiffNeg_, 1, dim_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueueWorkspace_, 1, dim_ * sizeof(float));
+        pipe_.InitBuffer(outQueueLoss_, 1, sizeof(float)); // store per-sample loss? Actually we accumulate sum in local variable.
+    }
+    __aicore__ inline void Process()
+    {
+        float totalLoss = 0.0f;
+        for (uint32_t i = 0; i < batchSize_; ++i) {
+            // Load one sample
+            uint32_t offset = i * dim_;
+            AscendC::LocalTensor<float> aLocal = inQueueA_.AllocTensor<float>();
+            AscendC::DataCopy(aLocal, anchorGm_[offset], dim_);
+            inQueueA_.EnQue(aLocal);
+
+            AscendC::LocalTensor<float> pLocal = inQueueP_.AllocTensor<float>();
+            AscendC::DataCopy(pLocal, positiveGm_[offset], dim_);
+            inQueueP_.EnQue(pLocal);
+
+            AscendC::LocalTensor<float> nLocal = inQueueN_.AllocTensor<float>();
+            AscendC::DataCopy(nLocal, negativeGm_[offset], dim_);
+            inQueueN_.EnQue(nLocal);
+
+            // Dequeue
+            AscendC::LocalTensor<float> a = inQueueA_.DeQue<float>();
+            AscendC::LocalTensor<float> p = inQueueP_.DeQue<float>();
+            AscendC::LocalTensor<float> n = inQueueN_.DeQue<float>();
+
+            // Compute diffPos = a - p
+            AscendC::LocalTensor<float> diffPos = tmpQueueDiffPos_.AllocTensor<float>();
+            AscendC::Sub(diffPos, a, p, dim_);
+            // Compute diffPosSq = diffPos * diffPos
+            AscendC::Mul(diffPos, diffPos, diffPos, dim_); // overwrite diffPos with squares
+            // Compute posDist = sum(diffPosSq)
+            AscendC::LocalTensor<float> workspace1 = tmpQueueWorkspace_.AllocTensor<float>();
+            AscendC::LocalTensor<float> posDistLocal = outQueueLoss_.AllocTensor<float>(); // temporary, size 1? Actually we need a scalar result. We can allocate a tensor of size 1.
+            AscendC::ReduceSum(posDistLocal, diffPos, workspace1, dim_);
+            AscendC::LocalTensor<float> negDistLocal = outQueueLoss_.AllocTensor<float>(); // reuse same queue? Better to allocate separate.
+            // But we only have one outQueueLoss_. We can reuse after reading value. Better to use a scalar variable.
+            // We'll copy the result to scalar variable.
+            float posDist = posDistLocal(0);
+            outQueueLoss_.FreeTensor(posDistLocal);
+
+            // Similarly for negDist
+            AscendC::Sub(diffNeg, a, n, dim_); // diffNeg not allocated yet
+            AscendC::Mul(diffNeg, diffNeg, diffNeg, dim_);
+            AscendC::ReduceSum(negDistLocal, diffNeg, workspace1, dim_);
+            float negDist = negDistLocal(0);
+            outQueueLoss_.FreeTensor(negDistLocal);
+
+            // Free tensors
+            tmpQueueWorkspace_.FreeTensor(workspace1);
+            tmpQueueDiffPos_.FreeTensor(diffPos);
+            // diffNeg not allocated? We need to allocate diffNeg tensor.
+            // Let's restructure: allocate diffPos and diffNeg separately from two tmp queues.
+
+            // Compute sampleLoss = max(posDist - negDist + margin, 0)
+            float sampleLoss = posDist - negDist + margin_;
+            if (sampleLoss < 0.0f) sampleLoss = 0.0f;
+            totalLoss += sampleLoss;
+
+            // Free queues
+            inQueueA_.FreeTensor(a);
+            inQueueP_.FreeTensor(p);
+            inQueueN_.FreeTensor(n);
+        }
+        // Write totalLoss to output
+        AscendC::LocalTensor<float> yLocal = outQueueLoss_.AllocTensor<float>();
+        yLocal(0) = totalLoss;
+        AscendC::DataCopy(yGm_, yLocal, 1);
+        outQueueLoss_.FreeTensor(yLocal);
+    }
+
+But we have issues with multiple queues. Let's redesign: use separate queues for diffPos and diffNeg, and a workspace queue. Also, outQueueLoss_ is used for temporary scalars. We'll create a separate queue for scalars.
+
+Simplify: Instead of using queues for temporaries, we can directly allocate and free as needed. We'll have:
+- posDiffQueue (VECCALC, 1)
+- negDiffQueue (VECCALC, 1)
+- workspaceQueue (VECCALC, 1)
+- scalarQueue (VECOUT, 1) for output.
+
+Then in each iteration:
+Allocate posDiff, negDiff, workspace from their queues.
+Compute diff, square, ReduceSum into scalar tensor from scalarQueue (allocate it), read value, free scalar tensor.
+Then free posDiff, negDiff, workspace.
+
+That works.
+
+We also need to handle the case where dim_ is zero? Unlikely.
+
+Now, host tiling: we need to pass batchSize, dim, margin. Also we might need totalLength for completeness, but not used. We'll set tileLength = dim (since we process one sample's dim elements at a time). But the tiling function typically sets tileLength based on UB budget. Since we process one sample at a time, tileLength is dim. So we can set tileLength = dim. Align to something? dim may not be multiple of alignment, but it's fine for DataCopy.
+
+We'll set blockDim = 1.
+
+Now, implement all strings.
+
+Let's write the code.

@@ -1,0 +1,80 @@
+We need to produce the six Python strings for the custom AscendC kernel for argmax over a dimension. The original architecture uses `torch.argmax(x, dim=self.dim)` with input shape (batch_size, dim1, dim2) where dim1=4096, dim2=4095, and dim=1 (from get_init_inputs). The kernel should compute argmax over a specified dimension.
+
+We need to define:
+- `project_json_src`: operator definition with input x (float), output y (int32? since indices), and attr dim (int, default 1). Argmax outputs integer indices, will use int32.
+- `host_tiling_src`: tiling data struct for ArgmaxOverADimensionCustomTilingData. Need totalLength, tileLength, dim, shape dimensions etc. Since it's argmax over a dimension, we need to know the shape and which dimension to reduce. The input is ND, we need to store the shape dimensions up to a max rank (e.g., 4). We'll store dim (the reduction axis), totalLength (number of elements), and the strides? Actually for argmax we need to process along a dimension, so tiling might be based on the outer dimensions. Typically for reduce operations, one tile processes a contiguous block, but for argmax over a dimension, we need to handle the stride across the reduction axis. The architecture uses batch_size=128, dim1=4096, dim2=4095, reduce dim=1. That means for each batch and each column, we need to find max index over dim1. So data is not contiguous in the reduction axis. Tiling strategy: tile over the outer dimensions (batch and dim2) and process a chunk of the reduction dimension? Actually we can do a simple approach: compute argmax by iterating over the reduction dimension. Since the input is ND, we can flatten all dimensions except the reduction dimension? Or we can use AscendC's vector reduce functions like `ArgMax`? There is an AscendC API `AscendC::ArgMax` but it might have limitations. From the retrieved context, there is mention of "ArgMax 用极小值" and also `ReduceMax` which returns value and index. The `ReduceMax` function can return both max value and index if `withIndex=true`. So we can use `ReduceMax` to get argmax. But we need to be careful about the axis.
+
+Given the complexity, a simpler approach: We can preprocess the input to reshape/flatten such that the reduction dimension is the inner-most? Actually we can use `ReduceMax` with axis. But AscendC's vector APIs work on contiguous tensors. For reduction along an arbitrary axis, typical approach is to manually compute using loops over the reduction dimension, or rearrange data. Another approach: use tiling to compute argmax per slice. For example, for each outer index (everything except reduction axis), we load the vector along the reduction axis and compute argmax using a loop or using ReduceMax with multiple tiles. We can use `ReduceMax` with `mask`, `repeat`, `repStride` to handle non-contiguous data? Actually `repStride` allows gaps between repeats. For argmax over dimension dim, the input has shape [D0, D1, ..., Dn]. For each output element (index tuple excluding dim), the data along dimension dim is strided. For a 3D tensor with dim=1, the data for a given (batch, column) is contiguous? Actually if dim=1, then for each batch and each column (dim2), the elements for dim1 are contiguous in memory? Yes, because row-major order: shape [B, D1, D2], then element (b, d1, d2) is at offset b*D1*D2 + d1*D2 + d2. For fixed b and d2, the offset increments by D2 when d1 increases? Wait: d1 changes, offset = b*D1*D2 + d1*D2 + d2. So the stride between consecutive d1 is D2, which is constant. So the data for argmax over dim=1 is not contiguous but has stride = last dimension size. So we can use `ReduceMax` with repeat and repStride. For each outer index (b,d2), we have a vector of length D1 with stride D2. We can set `mask` = D1, `repeat` = 1, `repStride` = D1? Actually reduce with gap: the API `ReduceMax<T>(dst, src, tmp, mask, repeat, repStride, withIndex)` where src is a local tensor containing the data in a contiguous buffer? The API works on contiguous local tensors. So we need to copy the strided data into a contiguous local buffer first. That could be done by using DataCopy with stride or by multiple DataCopy calls. Another approach: Use AscendC's `DataCopy` with `DataCopyExtParams` which supports source stride? Yes, `DataCopyPad` can copy with stride. So we can copy the relevant strided elements into a contiguous local tensor, then apply ReduceMax. The tiling would be over the outer dimensions.
+
+Given the evidence blocks, we have examples of ReduceMax with mask, repeat, repStride (Block 2) and ReduceMean with shape (Block 3). But for argmax, we can use ReduceMax with index. We'll design kernel to:
+- Input: float tensor, attr dim (0-based).
+- Output: int32 tensor with shape same as input but without dim dimension.
+- Tiling: tile over the output elements (i.e., over all indices except dim). For each tile, we process a chunk of outer indices. For each outer index, we need to gather the vector along dim from global memory into a local contiguous buffer, then compute argmax using ReduceMax with index. The size along dim is `sizeDim = shape[dim]`. The stride between consecutive elements along dim is `stride = product(shape[dim+1:])` (since row-major). We'll store the shape and strides in tiling data.
+
+But tiling data needs to be flexible. Let's design a simpler kernel: treat the operation as a "vector reduce" along a contiguous axis? Actually we can reshape the tensor to 2D: flatten all dims before dim into one dimension (outer), and all dims after dim into inner? That would make the reduction axis contiguous? For dim=1 in 3D, we can reshape to [batch, dim1, dim2] -> [batch*dim2, dim1] (since dim2 is innermost). Then argmax over dim=1 gives output [batch*dim2]. So with this reshaping, the reduction axis becomes contiguous in memory (each row is dim1 elements). That simplifies a lot. The tiling can then tile over the outer dimension (batch*dim2). For each tile (a set of rows), we compute argmax on each row using ReduceMax with mask=dim1, repeat=1, no stride. Output shape: [batch, dim2] (squeezed). This is much simpler. And the kernel only needs to handle 2D after flattening. The inner dim (dim2) remains. So we need to pass the shape info: numRows (number of rows = product of all dims except dim) and numCols (size of dim). Also we need the original output shape to write back properly? But output is 1D for each row? Actually output for each row is a scalar index, so output size is numRows. That is linear. So we can output a 1D tensor of indices and then reshape in Python? The model expects a tensor with the dimension removed, which in PyTorch will be (batch_size, dim2) for dim=1. So the output from kernel should be 1D of length batch*dim2, then the host/operator can infer shape accordingly. In InferShape, we will compute output shape as input shape with dim removed.
+
+So plan:
+- project_json_src: `ArgmaxOverADimensionCustom`, input x (float, ND), output y (int32, ND), attr dim (int, default 1).
+- host_tiling_src: TilingData with totalLength (input elements), numRows, numCols, blockDim.
+- host_operator_src: InferShape removes dim; InferDataType int32; TilingFunc computes numRows, numCols, tile over rows.
+- kernel_src: `argmax_over_a_dimension_custom`. Uses AscendC::ReduceMax with index. For each row, we load numCols elements, compute argmax (max with index), then store the index (int32). Use double buffering for rows.
+- python_bind_src: similar to leaky_relu example but for ArgmaxOverADimensionCustom.
+- model_src: import custom_ops_lib, call argmax_over_a_dimension_custom(x, dim).
+
+Need to handle the attribute dim.
+
+Let's produce the code.
+
+We'll use the structure from the leaky_relu example but adapted. For ReduceMax, we need a tmp buffer. The API: `AscendC::ReduceMax<T>(dst, src, tmp, srcDataSize, withIndex)` where dst contains both max value and index? Actually from Block 2, when withIndex=true, dst has first element max value, second element index? In Block 2, for ReduceMax with index, dstDataSize = 16 (for float, 2 floats). The index is stored as float? In the API, the index is returned as a float? According to documentation, ReduceMax returns the index as a float value. Then we need to convert to int32. But we can use `AscendC::ArgMax` if available? However, the constraint check says no violation, but we don't have explicit API. We'll use ReduceMax with index and convert.
+
+Alternatively, we can use `AscendC::ReduceMax` that returns value and index in a 2-element local tensor (value at pos0, index at pos1 as float). Then we can cast to int32. But better: use `AscendC::ArgMax`? From the code_search snippet, there is mention of ArgMax but no explicit API. We'll stick with ReduceMax.
+
+We'll set the data type for dst as float for the result from ReduceMax, but we need int32 output. So we'll compute argmax as float, then cast to int32 using `AscendC::Cast`. Or we can use `AscendC::ArgMax` if available but unsure. Let's use ReduceMax approach.
+
+But careful: The output of ReduceMax with withIndex=true: the dst is a tensor of size 2 (for the result). Actually from Block 2, dstDataSize = 16 for float, meaning 4 floats (since 16/4=4), but they have 2 floats? They said dstDataSize = 16 // 32B aligned, actually it's 16 elements? In Block 2, they have dstDataSize = 16 for all cases, but they only use it for max+index. For ReduceSum, they set dstDataSize=16 as well. The actual number of output elements depends on repeat. For single repeat, dst has 2 elements: value and index. So we can allocate dstLocal of size 2. Then extract the index, convert to int32, and store.
+
+Given the complexity, we can implement a simpler argmax using a loop and comparison. But that would not leverage vector compute. Let's try to use `AscendC::ArgMax` from the API? I don't have explicit API signature. However, from the retrieved context "ArgMax 用极小值" suggests there is an AscendC::ArgMax. But we cannot assume. I'll implement using ReduceMax with index.
+
+We'll need a tiling strategy: tile over rows. For each tile, we load a batch of rows (say tileRows), and for each row we compute argmax. We can do vectorized loading: load numCols* tileRows elements contiguously? If rows are stored row-major, then numCols consecutive elements belong to one row. So loading a contiguous chunk of tileRows*numCols gives tileRows rows. Then we can process each row using ReduceMax on the relevant slice. But ReduceMax works on a contiguous tensor. So we can load the whole tile into a big local tensor, then for each row, we call ReduceMax on a subview. That is straightforward.
+
+Thus:
+- tiling: numRows (total rows), numCols (length of reduction dimension), tileRows (number of rows per tile).
+- UB budget: need local tensors: inX (tileRows*numCols floats), outY (tileRows int32? but we need to collect indices), tmpBuf (for ReduceMax). ReduceMax needs a tmp buffer of size? For ReduceMax on a vector of length L, the tmp buffer size is (L+31)/32 * 32? Actually in Block 2 they compute workSize = RoundUp(repeat*2, elePerBlock) for withIndex? For single repeat, they need workSize? In scenario 1 srcDataSize=288, repeat=9 (288/32? Actually they use elePerRepeat=256/4=64, so repeat=RoundUp(288,64)=5? Not sure). But we can allocate tmp of size numCols (rounded up to alignment). Better to follow the practice: `pipe->InitBuffer(workQueue, 1, workSize * sizeof(T))` where workSize = RoundUp(repeat * 2, 32/sizeof(T)). For single mask without repeats, we can use `ReduceMax<T>(dst, src, tmp, numCols, true)` and the tmp size should be at least (numCols/32+1)*32? Actually the ReduceMax API may require a workspace. We'll allocate tmp of size numCols+256 to be safe. But we can also use `ReduceMax` without tmp? Some overloads don't need tmp if not using index? For withIndex, tmp is required. We'll allocate tmp of size numCols (aligned to 32 bytes).
+
+Given the evidence constraint "UB budget" and to avoid overflow, we'll compute tileRows such that total floats in UB = tileRows*numCols + tileRows (for output? we can store output in a separate tensor) + tmp (numCols) fits under UB_BUDGET_BYTES.
+
+But since this is a custom kernel with specific sizes, we can assume max numCols maybe 4096 or 4095. We'll compute tileRows accordingly.
+
+Let's write the code now.
+
+We'll need to include `kernel_operator.h` and use namespace AscendC.
+
+We'll implement the kernel class `KernelArgmaxOverADimensionCustom` with Init, Process.
+
+In Init: receive GM_ADDR x, y, and tiling data fields: numRows, numCols, tileRows (or we can compute tileRows in tiling). Use TQue for double buffering: inQueueX for input tiles, outQueueY for output indices (int32). tmpQueue for work buffer.
+
+In Compute: For each row, we call ReduceMax on the slice of the local tensor. We'll need to get the pointer to the start of the row. Since local tensor is contiguous, we can use `rowLocal = xLocal[ rowIdx * numCols ]` using operator[]? Actually LocalTensor can be indexed like a pointer: `xLocal[rowIdx*numCols]` returns a LocalTensor<float> at that offset? The API: `LocalTensor<T> Sub(uint32_t offset, uint32_t size)` or `LocalTensor<T> operator()(uint32_t offset, uint32_t size)`. We'll use Sub to get a sub-tensor for each row.
+
+Then we compute `AscendC::ReduceMax<float>(maxValAndIdx, rowLocal, tmpBuf, numCols, true);` where maxValAndIdx is a LocalTensor<float> of size 2 (or more? the API stores value at [0] and index at [1] as float). Then we extract the index (float), cast to int32, and store in output local tensor.
+
+We'll accumulate output indices in outYLocal (int32) of size tileRows. After processing all rows in the tile, we copy out.
+
+But we need to handle multiple tiles per block and grid stride. We'll use a similar grid-stride pattern as leaky_relu example.
+
+Simplify: We'll have one tile per block (since numbers are moderate). For argmax, we can use blockDim = number of rows / tileRows, each block handles a contiguous chunk of rows. No grid stride needed; each block processes its own tile(s) in a loop.
+
+We'll implement Process with a while loop over rows assigned to this block.
+
+Let's write the host operator and tiling.
+
+Important: The output data type is int32. In InferDataType, set output to DT_INT32. In kernel, we need to store int32 indices. We'll use `AscendC::LocalTensor<int32_t>` for output.
+
+Now produce the six strings.
+
+We'll follow the exact structure as leaky_relu example, but adapt.
+
+Let's write each piece.
+
+Note: The model_src expects that the custom operator is registered as `argmax_over_a_dimension_custom` in Python. The python_bind_src will register it as such.
+
+Now output only the code strings.

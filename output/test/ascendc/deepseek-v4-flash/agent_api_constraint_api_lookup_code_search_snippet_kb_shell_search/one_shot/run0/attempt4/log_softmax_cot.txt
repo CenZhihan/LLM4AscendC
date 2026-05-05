@@ -1,0 +1,91 @@
+We need to fix the compilation error in the host operator source: `const gert::StorageShape *x_shape = context->GetInputShape(0);` but `GetInputShape` returns `const gert::Shape*`, not `const gert::StorageShape*`. According to the retrieved code snippet, correct usage is `const gert::Shape *xShape = context->GetInputShape(0);` and then `gert::Shape *yShape = context->GetOutputShape(0); *yShape = *xShape;`. Also the tiling function has the same issue: `const gert::StorageShape *shape = context->GetInputShape(0);` should be `const gert::Shape *shape = context->GetInputShape(0);` and then `shape->GetOriginShape()` etc.
+
+Additionally, the kernel had runtime error (MTE out of range) likely due to incorrect buffer sizes or data copy lengths. The kernel uses subtiles and multiple passes, but the queues are initialized with subTileWidth_ elements, but DataCopy may be using lengths that exceed allocated buffers? Also there is a subtle issue: in ProcessRow, the kernel allocates and frees tensors multiple times, but the queue system may have constraints. The error "write address of the MTE instruction is out of range" suggests we are writing beyond allocated local memory. Possibly because we use subTileWidth_ for queue buffers, but when processing the last subtile, curLen may be less than subTileWidth_, but DataCopy still copies curLen elements, which is fine. However, the workspace and scalar queues are allocated with size subTileWidth_ * sizeof(float) and sizeof(float) respectively, but in the loops we allocate them per subtile and free them. The issue might be that we are not properly handling the queues (e.g., using scalarQueue_ with size 1 but then allocating and freeing multiple times). Actually the scalarQueue_ is a TQue with BUFFER_NUM=1, but we are trying to allocate and free multiple times within the loop - that might cause deadlock or memory corruption because we are not following the queue protocol correctly. The code is mixing queue-based and scalar allocations in a way that might not match the expected pipe management.
+
+A simpler and more robust approach is to use a single-pass softmax using the built-in AscendC SoftMax API (as seen in the retrieved softmax.asc kernel). That would be more reliable and likely fix the runtime error. The original user instruction wants to replace PyTorch operators with custom AscendC kernels. Using the built-in SoftMax library is acceptable; it's still a custom kernel that wraps the optimized library.
+
+Thus we should rewrite the kernel to use AscendC::SoftMax API. We also need to adjust tiling and host code accordingly.
+
+The host_tiling_src should include fields needed by the SoftMax tiling: rowLength, columnLength, etc. But we can simplify: we can just pass totalLength, height, width, and use the SoftMaxShapeInfo in the kernel. However, the SoftMax API requires a tiling structure (SoftMaxTiling). We can reuse the existing tiling fields but need to generate proper tiling data. Alternatively, we can use a simpler approach: since the input is 2D (batch_size x dim), we can process each row independently. The kernel can use the row-based approach similar to the example. The tiling should provide rowLength (number of rows per core) and columnLength (width). The kernel can then call SoftMax per row.
+
+Given the complexity, the safest is to mimic the successful leaky_relu_custom pattern but for log_softmax using the SoftMax library. But log_softmax = log(softmax(x)) = log(exp(x-max)/sum) = (x-max) - log(sum). We can compute softmax first then apply log. Or we can compute directly using the library: SoftMax<T, true>(xLocal, sumLocal, maxLocal, xLocal, tmpBuffer, softmaxTiling, srcShape); This computes softmax in-place (xLocal becomes softmax output). Then we can apply log element-wise. Or we can use the specialized log_softmax if available. But the AscendC API might have LogSoftMax? Not sure. I'll assume we compute softmax then log.
+
+Alternatively, we can use the kernel from the previous attempt but fix the memory issues. The main runtime error is MTE out of range, likely due to mismatched queue sizes. The kernel allocates inQueueX_ with subTileWidth_ elements, but then uses it to copy and enqueue, and then dequeue later. However, the kernel also uses expQueue_ and scalarQueue_ in a pattern that might exceed allocated buffers. The simplest fix: use a single queue for all operations and avoid multiple queues that are not properly synchronized. But given time, better to rewrite using the library.
+
+I'll rewrite the kernel to use the SoftMax library. The host_operator_src needs to generate SoftMaxTiling tiling data. We can include "softmax_tiling.h" or use the custom tiling structure. Actually, the SoftMaxTiling is a struct defined in the AscendC library. We need to include appropriate headers. The tiling function should set fields like coreRowNum, columnLength, etc. But for simplicity, we can adapt the example from the retrieved softmax.asc. However, that example has a complex tiling with many fields. We can start with a simpler approach: treat the input as 2D, assign rows to blocks, and use the built-in softmax for each row.
+
+Let's outline the corrected code:
+
+project_json_src: same as before (no attributes needed).
+
+host_tiling_src: define tiling data with height, width, blockDim, etc. For the built-in softmax, we need SoftMaxTiling. But we can compute it in the kernel from height/width. Alternatively, we can precompute some tiling parameters.
+
+host_operator_src: need to include "softmax_tiling.h" or the appropriate header. But the compilation might require it. Instead, we can keep our custom tiling data and in the kernel we can manually compute softmax without the library, but safely. Given the runtime error, it's better to use the library.
+
+After rethinking: The simplest fix for the compilation error is to change `const gert::StorageShape *` to `const gert::Shape *` and use `GetOriginShape()` only if needed. Actually the tiling function used `shape->GetOriginShape().GetDim(0)` but `GetOriginShape()` is a method of `StorageShape`? No, `gert::Shape` does not have `GetOriginShape()`. So we need to use `context->GetInputShape(0)->GetOriginShape()` but that returns a `gert::Shape`. Wait, the context provides `GetInputShape` returning `const gert::Shape*`. Then we can get dims via `GetDim(0)`. So we should not use `StorageShape`. So change all `StorageShape` to `Shape` and remove `GetOriginShape()` if not needed. Actually in the tiling function, we need height and width. We can get them directly: `uint32_t height = shape->GetDim(0); uint32_t width = shape->GetDim(1);`. That works for `const gert::Shape*`.
+
+Similarly in InferShape, we need to copy shape: `const gert::Shape *x_shape = context->GetInputShape(0); gert::Shape *y_shape = context->GetOutputShape(0); *y_shape = *x_shape;`.
+
+So the compilation error is fixed.
+
+Now for the runtime error: The kernel used many queues and allocate/free pattern may be incorrect. I will rewrite the kernel to be simpler: process each row, use a single queue for input, compute max and sum in two passes but with proper buffer management. The kernel should allocate enough buffer for one row (width elements). Then compute max, then compute sum of exp, then compute y. This avoids subtiling and complex queue usage. The buffer size will be width * sizeof(float) for each queue. Since width can be up to 393216, and UB budget is 192KB, that's too large. So need subtiling. But we can do subtiling within each row using a single queue of tileLen (subTileWidth) and process row in chunks. We can do three passes over the row, each pass loading the same chunks, computing partial results, and accumulating. This is similar to previous but with correct queue management.
+
+The previous error might be due to using multiple queues for the same pipe without proper synchronization. The safer pattern: use a single input queue and a single output queue, and use workspace buffer for temporary storage. For each subtile, allocate tensor from queue, copy in, dequeue, compute, enqueue to output, copy out, free. But we need to hold intermediate results (max and sum) across subtiles. We can keep a scalar variable per row (in local memory) using a scalar tensor. But we can't keep a local tensor across subtiles without queuing. Since the kernel is per-block, we can have a local variable (float) that is not a tensor. That's fine: we can use a regular float variable for globalMax and sum. So we can avoid using scalarQueue_ and workspaceQueue_ for reduction. Instead, use the built-in ReduceMax and ReduceSum with a workspace tensor that is allocated per subtile and freed.
+
+Thus the kernel should:
+
+- For each row assigned to this block:
+  - globalMax = -INF
+  - for each subtile:
+    - copy in subtile
+    - compute localMax using ReduceMax with workspace
+    - globalMax = max(globalMax, localMax)
+  - for each subtile (second pass):
+    - copy in subtile again
+    - compute exp(x - globalMax) and sum using ReduceSum
+    - accumulate sum
+  - for each subtile (third pass):
+    - copy in subtile
+    - compute y = (x - globalMax) - log(sum)
+    - copy out
+
+But loading the same data three times is inefficient but acceptable for correctness. Alternatively, we can store the processed subtile in a temporary local buffer, but that requires more memory.
+
+The key is to ensure each queue allocation/deallocation is paired correctly. We'll use a single input queue and a single workspace queue for reductions. For each subtile, we allocate a tensor from input queue, copy data, then dequeue for processing, then after processing we need to enqueue back if we want to reuse? Actually we need to keep the input for later passes? No, we can discard and reload. So we can simply allocate, copy, dequeue, compute, and free. That's fine.
+
+But we also need a workspace tensor for ReduceMax and ReduceSum. We'll allocate a workspace queue with BUFFER_NUM=1 and size subTileWidth. We'll allocate it each subtile, use, and free.
+
+For the exp and log operations, we need another tensor. We can allocate from output queue or another queue. Since we have two passes (max, sum) and third pass (output), we can reuse the input queue after freeing? Actually we need to keep the input data for each subtile only during that subtile's processing. So we can allocate, copy, dequeue, use, then free. For the third pass, we again allocate and copy.
+
+This should be safe.
+
+Thus the revised kernel will have:
+- inQueueX_ for loading x from global
+- outQueueY_ for storing y to global
+- workspaceQueue_ for reduction workspace (size subTileWidth)
+- expQueue_ for exp values (optional, we can reuse workspace)
+
+Actually we can allocate a temporary tensor for exp/sum from a separate queue or from the same pipe's temporary buffer.
+
+Simplify: use a single TBuf for shared temporary buffer (VECCALC) of size subTileWidth * sizeof(float) * 2 (for workspace and exp). That's more efficient.
+
+But to minimize changes, I'll stick with queues but ensure correct lifecycle.
+
+Now, the runtime error was "write address out of range" which suggests we wrote beyond allocated buffer. Probably because one of the queues was not big enough for the data copied. In the original kernel, inQueueX_ was initialized with subTileWidth_ elements, but in the loops they allocated and freed multiple times but also used scalarQueue_ with size 1, which might cause issues with queue ordering. The scalarQueue_ was allocated and freed multiple times without proper queuing protocol (enque/deque). The TQue with BUFFER_NUM=1 expects that after allocation, you enqueue, then dequeue, then free. But the code did something like:
+
+```
+LocalTensor<float> maxScalar = scalarQueue_.AllocTensor<float>();
+// ...
+float localMax = maxScalar.GetValue(0);
+scalarQueue_.FreeTensor(maxScalar);
+```
+
+This bypasses the queue protocol (no EnQue/DeQue). That is invalid. For queues with BUFFER_NUM=1, you must follow the FIFO order. Using AllocTensor/FreeTensor directly on a TQue is not the correct usage if you intend to use it as a queue. Actually TQue's AllocTensor returns a tensor from the pre-allocated buffer, but it does not add to queue. FreeTensor returns it back. You can use it as a simple buffer pool. But then you must ensure not to exceed BUFFER_NUM. This might work if you allocate and free sequentially, but the issue is that the tensor must be used before freeing. However, GetValue(0) requires the tensor to be in scope. That should be fine. The real problem might be that the scalar queue was initialized with 1 * sizeof(float) bytes, but then we allocate and free multiple times in the loop - that's okay. So the MTE error might be from elsewhere.
+
+Given the complexity, I think using the built-in SoftMax library is the most robust fix. It will handle the memory and tiling correctly. Let's adopt that.
+
+We'll need to include appropriate headers and use SoftMax API. The tiling will pass rowLength and columnLength. The kernel will use a TPipe and a shared temporary buffer.
+
+I'll generate the new code accordingly.
+
+Let's produce the final answer with the six strings.

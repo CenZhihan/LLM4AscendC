@@ -1,0 +1,197 @@
+We need to produce the six strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src. The kernel name is "layer_norm_custom" (PascalCase: LayerNormCustom). The original model uses nn.LayerNorm with normalized_shape = (features, dim1, dim2) = (64,256,256). But LayerNorm in PyTorch normalizes over the last dimensions. The input shape is (batch_size, features, dim1, dim2) so normalized_shape is (features, dim1, dim2) -> effectively normalizes over the last three dimensions. However, typical LayerNorm in AscendC library uses a 2D or 3D tiling. The provided retrieval examples include layernorm_v2 which uses aLength and rLength (2D). But here we have 4D input with normalization over last 3 dims. Usually we reshape to (batch_size, features*dim1*dim2) and normalize over the last dimension of size features*dim1*dim2. Or we can treat as (batch_size, features, dim1, dim2) and normalize over (features, dim1, dim2) but that's not standard; typically LayerNorm operates on the last dimension only. Wait, PyTorch nn.LayerNorm(normalized_shape) normalizes over the last len(normalized_shape) dimensions, with learnable affine parameters of shape normalized_shape. So input shape (batch_size, features, dim1, dim2) and normalized_shape=(features, dim1, dim2) means we normalize over the last three dimensions: for each batch element, we compute mean and std over all features*dim1*dim2 elements, and apply affine transform of shape (features, dim1, dim2). That is a huge normalization. In AscendC, the LayerNorm API typically expects a 2D shape: (batch, hidden) where hidden is the normalized dimension. So we can reshape the input to (batch_size, features*dim1*dim2) and treat as a 2D LayerNorm with normalization over the last dimension of size N = features*dim1*dim2. However, the affine parameters gamma and beta would be of shape (features*dim1*dim2,) but PyTorch's LayerNorm creates parameters of shape (features, dim1, dim2) which are broadcastable. So we need to flatten them as well. Then after normalization, we reshape back. That's the common approach.
+
+Alternatively, the AscendC library may support ND tiling via GetLayerNormNDTilingInfo which can handle a general shape with multiple dimensions. In the retrieval we see a function GetLayerNormNDTilingInfo that takes srcShape which can be N-dim. The example from "layernorm_tiling_impl.cpp" shows it for 2D shape (aLength, rLength) but the code uses shapeDims[0] and shapeDims[1]. For ND, it likely takes the last dimension as rLength and the product of previous as aLength? Actually the naming: aLength is the number of rows (batch), rLength is the normalization dimension. In the code, they do aLength = shapeDims[0], rLength = shapeDims[1]. So they assume 2D input. But there is also a "GetLayerNormNDTilingInfo" that can handle ND? Not sure. The example in "layernorm_custom_tiling.h" uses ge::Shape({ bLength, sLength, hLength, hLength }) (4D) and calls GetLayerNormNDTilingInfo, so it does support ND. The tiling data structure LayerNormSeparateTiling (from layernorm_v2) has set_aLength etc. So we can use the 4D shape directly. However, the kernel implementation in the retrieval (layernorm_v2) expects aLength and rLength, and copies all data in one go (no tiling loops). That's not optimal for large sizes. For large sizes we need tiling, but the provided kernel example does single-buffer. But we can adapt to use the library's LayerNorm API which handles tiling internally if we provide the tiling data. The sample from layernorm_v2 uses AscendC::LayerNorm with LayerNormSeparateTiling which includes tiling info from GetLayerNormNDTilingInfo. So we can use that.
+
+Thus we will generate a kernel that uses the AscendC LayerNorm library API, similar to the "KernelLayernorm" in the retrieval (block 1), but adapted to 4D input. We'll need to compute aLength = batch_size = dim0, rLength = product of remaining dims = features*dim1*dim2, and rLengthWithPadding = aligned to 32/typeSize. We'll also need to handle gamma and beta as flattened tensors of length rLengthWithPadding (with padding). The tiling data will be generated from the host tiling function.
+
+We'll follow the structure of the provided leaky_relu example but with LayerNorm specific details.
+
+Now produce the six strings.
+
+Important: The kernel function name in kernel_src must be "layer_norm_custom". The operator name in JSON and host must be "LayerNormCustom". The python model uses "layer_norm_custom" function name.
+
+Also note: The host_operator_src includes TilingFunc, InferShape, InferDataType, and OpDef. InferShape should copy input shape to output shape (and also for mean and variance? Actually the kernel outputs only the normalized output? In the original nn.LayerNorm, it returns only the output. The kernel from retrieval outputs output, mean, rstd. But the PyTorch LayerNorm only returns output. However, we can still compute mean/rstd as intermediate but not output them. In our custom operator, we only need to output the normalized tensor. So we can omit mean/rstd outputs in the operator definition. But the kernel in retrieval expects to write to outputGlobal, outputMeanGlobal, outputRstdGlobal. We can either not output them or output them as optional. For simplicity, we can just output the normalized output and discard mean/rstd inside kernel (or output them to workspace but not to user). However, the kernel we write can still compute them internally but not write to output. Or we can write them to workspace. But the operator only needs one output. So we'll define the operator with one output "y". The kernel will still compute mean/rstd but we can skip writing them to global memory or write them to workspace that is not returned. The retrieval kernel writes them to outputMeanGm and outputRstdGm. If we don't allocate those global buffers, we can't write. So we could modify the kernel to not output mean/rstd, but the library API requires output tensors. We can provide dummy local tensors? Actually the AscendC::LayerNorm API requires outputLocal, meanLocal, rstdLocal. We can allocate local tensors but not copy them out. That's fine. So we will not have outputMeanGlobal and outputRstdGlobal. We'll skip those in Init and CopyOut.
+
+Alternatively, we could use the simpler LayerNorm API (without separate tiling) from block 2: AscendC::LayerNorm<float, isReuseSource>(outputLocal, meanLocal, varianceLocal, inputXLocal, gammaLocal, betaLocal, epsilon, tiling_); That one takes tiling_ of type LayerNormTiling. The retrieval shows it for 3D (b,s,h) shape. But we need 4D. We can use the v2 version with LayerNormPara and config. The v2 version uses LayerNormSeparateTiling which supports arbitrary ND? It uses aLength and rLength, so we need to flatten. Let's use the v2 version from block 1 because it has more explicit tiling. But the v2 version uses LayerNormPara with aLength, rLength, rLengthWithPadding and config. That seems straightforward to flatten.
+
+Thus we will flatten input to (batch_size, N) where N = features*dim1*dim2. The gamma/beta will be flattened as well from shape (features,dim1,dim2) to (N). We need to handle padding for rLengthWithPadding.
+
+Now write the code.
+
+We'll need to include "kernel_operator.h" and maybe "lib/layernorm.h"? Actually the code includes "kernel_operator.h" only, but to use LayerNorm we need to include appropriate header. In the retrieval, they just include "kernel_operator.h" and use AscendC::LayerNorm. So it's likely part of the standard API. We'll assume it's available.
+
+Now produce each string.
+
+project_json_src: Define operator with one input "x", one output "y", and no attributes? LayerNorm doesn't have parameters like epsilon? In PyTorch, LayerNorm has epsilon default 1e-5. We can include an optional attribute "epsilon" with default 1e-5. Also the normalized_shape is known at compile time? Actually it's determined by the shape of x, but we need to know the last dimensions to compute gamma/beta shape. In the custom op, we don't need normalized_shape as input because gamma and beta are separate inputs? Wait, PyTorch's nn.LayerNorm has learnable parameters gamma and beta that are stored in the module. In the forward, they are applied. So if we replace the entire LayerNorm module with a custom op, we need to pass gamma and beta as inputs as well. But the original model defines nn.LayerNorm with normalized_shape and uses the default affine=True, so there are gamma and beta parameters. In the transformed model, we can either keep those parameters as PyTorch tensors and pass them to our custom op, or we can incorporate them into the op as weights. Typically, custom operators for LayerNorm take x, gamma, beta as inputs. In the retrieval examples, the kernel takes inputX, gamma, beta as separate global memory addresses. So our operator should have three inputs: x, gamma, beta, and one output y. Also optionally epsilon as attribute. That matches the PyTorch API: we have gamma and beta as parameters. So we'll define input_desc with three inputs: x, gamma, beta. Output: y.
+
+But in the PyTorch model, gamma and beta are of shape normalized_shape, which is (features, dim1, dim2) = (64,256,256). When flattened, size = 64*256*256 = 4194304. That's large. We'll pass them as tensors.
+
+Thus project_json_src:
+
+```json
+[
+  {
+    "op": "LayerNormCustom",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "x", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "gamma", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "beta", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "output_desc": [
+      {"name": "y", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "attr": [
+      {"name": "epsilon", "param_type": "optional", "type": "float", "default_value": "1e-5"}
+    ]
+  }
+]
+```
+
+host_tiling_src: Define tiling data struct. We'll need fields: aLength, rLength, rLengthWithPadding, epsilon, and the layernormSeparateTiling. In the retrieval, they use optiling::LayerNormSeparateTiling and LayernormCustomTilingData that contains that. We'll define our own TilingData that includes those. Actually we can directly use the predefined LayernormCustomTilingData from optiling? Not sure. To be safe, we define our own with aLength, rLength, rLengthWithPadding, epsilon, and a buffer for layernormSeparateTiling? But the layernormSeparateTiling is a complex struct. In the host code, we call GetLayerNormNDTilingInfo which fills a LayernormSeparateTiling object. We can store that as a byte array in our tiling data and then reinterpret in kernel? Or we can include the header for LayernormSeparateTiling and use it directly. However, the tiling data is passed as a blob. Typically, the host tiling function writes to a struct that is then read by kernel using GET_TILING_DATA. So we need to define the struct in the tiling header. In the retrieval example for layernorm_v2, they have a custom tiling data: LayernormCustomTilingData that includes aLength, rLength, rLengthWithPadding, epsilon, and a layernormTilingData of type LayerNormSeparateTiling. That is what we should replicate. We'll include the necessary headers. So our host_tiling_src will include "register/tilingdata_base.h" and also "impl/normalization/layernorm/layernorm_tiling.h"? Actually the struct LayernormCustomTilingData is defined in the example. We'll define it ourselves.
+
+We'll write:
+
+```cpp
+#include "register/tilingdata_base.h"
+#include "inner_tiling.h" // or the appropriate header for LayerNormSeparateTiling? Actually the API header might be "kernel_operator.h" but for host we need the definition. The example uses optiling::LayerNormSeparateTiling which is likely in "register/tiling_data_def.h"? Not sure. To keep it simple, we can define our own structure that contains the necessary fields for the kernel. The kernel expects aLength, rLength, rLengthWithPadding, epsilon, and the internally computed tiling data (like oneTmpSize, etc.). However, the kernel uses tiling_ of type LayerNormSeparateTiling which is set by GetLayerNormNDTilingInfo. We can pass that as a byte array in our tiling data. But it's easier to include the header that defines LayerNormSeparateTiling. In the retrieval, the host tiling code includes "layernorm_custom_tiling.h" which defines LayernormCustomTilingData with a field of type optiling::LayerNormSeparateTiling. We'll follow that pattern. Since we cannot be sure of the exact header path, we'll assume the user has access to the appropriate API headers. For the answer, we'll write a tiling data struct that mimics that.
+
+Given the complexity, maybe we can avoid the separate tiling struct and use a simpler approach: we can flatten the input and use the simpler LayerNorm API from block 2 that takes a tiling_ of type LayerNormTiling. But that API also requires tiling data from GetLayerNormNDTilingInfo. Ultimately we need to call GetLayerNormNDTilingInfo which fills a LayerNormSeparateTiling. So we must include it.
+
+I'll produce the host_tiling_src similar to the layernorm_custom_tiling.h from retrieval but adapted for our shape. Also include function ComputeTiling that computes tiling and fills a struct.
+
+Let's write:
+
+```cpp
+#ifndef LAYER_NORM_CUSTOM_TILING_H
+#define LAYER_NORM_CUSTOM_TILING_H
+
+#include "register/tilingdata_base.h"
+#include "impl/normalization/layernorm/layernorm_tiling.h" // adjust path as needed
+
+namespace optiling {
+
+struct LayernormCustomTilingData {
+    uint32_t aLength;
+    uint32_t rLength;
+    uint32_t rLengthWithPadding;
+    float epsilon;
+    AscendC::LayerNormSeparateTiling layernormTilingData;
+};
+
+} // namespace optiling
+
+#endif
+```
+
+But the host_tiling_src is just the implementation, not header. In the provided example, host_tiling_src defined the tiling data class and the TilingFunc. We'll follow that pattern. So we'll define BEGIN_TILING_DATA_DEF and use FIELD_DEF for the simple fields, and for the complex struct we might need to store as byte array. However, it's easier to just store the necessary parameters that the kernel can use to recompute tiling? The kernel can recompute tiling on device? It could, but that's not efficient. Better to pass precomputed tiling.
+
+Given the time, I'll adopt a simpler approach: Instead of using the advanced tiling API, we can implement a straightforward LayerNorm kernel that computes mean and variance in a single pass using vector ops, without relying on the built-in LayerNorm library. That might be simpler for the purpose of this exercise. However, the instruction says to generate the six strings based on provided examples. The examples use the built-in API. So we must likely use it.
+
+Let me look at the retrieval examples again. Block 1 (layernorm_v2) shows a kernel that uses AscendC::LayerNorm with config and para. That version uses LayerNormSeparateTiling tiling_. The host tiling in retrieval for layernorm_v2 (block 2 in rag) shows a function ComputeTiling that uses GetLayerNormMaxMinTmpSize and GetLayerNormNDTilingInfo. So we can copy that pattern.
+
+We'll define our tiling data struct in host_tiling_src using the macro, but the macro only supports simple fields. We cannot embed a complex struct directly. In the retrieval example for leaky_relu, they defined simple fields. For layernorm, they used a custom struct LayernormCustomTilingData defined in a separate header. So we'll do similar: define a header file in host_tiling_src? But the user expects only one string host_tiling_src. We can inline the struct definition inside the tiling function, and then cast the buffer to that struct in the kernel. That works.
+
+So we'll define:
+
+```cpp
+#include "register/tilingdata_base.h"
+#include "kernel_operator.h" // for LayerNormSeparateTiling? Actually the namespace might be AscendC. But on host, we can include the same headers.
+
+namespace optiling {
+
+// Custom tiling data as a plain structure to be passed via tiling buffer
+struct LayerNormCustomTilingData {
+    uint32_t aLength;
+    uint32_t rLength;
+    uint32_t rLengthWithPadding;
+    float epsilon;
+    // For simplicity, we'll store the individual tiling parameters that can be computed on host,
+    // and then the kernel will use the AscendC::LayerNorm API which expects a LayerNormSeparateTiling.
+    // We can store a byte array for the full tiling struct. But we need to know its size.
+    // Instead, we'll let the kernel recompute the tiling on device using the same function? Not possible.
+    // The simplest: we won't use the built-in LayerNorm API; we'll implement our own kernel.
+};
+```
+
+Given the complexity and time, I think the best is to implement a custom LayerNorm kernel without using the built-in library, as a direct vector implementation. This avoids the tiling header dependency and is more self-contained. The user only asked to replace the PyTorch operators with custom AscendC kernels; they didn't require using the library. So we can write a straightforward kernel that computes mean and variance over the last dimensions, then normalizes and applies gamma/beta. This is doable with standard vector ops.
+
+We'll follow the pattern of the leaky_relu kernel but with more steps. We'll need to handle the flattening. The kernel will take x, gamma, beta, and output y. It will also take parameters: N (normalized dimension size), and epsilon. The kernel will loop over batches (aLength = totalElements / N). Since input is already flattened in global memory, we can treat it as 2D: outer dimension aLength (batch size) and inner dimension N. The gamma and beta are of length N (with padding). So we can process each row.
+
+We'll implement using double buffering and tiling over the inner dimension N if it's large. N = 64*256*256 = 4,194,304, which is large. We need to tile over the inner dimension to fit in UB. So we'll tile the inner dimension into chunks of tileLen. We'll compute mean and variance in multiple passes: first pass compute sum and sum of squares for each tile, accumulate across tiles for the row, then compute mean and variance, then second pass normalize with gamma/beta. This requires two passes over the data. To reduce memory traffic, we can use the approach of computing mean in first pass, then second pass compute variance and normalize in one pass? Actually variance requires mean, so we need two passes. But we can combine: first pass compute sum and sum_sq, then compute mean and variance, then second pass normalize using precomputed mean and variance. That means we need to store the mean and variance for each row (aLength). We can store them in a local buffer or global memory. Since aLength = batch_size = 64, that's small. We can store them in a local tensor of size aLength.
+
+Given that we have double buffering and tiling, the kernel will be more complex. But we can keep it simple by processing one row at a time and tiling the inner dimension for that row. For each row, we can read the whole row in tiles, compute sum and sum_sq, then later read again for normalization. That means two reads of the input, which is okay for demonstration.
+
+Alternatively, we can use the built-in LayerNorm API which handles tiling and two-pass internally. But we need to include proper headers. Since the retrieval provides a working example with the library, I think it's acceptable to use it. We'll assume that the necessary headers are available and we can embed the struct definition.
+
+Given the constraints, I'll produce a solution similar to the layernorm_v2 retrieval, but adapted to 4D input and with only one output. I'll define the tiling data struct in host_tiling_src using a byte array approach: we will store aLength, rLength, rLengthWithPadding, epsilon, and a buffer for the LayerNormSeparateTiling. The size of LayerNormSeparateTiling can be obtained from sizeof. We'll allocate space in the tiling data buffer accordingly. However, the tiling data buffer is sized by the framework. Usually, we define a struct with all fields. The macro BEGIN_TILING_DATA_DEF allows defining fields that are later serialized. But that macro is for simple types. For complex struct, we can store it as a byte array. Let's see the retrieval: in "layernorm_custom_tiling.h" they have a struct with a field of type optiling::LayerNormSeparateTiling. That suggests it's possible to have a struct with nested struct. So we can define our tiling data class with a nested TILING_DATA_FIELD_DEF of type LayerNormSeparateTiling? But the macro likely expects fundamental types. In the retrieval, they use a custom struct with a member of type optiling::LayerNormSeparateTiling, not using the macro. So in host_tiling_src, we can define a plain struct (not using the macro) and then manually serialize it. That is common: in host tiling function, we fill a local struct and then save it using SaveToBuffer. The kernel reads it using GET_TILING_DATA which casts the buffer to the struct. So we can define the struct in the host_tiling_src file, then use it. That is fine.
+
+Thus host_tiling_src will include:
+
+```cpp
+#include "kernel_operator.h"
+
+struct LayerNormCustomTilingData {
+    uint32_t aLength;
+    uint32_t rLength;
+    uint32_t rLengthWithPadding;
+    float epsilon;
+    AscendC::LayerNormSeparateTiling layernormTilingData;
+};
+
+extern "C" ge::graphStatus TilingFunc(gert::TilingContext *context) {
+    // compute shape, call GetLayerNormMaxMinTmpSize, GetLayerNormNDTilingInfo, fill tiling, save
+}
+```
+
+But we need to include "impl/normalization/layernorm/layernorm_tiling.h" for GetLayerNormNDTilingInfo. We'll assume the include paths work.
+
+Given the uncertainty, I will write a simpler kernel that does not use the built-in LayerNorm library, but instead does it manually with vector ops, which is more self-contained and understandable. This avoids dependency on external tiling headers. The user may not have the exact environment. So I'll implement a custom LayerNorm kernel that is clear and follows the pattern of the leaky_relu example.
+
+Plan for kernel:
+
+Input: x (flattened to 2D: [aLength, rLength]), gamma (rLength), beta (rLength), epsilon.
+
+Output: y (same shape as x).
+
+We'll tile the inner dimension rLength into tiles of size tileLen (aligned). We'll process each row (indexed by blockIdx). For each row, we need to compute mean and variance. We'll do two passes over the row's tiles: first pass to compute sum and sum_sq, then compute mean and variance, then second pass to normalize using gamma and beta. We'll use double buffering for overlap.
+
+Since aLength may be large (batch_size), we can assign each block to process a subset of rows. We'll use grid-stride loop over rows.
+
+We'll need to store mean and variance for each row in a local buffer? But number of rows per block is limited. Alternatively, we can compute mean and variance for a row and then immediately normalize that row, without storing all rows. That's fine: for each row, do two passes. The first pass reads all tiles of that row and accumulates sum and sum_sq. Then we compute mean and variance. Then second pass reads again the same row tiles and normalizes. That is heavy but works.
+
+We can improve by using a single pass if we use the formula: variance = E[x^2] - (E[x])^2, but we still need two passes if we want to use gamma/beta normalization after computing mean and variance. Actually we can compute mean in first pass, then in second pass compute variance and normalize simultaneously using the mean from first pass. That is two passes anyway.
+
+Given that the inner dimension is large (4M), we need to tile. We'll use double buffering for reads and writes.
+
+We'll structure the kernel similar to leaky_relu but with two phases.
+
+We'll define class KernelLayerNormCustom with Init, Process. Process will iterate over rows assigned to this block. For each row, we do:
+
+- Phase 1: For each tile in row, read tile, compute sum and sum_sq using vector reduce (ReduceAdd) or manual accumulation. We'll accumulate in local tensor for sum and sum_sq? But sum_sq requires per-element squares and then reduce. We can use AscendC::ReduceAdd after computing element-wise sq. We'll need a temporary tensor for reduction. We can accumulate into a scalar? Actually we can use AscendC::ReduceAdd which outputs a scalar? Not exactly; it outputs a tensor of size 1? We'll use a vector of length 1. We'll allocate local tensor for sum of length 1 and for sum_sq of length 1. For each tile, we compute element-wise sums and squares and then reduce into those scalars (or reduce to a 1-element tensor). This is efficient.
+
+- After all tiles, compute mean = sum / rLength, variance = (sum_sq / rLength) - mean*mean, then rstd = 1 / sqrt(variance + epsilon). Actually typical LayerNorm computes std first: variance = sum_sq/rLength - mean^2, then rstd = 1/sqrt(variance+epsilon). Then normalized = (x - mean) * rstd, then scale by gamma and add beta.
+
+- Phase 2: Loop over tiles again, read each tile, subtract mean, multiply by rstd, then multiply by gamma (broadcast) and add beta. Write result.
+
+We'll need to read gamma and beta from global memory each time? They are the same for each tile. We can load them once into a local buffer (entire gamma/beta of length rLength) if they fit in UB. rLength = 4M, too large for UB (192KB). So we cannot load entire gamma. We need to tile gamma and beta similarly. So in phase 2, for each tile, we load the corresponding portion of gamma and beta.
+
+Thus the kernel will tile both input and gamma/beta.
+
+We'll set tileLen based on UB budget. We'll need to account for buffers: input tile, output tile, gamma tile, beta tile, plus temporary for sums, etc. Approximate: 5 tiles of floats. tileLen = UB_BUDGET / (5*4). Use alignment.
+
+We'll implement with double buffering for input and output, but phase 1 and phase 2 separate. For phase 1, we can use single buffer (no double buffering needed for accumulation since we need to accumulate across all tiles). We'll just read tiles sequentially and accumulate. For phase 2, we can use double buffering for read and write.
+
+Given the complexity of this manual implementation, and the risk of errors, I think it's acceptable to use the built-in API as in the retrieval, which is proven. The user instruction says "use them faithfully and produce the full Ascend C kernel / host / project artifacts". The retrieval provides a working layernorm kernel. So I should adopt that. I'll adapt the kernel from block 1 to our operator definition, ensuring we only output y.
+
+We'll modify the kernel to not output mean/rstd. The library requires outputMeanLocal and outputRstdLocal, but we can allocate local tensors for those and not copy them out. Also we need to ensure the tiling data is computed correctly for the flattened shape.
+
+Let's write the final solution.
+
+I'll produce the six strings as follows.
+
+Note: The model_src must be a Python module that uses the custom op. Since our custom op takes x, gamma, beta as inputs, we need to get the parameters from the model. The original Model has self.ln.weight and self.ln.bias. In ModelNew, we'll instantiate the LayerNorm with the same normalized_shape and then in forward, we'll call the custom op with x, self.ln.weight, self.ln.bias. That matches.
+
+Now write each string with careful formatting.
+
+I'll output the code blocks.

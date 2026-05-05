@@ -1,0 +1,114 @@
+We need to produce six Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src. The kernel name is "argmax_over_a_dimension_custom", PascalCase "ArgmaxOverADimensionCustom". The original model applies torch.argmax over a specified dimension. The input tensor is 3D, output is 2D (removing that dimension). We need to implement a custom AscendC kernel that performs argmax over a given dimension.
+
+Key considerations:
+- The kernel must handle arbitrary batch size and dimension sizes. The input shape is [batch_size, dim1, dim2] with dim=1 (the middle dimension). But the model parameter dim can be any valid dimension. For simplicity, we can assume dim is the second dimension (index 1) as given in get_init_inputs returns [1]. We'll design the kernel for a generic reduction along a specified axis, but for this example we can implement for reduction along axis 1 (the middle dimension). Alternatively, we can use a tiling approach that reduces along a contiguous axis.
+
+Given the complexity of a generic reduction along an arbitrary axis, we can implement for the specific case: input shape [N, C, W] (batch, channels, width) and reduce along axis=1 (channels). The output shape [N, W]. We'll use AscendC's ReduceMax which returns both max value and index (if using ReduceMax with argmax enable). The API signature for ReduceMax includes a boolean "argmaxEnable" to return index. But in the provided code snippets, we see ReduceMax with true for argmax (scenario 1-4). That returns value and index. The output size includes both value and index? In the snippet, dstDataSize = 16 (32B aligned) and they do ReduceMax with true. The output tensor should contain the max values and indices. For argmax we only need indices, but we can compute max indices. We can use ReduceMax with argmax=True and then output the index portion.
+
+We need to design the kernel to:
+- Accept input tensor (ND) and output tensor (ND) where output has the reduced dimension removed.
+- Use tiling to handle large tensors.
+- The kernel function name: argmax_over_a_dimension_custom.
+- The operator JSON: define input "x", output "y", attribute "dim" (int, optional default 1).
+- Tiling data: totalLength, tileLength, blockDim, dim (the dimension to reduce), and maybe the input shape dimensions. We need to know the shape to compute offsets for reduction along a non-contiguous axis. Since reduction along a middle dimension is not straightforward with simple DataCopy, we need to handle strides. A common approach: flatten the batch and width dimensions and treat the reduction axis as contiguous? Actually if we reduce along axis 1, the data layout in ND is [batch, channels, width]. For each batch and width index, we need to find the max among channels. Channels are contiguous for a given batch and width? Actually in ND, the last dimension is contiguous. For axis=1, the elements of the same (batch, width) are separated by width? Let's clarify: shape (N, C, W). Strides: stride[0]=C*W, stride[1]=W, stride[2]=1. So elements with same batch and width but different channel are spaced by W elements. So we need to gather elements with stride W. This is not a simple contiguous vector. We can either:
+  1. Use AscendC's BatchReduceMax or ReduceMax with stride support. The ReduceMax API supports a "repStride" parameter for non-contiguous repeat patterns. In the snippet, they use repStride = 8 (no gap). But we can set repStride to W (the step between channels). However, the mask and repeat parameters: mask is the number of elements per reduction (i.e., number of channels? Actually for ReduceMax with repeats, mask is the number of elements in each repeat, repeat is number of repeats, repStride is the step between the start of each repeat. For reducing along axis 1, we have N*W sequences, each of length C. We can treat each sequence as a separate reduction. But the ReduceMax API can handle multiple repeats with a stride. For each repeat, it reduces mask consecutive elements? Wait, check the API: ReduceMax<T>(dstLocal, srcLocal, sharedTmpBuffer, mask, repeat, repStride, argmaxEnable). It reduces mask consecutive elements starting at positions 0, repStride, 2*repStride,... for repeat times. So if we set mask = C, repeat = N*W, repStride = W? Let's compute: starting points: 0, W, 2W,... That would be positions for each (batch,width) pair? But the starting points need to be at the beginning of each channel group. For batch i, width j, the start index is i*C*W + j. That's not a constant stride because the stride between start of groups is not constant: within a batch, consecutive widths are 1 apart? Actually if we iterate over (batch, width) pairs, the starting indices are not equally spaced. We need a more sophisticated approach. Perhaps we can transpose the data to make the reduction axis contiguous. For example, we can reshape from (N, C, W) to (N*W, C). That would make C contiguous. Then we can perform ReduceMax on each row of length C. That is feasible: we can copy data from GM to UB with appropriate strides (using DataCopy with stride? DataCopy only supports contiguous copy from GM to UB. So we need to transpose in GM before kernel? Not feasible. Alternative: use AscendC's SetLocalTensor with stride? Not directly.
+
+Given the complexity, perhaps we can implement a simpler kernel that handles only the specific case where dim=1 and the input is 3D, using a nested loop over batch and width dimensions and manually copying each channel slice into UB and performing reduction. But that would be inefficient and may not meet performance expectations. Another approach: use the AscendC's ReduceMax with a custom "repStride" pattern. If we set mask = C, repeat = N*W, repStride = C? That would start at 0, C, 2C,... which would give positions: 0, C, 2C,... but those are the starts for each batch's first width? Actually for batch 0, width 0 start=0. For batch 0, width 1 start=1? That's not C away. So not.
+
+The correct starting indices for each (i,j) pair: index = i*C*W + j. The stride between consecutive pairs if we iterate first over j then i: for fixed i, j goes 0..W-1, stride=1. Then next i, stride = C*W - (W-1) = C*W-W+1. That's not constant. So we cannot use a single repStride.
+
+Thus, we need a more flexible approach. We could use a double buffered method: for each batch, iterate over width, and for each width, load the entire channel dimension into UB and compute argmax. That would involve many small copies (each of size C). Overhead may be acceptable if C is moderate. For the given sizes, N=128, C=4096, W=4095. Each slice is 4096 floats. Total copies: 128*4095 ≈ 524k slices. That's a lot. Not efficient.
+
+Maybe we can use AscendC's BatchReduceMax which is designed for this? There is a BatchReduceMax in the API? Not in the snippets. Alternatively, we can reshape the tensor on the host to have the reduction axis as the last dimension and then use the kernel that reduces the last dimension. But the model expects to receive an input of any shape and we cannot modify the input layout. However, the kernel can internally treat the input as a 2D array after flattening batch and width, and then reduce over the middle dimension by reorganizing memory. This is possible by using a custom tiling that handles the non-contiguous loads.
+
+Given the complexity, I'll design a kernel that uses AscendC's ReduceMax with stride but we need to rearrange data. A simpler route: we can use the AscendC's "ArgMaxWithValue" API if available, but the API lookup showed not found. So we rely on ReduceMax.
+
+I'll implement a kernel that:
+- Takes input shape (N, C, W) and dim=1.
+- Uses two-level loops: outer over batch (N), inner over width (W). For each (i,j), it copies the C elements (stride=W) from GM to UB (non-contiguous copy is problematic; we need to use DataCopy with a gather pattern? DataCopy only supports contiguous. So we must use DataCopy for a single element? No, we can use AscendC::DataCopy with a local tensor pointer? There is a variant that copies from a global tensor with a step? In the API, there is DataCopy for contiguous block only. However, we can use AscendC::Tensor with a "SetLocalBuffer" that points to the start, and then use vectorized reduce? Not trivial.
+
+Maybe we can use the "RepStride" approach if we permute the data on the fly. We could load the entire input tensor into UB or local memory, but that's too large.
+
+Given the constraints, I'll simplify: assume the model always reduces along the last dimension (dim=-1) with input shape [N, C]. But the example has dim=1 with 3D. However, the user said "Your task: Replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels. Generate an optimized version named ModelNew". We can adapt the kernel to handle any dim by using generic reduction along a contiguous axis after reshaping. For a tensor of arbitrary shape, we can compute the new shape by moving the reduction axis to the last position. That would require data permutation which is heavy. But for the sake of this exercise, we can implement for dim=-1 only, and document that it only supports reduction on the last dimension. But the model uses dim=1. To be faithful, we could implement the kernel to handle the specific case by hardcoding accessing elements with stride.
+
+Let's look at the provided example for LeakyReLU: it's element-wise, simple. For ArgMax, it's a reduction. The retrieved code snippets show ReduceSum and ReduceMax examples. They handle a 1D input essentially (srcDataSize). For 2D with reduction along axis, the snippet "pair_reduce_sum" might do something similar? Not clear.
+
+Given the time, I'll produce a kernel that reduces the last dimension (dim=-1) because it's simpler using contiguous vectors. I'll modify the model to use dim=-1 (or we can design for dim=1 but treat as last after reshaping? Actually the model passes dim=1 as init parameter, so we can change the model to output with dim=-1? But the user expects the same behavior. We could override by reshaping the input: if dim != -1, we can transpose on host? That defeats the purpose.
+
+I think the best is to implement the kernel using the "ReduceMax with stride" pattern, assuming the reduction axis is the second dimension (index 1) and that the input is always 3D. We'll compute starting indices manually using a loop over batch and width, and for each (i,j) we load a contiguous vector of length C from GM using DataCopy from offset i*C*W + j*? Wait, the elements are not contiguous because the channel dimension is contiguous? Actually in shape (N, C, W), the channels for a fixed (i,j) are at positions: i*C*W + k*W + j for k=0..C-1. That's stride=W. These elements are not contiguous in memory; they are spaced by W. DataCopy can only copy contiguous blocks. So we cannot copy all C values with one DataCopy. We need to copy each element individually? That's extremely inefficient. Instead, we can use AscendC::Mask and vector operations to gather? There is no gather instruction.
+
+Therefore, a more practical approach for the NPU is to reduce over the last dimension because that's contiguous. Perhaps we can assume that the input to Model has been transposed such that the reduction dimension is the last. But the original model does not do that. However, we can modify the kernel to accept a "dim" parameter and internally treat the input as a 2D tensor by flattening all dimensions before and after the reduction axis? For example, for input shape (N, C, W) and dim=1, we can reshape to (N, C*W) and then reduce over the last? No, that would reduce over both C and W. Not correct.
+
+Another idea: use AscendC's "ReduceMax" with a custom mapping. There is a "ReduceMax" that takes a "srcLocal" and "dstLocal" and "mask" and "repeat" and "repStride". If we set mask = 1, repeat = C, repStride = W, then for each (i,j) we could process one element? Not efficient.
+
+Given the difficulty, I'll produce a kernel that reduces the innermost dimension (last dimension) and include a comment that for other dimensions, one can transpose the input first or use alternative approach. The model_src can be adapted to transpose if necessary. But the user wants replacement of the operator in the architecture named Model. We can modify Model's forward to transpose so that the reduction axis becomes last, then call the custom kernel, then transpose back (if needed) to get the correct shape. However, the output shape should have the reduced dimension removed, so the order of dimensions matters.
+
+I think the most reasonable solution is to implement the kernel for reduction over the last dimension, and in the Python model, we permute the dimensions before calling the kernel and permute back after. This is a common pattern to handle arbitrary axis. But the task says "Replace relevant PyTorch operators ... with custom AscendC kernels". It doesn't prevent us from adding pre/post processing in Python. The model_src is the new model, so we can include that logic.
+
+Thus, I'll implement:
+- Kernel: reduces over the last dimension (contiguous) using ReduceMax with argmax enabled. Output will be a 1D? Actually input shape [..., X] -> output shape [...] with X removed. We'll treat the input as 2D (flatten all leading dimensions) and reduce the last. Then reshape back.
+- Tiling: handle generic totalLength and tileLength per batch, etc.
+- Host operator: define attribute "dim" (int) but we'll ignore it in kernel and use last dimension logic; or we can compute shape and strides for reduction on any axis using tiling data, but that's complex.
+
+Given the output constraint, I'll produce a working solution for the specific case: input shape [N, C, W] reduce along axis=1. I'll implement the kernel using a 2D approach: treat the input as N*W sequences of length C, but we need to load each sequence by contiguous copy. However, as argued, the sequence is not contiguous. The only way to make it contiguous is to transpose the tensor on the fly. The kernel can first copy the entire input (if small enough) to UB and then perform reduction column-wise? Not practical.
+
+I'll search my memory: AscendC has a function "DataCopy" that can copy with a stride? In the API, there is "DataCopyGather" perhaps. Not in provided snippets.
+
+Given the difficulty, I will produce a solution that reduces the last dimension (dim=-1). I'll modify the model to permute the input so that the specified dimension becomes last. For example, if dim=1 in a 3D tensor, we can transpose axis 1 to last, apply kernel (reduce last), and then remove the last dimension. That's straightforward.
+
+Thus, the kernel will only handle reduction over the last dimension. The host operator will accept "dim" attribute and we will compute the permutation in Python. The Python model_src will do:
+
+```
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        self.dim = dim
+    def forward(self, x):
+        # Move reduction dim to last
+        perm = list(range(x.dim()))
+        perm.append(perm.pop(self.dim))
+        x_t = x.permute(perm)
+        y_t = custom_ops_lib.argmax_over_a_dimension_custom(x_t)  # kernel reduces last dim
+        # No need to permute back because last dim is removed, shape is original except reduced dim removed, but order of remaining dims is changed? 
+        # Actually after permute, the last dim is the one we reduced, and the other dims are in permuted order. To get original order, we need to permute back.
+        # But the output should have the reduced dimension removed, and the other dimensions in original order.
+        # After reduction on last dim, the output shape is x_t.shape[:-1]. That's permuted order. To get original order, we need to apply inverse permutation.
+        # inverse perm: for i in range(len(perm)-1): if perm[i] < self.dim: ... This is messy.
+        # Simpler: we can reduce over the dimension in place by using the kernel that can handle non-last dim. But we'll stick with last-dim reduction and assume we can rearrange correctly.
+        # Actually, we can just output the result with the reduced dimension removed but keep the order of remaining dimensions as per permuted order. Not correct.
+```
+
+This is getting complicated. For simplicity, I will implement the kernel for reduction over the last dimension only, and in the model we require that the user passes dim=-1. Since the example uses dim=1, we can say that for this specific model we assume dim=1 and we will transpose in Python. But the task expects to replace the operator exactly. I'll output a note that the kernel supports any dim by pre-permuting in Python. The model_src will handle permuting.
+
+Given the length of this analysis, I'll now produce the code.
+
+I'll use the template from the leaky_relu example, adapt for reduction.
+
+Project JSON: op "ArgmaxOverADimensionCustom", input "x" type float32, output "y" type int32 (argmax returns index), attr "dim" int optional default 0. Actually output type should be int64 for consistency with PyTorch (torch.argmax returns int64). We'll use int64. Output dtype int32? In snippets, they use T for both. We'll define output as int32 to simplify, but PyTorch expects int64. We can cast later.
+
+I'll set output type as int64 (ge::DT_INT64). For Host operator, we'll set output type as int64.
+
+Tiling data: totalLength (number of reduction groups?), tileLength for each group, dim, and maybe shape info.
+
+Kernel: Use ReduceMax with argmax true. We'll process each row (last dim contiguous). Input tensor reshaped to 2D: [M, K] where M = product of all dims except last, K = last dim. Output is [M] of indices (int64). We'll use ReduceMax on each row? Actually ReduceMax works on a 1D tensor. We can treat the input as 1D and use repeat and stride. Set mask = K, repeat = M, repStride = K. That will reduce each contiguous block of size K. That's correct because the input is stored as [row0, row1, ...] where each row is contiguous. So we can use ReduceMax with mask=K, repeat=M, repStride=K, argmax=true. The output dstLocal will have M elements? Actually ReduceMax with argmax returns the max value and the index. In the snippet, dstDataSize = 16 (32B aligned) but they only compute one reduction? In scenarios with repeats, they set repeat and repStride. For reduce over multiple rows, the output will be M*2? Actually they output dstLocal with size? In scenario 6, they use mask and repeat but dstDataSize = 16? I suspect the output for ReduceMax with argmax when used with repeats is not clearly documented. From scenario 1 and 3, they process whole input at once and output a single value and index. For multiple repeats, they may output concatenated results. In scenario 2 and 4, they use repeat and repStride and argmax true. They set workSize = RoundUp(repeat * 2, elePerBlock) indicating output has 2*repeat elements (value+index per repeat). So for our case, repeat = M, output should have M*2 elements (values and indices interleaved?). In the code they use dstLocal which is from outQueueDst of size dstDataSize=16? Wait, in scenario 2, srcDataSize=512, mask=512, repeat=1 (since RoundUp(512,512)=1), workSize=2. So output is 2 elements (value and index). For scenario 4 similar. For scenario 6, mask=512, repeat= CeilDiv(8320,512)=17, workSize=17. But they don't use argmax there (ReduceSum). So to get indices, we need to use ReduceMax with argmax true. So we can set output as M*2 floats? But we only need indices. We can extract the second half of the output (every other element). The indices are stored as float? In the code, they treat dstLocal as T (float). Actually ReduceMax returns value and index as the same type? The index might be integer but stored in float format? That seems odd. In the snippet, they use T for both. Probably the index is stored as float representing integer. We'll need to handle that.
+
+Given the complexity, I'll simplify: use only one repeat for each row individually, loop over M rows. That is simpler and less error-prone.
+
+Kernel process:
+- Compute M = totalLength / K (where K = last dim size).
+- For i from 0 to M-1:
+    - Load row i from GM to UB (contiguous K elements).
+    - Use ReduceMax with mask=K, repeat=1, argmax=true, store result in local.
+    - Extract index (second element) and cast to int64.
+    - Store to output GM at position i.
+
+UB buffer: inQueue for one tile, outQueue for result (2 floats), workQueue for tmp.
+
+We'll double buffer to overlap copy and compute: use double buffer for input.
+
+Thus, we can produce a working kernel.
+
+Now, produce the six strings.
+
+I'll follow the exact format as the example.
+
+Let's write the code.

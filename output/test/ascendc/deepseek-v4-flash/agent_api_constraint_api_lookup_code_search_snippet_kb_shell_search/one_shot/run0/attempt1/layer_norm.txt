@@ -1,0 +1,407 @@
+```python
+project_json_src='''
+
+[
+  {
+    "op": "LayerNormCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "bias",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "eps",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "1e-5"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(LayerNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);      // batch_size
+  TILING_DATA_FIELD_DEF(uint32_t, cols);      // product of normalized_shape
+  TILING_DATA_FIELD_DEF(uint32_t, tileLen);   // how many columns per tile
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);  // number of blocks to use
+  TILING_DATA_FIELD_DEF(float, eps);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(LayerNormCustom, LayerNormCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "layer_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+// UB budget: 2 input tiles (x and weight+bias combined?) Actually we need local buffers:
+// For first pass: xLocal, sumLocal (1 float per tile? We accumulate in registers, so minimal)
+// For second pass: xLocal, yLocal, weightLocal, biasLocal, plus temporary.
+// Estimate: 4 tiles * tileLen * sizeof(float) = 4 * tileLen * 4 = 16*tileLen bytes.
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
+static constexpr uint32_t ALIGN_ELEMS = 2048;
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    LayerNormCustomTilingData tiling;
+    const gert::StorageShape *shape = context->GetInputShape(0);
+    const gert::Shape &originShape = shape->GetOriginShape();
+    // Input x: shape = [batch_size, features, dim1, dim2]
+    // The normalized_shape is [features, dim1, dim2]
+    uint32_t batchSize = static_cast<uint32_t>(originShape.GetDim(0));
+    uint32_t cols = 1;
+    for (size_t i = 1; i < originShape.GetDimNum(); ++i) {
+        cols *= static_cast<uint32_t>(originShape.GetDim(i));
+    }
+    uint32_t totalLength = batchSize * cols;
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const float *epsPtr = attrs->GetAttrPointer<float>(0);
+    float eps = (epsPtr != nullptr) ? *epsPtr : 1e-5f;
+
+    // tileLen from UB budget: maximize but fit 4 tiles of float
+    // We need at least cols to be covered, but we divide into tiles.
+    // Budget: 4 * tileLen * 4 = 16*tileLen bytes.
+    uint32_t maxTile = UB_BUDGET_BYTES / 16; // elements
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t tileLen = (cols < maxTile) ? cols : maxTile;
+    // Ensure tileLen divides cols? Not necessary but helps alignment.
+    // We'll just use tileLen as is.
+
+    // blockDim adaptive
+    uint32_t blockDim = batchSize; // ideally one row per block
+    if (blockDim < 8) blockDim = 8;
+    if (blockDim > 24) blockDim = 24; // limit
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_rows(batchSize);
+    tiling.set_cols(cols);
+    tiling.set_tileLen(tileLen);
+    tiling.set_blockDim(blockDim);
+    tiling.set_eps(eps);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0; // no workspace needed
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class LayerNormCustom : public OpDef {
+public:
+    explicit LayerNormCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("eps").AttrType(OPTIONAL).Float(1e-5);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(LayerNormCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelLayerNormCustom {
+public:
+    __aicore__ inline KernelLayerNormCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR weight, GM_ADDR bias,
+                                uint32_t rows, uint32_t cols, uint32_t tileLen, float eps)
+    {
+        rows_ = rows;
+        cols_ = cols;
+        tileLen_ = tileLen;
+        eps_ = eps;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, rows_ * cols_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, rows_ * cols_);
+        weightGm_.SetGlobalBuffer((__gm__ float*)weight, cols_);
+        biasGm_.SetGlobalBuffer((__gm__ float*)bias, cols_);
+
+        // We need multiple local tensors: xLocal, weightLocal, biasLocal, yLocal, and a temporary for subtract/scale.
+        // Budget: 5 tiles (2 for pass1? Actually we reuse; worst-case 4 tiles simultaneously)
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueW_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueB_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (rows_ == 0 || cols_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        // Each block processes rows in a grid-stride loop
+        for (uint32_t row = blockIdx; row < rows_; row += blockNum) {
+            ProcessRow(row);
+        }
+    }
+
+private:
+    __aicore__ inline void ProcessRow(uint32_t row)
+    {
+        // First pass: compute mean and variance for this row
+        float sum = 0.0f;
+        float sumSq = 0.0f;
+        uint32_t offset = row * cols_;
+
+        uint32_t remaining = cols_;
+        uint32_t base = 0;
+        while (remaining > 0) {
+            uint32_t len = (remaining > tileLen_) ? tileLen_ : remaining;
+            // Load x tile
+            AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            AscendC::DataCopy(xLocal, xGm_[offset + base], len);
+            inQueueX_.EnQue(xLocal);
+
+            AscendC::LocalTensor<float> xDeq = inQueueX_.DeQue<float>();
+            // Compute sum and sumSq using AscendC reductions or manual loop? Use ReduceSum
+            // AscendC::ReduceSum sum
+            float tileSum = AscendC::ReduceSum(xDeq, len);
+            // For sumSq, we need element-wise square and then reduce
+            AscendC::LocalTensor<float> tmp = tmpQueue_.AllocTensor<float>();
+            AscendC::Mul(tmp, xDeq, xDeq, len);
+            float tileSumSq = AscendC::ReduceSum(tmp, len);
+            tmpQueue_.FreeTensor(tmp);
+            sum += tileSum;
+            sumSq += tileSumSq;
+
+            inQueueX_.FreeTensor(xDeq);
+
+            base += len;
+            remaining -= len;
+        }
+
+        float mean = sum / static_cast<float>(cols_);
+        float var = sumSq / static_cast<float>(cols_) - mean * mean;
+        float invStd = 1.0f / sqrtf(var + eps_);
+
+        // Second pass: normalize and apply weight and bias
+        remaining = cols_;
+        base = 0;
+        while (remaining > 0) {
+            uint32_t len = (remaining > tileLen_) ? tileLen_ : remaining;
+
+            // Load x
+            AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            AscendC::DataCopy(xLocal, xGm_[offset + base], len);
+            inQueueX_.EnQue(xLocal);
+
+            // Load weight and bias (constant across rows, can be cached but we reload each row for simplicity)
+            AscendC::LocalTensor<float> wLocal = inQueueW_.AllocTensor<float>();
+            AscendC::DataCopy(wLocal, weightGm_[base], len);
+            inQueueW_.EnQue(wLocal);
+
+            AscendC::LocalTensor<float> bLocal = inQueueB_.AllocTensor<float>();
+            AscendC::DataCopy(bLocal, biasGm_[base], len);
+            inQueueB_.EnQue(bLocal);
+
+            // Dequeue
+            AscendC::LocalTensor<float> xDeq = inQueueX_.DeQue<float>();
+            AscendC::LocalTensor<float> wDeq = inQueueW_.DeQue<float>();
+            AscendC::LocalTensor<float> bDeq = inQueueB_.DeQue<float>();
+
+            // y = (x - mean) * invStd * weight + bias
+            AscendC::LocalTensor<float> tmp = tmpQueue_.AllocTensor<float>();
+            AscendC::Subs(tmp, xDeq, mean, len);
+            AscendC::Muls(tmp, tmp, invStd, len);
+            AscendC::Mul(tmp, tmp, wDeq, len);
+            AscendC::Add(tmp, tmp, bDeq, len);
+
+            // Write to y
+            AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+            AscendC::DataCopy(yLocal, tmp, len); // copy from tmp to yLocal (or use tmp as yLocal directly, but we need to enqueue)
+            outQueueY_.EnQue(yLocal);
+
+            // Free
+            tmpQueue_.FreeTensor(tmp);
+            inQueueX_.FreeTensor(xDeq);
+            inQueueW_.FreeTensor(wDeq);
+            inQueueB_.FreeTensor(bDeq);
+
+            // Dequeue y and write to global
+            AscendC::LocalTensor<float> yDeq = outQueueY_.DeQue<float>();
+            AscendC::DataCopy(yGm_[offset + base], yDeq, len);
+            outQueueY_.FreeTensor(yDeq);
+
+            base += len;
+            remaining -= len;
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueW_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueB_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+    AscendC::GlobalTensor<float> weightGm_;
+    AscendC::GlobalTensor<float> biasGm_;
+
+    uint32_t rows_ {0};
+    uint32_t cols_ {0};
+    uint32_t tileLen_ {0};
+    float eps_ {1e-5f};
+};
+
+extern "C" __global__ __aicore__ void layer_norm_custom(GM_ADDR x, GM_ADDR y, GM_ADDR weight, GM_ADDR bias, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelLayerNormCustom op;
+    op.Init(x, y, weight, bias, tiling_data.rows, tiling_data.cols, tiling_data.tileLen, tiling_data.eps);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+std::tuple<at::Tensor> layer_norm_impl_npu(const at::Tensor& self, const at::Tensor& weight, const at::Tensor& bias, double eps) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnLayerNormCustom, self, weight, bias, eps, result);
+    return {result};
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("layer_norm_custom", &layer_norm_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("layer_norm_custom", &layer_norm_impl_npu, "Layer Normalization (LayerNormCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'layer_norm_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, normalized_shape):
+        super(ModelNew, self).__init__()
+        # We need to mirror the LayerNorm parameters
+        self.normalized_shape = normalized_shape
+        self.weight = torch.nn.Parameter(torch.ones(normalized_shape, dtype=torch.float32))
+        self.bias = torch.nn.Parameter(torch.zeros(normalized_shape, dtype=torch.float32))
+        self.eps = 1e-5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Flatten weight and bias to 1D: they already have shape normalized_shape (3D: features, dim1, dim2)
+        w = self.weight.view(-1)
+        b = self.bias.view(-1)
+        fn = getattr(custom_ops_lib, _FN)
+        # The custom kernel expects all inputs as Tensors; eps can be passed as a float attribute in the operator,
+        # but our custom op uses attribute "eps". In this binding, we assume the kernel receives eps via tiling.
+        # So we just pass x, w, b.
+        return fn(x, w, b)
+'''

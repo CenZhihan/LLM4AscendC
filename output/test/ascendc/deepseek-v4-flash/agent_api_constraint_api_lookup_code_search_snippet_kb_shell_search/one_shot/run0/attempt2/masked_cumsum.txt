@@ -1,0 +1,418 @@
+```python
+project_json_src='''
+
+[
+  {
+    "op": "MaskedCumsumCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "mask",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["bool"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "dim",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "1"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MaskedCumsumCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, outerSize);
+  TILING_DATA_FIELD_DEF(uint32_t, innerSize);
+  TILING_DATA_FIELD_DEF(uint32_t, tileOuter);
+  TILING_DATA_FIELD_DEF(uint32_t, tileInner);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(int32_t, dim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MaskedCumsumCustom, MaskedCumsumCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "masked_cumsum_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+static constexpr uint32_t UB_BUDGET_BYTES = 240 * 1024;
+static constexpr uint32_t ALIGN_ELEMS = 256;
+static constexpr uint32_t MAX_TILE_INNER = 2048;
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return (x / a) * a;
+}
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (a + b - 1u) / b;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    MaskedCumsumCustomTilingData tiling;
+
+    // Fix: Use StorageShape* to access GetOriginShape()
+    const gert::StorageShape *inputShape = context->GetInputShape(0);
+    auto shapeDimNum = inputShape->GetOriginShape().GetDimNum();
+    if (shapeDimNum < 2) {
+        // treat 1D as 1 x n
+        const uint32_t n = static_cast<uint32_t>(inputShape->GetOriginShape().GetDim(0));
+        tiling.set_outerSize(1);
+        tiling.set_innerSize(n);
+    } else {
+        tiling.set_outerSize(static_cast<uint32_t>(inputShape->GetOriginShape().GetDim(0)));
+        tiling.set_innerSize(static_cast<uint32_t>(inputShape->GetOriginShape().GetDim(1)));
+    }
+
+    const uint32_t totalLength = tiling.get_outerSize() * tiling.get_innerSize();
+    tiling.set_totalLength(totalLength);
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t *dimPtr = attrs->GetAttrPointer<int32_t>(0);
+    const int32_t dim = (dimPtr != nullptr) ? *dimPtr : 1;
+    tiling.set_dim(dim);
+
+    // Tiling for the contiguous cumulative dimension (inner)
+    uint32_t inner = tiling.get_innerSize();
+    uint32_t tileInner = (inner <= MAX_TILE_INNER) ? inner : MAX_TILE_INNER;
+    tileInner = AlignDown(tileInner, ALIGN_ELEMS);
+    if (tileInner == 0) tileInner = inner;
+
+    // Estimate max elements for three large buffers: src, mask, dst (each tileOuter * tileInner)
+    // plus two per-row buffers: lastRow (tileOuter) and rowSum (tileOuter)
+    // UB budget / 4 bytes per float => max floats
+    uint32_t maxFloats = UB_BUDGET_BYTES / 4;
+    // buffers needed: 3 * tileOuter * tileInner + 2 * tileOuter
+    uint32_t tileOuter = maxFloats / (3 * tileInner + 2);
+    if (tileOuter > tiling.get_outerSize()) tileOuter = tiling.get_outerSize();
+    if (tileOuter == 0) tileOuter = 1;
+    tileOuter = (tileOuter < 8) ? 8 : tileOuter; // minimum 8 rows per tile
+
+    tiling.set_tileOuter(tileOuter);
+    tiling.set_tileInner(tileInner);
+
+    // Compute block dim based on number of tiles
+    const uint32_t tilesOuter = CeilDiv(tiling.get_outerSize(), tileOuter);
+    const uint32_t tilesInner = CeilDiv(inner, tileInner);
+    const uint32_t totalTiles = tilesOuter * tilesInner;
+    uint32_t blockDim = totalTiles;
+    if (blockDim < 8) blockDim = 8;
+    if (blockDim > 24) blockDim = 24;
+    tiling.set_blockDim(blockDim);
+
+    context->SetBlockDim(blockDim);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class MaskedCumsumCustom : public OpDef {
+public:
+    explicit MaskedCumsumCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("mask")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_BOOL})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("dim").AttrType(OPTIONAL).Int(1);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MaskedCumsumCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelMaskedCumsumCustom {
+public:
+    __aicore__ inline KernelMaskedCumsumCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR mask, GM_ADDR y,
+                                uint32_t outerSize, uint32_t innerSize,
+                                uint32_t tileOuter, uint32_t tileInner,
+                                int32_t dim)
+    {
+        outerSize_ = outerSize;
+        innerSize_ = innerSize;
+        tileOuter_ = tileOuter;
+        tileInner_ = tileInner;
+        dim_ = dim;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, outerSize_ * innerSize_);
+        maskGm_.SetGlobalBuffer((__gm__ int8_t*)mask, outerSize_ * innerSize_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, outerSize_ * innerSize_);
+
+        // Allocate maximum required buffers
+        uint32_t maxOuterBytes = tileOuter_ * sizeof(float);
+        uint32_t maxInnerBytes = tileInner_ * sizeof(float);
+        uint32_t batchBytes = tileOuter_ * tileInner_ * sizeof(float);
+
+        // buffer for x slice (after multiplication)
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, batchBytes);
+        // buffer for masked input (temporary)
+        pipe_.InitBuffer(maskedQueue_, BUFFER_NUM, batchBytes);
+        // buffer for output
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, batchBytes);
+        // last row per tile (carry)
+        pipe_.InitBuffer(lastRowQueue_, 1, maxOuterBytes);
+        // running row sum
+        pipe_.InitBuffer(rowSumQueue_, 1, maxOuterBytes);
+        // buffer for current mask slice
+        pipe_.InitBuffer(maskLocalQueue_, 1, batchBytes);
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (outerSize_ == 0 || innerSize_ == 0) return;
+
+        const uint32_t blkIdx = AscendC::GetBlockIdx();
+
+        // Grid-stride over outer tiles
+        for (uint32_t outerTileStart = blkIdx * tileOuter_;
+             outerTileStart < outerSize_;
+             outerTileStart += AscendC::GetBlockNum() * tileOuter_) {
+
+            const uint32_t outerTileEnd = (outerTileStart + tileOuter_ <= outerSize_) ?
+                                           outerTileStart + tileOuter_ : outerSize_;
+            const uint32_t curTileOuter = outerTileEnd - outerTileStart;
+
+            // Initialize row sum for this batch of rows
+            AscendC::LocalTensor<float> rowSum = rowSumQueue_.AllocTensor<float>();
+            AscendC::Duplicate(rowSum, 0.0f, curTileOuter);
+
+            // Loop over inner tiles (carry forward)
+            for (uint32_t innerTileStart = 0; innerTileStart < innerSize_;
+                 innerTileStart += tileInner_) {
+
+                const uint32_t innerTileEnd = (innerTileStart + tileInner_ <= innerSize_) ?
+                                                innerTileStart + tileInner_ : innerSize_;
+                const uint32_t curTileInner = innerTileEnd - innerTileStart;
+
+                // Allocate local tensors
+                AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+                AscendC::LocalTensor<int8_t> maskLocal = maskLocalQueue_.AllocTensor<int8_t>();
+                AscendC::LocalTensor<float> maskedLocal = maskedQueue_.AllocTensor<float>();
+                AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+
+                // Copy x slice (contiguous rows * inner tile)
+                CopyIn(xLocal, xGm_, outerTileStart, innerTileStart, curTileOuter, curTileInner);
+                CopyIn(maskLocal, maskGm_, outerTileStart, innerTileStart, curTileOuter, curTileInner);
+
+                // Multiply x * mask (cast mask to float)
+                AscendC::LocalTensor<float> maskFloat;
+                AscendC::Cast(maskFloat, maskLocal, AscendC::RoundMode::CAST_NONE, curTileOuter * curTileInner);
+                AscendC::Mul(maskedLocal, xLocal, maskFloat, curTileOuter * curTileInner);
+
+                // Compute cumulative sum on the inner dimension for each row
+                AscendC::CumSumInfo cumSumInfo{curTileOuter, curTileInner};
+                AscendC::LocalTensor<float> lastRow = lastRowQueue_.AllocTensor<float>();
+                AscendC::CumSum<float, AscendC::CumSumConfig::DEFAULT>(yLocal, lastRow, maskedLocal, cumSumInfo);
+
+                // Add running row sum (carry from previous inner tiles)
+                // rowSum has shape (curTileOuter, 1) ; broadcast along inner dimension
+                AscendC::Add(yLocal, yLocal, rowSum, curTileOuter, curTileInner,
+                             {1, curTileInner, 1, 1});
+
+                // Update rowSum with lastRow of this tile
+                AscendC::Add(rowSum, rowSum, lastRow, curTileOuter);
+
+                // Copy out
+                CopyOut(yLocal, yGm_, outerTileStart, innerTileStart, curTileOuter, curTileInner);
+
+                // Free tensors
+                lastRowQueue_.FreeTensor(lastRow);
+                outQueueY_.FreeTensor(yLocal);
+                maskedQueue_.FreeTensor(maskedLocal);
+                maskLocalQueue_.FreeTensor(maskLocal);
+                inQueueX_.FreeTensor(xLocal);
+            }
+
+            rowSumQueue_.FreeTensor(rowSum);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(AscendC::LocalTensor<float> dst, AscendC::GlobalTensor<float> src,
+                                  uint32_t outerStart, uint32_t innerStart,
+                                  uint32_t rows, uint32_t cols)
+    {
+        // Copy rows*cols contiguous block; rows are contiguous in global memory
+        for (uint32_t r = 0; r < rows; r++) {
+            uint32_t gmOffset = (outerStart + r) * innerSize_ + innerStart;
+            uint32_t localOffset = r * cols;
+            AscendC::DataCopy(dst[localOffset], src[gmOffset], cols);
+        }
+    }
+
+    __aicore__ inline void CopyIn(AscendC::LocalTensor<int8_t> dst, AscendC::GlobalTensor<int8_t> src,
+                                  uint32_t outerStart, uint32_t innerStart,
+                                  uint32_t rows, uint32_t cols)
+    {
+        for (uint32_t r = 0; r < rows; r++) {
+            uint32_t gmOffset = (outerStart + r) * innerSize_ + innerStart;
+            uint32_t localOffset = r * cols;
+            AscendC::DataCopy(dst[localOffset], src[gmOffset], cols);
+        }
+    }
+
+    __aicore__ inline void CopyOut(AscendC::LocalTensor<float> src, AscendC::GlobalTensor<float> dst,
+                                   uint32_t outerStart, uint32_t innerStart,
+                                   uint32_t rows, uint32_t cols)
+    {
+        for (uint32_t r = 0; r < rows; r++) {
+            uint32_t gmOffset = (outerStart + r) * innerSize_ + innerStart;
+            uint32_t localOffset = r * cols;
+            AscendC::DataCopy(dst[gmOffset], src[localOffset], cols);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> maskedQueue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> maskLocalQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> lastRowQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> rowSumQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<int8_t> maskGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t outerSize_ {0};
+    uint32_t innerSize_ {0};
+    uint32_t tileOuter_ {0};
+    uint32_t tileInner_ {0};
+    int32_t dim_ {1};
+};
+
+extern "C" __global__ __aicore__ void masked_cumsum_custom(GM_ADDR x, GM_ADDR mask, GM_ADDR y,
+                                                             GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMaskedCumsumCustom op;
+    op.Init(x, mask, y,
+            tiling_data.outerSize, tiling_data.innerSize,
+            tiling_data.tileOuter, tiling_data.tileInner,
+            tiling_data.dim);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor masked_cumsum_impl_npu(const at::Tensor& self, const at::Tensor& mask, int64_t dim) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnMaskedCumsumCustom, self, mask, dim, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("masked_cumsum_custom", &masked_cumsum_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("masked_cumsum_custom", &masked_cumsum_impl_npu, "Masked cumulative sum (MaskedCumsumCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'masked_cumsum_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
+```

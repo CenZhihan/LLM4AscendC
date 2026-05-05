@@ -1,0 +1,103 @@
+We need to generate the six files for the custom kernel named `gemm_bias_add_hardtanh_mish_group_norm_custom` (PascalCase: `GemmBiasAddHardtanhMishGroupNormCustom`). The model performs: linear (matmul + bias), then add bias, hardtanh, mish, group_norm. We need to fuse all these into a single custom AscendC kernel.
+
+Given the retrieved context, we have examples of matmul fused kernels (matmul_fused, matmul_preload) and group norm implementation. We need to combine matmul + bias + elementwise + group_norm.
+
+Constraints from the example: we have six strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+For the kernel, we will use the matmul API (using MatmulImpl) to perform the linear transformation, then add the second bias, then perform hardtanh, mish, and finally group_norm. We'll need to manage UB memory and tiling.
+
+From the retrieved code snippets, we see patterns: matmul_fused uses MatmulLeakyKernel with Init/Process, and groupnorm uses GroupNorm API. For mish, we can implement using element-wise operations: mish = x * tanh(softplus(x)) where softplus(x) = ln(1+exp(x)). We can use built-in functions like Exp, Log, Tanh, Mul.
+
+Also note that group norm requires mean and variance computation; we can use reduce mean and variance or the GroupNorm API.
+
+Given the complexity, we might implement the kernel class that uses matmul API and then does the rest manually.
+
+Let's outline:
+
+- Inputs: x (batch_size, in_features), weight (out_features, in_features), lin_bias (out_features), bias (out_features), gn_gamma (out_features), gn_beta (out_features). Output: y (batch_size, out_features) after group norm.
+
+- We need to compute linear: matmul(x, weight.T) + lin_bias? Actually F.linear(x, weight, lin_bias) does x @ weight.T + lin_bias. So we need to perform matmul with transposed weight. Then add bias, hardtanh, mish, group_norm.
+
+In the matmul_fused examples, they use half for A and B, float for C and bias. Here we have all float32. We can use float.
+
+We'll need to implement the kernel class that on each block processes a subset of rows (batch), doing the matmul and then the rest.
+
+Because the matmul API (MatmulImpl) works on tiles, we need to integrate with our tiling. We can use the matmul fused kernel pattern where we have a Matmul object and then do custom post-processing.
+
+Alternatively, we could implement the matmul using macro or MT (as in grouped_matmul_add). But simpler: use the matmul_fused pattern with a custom kernel class that after matmul applies bias_add, hardtanh, mish, and then group_norm per row (since group norm is per sample). We need to compute group norm per sample: for each sample, we compute mean and variance across channels, then normalize.
+
+Group norm: For a tensor (N, C, H, W) or (N, C), group norm divides channels into groups, computes mean/variance per group, then normalizes. Here input is (batch_size, out_features) so it's (N, C) with H=W=1. So we treat (N, C) as (N, C, 1, 1). Group norm with num_groups groups: each group has C/num_groups channels. Compute mean and variance for each group across those channels. Then normalize.
+
+We can implement the group norm manually using reductions.
+
+Given the complexity, we might use the GroupNorm API but need to ensure it works for 2D input. The GroupNorm API expects (N, C, H, W) layout. We can reshape? Possibly use the API with H=1, W=1.
+
+From the retrieved groupnorm code, the API is `GroupNorm(output, outputMean, outputVariance, inputX, gamma, beta, epsilon, tiling)`. We'll need to provide tiling data. Alternatively, we can implement our own reduction.
+
+Better to implement the group norm ourselves to avoid dependency on the specific API and tiling. We'll compute mean and variance locally.
+
+We need to produce the full code. Let's structure:
+
+- project_json_src: define Op with inputs: x, weight, lin_bias, bias, gn_gamma, gn_beta; output: y; attrs: in_features, out_features, num_groups? Actually num_groups is a constant from the model init. We can pass it as attribute or as input? In the example, the model passes init args. In the kernel, we need to know num_groups. We can pass it as a tiling parameter. The op can have an attribute for num_groups. Also we need to pass in_features/out_features? They can be derived from shapes. So define attrs: num_groups (int). Inputs: x (float, ND), weight (float, ND), lin_bias (float, ND), bias (float, ND), gn_gamma (float, ND), gn_beta (float, ND). Output: y (float, ND).
+
+- host_tiling_src: define tiling data struct with fields: totalRows, outFeatures, inFeatures, numGroups, tileRows, etc. Also blockDim. We'll compute tiling based on UB budget. The main challenge is the matmul requires its own tiling (M, N, K). We can use a fixed tile for matmul or reuse the matmul tiling. Possibly we can implement the kernel using the high-level Matmul API which handles tiling internally if we provide the tiling data from the operator tiling. Actually in the matmul_fused example, they have a TCubeTiling tiling that is copied from GlobalMemory (tilingGm). That tiling is computed by the tiling function. So we need to compute the matmul tiling as part of our host tiling function. That is complex.
+
+Alternative: Use the MatmulImpl with the common pattern: REGIST_MATMUL_OBJ and then use the cube to compute linear, then we handle the rest. But the cube operates on tiles and we need to coordinate with our own compute.
+
+Given time, a simpler approach: implement the matmul using the DSL macros (like MT) as seen in grouped_matmul_add. That handles tiling automatically. Then after matmul, we do the remaining operations on the result tile by tile.
+
+From the grouped_matmul_add code, they use `MmImplType` and `mm` object. They then call computeOp which does matmul and then add bias. We can extend that pattern.
+
+Let's model after grouped_matmul_add but for single matmul. We'll have:
+
+- In kernel_src, define a class that uses matmulType and then after matmul, apply bias_add, hardtanh, mish, group_norm.
+
+But group_norm requires aggregate across channels. Since we process tiles of rows (batch), we need to compute group norm per row after the matmul. However, group norm needs mean and variance of all channels for that row. That's a reduction across the entire outFeatures dimension, which is the N axis of the matmul output (second dimension). That means we cannot fully pipeline chunking across columns easily. But we can process each row fully.
+
+Given that outFeatures might be 8192, we can process one row at a time? That would be inefficient. We need to handle multiple rows in parallel. The group norm for each row is independent across rows but within a row we need all channels. We can accumulate matmul output for a block of rows, then for each row compute group norm.
+
+We can use a two-phase approach: first compute matmul + first bias + second bias + hardtanh + mish for a block of rows (tileRows x outFeatures), then compute group norm for each row in that block using reduction across outFeatures. But reduction requires partial sums across tiles of outFeatures. That is manageable if we process outFeatures in tiles too.
+
+Thus we need a tiling strategy: We'll tile along batch (M) and along outFeatures (N). For each tile of M rows and N columns, we compute matmul on that portion (M x K matmul with weight K x N, but weight is constant per kernel, so we need to load weight tiles). Then accumulate into output tile for that block. After processing all N partitions for that M block, we have the full output row segment for those rows. Then we can compute mish and then group norm on the full row? But mish is elementwise, we can apply after each partial sum? Actually mish can be applied after the full row is computed because mish is per element. But group norm requires the full row. So after we finish all N columns for a row block, we have the full rows in local memory. Then we compute group norm per row.
+
+This is complex but feasible.
+
+Given the example, we might simplify: The architecture is for batch_size=1024, in_features=out_features=8192, num_groups=256. That's a specific size. We could design a kernel that processes each row individually (M=1) and uses the full matmul to compute the entire row (N=outFeatures) in one go. Since outFeatures=8192, which is relatively large, but with proper UB tiling we can fit. We can set tileRows=1 and process one sample at a time. That makes group norm easy: compute mean and variance over the 8192 elements, then normalize. This might be acceptable if the kernel is still efficient because it's compute bound.
+
+Given the instruction, we need to produce a working replacement. I'll assume tileRows=1 to simplify.
+
+Let's design:
+
+- Tiling: totalRows = batch_size, outFeatures, inFeatures, numGroups.
+- For each row (blockIdx < totalRows), we do:
+    - Compute linear: multiply row vector (1, inFeatures) with weight matrix (inFeatures, outFeatures) and add lin_bias -> (1, outFeatures). Use matmul API but we need to handle weight loading. Using MatmulImpl with M=1, N=outFeatures, K=inFeatures.
+    - Then add bias (broadcast) -> elementwise add.
+    - Then hardtanh: clamp between -1 and 1? Actually hardtanh default min=-1, max=1. So clamp.
+    - Then mish: x * tanh(ln(1+exp(x))). Implement using Exp, Log1p, Tanh, Mul.
+    - Then group norm: for each group of outFeatures/numGroups channels, compute mean and variance, then normalize using gamma and beta.
+
+We need to allocate local tensors for the row.
+
+We'll implement the kernel class with Init and Process.
+
+For matmul, we can use the MatmulImpl directly by setting up the parameters. But the MatmulImpl requires tiling data which we can compute in the tiling function and pass via tilingGm. However, we also need to compute per-row group norm tiling.
+
+Given the retrieved context, we have matmul_fused example which uses MatmulLeakyKernel. That kernel already includes a leaky relu? No, it's a custom kernel that does matmul+leaky relu. So we can inherit similar structure: define a kernel class that contains a Matmul object (using REGIST_MATMUL_OBJ) and then after matmul processing, apply the rest.
+
+In matmul_fused, they have MatmulLeakyKernel which is a class that has matmulObj and tiling. Their Process does matmul and then applies leaky relu via vector compute. We can do similar but with more operations.
+
+So our kernel class will:
+
+- Have a Matmul object (using MatmulImpl<half, half, float, float> maybe but we want float). The matmul_fused uses half for A and B, float for C and bias. We could also use float for A and B to avoid cast overhead. But the API might require specific types. In the retrieved API signature, Matmul is parameterized with A_TYPE, B_TYPE, C_TYPE, BIAS_TYPE, ... So we can use `Matmul<float, float, float, float>` but check if supported. The examples use half for A and B because that's common. We'll use float to match input. But the API may impose alignment constraints. We'll assume float works.
+
+- For tiling, we need to compute the matmul tiling data (TCubeTiling) which includes M, N, K, base blocks, etc. We can compute that in the host tiling function and store in tiling data. We'll also include our own tiling parameters (totalRows, numGroups, etc.).
+
+- In kernel, we init the matmul object with the tiling data.
+
+- Then in Process, for each row, we call matmul to compute the linear result into a local tensor, then apply bias_add, hardtanh, mish, group_norm. For group norm, we need to compute mean/variance per group. We can do that by iterating over groups, summing and summing squares, then compute mean and variance, then normalize using gamma and beta.
+
+We'll need to manage the UB queue buffers.
+
+Given the length, I'll produce the code. I'll base the kernel_src on the matmul_fused pattern but modify.
+
+Let's write the six files.

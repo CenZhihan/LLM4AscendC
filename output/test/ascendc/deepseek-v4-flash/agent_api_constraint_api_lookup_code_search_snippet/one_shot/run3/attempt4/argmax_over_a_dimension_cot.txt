@@ -1,0 +1,79 @@
+We need to fix the argmax kernel. The previous attempt had correctness issue: output mismatched (many zeros, dtype int32 but wrong values). Likely issues: WholeReduceMax usage is wrong, or index extraction is wrong. Also the output shape is not correct: argmax reduces one dimension, output should be int32 with same shape except reduced dim. The previous kernel's output shape and DataCopy might be wrong. The log shows new output has many zeros and wrong values comparing to reference. Need to examine the kernel.
+
+Key observations:
+1. The previous kernel used WholeReduceMax with ORDER_VALUE_INDEX? Actually it used WholeReduceMax without specifying order, default? In code: `AscendC::WholeReduceMax<float>(reduceOut, xLocal, mask, repeat, 1, 1, srcRepeatStride, AscendC::ReduceOrder::ORDER_VALUE_INDEX);` That seems okay.
+2. But the mask is set to `numCols` which is the number of columns per row (i.e., the reduced dimension size). However WholeReduceMax expects mask to be the number of elements per repeat (up to 64 for float, because 256/4=64). If numCols > 64, it will not work correctly. The documentation says WholeReduceMax mask maximum is 64 for float? Actually in the code snippets, mask is often 64 for float (256 bytes). So we cannot use mask = numCols directly if numCols > 64. Need to handle per-row reduction differently: we should use ReduceMax per row? Or use a loop over rows and use ReduceMax on each row with mask=numCols? But ReduceMax has repeat limitation 255, and mask must be <=64. For argmax over dimension, we need to find max index along one dimension. If the reduced dimension is large (e.g., 4095 in the example), mask=4095 is too big. We need to split each row into chunks and reduce with keeping index? That is complex.
+
+Alternative: Use a simpler approach: for each row, loop over blocks of columns, compute local max and index, then combine. But that would be more code. However the problem might be simpler: maybe the output shape is wrong. The reference output is of shape (batch_size, dim2) i.e., (128, 4095) because dim=1 (dimension 1 of size 4096 reduced). The new output shape? It seems new output is also (128, 4095) but values are wrong. So the shape is correct, but values are incorrect. The zeros might be from indices that are zero because the max value is not found correctly.
+
+Another issue: The data copy for output: `AscendC::DataCopy(yGm_[rowBase], yLocal, rows);` This copies `rows` elements from yLocal to yGm starting at rowBase. But yLocal has `rows` indices (int32). However each index is 4 bytes, and rows is number of indices. That should be fine. But note that yGm is of type `__gm__ int32_t*` and we set global buffer with `yGm_.SetGlobalBuffer((__gm__ int32_t*)y);` without specifying size. Then `yGm_[rowBase]` accesses at offset rowBase (in elements). Since output is a 2D flattened tensor with shape (numRows,), rowBase is the row index, and we copy rows indices. That seems correct.
+
+The main suspect is the WholeReduceMax call. For a row with numCols elements, we need to find the index of max. WholeReduceMax with mask=numCols, repeat=1, srcBlkStride=1, dstBlkStride=1, srcRepeatStride? The srcRepeatStride is the number of 32B blocks between repeats. Here repeat=1, so it doesn't matter. For a single repeat, WholeReduceMax will reduce one vector of length mask (must be <=64). If numCols > 64, it will fail (runtime error?) Or it might process only the first 64 elements? Possibly the reason for zeros: many columns are not processed, so max might be smaller than others, leading to index 0 maybe.
+
+Given the example input shape (128, 4096, 4095) and dim=1, reduced dimension size is 4096. That is much larger than 64. So the current approach is fundamentally flawed for large reduced dimensions.
+
+We need a different kernel design: either iterate over blocks of columns and do pairwise reduction, or use a different AscendC API that supports larger masks. There is ReduceMax with calIndex=true (returns value and index). But ReduceMax also has mask limitation (max 64). So we need to chunk.
+
+Simpler fix: Since the reduced dimension is contiguous in memory (row-major), we can process each row by dividing into chunks of size 64, compute local argmax (using ReduceMax with index) on each chunk, then compare local maxima to find global argmax for the row. However, this requires a two-pass approach per row, which increases complexity.
+
+Alternative: Use the AscendC library reduce functions that handle larger dimensions? There is `WholeReduceMax` with mask up to 128 for half, but for float it's 64. So we must split.
+
+Maybe the test input is such that the reduced dimension is small? Actually the example input: dim1=4096, dim2=4095, dim=1, so reduced dim size is 4096. That is large. So our kernel must handle that.
+
+We could design the kernel to do per-row reduction using a loop over chunks and keep track of best index. This will require more local memory and a two-step process per row.
+
+Alternatively, we can use the `ReduceMax` API with repeat and mask parameters correctly. For a row of length L, we can set mask=64, repeat=ceil(L/64), and use ReduceMax with calIndex=true to get per-block max and index. Then we need to combine all blocks to find global max and index. The output of ReduceMax with calIndex is interleaved: [max0, idx0, max1, idx1, ...]. We can then do a second reduction over those max values to find the global max and its corresponding block index. Then we combine to get the original index.
+
+Given time, perhaps we can implement a simpler but suboptimal kernel that works correctly: for each row, iterate over columns in chunks, compute local max and index using ReduceMax on each chunk, then keep global best. This will be sequential per row but parallel across rows (grid-stride).
+
+Let's adapt the kernel:
+
+- In Init, we set numCols, numRows, tileRows (number of rows processed per iteration). Also we compute chunkSize = 64 (since mask limit). We'll need two queues: one for input (double buffer), and a tmp buffer for reduction results from each chunk. Actually we can process each row sequentially within a thread: for each row, we load the row in chunks, compute local argmax using a custom loop (using ReduceMax per chunk). Then write the final index to output.
+
+Given the complexity, but to meet correctness, we can implement a simple kernel that uses `ReduceMax` on each chunk (mask=chunkSize) and then a scalar comparison loop to find global argmax. This avoids hardware-accelerated whole-row reduction but should be correct.
+
+Let's write the kernel accordingly.
+
+Also need to adjust host tiling to pass necessary parameters (chunkSize maybe fixed).
+
+Let's produce the fixed code.
+
+But note: The error logs show the kernel compiled successfully and ran, but output wrong. So our fix should be minimal changes to the kernel, while keeping other files mostly same.
+
+We'll modify kernel_src only, and possibly tiling (add chunkSize). But we can keep chunkSize constant (64) in kernel and not in tiling.
+
+We also need to fix the output data copy: currently copy `rows` elements, but that is correct.
+
+Let's rewrite the kernel class:
+
+- Remove WholeReduceMax usage.
+- In Compute, after loading rows*numCols tile, we process each row individually:
+   - For row in [0, rows):
+     - Initialize best_val = -FLT_MAX, best_idx = 0.
+     - For offset in [0, numCols) step chunkSize:
+        - Compute actual chunk length (min(chunkSize, numCols - offset)).
+        - Extract slice from xLocal.
+        - Use ReduceMax on that slice to get local max and index (using a tmp workspace).
+        - Compare with best_val, update if larger.
+     - Set yLocal[row] = best_idx.
+- This will be slower but correct.
+
+We'll need a temporary buffer for ReduceMax workspace. We can allocate a single local tensor of size chunkSize (for workspace) per thread. Since we process sequentially, we can reuse.
+
+We'll modify Init: add a queue for workspace (tensor) sized chunkSize (or maybe 2*chunkSize for value+index). ReduceMax with calIndex=true expects workspace of size (count + 2*? Actually from API: `ReduceMax(dst, src, workspace, count, calIndex)` where workspace must have at least `count * sizeof(T)` bytes? In documentation, workspace is used as temporary buffer. We'll allocate workspace local tensor of size (chunkSize * 2) to be safe.
+
+Also, we need to handle the case where rows are processed in parallel across blocks. Use grid-stride loop.
+
+Let's implement.
+
+Also note that the output yGm is for indices (int32). We'll copy rows indices.
+
+Now, update kernel_src accordingly. Also need to ensure we include float.h for FLT_MAX? We can set best_val to a very small number initially.
+
+Let's write the corrected kernel.
+
+We'll also adjust host_operator_src if needed for workspace size? No, workspace is 0.
+
+But we also need to ensure the tiling passes numRows, numCols, tileRows. That's already there.
+
+Now produce the final answer.

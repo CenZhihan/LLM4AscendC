@@ -1,0 +1,312 @@
+```python
+project_json_src='''
+
+[
+  {
+    "op": "LogSoftmaxCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(LogSoftmaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, height);
+  TILING_DATA_FIELD_DEF(uint32_t, width);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(LogSoftmaxCustom, LogSoftmaxCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "log_softmax_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+// UB budget: one row tile of floats (width) + workspace
+// row buffer: width * 4 bytes, workspace: width * 4 bytes -> 2*width*4 <= 192K => width <= 24576
+// For width > 24576 we still process row by row, but need to ensure enough UB.
+// We'll keep conservative: treat width as passed, kernel will handle if necessary.
+static constexpr uint32_t MAX_UB_BYTES = 192 * 1024;
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) {
+    return (x / a) * a;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context) {
+    LogSoftmaxCustomTilingData tiling;
+
+    const gert::Shape *shape = context->GetInputShape(0);
+    uint32_t height = static_cast<uint32_t>(shape->GetDim(0));
+    uint32_t width  = static_cast<uint32_t>(shape->GetDim(1));
+    uint32_t totalLength = height * width;
+
+    // Block dim: each block processes a subset of rows.
+    // For simplicity, assign rows to blocks in round-robin.
+    const uint32_t blockDim = (height < 24) ? height : 24;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_height(height);
+    tiling.set_width(width);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context) {
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context) {
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class LogSoftmaxCustom : public OpDef {
+public:
+    explicit LogSoftmaxCustom(const char* name) : OpDef(name) {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(LogSoftmaxCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+using namespace AscendC;
+
+constexpr int32_t BUFFER_NUM = 2;
+constexpr float INF_NEG = -1e38f;
+
+class KernelLogSoftmaxCustom {
+public:
+    __aicore__ inline KernelLogSoftmaxCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t height, uint32_t width) {
+        height_ = height;
+        width_ = width;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, height_ * width_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, height_ * width_);
+
+        // Allocate buffers for one row (width floats) and a workspace of same size
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, width_ * sizeof(float));
+        pipe_.InitBuffer(workspaceQueue_, 1, width_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, width_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        uint32_t blockNum = GetBlockNum();
+        uint32_t blockIdx = GetBlockIdx();
+
+        for (uint32_t row = blockIdx; row < height_; row += blockNum) {
+            ProcessRow(row);
+        }
+    }
+
+private:
+    __aicore__ inline void ProcessRow(uint32_t row) {
+        uint32_t base = row * width_;
+
+        // Load entire row into local buffer (may split if width too large for UB, but keep simple)
+        // For safety, we process row in chunks if width > UB capacity/2, but for typical sizes it's fine.
+        // Here we assume width fits in UB (width <= 24576).
+        // If not, we would need sub-tiling, but for the given model width=393216 is too large.
+        // So we must handle large width by processing in subtiles.
+        // We'll process width in chunks of tileSize (max possible per UB).
+        const uint32_t tileSize = (192 * 1024) / (2 * sizeof(float)); // half UB for input+workspace
+        uint32_t numTiles = (width_ + tileSize - 1) / tileSize;
+
+        float globalMax = INF_NEG;
+        // Pass 1: compute global max
+        for (uint32_t t = 0; t < numTiles; ++t) {
+            uint32_t offset = t * tileSize;
+            uint32_t len = (offset + tileSize <= width_) ? tileSize : (width_ - offset);
+
+            LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            DataCopy(xLocal, xGm_[base + offset], len);
+            inQueueX_.EnQue(xLocal);
+            xLocal = inQueueX_.DeQue<float>();
+
+            LocalTensor<float> workspace = workspaceQueue_.AllocTensor<float>();
+            LocalTensor<float> maxLocal = tmpQueue_.AllocTensor<float>();
+            ReduceMax(maxLocal, xLocal, workspace, len);
+            float localMax = maxLocal.GetValue(0);
+            if (localMax > globalMax) globalMax = localMax;
+
+            tmpQueue_.FreeTensor(maxLocal);
+            workspaceQueue_.FreeTensor(workspace);
+            inQueueX_.FreeTensor(xLocal);
+        }
+
+        // Pass 2: compute sum of exp(x - globalMax)
+        float sum = 0.0f;
+        for (uint32_t t = 0; t < numTiles; ++t) {
+            uint32_t offset = t * tileSize;
+            uint32_t len = (offset + tileSize <= width_) ? tileSize : (width_ - offset);
+
+            LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            DataCopy(xLocal, xGm_[base + offset], len);
+            inQueueX_.EnQue(xLocal);
+            xLocal = inQueueX_.DeQue<float>();
+
+            LocalTensor<float> workspace = workspaceQueue_.AllocTensor<float>();
+            LocalTensor<float> expLocal = tmpQueue_.AllocTensor<float>();
+            // compute exp(x - globalMax) into expLocal, using workspace as temp
+            Sub(workspace, xLocal, globalMax, len);
+            Exp(expLocal, workspace, len);
+
+            // sum of exp values
+            LocalTensor<float> sumLocal = tmpQueue_.AllocTensor<float>();
+            ReduceSum(sumLocal, expLocal, workspace, len);
+            sum += sumLocal.GetValue(0);
+
+            tmpQueue_.FreeTensor(sumLocal);
+            tmpQueue_.FreeTensor(expLocal);
+            workspaceQueue_.FreeTensor(workspace);
+            inQueueX_.FreeTensor(xLocal);
+        }
+
+        float logSum = logf(sum);
+
+        // Pass 3: compute y = (x - globalMax) - logSum and copy out
+        for (uint32_t t = 0; t < numTiles; ++t) {
+            uint32_t offset = t * tileSize;
+            uint32_t len = (offset + tileSize <= width_) ? tileSize : (width_ - offset);
+
+            LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            DataCopy(xLocal, xGm_[base + offset], len);
+            inQueueX_.EnQue(xLocal);
+            xLocal = inQueueX_.DeQue<float>();
+
+            LocalTensor<float> yLocal = tmpQueue_.AllocTensor<float>();
+            // y = (x - globalMax) - logSum
+            Sub(yLocal, xLocal, globalMax, len);
+            Sub(yLocal, yLocal, logSum, len);
+
+            DataCopy(yGm_[base + offset], yLocal, len);
+
+            tmpQueue_.FreeTensor(yLocal);
+            inQueueX_.FreeTensor(xLocal);
+        }
+    }
+
+private:
+    TPipe pipe_;
+    TQue<QuePosition::VECIN, BUFFER_NUM> inQueueX_;
+    TQue<QuePosition::VECIN, 1> workspaceQueue_;
+    TQue<QuePosition::VECIN, 1> tmpQueue_;
+
+    GlobalTensor<float> xGm_;
+    GlobalTensor<float> yGm_;
+
+    uint32_t height_ {0};
+    uint32_t width_ {0};
+};
+
+extern "C" __global__ __aicore__ void log_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelLogSoftmaxCustom op;
+    op.Init(x, y, tiling_data.height, tiling_data.width);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor log_softmax_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnLogSoftmaxCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("log_softmax_custom", &log_softmax_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("log_softmax_custom", &log_softmax_impl_npu, "LogSoftmax activation (LogSoftmaxCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'log_softmax_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
+```

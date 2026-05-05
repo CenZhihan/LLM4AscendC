@@ -1,0 +1,57 @@
+We need to generate six code strings for a custom AscendC kernel that replaces nn.LayerNorm. The kernel name is "layer_norm_custom" (snake_case) and PascalCase for op definition is "LayerNormCustom". The model normalizes over the last three dimensions (features, dim1, dim2) as given by normalized_shape (features, dim1, dim2). Input shape: (batch_size, features, dim1, dim2). LayerNorm applies per instance normalization across the last three dimensions. So we need to compute mean and variance (or use RMS norm? Standard LayerNorm uses mean and var). The kernel should take input x and output y, possibly with additional buffers for workspace. Since LayerNorm has learnable parameters weight and bias (optional), but in the given Model, nn.LayerNorm is initialized with normalized_shape only, no elementwise_affine=False? Actually default is True, but the model does not use weight and bias explicitly? In forward, it just calls self.ln(x). The nn.LayerNorm module has parameters weight and bias by default. However, the custom kernel can be designed to take those parameters as inputs or we can hardcode no affine? The user instruction doesn't specify, but typical LayerNorm kernel should support weight and bias. In the original architecture, the model does have weight and bias as parameters, but they are not in the forward signature. The get_inputs() only returns x. So the custom kernel should handle affine parameters? Possibly we need to pass them as additional inputs. But the given Model uses nn.LayerNorm which internally uses weight and bias. The transformation should replace the entire LayerNorm operation including the affine. So the custom kernel should accept x, weight, bias, and output y. However, the original forward doesn't take those as arguments; they are stored as module parameters. In the custom model, we need to pass them. So in model_src, we'll pass them.
+
+We need to design the kernel. LayerNorm: 
+- Input x with shape (batch_size, *normalized_shape)
+- Compute mean and variance along the last dimensions (normalized_shape size).
+- Normalize: (x - mean) / sqrt(var + eps)
+- Then scale by weight and add bias.
+
+We can implement a fused kernel.
+
+We'll generate:
+1. project_json_src: Operator definition with inputs: x, weight, bias; outputs: y; attributes: epsilon (float default 1e-5).
+2. host_tiling_src: Tiling data struct with fields like totalLength, tileLength, numElements (total elements per batch? Actually need to flatten the last dimensions). Might have rows (batch size) and columns (product of normalized_shape). For simplicity, treat as 2D: rows = batch_size (since independent per sample), cols = product of normalized_shape. Tiling should compute per row. We'll use blockDim = number of rows (batch_size). But batch_size might be large. We can use grid stride. Alternative: treat whole tensor as 1D and compute in tiles across all elements, but mean/variance need per-group reduction. Better to use 2D tiling: each block handles one row (sample). Each block processes its row in tiles along cols. So tiling fields: rows, cols, tileLen (number of columns per iteration), blockDim = rows, eps.
+3. host_operator_src: Full operator registration with InferShape, InferDataType, TilingFunc, and workspace sizes (maybe need workspace for mean and variance buffers? We'll use local memory in kernel). Tiling function computes rows, cols, tileLen from UB budget. Use AlignDown etc.
+4. kernel_src: Kernel class with Init, Process. Uses vector pipes. For each row, compute mean and variance in two passes? Or using a single pass with Welford? We'll do two passes: first compute sum and sum_sq (or mean and mean_sq) in local tiles, then reduce across tiles to get global mean and variance for the row. Then second pass to normalize and apply weight/bias. But that requires storing the mean and variance for each row. We can compute mean and variance in the same loop using accumulative sums, but need shared memory. Since each block handles one row, we can store row mean and variance in UB after reduction across tiles. We'll use a queue to accumulate sum and sum_sq. We'll compute row mean and variance in a local buffer (temporary). Then second pass: reload row data from global memory or from previous tile? Better to re-fetch data. Or we can store all tiles in UB? Not feasible. So we'll do two passes: first pass to compute row statistics, second pass to normalize. Each pass will stream through the row's columns in tiles.
+
+Simplify: Use a single pass with vectorized calculation of mean and variance using AscendC's ReduceSum? Actually AscendC has instructions for reduction. But we need to compute per row. So we'll implement manually: for each row, for each tile, compute local sum and sum_sq, then after all tiles, compute mean and var. Then second pass for normalization. This is typical.
+
+We'll need a temporary buffer for intermediate sums (per row). Since each block handles one row, we can store just two floats (sum and sum_sq) in registers, but need to accumulate across tiles. We'll use local variables.
+
+We'll also need to handle weight and bias: they are 1D tensors of size cols. They are shared across rows. We can broadcast them in the second pass.
+
+BlockDim: number of rows. But batch_size may be large; we don't want too many blocks. We can set blockDim = min(batch_size, max blocks). Tiling function will set blockDim = rows (batch_size) but limited to 24? In example they cap at 24. For LayerNorm, if batch_size > 24, we can use grid stride: each block processes multiple rows. So tiling: blockDim = some number, and each block handles a range of rows.
+
+To keep it simple, we'll set blockDim = rows (batch_size) but if rows > 24, we'll set blockDim = 24 and use grid-stride loop in kernel (each block handles multiple rows). That is more robust.
+
+We'll write the kernel to use grid-stride: blockIdx * blockDim + thread? Actually each block is independent. We'll have a loop over rows: start = blockIdx * stride; stride = blockNum * 1 (since each block handles one row per iteration). So each block handles rows: start, start+blockNum, etc.
+
+Process:
+- Compute numRows = totalLength / cols (cols = product of normalized_shape)
+- For each row assigned:
+  - First pass: iterate over tiles of this row to compute sum and sum_sq.
+  - Compute mean and variance (with epsilon).
+  - Second pass: iterate over tiles again to compute normalized output = (x - mean) / sqrt(var) * weight + bias.
+  - Write output.
+
+We need to fetch global weight and bias: assume they are stored in global memory with size cols.
+
+For simplicity, we'll treat weight and bias as optional (if null, assume 1 and 0). But in the model they are present. We'll pass them as gm_addr.
+
+So kernel signature: layer_norm_custom(GM_ADDR x, GM_ADDR y, GM_ADDR weight, GM_ADDR bias, GM_ADDR workspace, GM_ADDR tiling). The weight and bias are global pointers.
+
+We need to define tiling data: rows (uint32_t), cols (uint32_t), tileLen (uint32_t), eps (float), blockDim (uint32_t). Also maybe have weightAddr and biasAddr? Not needed, they are passed separately. Actually in Ascend C, the kernel receives all inputs as GM_ADDR parameters. In the operator definition, we must list all inputs. So we'll define inputs: x, weight, bias. Output: y. The kernel will receive them in order. Tiling data includes rows, cols, tileLen, eps, blockDim.
+
+We'll embed the weight and bias as optional in the operator? They are required because nn.LayerNorm has them. In project_json, we list inputs; weight and bias can be optional? But they are always present in the model. We'll make them required for simplicity.
+
+Now, writing the six strings. We'll follow the pattern from the example but adapt.
+
+Important: Kernel name in kernel_src must be exactly "layer_norm_custom". Operator name in project_json and host_operator_src should be "LayerNormCustom".
+
+We'll write them.
+
+Note: The example uses "Extern C" with GET_TILING_DATA macro. We'll do the same.
+
+We'll also handle batch normalization? No, it's layer norm.
+
+Let's produce the code.

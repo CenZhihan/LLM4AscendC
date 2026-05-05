@@ -1,0 +1,80 @@
+We need to fix the build error: the kernel includes "adv_api/activation/sigmoid.h" which is not found. The API signature lookup says the header is "adv_api/activation/sigmoid.h" but the build system cannot find it. Possibly the header path is incorrect or the Adv API is not available in this environment. The previous attempt error log indicates that the header is not found. We need to implement Sigmoid without using that header, using basic math operations (exp, div, etc.) that are available in kernel_operator.h. The AscendC API provides Exp, Adds, Div, etc. We can implement sigmoid manually: sigmoid(x) = 1 / (1 + exp(-x)). That uses only basic vector intrinsics.
+
+Also note the Python bindings: Model forward calls `swish_custom` with one argument (x). In the original architecture, Model.forward takes a single tensor. The custom op takes only x (no negative_slope). So the kernel should be SwishCustom with one input and one output.
+
+We need to correct the kernel_src to not include adv_api/activation/sigmoid.h, and instead implement sigmoid using Exp and Div. Also ensure the kernel uses proper tiling data and works with the tiling structure.
+
+Other parts: host_tiling_src, host_operator_src, python_bind_src, model_src seem okay except the kernel_src. Also note the project_json_src has no attr, which is correct for Swish (no negative slope). The op class in host_operator_src needs to match SwishCustom. The host_tiling_src does not have negativeSlope field, correct.
+
+We must also ensure that the kernel's Init and Process functions match the tiling. The original attempt had a mistake: it used AscendC::Sigmoid with a uint8_t buffer, but the header is missing. We'll replace with manual sigmoid.
+
+Additionally, the kernel used both tmpQueue_ (unused) and sigmoidTmpBuf_. We can remove tmpQueue_ and use a single temporary buffer for the sigmoid computation (sharedTmpBuffer). According to the API constraint, Sigmoid (the manual one) will need a temporary buffer for intermediate results (e.g., for exp). We can use a TBuf for that.
+
+Let's rewrite kernel_src to:
+
+- Include only kernel_operator.h.
+- In Compute: compute sigmoid using Exp and Div.
+  Steps: y = -x, then exp(y), then add 1, then reciprocal? Actually sigmoid = 1 / (1 + exp(-x)). So we do:
+    1. t = -x  (Muls by -1)
+    2. y = exp(t) (using Exp)
+    3. y = y + 1 (Adds)
+    4. y = 1.0 / y (Reciprocal? Or use Div with 1.0). We can do Div(one, y, y) where one is a constant tensor of 1.0.
+  Need a temporary buffer for exp? The Exp API can work in-place. But we need to be careful about data dependency. We can reuse buffers.
+
+Simplify: Use a single TBuf for intermediate. Since we have inQueueX (x), outQueueY (y), and we can use a local tensor from TBuf for intermediate.
+
+In Compute:
+  - Deque x from inQueueX.
+  - Alloc y from outQueueY.
+  - Alloc tmp from tmpBuf (size tileLen).
+  - Step: copy x to tmp? Actually we need to do operations without destroying x? x is needed for final multiplication (swish = x * sigmoid(x)). So we need to keep x for later. So we compute sigmoid on a copy (tmp) and then multiply x by that sigmoid result.
+  - Process:
+    1. Copy x to tmp (or use x as src for sigmoid? But then x would be overwritten? No, we can't modify x because we need it later. So we need separate buffer for sigmoid result. We can compute sigmoid into y (output buffer) first, then multiply by x.
+    2. Compute sigmoid(y, x, tmpBuf, len) where y is output, x is input, tmpBuf is temporary.
+    3. Then multiply: Mul(y, x, y, len). That uses y as both source and dest? Mul signature: Mul(dst, src1, src2, len). We can do Mul(y, x, y, len) if we ensure no overlap issues? Typically it's fine if dst not overlap with src2? Actually dst can be same as src1 or src2 in vector Mul? In AscendC, the vector operations support in-place when dst is same as one of the sources? Usually yes for elementwise. But to be safe, we can use another buffer. But we have only one tmpBuf and we already used it for sigmoid intermediate. We can reuse after sigmoid. Actually after sigmoid, we have y = sigmoid(x). Then we want to compute x * y. We can use Mul(y, x, y, len) if supported. Let's assume it works. Alternatively, we can allocate another buffer from tmpQueue_ (which we removed) but we can use a second TBuf. Let's keep it simple: use two TBufs? But we want minimal changes. Instead, we can compute swish as: y = x * sigmoid(x) using the formula: y = x * (1 / (1 + exp(-x))). We can compute in-place on y but need to keep x. We'll use a single tmp buffer.
+  We'll do:
+    - tmp = -x (Muls)
+    - Exp(tmp, tmp) -> tmp = exp(-x)
+    - Adds(tmp, tmp, 1.0) -> tmp = 1 + exp(-x)
+    - Div(y, 1.0, tmp) -> y = 1 / (1+exp(-x)) = sigmoid(x)
+    - Mul(y, x, y) -> y = x * sigmoid(x)
+  This uses tmp for the chain, and y for final result. x is preserved. Good.
+
+  Need a constant tensor of 1.0 for Adds and Div. We can use Duplicate to create a local tensor of all 1.0s, but that's heavy. Instead, use Adds with scalar (float) and Div with scalar? The API: Adds(dst, src, scalar, len) adds scalar to each element. Div(dst, src1, src2, len) divides elementwise. We can do Div(y, oneTensor, tmp) where oneTensor is a buffer filled with 1.0. So we need to fill a buffer with 1.0. We can use Duplicate or we can use Muls to set it? Duplicate is available. We'll have a small constant buffer? Better: Use a separate TBuf for the constant 1.0, but we can fill it once per tile. Since we have tmpBuf, we can first fill tmpBuf with 1.0 using Duplicate, then use it for the division. However, tmpBuf is used for intermediate. We need two temporaries: one for exp chain, one for constant. But we can reuse: after we compute exp chain into tmp, we then compute reciprocal by dividing 1.0 by tmp. We need the 1.0 constant. We can have a second TBuf for constant, or we can compute reciprocal by using Rec(reciprocal) intrinsic? There is no Rec directly. We can compute 1.0 / tmp by using Div with a local tensor that is all 1.0. So we need that constant. We'll add a second TBuf for constant. But to keep it minimal, we can fill the constant once per tile using Duplicate on a separate buffer. Let's add a second TBuf for constant (tmpConstBuf). That's acceptable.
+
+So revised Compute:
+  - Deque x from inQueueX.
+  - Alloc y from outQueueY.
+  - Get local tensors: tmp = tmpBuf.Get<float>(), ones = tmpConstBuf.Get<float>().
+  - Fill ones with 1.0: Duplicate(ones, 1.0f, len) (or use Muls? Duplicate is correct).
+  - Muls(tmp, x, -1.0f, len) // tmp = -x
+  - Exp(tmp, tmp, len) // tmp = exp(-x)
+  - Adds(tmp, tmp, 1.0f, len) // tmp = 1+exp(-x)
+  - Div(y, ones, tmp, len) // y = 1/(1+exp(-x)) = sigmoid(x)
+  - Mul(y, x, y, len) // y = x * sigmoid(x)
+  - Enque y.
+  - Free x.
+
+Need to be careful: Muls, Exp, Adds, Div, Mul signatures need to match. They all take length as last parameter? Actually pattern: Fun(dst, src, scalar, len) for Muls, Adds. Exp(dst, src, len). Div(dst, src1, src2, len). Mul(dst, src1, src2, len). Yes.
+
+Also, Exp requires a temporary buffer? The API might need a shared tmp buffer. Looking at the API constraint: Exp is part of vector compute, usually no extra buffer needed? Actually Exp in AscendC may require a temporary buffer? Let's check: The ascending API for Exp typically does not require a shared buffer (unlike Sigmoid). In the earlier code, Sigmoid needed a uint8_t buffer, but Exp does not. So we can just call Exp(tmp, tmp, len) and it works.
+
+Also, we need to ensure that the constant buffer (ones) is filled each tile. Duplicate(ones, 1.0f, len) works.
+
+Now, adjust the kernel class: remove tmpQueue_, add tmpBuf_ and tmpConstBuf_. Also adjust Init to initialize these buffers.
+
+In Init, we already have pipe_.InitBuffer for inQueueX, outQueueY, and we need to init tmpBuf_ and tmpConstBuf_ with size tileLen * sizeof(float) each. We'll add them.
+
+We also need to remove the sigmoidTmpBuf_ that was used for the Adv API.
+
+Also, in kernel entry, we don't need the negativeSlope field; the swish kernel only takes totalLength and tileLength.
+
+Now, check host_tiling_src: it has totalLength, tileLength, blockDim. That's fine. The host_operator_src: TilingFunc should compute tileLen and blockDim similarly to the leaky_relu example. The previous attempt's host_operator_src for Swish was copied from leaky_relu but adapted. It didn't have negativeSlope tiling field. That's correct. So host_operator_src is fine as is? Actually the error was not in host_operator_src but in kernel compilation due to missing header. So we keep host_operator_src unchanged.
+
+But the host_operator_src also includes "swish_custom_tiling.h". That's auto-generated from tiling data. Should be fine.
+
+Now, we need to produce the six strings. We'll output the corrected kernel_src and keep the others as they were. But ensure consistency: project_json_src has no attr, fine. host_tiling_src has totalLength, tileLength, blockDim. host_operator_src uses those and sets blockDim. python_bind_src and model_src seem fine.
+
+One more thing: The build error also includes a CPack error about missing binary/config directory. That is likely a consequence of the kernel compilation failure; once kernel compiles, the binary/config will be generated. So fixing kernel compilation should resolve.
+
+Let's write the corrected kernel_src.

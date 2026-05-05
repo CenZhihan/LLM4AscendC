@@ -1,0 +1,110 @@
+We need to fix the softmax custom kernel. The error logs show "The write address of the MTE instruction is out of range." This is a memory access violation. The previous attempt used a complex tiling and the kernel had issues: the SoftMax API signature from the retrieved context is `SoftMax(dst, sum, max, src, tiling, shapeInfo)` but the previous attempt used `SoftMax(yLocal, sumLocal, maxLocal, xLocal, tmpBuffer, softmaxTiling, srcShape)` with an extra tmpBuffer argument. That's wrong. Also the tiling data structure and kernel init had many fields not needed for a simpler row-wise softmax.
+
+The retrieved code block (Block 2) shows a correct KernelSoftmax implementation with proper init and use of queues. It uses xGm, zGm (output), and also maxGm/sumGm for global max/sum (though the user's op only needs output y). But the reference code uses additional global buffers for max/sum, which we don't need as per the op definition (only input x, output y). However, the SoftMax API requires sum and max local tensors, but they can be local and discarded after compute. The global max/sum are not needed for output.
+
+The error likely comes from incorrect tiling: the kernel tries to copy larger than allocated or misaligned. The previous kernel had complex stride logic and might have out-of-bounds access.
+
+We need to simplify: implement a correct row-wise softmax using the Adv API. Use queues for input and output. Tiling: each block processes a set of rows. Tiling data: rowLength, colLength, coreRowNum. Kernel: for each block, loop over its assigned rows, copy in one row at a time (or multiple rows if UB fits), compute SoftMax per row, copy out.
+
+Based on the reference code, the correct API is: `AscendC::SoftMax<float, true>(dst, sum, max, src, tmpBuffer, softmaxTiling, srcShape);` where srcShape is {rowNum, colLen, rowNum, colLen}. No extra arguments.
+
+The previous attempt used `AscendC::SoftMax<float, true>(yLocal, sumLocal, maxLocal, xLocal, tmpBuffer, softmaxTiling, srcShape);` which matches the signature (though the argument order: dst, sum, max, src, tmpBuffer, tiling, shapeInfo? Actually the signature from retrieval: `void SoftMax(const LocalTensor<T>& dstTensor, const LocalTensor<T>& sumTensor, const LocalTensor<T>& maxTensor, const LocalTensor<T>& srcTensor, const SoftMaxTiling& tiling, const SoftMaxShapeInfo& softmaxShapeInfo = {})`. That has 6 args, not 7. The tmpBuffer is separate? The reference code in Block 2 uses `AscendC::SoftMax<float, true>(xLocal, sumLocal, maxLocal, xLocal, tmpBuffer, softmaxTiling, srcShape);` That's 7 args, including tmpBuffer. So the API has an overload with tmpBuffer. The exact signature from header: maybe there are multiple overloads. The error might be due to using tmpBuffer incorrectly (e.g., size mismatch). Or the shapeInfo was wrong.
+
+Let's check the retrieved signature: "__aicore__ inline void SoftMax(const LocalTensor<T>& dstTensor, const LocalTensor<T>& sumTensor, const LocalTensor<T>& maxTensor, const LocalTensor<T>& srcTensor, const SoftMaxTiling& tiling, const SoftMaxShapeInfo& softmaxShapeInfo = {})" That's 6 args. But the reference code uses 7 (with tmpBuffer). Possibly the template parameter <float, true> indicates an optimized version that expects a tmpBuffer. Looking at the reference code, it includes `AscendC::LocalTensor<uint8_t> tmpBuffer = sharedTmpBuffer.Get<uint8_t>();` and passes it. So the correct overload for the optimized version is: `SoftMax<float, true>(dst, sum, max, src, tmpBuffer, tiling, shapeInfo)`. That's 7 args.
+
+Given the error "write address out of range", it's likely that either the tmpBuffer size is insufficient or the shapeInfo is wrong causing the kernel to write beyond allocated local memory. The previous attempt set sharedTmpBufferSize to 60KB, but the tiling might have computed a larger requirement. Also, the SoftMaxShapeInfo was set to {rows, colLen_, rows * colLen_, rows * colLen_}. In the reference code, it's `{rowNum, this->columnLength, rowNum, this->columnLength}`. That's correct.
+
+Another potential issue: the previous kernel used `maxQueue_` and `sumQueue_` with size `coreRowNum_ * FLOAT_NUM_OF_SINGLE_BLOCK * sizeof(float)`. But in the reference, they use `msTileLength = singleLoopCoreRowNum * FLOAT_NUM_OF_SINGLE_BLOCK`. That's fine. However, the compute function enqueues y, max, sum but only dequeues y for copy out. The max and sum are freed, so they are not needed after compute. That's fine.
+
+But the error persists. Maybe the tiling overcommits block dimensions, causing many blocks to access out-of-bounds. The previous tiling set blockDim = numTiles and clamped between 8 and 24. That's okay.
+
+I think the main issue is the incorrect usage of queues for max and sum. In the reference, they enqueue max and sum after compute and dequeue them in CopyOut, but the previous kernel didn't dequeue max and sum in CopyOut, leading to queue deadlock? Actually they freed them immediately after compute. That might be okay if the queue is not used later. But the reference code enqueues them and then dequeues in CopyOut. The previous code freed them inside Compute, so the queue is not used. That might not cause memory out-of-range but could cause resource leak. However, the error is about write address out of range, likely due to SoftMax writing to a wrong local address.
+
+Simplify: follow the reference code more closely. Remove the extra sharedTmpBufferSize from tiling (hardcode a reasonable size) and use a single pipe buffer for tmp. Also, the kernel should only output y, not max/sum globally. So we can keep max/sum local and discard after compute. But the reference code still copies them to global, which we don't need. We can simply not enqueue them and free after compute. That is fine.
+
+But the error "write address of the MTE instruction is out of range" typically means the DataCopy or SoftMax tried to write beyond the allocated local tensor. Check the tileLength and msTileLength mismatches. The tileLength for x should be rows * colLen. msTileLength for max/sum should be rows * FLOAT_NUM_OF_SINGLE_BLOCK. In the previous code, they used `coreRowNum_ * FLOAT_NUM_OF_SINGLE_BLOCK` for max/sum queue size. That is correct. However, in Compute, they allocated maxLocal and sumLocal with that size, but then called SoftMax with len = rows * colLen? Actually SoftMax handles internal row-wise max/sum and uses the provided max/sum tensors; they must have at least rows * FLOAT_NUM_OF_SINGLE_BLOCK elements. That should be fine.
+
+Another possibility: the SoftMaxShapeInfo's stride parameters were wrong. The shape info is {rows, cols, strideRow, strideCol}. For contiguous buffer, strideRow = rows * cols? Actually in the reference: `{rowNum, columnLength, rowNum, columnLength}`. That means the leading dimension for rows is rowNum? That seems odd. Usually strideRow = cols (since each row is contiguous). But the reference uses rowNum as the stride, which might be a typo. Wait, the SoftMaxShapeInfo struct: likely fields are (batch, height, width, stride) or similar. Looking at the header: `struct SoftMaxShapeInfo { int32_t N; int32_t H; int32_t W; int32_t D; }`. Actually the API doc says "SoftMaxShapeInfo = {dimN, dimH, dimW, dimD}"? Not sure. Let's infer from the reference: they set `{rowNum, this->columnLength, rowNum, this->columnLength}`. That suggests the shape info is (rows, cols, strideRows, strideCols). For a 2D tensor stored in row-major, the stride between rows is cols. So it should be {rows, cols, cols, 1}? But they use rowNum and columnLength again. Possibly the API expects (batch, height, width, depth). For a 2D input, batch=rows, height=1, width=cols, depth=cols? That doesn't match.
+
+Given the reference code works (as it's from official sample), we should replicate its exact usage. So use the same shape info: `{rowNum, this->columnLength, rowNum, this->columnLength}`.
+
+Given the complexity and the error, I think the safest fix is to adopt the exact kernel pattern from the retrieved Block 2 (the reference implementation). That implementation uses additional global max/sum outputs, but we can omit them by not including those global buffers. However, the reference kernel's Process and CopyOut also copy max/sum to global. We can modify to not need those: we can just allocate local max/sum, compute, then free without copying out. That should work.
+
+But the error might also be due to the tiling data not matching the kernel expectations. The previous tiling had fields like `sharedTmpBufferSize` which is used in Init. In the reference, they set a fixed 60KB buffer. The previous tiling set it based on columnLength, but might be too small for large columns (colLen=393216). 60KB is 15360 floats, which is small. For columnLength=393216, the tmp buffer should be at least colLen * 4 bytes = ~1.5MB, which exceeds UB budget. So we cannot process the entire column in one row? Actually softmax per row requires computing max and sum across all columns. The temporary buffer for exp and other intermediate values may need colLen floats. So tmp buffer must be at least colLen * sizeof(float) = 1.5MB, which is too large for UB (192KB). So we need to tile within the column dimension as well. The SoftMax API likely handles internal tiling using the tiling parameter. But the tmp buffer is used for internal workspace. The documentation suggests that for large columns, the SoftMax API can handle it, but requires adequate tmp buffer. The reference code uses 60KB, which works for smaller columns. For 393216 columns, we need a larger tmp buffer or use the tiling to split columns. But the SoftMax API has a tiling parameter that can specify sub-tiling. However, the default might not handle such a large column. The error might be that the internal implementation tries to write beyond the tmp buffer.
+
+Given the user input shape is (4096, 393216), that's huge. The previous attempt used coreRowNum=1, tileLength=colLen, which means each block processes one entire row (393216 elements). That requires a huge tmp buffer. The UB budget is 192KB, which is only 49152 floats. So we cannot fit a full row's worth of workspace. Therefore we need to tile within the column dimension as well. The SoftMax API may internally split, but it relies on the tmp buffer to hold intermediate results. The documentation suggests setting the tiling data to indicate the column range. Alternatively, we can implement softmax manually with per-column reduction using the vector API, but that's more complex.
+
+Simplify: we can process smaller chunks of columns per iteration and do the softmax in a numerically stable way by first computing max per row chunk, then exp, then sum, then renormalize. But the AscendC SoftMax API likely does that internally if we set the tiling appropriately. However, the reference code does not handle large columns; it assumes col length fits in UB. For 393k columns, we must tile.
+
+Given time, the best minimal fix is to change the kernel to process only a subset of columns per iteration, using the vector API to manually implement softmax in a tile-wise manner. But that's complex.
+
+Alternatively, we can note that the input shape is (4096, 393216). That's likely a specific test. The previous tiling had coreRowNum such that tileLength = coreRowNum * colLen. With colLen=393216, even coreRowNum=1 gives tileLength=393216 floats = 1.5MB, which exceeds pipe buffer size. The pipe buffer was allocated with tileLen_ * sizeof(float) = 1.5MB, which is far beyond UB budget (192KB). That will cause out-of-range. Indeed, the error is "write address of MTE instruction out of range", likely when trying to allocate such a large local tensor.
+
+Thus the root cause: the tile length is too large. We need to cap tile length so that the total UB usage fits within UB_BUDGET_BYTES. The total UB used includes: xLocal (tileLen floats), yLocal (tileLen floats), maxLocal (coreRowNum * FLOAT_NUM_OF_SINGLE_BLOCK), sumLocal (same), tmpBuffer (sharedTmpBufferSize). A safe estimate: 2*tileLen + 2*coreRowNum*8 + tmpBuf. The tileLen should be limited to (UB_BUDGET_BYTES - tmpBuf - overhead) / (2 * sizeof(float)). With tmpBuf maybe 60KB, overhead ~ few KB, we get at most (192KB - 60KB) / 8 = 16.5K floats per tile. So tileLen should be around 16384 or less. But our column length is 393216, so we need multiple iterations per row. That means we cannot process an entire row at once; we need to split the row into column tiles.
+
+Thus the kernel must handle both row tiling and column tiling. That's more complex but necessary.
+
+Given the repair constraints, we need minimal and targeted changes. The previous attempt compiled but correctness failed with vec exception. The main fix is to reduce tile size and implement a correct softmax across column tiles. But that would be a large rewrite.
+
+Maybe we can use a different approach: since the SoftMax API may already handle large columns if we provide correct tiling, but the documentation is unclear. Alternatively, we can implement a simplified version using the built-in AscendC softmax vector intrinsic? Actually there is a `AscendC::SoftMax` that works on entire local tensors, but it requires the whole row in memory. That's not possible.
+
+Given the context, I think the best is to adopt the reference kernel pattern but with a reasonable tile size per row (e.g., 8192 columns per tile) and manually combine results across column tiles. But that is not minimal.
+
+Maybe the provided reference code from the retrieval (Block 2) is for a smaller scale and works. The user's input is huge, but maybe the test only uses smaller data? The original user instruction had batch_size=4096, dim=393216, so it is huge. The softmax custom kernel should handle that. The previous attempt failed because of large tile size.
+
+We can modify the tiling to set tileLength to a moderate value, e.g., 8192, and adjust the kernel to loop over column tiles per row. In the kernel, for each row, we need to compute max, sum across column tiles, then exp and normalize. That can be done with two passes: first pass compute max for each row, second pass compute sum of exp(x-max), third pass compute exp(x-max)/sum. That requires multiple iterations and global/local communication between steps. Alternatively, we can use the SoftMax API per column tile but then combine results? The SoftMax API is per row, not per column tile.
+
+Given complexity, a simpler fix: reduce the tile size to a small value that fits in UB, and implement a row-wise softmax using vector instructions (Max, Sub, Exp, Sum, Div) across column tiles. This is a common pattern. But that's a significant change.
+
+Maybe the error also comes from the queue enqueue/dequeue mismatch. In the previous kernel, they enqueued max and sum but never dequeued them (they freed inside Compute). That might cause pipe resource exhaustion. The reference code dequeues them in CopyOut. So we should align with that.
+
+Given the constraints, I propose to modify the kernel to follow the reference implementation exactly, but with the understanding that it may not handle large columns. However, the test data is fixed; if the reference works for smaller columns, maybe the eval uses a different shape? The error log shows it failed with the big shape.
+
+I'll make the following targeted changes:
+1. Simplify tiling: use fixed blockDim=8, and set tileLength such that coreRowNum * columnLength fits in UB. But columnLength is large, so we set coreRowNum = 1 and tileLength = min(columnLength, 4096) or something. Then we process each row in multiple column tiles. But the kernel currently assumes tileLength includes entire rows. We need to change the kernel to iterate over column tiles as well.
+
+Given the time, I'll produce a corrected version that addresses the immediate error: reduce the tile size so that the buffer allocations don't exceed UB budget. I'll set tileLength to 4096 (or 8192) and have the kernel process column chunks. The SoftMax API might still be used per chunk, but the max/sum are per row across chunks, so we need manual implementation.
+
+Actually, we can use the AscendC vector API: for each row, we can use `ReduceMax` to get row-wise max, then `Sub`, `Exp`, `ReduceSum`, `Div`. That can be done with tiled data movement. This is more complex but doable.
+
+Given the repair constraints, I'll provide a corrected version based on the reference code but with proper tile sizing and using the vector API for column-tiled softmax.
+
+But the user expects the six strings to be replaced. I'll generate the corrected source.
+
+Let's write the kernel with a two-pass approach:
+- Pass 1: for each row, compute max across all column tiles.
+- Pass 2: for each row, compute sum of exp(x - max) across column tiles.
+- Pass 3: for each row, compute exp(x - max) / sum.
+
+This requires three passes over the data. To minimize memory, we can combine pass 2 and pass 3? Actually we need the sum before we can normalize. So two passes: first compute max (store per row), second compute sum and normalize in one tile? But we need global sum across all tiles, so we need to accumulate sum. We can do:
+- For each row, init globalMax = -inf.
+- For each column tile, compute localMax, update globalMax.
+- Then for each column tile, compute exp(x - globalMax), accumulate sum into globalSum.
+- Then for each column tile, compute exp(x - globalMax) / globalSum.
+
+That's three passes. We can combine the first two? Not easily because max is needed for exp.
+
+Given the complexity, maybe we can use a simpler approach: since the SoftMax API might handle large columns if we set the tiling data correctly. Let's research the SoftMaxShapeInfo: it has a field `tiling` that specifies how to split. The API might automatically split into column tiles. If we provide a small tmp buffer, it will tile internally. The documentation says "The tiling parameter is used to specify splitting strategy". So maybe we just need to set the tiling data correctly in the kernel, not in the host tiling. The host tiling should provide parameters like column length and a tmp buffer size that is sufficient for internal tiling. The kernel then calls SoftMax with the tiling struct that tells it how to split columns. The default tiling might handle large columns if enough workspace is given? But we only have 192KB UB.
+
+I think the best is to limit the column length per softmax call by splitting rows into smaller chunks. Actually, the softmax is per row, so we can process each row individually, but each row has 393216 columns. We can split each row into multiple column tiles and do the two-pass approach manually. That is the only way.
+
+Given the time, I'll implement a manual softmax using AscendC vector ops. I'll use the provided reference as a guide but adapt for column tiling.
+
+Let's produce the corrected source.
+
+Note: The kernel name is `softmax_custom`, and the operator class is `SoftmaxCustom`.
+
+I'll provide the full six strings with the corrected kernel and tiling.
+
+Given the complexity, I'll produce a version that uses the AscendC SoftMax API on column tiles and combine with global max/sum. But to keep it simpler, I'll implement a straightforward three-pass approach using vector instructions (Muls, Add, etc.) but that's like the LeakyReLU example. However, the AscendC API has `ReduceMax`, `ReduceSum`, `Exp`, `Sub`, `Div`. I'll use those.
+
+But the instruction says "Just output the code, no other text". I'll output the corrected code.
+
+After reviewing the error logs and the retrieved reference, I believe the correct fix is to align the kernel with the reference implementation and fix the tiling to avoid oversized local tensors. Specifically:
+- Reduce coreRowNum to 1 (since each row is huge).
+- Reduce tileLength to a value that fits within UB, say 16384.
+- Implement a manual softmax across multiple column tiles per row.
+
+I'll generate the corrected code accordingly.
+
+Let's write the code.

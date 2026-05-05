@@ -1,0 +1,80 @@
+We need to understand the error: The previous attempt produced incorrect output. The kernel is supposed to compute argmax over a dimension, but the output shows many zeros and incorrect indices. The likely issue is in the kernel implementation: The `ReduceMax` API with `calIndex=true` returns a tensor of two values (max value and index) per reduction. However, the code attempted to use `AscendC::ReduceMax` with a workspace, but the usage seems wrong. Also, the output type is int32, but the index returned by ReduceMax is probably float? The example in the reference code shows that `ReduceMax` with `calIndex=true` returns value and index as float (the index is returned as float). We need to cast to int32. Also, the kernel processes rows independently, but the indexing into the local tensor might be incorrect. The error log shows output has many zeros, which suggests that the argmax computation is not correct.
+
+We need to fix the kernel_src. The proper way to compute argmax over a dimension using AscendC's ReduceMax is to use `ReduceMax` with `calIndex=true`, which outputs a tensor where for each reduction, the first element is the max value (float) and the second is the index (float). Then we need to extract the index as int32.
+
+Look at the snippet from `reduce_computation.asc`: they use `AscendC::ReduceMax<T>(dstLocal, srcLocal, sharedTmpBuffer, srcDataSize, true);` with `dstDataSize = 16` (meaning 2 values? Actually they set `dstDataSize = 16` for all scenarios, but with float that's 4 floats? Not sure). But the reference shows that `ReduceMax` with `calIndex=true` outputs a tensor of size 2 (value and index). The workspace size needs to be at least (repeat * 2) * sizeof(T) for aligned work. In our case, we are reducing over `numCols` elements per row, so we need to call ReduceMax per row. But we can also use `BatchReduceMax`? Simpler: for each row, call ReduceMax on the row segment.
+
+The previous kernel used a local tensor `smallResult` of size 2 floats, and then tried to get the index via `GetValue(1)`. That is correct. However, the `ReduceMax` call might have been incorrectly parameterized. The code used `AscendC::ReduceMax(smallResult, rowLocal, tmpLocal, numCols_, true);` but `rowLocal` is a sub-tensor of `xLocal`. However, `xLocal` is a flat LocalTensor of size `rows * numCols`. To get a row slice, we need to offset correctly. In the previous code, they used `xLocal[r * numCols_]` which is a LocalTensor referencing a subregion? In AscendC, you can index a LocalTensor with an integer to get a sub-tensor starting at that offset? Actually, `LocalTensor` has an overloaded `operator[]` that returns a new LocalTensor representing a slice? I think `xLocal[r * numCols_]` gives a LocalTensor referring to that offset, but the size is not specified. That might be invalid. The correct way is to use `AscendC::LocalTensor<float> rowLocal = xLocal[r * numCols_];` but that is a view with remaining length from that offset to end? Not sure.
+
+Better approach: Instead of processing row by row with separate ReduceMax calls, we could use `WholeReduceMax` per row? But the API `WholeReduceMax` is for reducing across repeats. Another approach: Use `ReduceMax` on a segment of length `numCols` each time, but we need to ensure the input tensor is properly aligned. The simplest fix: avoid the row-by-row loop and instead use `ReduceMax` on the entire tile? No, we need per-row argmax.
+
+Actually, we can use `BatchReduceMax`? Not sure. Let's think about correct AscendC practices.
+
+Looking at the reference code in `whole_reduce_min_max_sum.asc`, there is a scenario for per-row reduce (scenario 7) using `WholeReduceSum` with mask=SRC_COL, repeat=SRC_ROW. That performs a reduction over each row independently. But for `WholeReduceMax` with index, we need the index. The API `WholeReduceMax` can return index if using `ReduceOrder::ORDER_VALUE_INDEX`. That's promising. In the example, scenario 5 and 6 show using `WholeReduceMax` with mask (bitmask) and then using `GetReduceRepeatMaxMinSpr` to get the global max and index. That's for a single reduction over all elements. But for per-row reduction, we could use `WholeReduceMax` with mask=numCols, repeat=numRows, and proper strides, and the output would be a sequence of (value, index) pairs for each row. Then we can extract indices.
+
+In scenario 2 of the reference, they use `WholeReduceMin` with `MASK=128, repeat=srcDataSize/mask`, and the output stores values and indices interleaved: `[min0, idx0, min1, idx1, ...]`. That is exactly what we need for per-row argmax if we set mask=numCols, repeat=numRows. So we can use `WholeReduceMax` with `ORDER_VALUE_INDEX` (which is default) to get per-row max and index. Then we can copy the indices to the output.
+
+Thus, the kernel can be simplified: no need for row-by-row loop. Instead, we can copy a tile of data (multiple rows) into local, then call `WholeReduceMax` on that tile with mask=numCols, repeat=numRows (or the tile rows), and the output will be an interleaved tensor of (value, index) pairs. Then we copy only the index part (odd positions) to the output.
+
+Let's design the kernel accordingly.
+
+Also, the tiling should be based on rows, not totalLength. The previous tiling seems reasonable: numRows, numCols, tileRows.
+
+Now, the error logs show that the output is partially correct (some non-zero indices) but many zeros. That suggests that the row processing loop either didn't process all rows, or the index extraction was wrong. The zeros might be because the ReduceMax call didn't work properly and returned zeros for index.
+
+Given the complexity, the best fix is to rewrite the kernel using the `WholeReduceMax` approach.
+
+I'll modify kernel_src:
+
+- Use `WholeReduceMax` with `mask=numCols, repeat=tileRows, srcStride=?` Actually, the data is stored contiguously row-major, so each row is numCols elements. After copying a tile of rows into a local tensor, the rows are contiguous. So we can call `WholeReduceMax<float>(dstLocal, srcLocal, numCols, tileRows, ...)`. The `srcStride` (in blocks of 32 bytes) should be the distance between consecutive rows in the local tensor. Since the rows are contiguous with no padding, the stride in bytes is `numCols * sizeof(float)`, and in blocks of 32 bytes: `(numCols * sizeof(float) + 31) / 32`. However, the API expects `srcRepeatStride` as the number of blocks (32B) per repeat. So we need to compute that.
+
+Alternatively, we can use the simpler `ReduceMax` per row but with correct sub-tensor handling. Let's check AscendC documentation: `LocalTensor` can be sliced using `operator()(offset, length)` to get a sub-tensor of given length? I think the API provides `AscendC::LocalTensor<T> slice = srcLocal[r * numCols_];` returns a tensor starting at that offset with length (remaining). That is dangerous. Better to use `AscendC::LocalTensor<T> rowLocal = srcLocal[r * numCols_];` then we can call ReduceMax on it with count=numCols. However, the count must be <= 255 (repeatTimes limit). numCols can be up to 4095 in the test case. That exceeds the limit. So we would need to use the mask/repeat version of ReduceMax, which is more complex.
+
+Thus, the `WholeReduceMax` approach is better because it handles arbitrary mask size and multiple repeats.
+
+Let's write the kernel using `WholeReduceMax` with `ORDER_VALUE_INDEX`. The output will be a tensor of size `tileRows * 2` floats. Then we need to extract the indices (odd positions) and cast to int32.
+
+Implementation steps in Compute:
+
+1. Copy tile of rows from global to local: `DataCopy(srcLocal, xGm_[rowBase * numCols_], tileRows * numCols_);`
+2. Allocate `dstLocal` of size `tileRows * 2` floats.
+3. Call `WholeReduceMax<float>(dstLocal, srcLocal, mask, repeat, 1, 1, srcRepeatStride, ReduceOrder::ORDER_VALUE_INDEX);`
+   - mask = numCols (but WholeReduceMax expects mask as number of elements per block? Actually, the mask parameter is the number of elements in each block (each repeat). So mask = numCols.
+   - repeat = tileRows.
+   - srcBlkStride = 1 (because within a block, elements are contiguous).
+   - dstBlkStride = 1 (output contiguous).
+   - srcRepeatStride = (numCols * sizeof(float) + 31) / 32 (since stride in 32-byte blocks). We'll compute this.
+4. After call, `dstLocal` contains values and indices interleaved: [max0, idx0, max1, idx1, ...].
+5. We need to extract indices only: we can copy using Indexed copy? Simpler: loop over i and write `yLocal.SetValue(i, (int32_t)dstLocal.GetValue(2*i+1));` But that's slow. Better to use AscendC's vector operations to select odd elements. There is an API `AscendC::Select` or `AscendC::MaskedAssign`? Alternatively, we can use `AscendC::DataCopy` with strides? Not straightforward.
+
+Given the constraint that we need to fix with minimal changes, perhaps the previous approach can be fixed by correcting the row slice and using the proper ReduceMax with mask/repeat per row? But the repeat limit (255) may be an issue.
+
+Wait, the test case has numCols=4095, which is > 255. So we cannot use simple ReduceMax per row. The previous code used `ReduceMax(smallResult, rowLocal, tmpLocal, numCols_, true);` which would fail if numCols > 255? Actually, the simple version of ReduceMax with count parameter is only for count <= 255 (the repeatTimes limit). So that was likely causing the zeros.
+
+Thus, we must use the mask/repeat version or WholeReduceMax. WholeReduceMax is designed for that.
+
+Let's adopt WholeReduceMax with mask=numCols and repeat=tileRows. The output is a sequence of values and indices. To extract indices, we can use a simple loop because tileRows is limited (max maybe 256). That's acceptable for performance? Since the loop is small, it's fine.
+
+But we also need to ensure the local tensor for dst is properly sized: we need 2 * tileRows floats. And the output type is int32, so we copy each index manually.
+
+Better: we can allocate yLocal as int32 tensor of size tileRows, and after WholeReduceMax, we loop and cast.
+
+Now, the WholeReduceMax API signature: from the reference code, it takes parameters: (dst, src, mask, repeat, srcBlkStride, dstBlkStride, srcRepeatStride, order). The mask is the number of elements per block? Actually, in the reference scenario 2, they use `MASK = 128` for half (16-bit), so mask is the number of elements per block (per repeat). mask should be the number of elements per row (numCols). That's correct.
+
+The `srcRepeatStride` is the stride between consecutive repeats in the source tensor, measured in blocks of 32 bytes. Since rows are contiguous, srcRepeatStride = (numCols * sizeof(float) + 31) / 32.
+
+Also, we need to ensure that the local tensor for src is aligned to 32 bytes. We'll allocate with proper size.
+
+Now, let's write the corrected kernel_src.
+
+We also need to ensure that the host_operator_src passes the correct tiling data: we need totalLength? Not needed if we use numRows, numCols, tileRows. That's already in the previous tiling.
+
+The kernel entry should be the same.
+
+Now, the Python bind and model_src seem fine. The only issue is the kernel.
+
+Let's produce the corrected kernel_src. I'll keep the class structure similar but replace Compute with WholeReduceMax.
+
+Also, we need to handle the case where numCols is not aligned? The WholeReduceMax requires that the mask (numCols) is a multiple of something? Probably it can handle any size. The reference scenario 7 uses mask=57 (unaligned) and it works. So fine.
+
+Now, I'll write the corrected code.

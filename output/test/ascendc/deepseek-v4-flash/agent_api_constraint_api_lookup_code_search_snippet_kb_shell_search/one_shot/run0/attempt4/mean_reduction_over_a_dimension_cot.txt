@@ -1,0 +1,117 @@
+We need to analyze the failure. The kernel compiled successfully but output is all zeros except some partial correct values. The error log shows output is mostly 0.0 with some non-zero values scattered, indicating the kernel is not computing correctly for all batches. The kernel uses block dim = batchSize and each block processes one batch. However, the output shows zeros, meaning many blocks didn't produce correct results.
+
+Potential issues:
+1. The kernel uses `AscendC::DataCopy` for reading and writing. Possibly the tile length or addressing is wrong.
+2. The tiling and block dimension may be misconfigured.
+3. The kernel uses `AscendC::Duplicate` and `AscendC::Muls` - but note that `Duplicate` may require the tensor to be of type vector, and the API may have constraints.
+4. The kernel uses `TQue` for VECCALC and VECIN; but in the kernel, we allocate and free tensors manually. The use of queues might be incorrect: we allocate from queue but then manually free? Actually we use `accBuf_.AllocTensor<float>()` which gets a tensor from the queue, then later we free via `rowBuf_.FreeTensor` and `accBuf_.FreeTensor`. That's fine.
+5. However, note that `DataCopy` requires a LocalTensor destination, and the source is a GlobalTensor slice. The addressing: `xGm_[readOffset]` returns a GlobalTensor for that offset, but the number of elements to copy is `curTileLen`. That seems correct.
+6. The output is written similarly.
+7. The `Duplicate(accLocal, 0.0f, curTileLen)` initializes accumulator to zero. Then we loop over dim1, add each row. Then multiply by invDim1. This should produce correct mean over dim1.
+8. The kernel is per-block for each batch; the output shape is `(batchSize, dim2)`. The output GM tensor pointer `yGm_` is set with size `batchSize_ * dim2_`. In Process, we compute `writeOffset = blockIdx * dim2_ + colBase`. That's correct.
+
+But why are many outputs zero? Possibly because `blockDim` in tiling is set to `d0` (batchSize). If batchSize is 128, blockDim=128, but the device may have only 24 cores? Actually the kernel uses `AscendC::GetBlockNum()` but in the kernel we don't use it; we rely on the number of blocks launched equals blockDim set in tiling. If blockDim exceeds the actual number of cores, some blocks may not run? Actually each block corresponds to a core; the runtime will launch as many blocks as blockDim, but if more than physical cores, they are serialized? Possibly the kernel fails silently for some blocks? But the output shows mostly zeros, so many blocks may have been skipped due to early return condition `if (blockIdx >= batchSize_) return;` but blockIdx should be within blockDim. blockDim is set to batchSize, so blockIdx ranges 0..batchSize-1. That seems fine.
+
+Wait, there is a more subtle issue: The kernel uses `AscendC::GetBlockIdx()` and `AscendC::GetBlockNum()` but we are not using GetBlockNum. The block dimension is set in tiling. The kernel assumes each block processes one batch. But if blockDim > batchSize, some blocks will have blockIdx >= batchSize and return early; that's fine. But here blockDim = d0 (128), batchSize=128, so all blocks are used.
+
+The output shows some non-zero rows, e.g., the third row in sample output has `[0.5003, 0.4936, 0.4979, ...]` but the rest are zeros. That suggests only block 2 (index 2) computed correctly? But why only one block? Possibly the other blocks didn't execute due to some condition, or the GM address setup is wrong.
+
+Let's examine the Init function: it sets `xGm_.SetGlobalBuffer((__gm__ float*)x, batchSize_ * dim1_ * dim2_);` and `yGm_.SetGlobalBuffer((__gm__ float*)y, batchSize_ * dim2_);`. The `x` pointer is the same for all blocks, so each block has the same global memory view. That's correct.
+
+But note: In the Process function, we compute `batchOffset = blockIdx * dim1_ * dim2_;` and then access `xGm_[readOffset]`. This indexing is correct.
+
+Potential issue: The `DataCopy` expects contiguous elements; we are copying `curTileLen` elements. That's fine.
+
+Maybe the problem is that the tiling's `tileLen` may be larger than `dim2`, causing the tile loop to not execute? The tile loop `for (colBase = 0; colBase < dim2_; colBase += tileLen_)` - if tileLen > dim2, then the loop body may still execute once with colBase=0 and curTileLen = dim2_. That's fine.
+
+The tiling function: `tileLen` is computed based on UB budget and d2. It uses `d2` to clamp: `if (d2 < tileLen) { tileLen = aligned; }`. But if d2 is 4095, and tileLen originally is 32768, then tileLen becomes 2048 (aligned down from 4095). That's fine. But note: `AlignDown(d2, ALIGN_ELEMS)`: d2=4095, ALIGN_ELEMS=2048, so AlignDown gives 2048. That's less than d2, so it's fine.
+
+However, there is a problem: In the tiling function, the UB budget calculation: `maxTile = UB_BUDGET_BYTES / 8;` because we have two buffers accBuf and rowBuf each of tileLen floats => 2 * tileLen * 4 = 8 * tileLen bytes. But note: the `rowBuf` is allocated as VECIN, but we allocate it with `pipe_.InitBuffer(rowBuf_, 1, tileLen_ * sizeof(float));` That uses a TQue of size 1, so memory is allocated. The total UB usage per block may also include other overhead. But the calculation might be okay.
+
+But the main issue likely lies in the kernel's use of `AscendC::Duplicate`. The `Duplicate` function may have constraints: it may require the tensor to be a vector of specific alignment? In AscendC, `Duplicate` sets all elements to a constant. It should work. However, note that `accLocal` is a LocalTensor<float> allocated from `accBuf_` which is VECCALC. `Duplicate` is in vector_compute_api. Should work.
+
+Another possibility: The `DataCopy` from Global to Local may not work correctly if the global memory is not properly aligned? But the input is a standard tensor.
+
+Let's check the python bind: The `mean_reduction_impl_npu` creates result with `at::empty(outShape, self.options())` and then calls EXEC_NPU_CMD. That should work. But note: In the model_src, the `ModelNew.forward` calls `fn(x, self.dim)`. The `fn` is `mean_reduction_over_a_dimension_custom` which expects two arguments: tensor and dim. In the python_bind, the function bound is `mean_reduction_impl_npu(self, dim)`. That should be fine.
+
+But wait: In the python_bind, we have `at::Tensor mean_reduction_impl_npu(const at::Tensor& self, int64_t dim)`. That's double? Actually `self` is the tensor, `dim` is a scalar. That matches the call `fn(x, self.dim)` where `self.dim` is an int.
+
+Now, the error output: "New output: tensor([[0.0000, ...]])" many zeros, with some non-zero. That indicates the kernel produced outputs only for a few batches. Possibly the block dimension was set incorrectly in tiling? The tiling function sets `blockDim = d0;` then clamps to min 8 and max 24. If d0=128, after clamp: `if (blockDim < 8u) blockDim = 8u; if (blockDim > 24u) blockDim = 24u;`. So blockDim becomes 24, not 128. That's a problem! Because each block assumes it processes a single batch (blockIdx maps to batch index). But if blockDim is 24, only 24 blocks will be launched, each with blockIdx from 0 to 23. They will process batches 0-23, but batches 24-127 will not be processed. The output for those batches will remain zero (since result is zero-initialized). That explains the output: first 24 batches (maybe) have correct values, rest zeros? But the sample output shows only third batch (index 2) has non-zero? Actually in the sample, the third row (index 2) has non-zero values, but other rows also have some non-zero? Let's re-examine: the output shows:
+
+```
+New output: tensor([[0.0000, 0.0000, 0.0000,  ..., 0.0000, 0.0000, 0.0000],
+        [0.0000, 0.0000, 0.0000,  ..., 0.0000, 0.0000, 0.0000],
+        [0.5003, 0.4936, 0.4979,  ..., 0.0000, 0.0000, 0.0000],
+        ...,
+        [0.0000, 0.0000, 0.0000,  ..., 0.0000, 0.0000, 0.0000],
+        [0.0000, 0.0000, 0.0000,  ..., 0.0000, 0.0000, 0.0000],
+        [0.0000, 0.0000, 0.0000,  ..., 0.0000, 0.0000, 0.0000]],
+```
+
+Only the third row has some non-zero values at the beginning, but the zeros at the end suggest that maybe only a partial tile was written? Actually within that row, the first few columns are correct, then zeros. That indicates that within a single block, the tile loop may have only partially executed. For example, if tileLen is 2048, and dim2=4095, then first tile covers columns 0-2047, second tile covers 2048-4094. But the second tile may not have executed due to some issue, or the output for the second tile was not written. In the output, the third row shows correct values for first 4 columns? Actually it shows `0.5003, 0.4936, 0.4979, ...` then `0.0000`. That matches the first tile of 2048 elements, then zeros. So maybe the second tile wrote zeros? Or the loop stopped early.
+
+Why would the second tile fail? Possibly because the `DataCopy` for the second tile has an alignment issue? Or the pipe buffer for rowBuf_ or accBuf_ may be exhausted? We allocate new tensors each tile, but we only have one tile of buffer because we allocate and free each iteration. That should be fine.
+
+But the bigger issue is blockDim clamping. The tiling function clamps blockDim to between 8 and 24. With d0=128, it sets 24. But the kernel expects exactly blockDim = batchSize, so that each block processes one batch. With only 24 blocks, only batches 0-23 are processed, and the rest remain zero. That matches the observed behavior: only a few batches have non-zero rows? But in the output, only one row (third) has non-zero? That suggests that maybe only blockIdx 2 (third batch) executed correctly? Possibly the other blocks also failed due to some other issue.
+
+But note: The tiling function sets blockDim to 24, but the kernel does not use GetBlockNum; it just uses GetBlockIdx. The runtime launches 24 blocks. For blockIdx 0..23, they process batches 0..23. So we should see outputs for rows 0-23. But we see only one row with non-zero. So other blocks might have failed due to some other reason, such as incorrect alignment or UB overflow for larger batches? That seems unlikely.
+
+Maybe the problem is that the kernel's `Init` sets `yGm_` with size `batchSize_ * dim2_`, but only the first 24 blocks write to their corresponding output portions. That should be fine.
+
+Let's look at the init in kernel: it sets `yGm_.SetGlobalBuffer((__gm__ float*)y, batchSize_ * dim2_);`. The `y` pointer is the same for all blocks. Each block writes to its own batch offset. That's fine.
+
+Given that only one row has partial data, it's likely that most blocks encountered an error and returned early? The kernel does not have any error handling; it will write zeros if something fails silently? But if DataCopy fails, maybe the kernel crashes? But the entire process completes.
+
+Another possibility: The `AccBuf_` and `RowBuf_` are initialized with `tileLen_` elements, but if `tileLen_` is 2048, that's fine. However, the `Duplicate` and `Add` operations might require the tensor to be aligned to 32 bytes? 2048 floats = 8192 bytes, aligned. Should be fine.
+
+Maybe the issue is that the `TQue` for VECIN (rowBuf_) is allocated with `pipe_.InitBuffer(rowBuf_, 1, tileLen_ * sizeof(float));` but then we use `rowBuf_.AllocTensor<float>()` to get a tensor. That allocates from the queue. Then we do `DataCopy` into it. That's fine. But note: The `TQue` for VECIN is a queue that holds memory in the Vector Input buffer. However, we are also using `AscendC::Duplicate` on accLocal which is VECCALC. Mixing different memory positions might cause issues. Actually, VECIN and VECCALC are different UB regions. We cannot directly use a tensor allocated from VECIN as operand in vector computations? In AscendC, you can use any local tensor for computation; the vector unit can access VECIN and VECCALC. It should be fine. But the rowBuf_ is VECIN, and we use it in `Add(accLocal, accLocal, rowLocal, curTileLen)`. That should be valid.
+
+Maybe the issue is that we are not double-buffering and thus the DataCopy and compute overlap? But we are doing sequential for each tile, so it should be okay.
+
+Given the most obvious bug is blockDim clamping, we should fix that. In the tiling function, we set `blockDim = numTiles` which is d0, but then clamp to [8,24]. That is wrong. We should not clamp blockDim arbitrarily; we should set it to the actual number of batches (d0), but ensure it does not exceed some reasonable limit? The AscendC runtime can handle blockDim > number of cores; they will be scheduled sequentially. So we should set blockDim = d0 without clamping. However, very large blockDim may cause resource issues? But d0=128 is okay. The previous attempt for leaky_relu used adaptive blockDim based on number of tiles, clamped between 8 and 24. That was for a different kernel that did grid-stride. For this reduce kernel, each block processes one batch, so blockDim should equal batchSize. So remove clamping, just set blockDim = d0. But we need to ensure blockDim is not zero. Also, we should ensure that d0 is not larger than something? The runtime may support up to 256 or more. So we can set blockDim = d0 without clamping.
+
+Additionally, there is another potential issue: In the kernel, we use `AscendC::GetBlockIdx()` but that returns the block index within the launched blocks (0..blockDim-1). If blockDim is 128, but actual hardware cores are 24, the blocks will be serialized. That's fine. So we should set blockDim = d0.
+
+Also, in the tiling function, we should compute tileLen more carefully. The current calculation of maxTile: `maxTile = UB_BUDGET_BYTES / 8;` (8 bytes per element because 2 floats per tile: acc and row). That's 192*1024/8 = 24576. Then AlignDown to 2048 gives 24576? Actually 24576 / 2048 = 12, so AlignDown gives 24576, which is less than HARD_CAP (32768), so maxTile = 24576. Then clamp with d2: d2=4095, so tileLen = AlignDown(4095, 2048) = 2048. That's fine.
+
+But note: The UB budget may also include other overhead (pipe, etc.), but using 24576 floats is 24576*4*2=196608 bytes, which is close to 192KB. Might be okay.
+
+Now, another issue: The kernel uses `AscendC::Muls(accLocal, accLocal, invDim1_, curTileLen);` but `Muls` multiplies all elements by a scalar. That's correct.
+
+Now, we need to ensure the output shape is correctly set in python_bind. The python_bind creates result with outShape that excludes the reduced dimension. That's correct.
+
+Also, in model_src, we set `self.dim = init_inputs[0] if init_inputs else 1`. The original model has dim as init arg, so that's correct.
+
+Now, let's also check the host_operator_src: The InferShape correctly reduces dimension. The OpDef uses `this->Attr("dim").AttrType(OPTIONAL).Int(1);` and the attribute is passed as int64. In tiling, we read `attrs->GetAttrPointer<int64_t>(0)`. That's fine.
+
+One more thing: In the kernel, we use `AscendC::Duplicate<float>(accLocal, 0.0f, curTileLen);` - but note that `Duplicate` may require the count to be a multiple of some block size? In AscendC, `Duplicate` can handle any length up to 255*512? Actually, the vector operations have a repeat limit of 255 times the block size. For float, block size is 64? Typically, the API handles tiling internally. It should work for arbitrary lengths.
+
+Given the failure pattern, the most probable fix is to remove the clamp on blockDim in the tiling function. Also, we should verify that the kernel's Process function is correct for the case when dim1_ is large (4095). The loop over dim1_ with `Add` for each row should work.
+
+Let's also check if there is an issue with the `DataCopy` when the source address is not 32-byte aligned. The xGm_ starts at batchOffset, which is blockIdx * dim1_ * dim2_ in floats. That's aligned if batchSize * dim1_ * dim2_ is a multiple of 8? But alignment might be 32 bytes = 8 floats. The input tensor is contiguous, so the base pointer is aligned. The offset might not be 8-aligned? For blockIdx=2, batchOffset = 2*4096*4095 = big number, but the pointer arithmetic on GlobalTensor should handle it.
+
+We can also improve the kernel by using double buffering to improve performance, but correctness is the priority.
+
+I will fix the tiling function to set blockDim = d0 without clamping. Also, ensure that if d0 is 0, we handle it. Also, we might want to add a check that tileLen should be at least 1.
+
+Additionally, I noticed that in the kernel's Init, we don't set the pipe properly? The pipe must be initialized before using InitBuffer. That's done.
+
+Now, we need to produce the corrected six strings.
+
+Let's produce the corrected code.
+
+I'll modify host_tiling_src to remove the clamping and set blockDim = d0, but also ensure blockDim > 0 and maybe cap at some max like 256? The device may support up to 256 blocks? Actually Ascend910b supports up to 24 cores, but blockDim can be larger, it will be serialized. So we can leave it as d0. But to be safe, we can cap at 256? I'll just set blockDim = d0.
+
+Also, in host_tiling_src, we should compute tileLen more robustly: ensure that tileLen <= d2 and is a multiple of ALIGN_ELEMS if possible.
+
+Now, regenerate the strings.
+
+One more note: In the kernel, we are using `AscendC::Add(accLocal, accLocal, rowLocal, curTileLen);` This adds rowLocal to accLocal in-place. That's correct.
+
+Potential issue: The `accBuf_` is VECCALC, and `rowBuf_` is VECIN. When we call `Add`, it may require both operands to be in the same memory position? In AscendC, vector operations can operate on tensors from different UB positions (VECIN, VECOUT, VECCALC) as long as they are in UB. It should be fine.
+
+Given the evidence, the fix is minimal: change the blockDim setting in TilingFunc.
+
+Also, ensure that the kernel's Init receives the correct tiling data fields. Currently it receives batchSize, dim1, dim2, tileLen, invDim1. That matches tiling data.
+
+Now, produce the corrected code.

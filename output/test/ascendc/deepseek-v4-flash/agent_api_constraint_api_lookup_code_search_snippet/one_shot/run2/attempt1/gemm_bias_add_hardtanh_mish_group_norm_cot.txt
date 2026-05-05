@@ -1,0 +1,183 @@
+We need to produce the same six strings as in the example: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src. The kernel name is gemm_bias_add_hardtanh_mish_group_norm_custom. PascalCase: GemmBiasAddHardtanhMishGroupNormCustom.
+
+We have retrieved examples for leaky_relu, layernorm, matmul, etc. The task is to fuse linear + add bias + hardtanh + mish + group_norm into one custom AscendC kernel.
+
+Key constraints from evidence:
+- Use queue_api, datacopy_api, vector_compute_api as in the example.
+- Use Matmul API if needed. From matmul_fused example, we see pattern: REGIST_MATMUL_OBJ, process with tiling.
+- GroupNorm: there is a GroupNormImpl snippet but that's for internal use. We can adapt similar structure but we need to write our own GroupNorm logic in the kernel. The kernel will do:
+  1. Matmul: input x (batch*in) with weight (out,in) -> out (batch*out). Since it's batched, we may treat as matrix multiplication: batch_size rows, each row is in_features, multiply by weight of shape (out_features, in_features). The linear layer is y = x @ W^T + lin_bias? Actually F.linear(x, weight, bias) does y = x @ weight^T + bias. So we need to do matrix multiply: (batch, in) * (in, out) -> (batch, out). Then add bias (lin_bias) and also another bias (from forward: x = x + bias). Then hardtanh, mish, group_norm.
+
+We need to design tiling, UB budget, etc. Use matmul from AscendC library. For the fused activation and normalization, we can process tile-wise after matmul.
+
+Given complexity, we'll structure kernel class: Init with all GM_ADDRs and tiling data. In Process, handle matmul computation (with bias from lin_bias maybe?), then apply add second bias, hardtanh, mish, group_norm. Use double buffer for input/output.
+
+We need to define tiling data: totalLengths, tile sizes, etc. For matmul we need to use TCubeTiling from tilingGm? The example matmul_fused copies tiling from GM_ADDR. The host operator will set tiling data accordingly. We can define custom tiling data for the whole fused operation: number of rows, cols, batch, tileM, tileN, tileK, etc. But since we are using Matmul API, we need to pass proper TCubeTiling. The host tiling can compute and fill a TCubeTiling buffer.
+
+The example shows host operator uses GetBlockDim and SetTiling. For matmul, we need to set tiling for cube. We can follow matmul_constant_tiling pattern: Init(a,b,bias,c,tilingGm) where tilingGm is GM_ADDR pointing to TCubeTiling. But TilingData is a struct defined by user (LeakyReluCustomTilingData). For our kernel, we need a custom tiling struct that includes both matmul tiling info and the rest (like norm params, etc.). So we can define GemmBiasAddHardtanhMishGroupNormCustomTilingData with fields: totalM, totalN, totalK, tileM, tileN, tileK, blockDim, normalizedShape, numGroups, epsilon, etc. But note: TCubeTiling is separate; we can embed it inside or just pass two tiling buffers? In matmul_fused example, they use CopyTiling(&tiling, tilingGm) where tilingGm points to TCubeTiling. But here we need both matmul tiling and our own parameters. We can define our own tiling data struct that includes a TCubeTiling inside. Then in kernel, we copy the whole struct and extract parts.
+
+Better: follow pattern from matmul_constant_tiling: they pass tilingGm as GM_ADDR pointing to TCubeTiling. So we can define our own tiling data struct that has a TCubeTiling as first field (or separate). Actually, we can just use two tiling GM_ADDRs? The example kernel_entry only has one tiling GM_ADDR. In our case, we can pack everything into a single struct. The host tiling function will fill a custom struct and save to buffer. The kernel will cast that buffer pointer to the struct type.
+
+So define:
+
+```cpp
+struct GemmBiasAddHardtanhMishGroupNormCustomTilingData {
+    TCubeTiling cubeTiling;
+    uint32_t totalElements; // after linear, up to group norm input: batch*out
+    uint32_t tileElements;  // per iteration after matmul
+    uint32_t blockDim;
+    float epsilon;
+    uint32_t numGroups;
+    // maybe also bias shape? bias is same size as out (out_features), so it's added after matmul.
+};
+```
+
+But note: group_norm parameters: gn_gamma, gn_beta shape (out_features,). Group norm requires per-channel mean/var over groups. We'll compute on the fly.
+
+We need to handle the entire pipeline per tile after matmul. Since matmul produces a full result, we might need to process the entire output in tiles. But we can do matmul then immediately apply activations and group norm per tile, but group norm requires statistics over the whole tensor for each channel? Group norm: for each group, compute mean and variance of all elements in that group across spatial dimensions (here spatial dims are 1? Actually group_norm with input shape (N, C, H, W) but here it's 2D: (batch, out_features). So we treat (batch, out) as (N, C, H=1, W=out_features). Then groups: divide channels into num_groups, each group has (out_features/num_groups) channels. For each group, compute mean and var over that group for each batch element. Then normalize: (x - mean) / sqrt(var + eps) * gamma[channel] + beta[channel].
+
+So per tile after matmul, we may process a subset of batch rows? But we need full stats per group for the whole output for a given batch index. So we can process one batch element at a time? That would be inefficient. Better to process entire output of matmul (all batch rows) then do group norm sequentially per batch? Not fully tileable. But we can tile along batch dimension. For each batch, we can compute matmul for that batch (or multiple batches) then apply group norm per batch. Since batch is large (1024) and out=8192, we can tile batch dimension. The matmul can be done with appropriate tiling (tileM). The rest operations per batch can be done tile-wise within each batch row? For group norm, we need full channel dimension for a given batch index to compute stats across groups. So we can process one batch element at a time after matmul? That might be okay if we double buffer between batch elements.
+
+Let's design: Tile across batch dimension. For each batch index (or a group of rows), do matmul to produce output row(s). Then apply bias addition, hardtanh, mish, group norm per row. Since group norm needs per-group stats across channels, we can process the entire row (out_features) at once, compute group stats, then normalize. That would require storing the whole row in local memory, which might be large (8192 floats ~ 32KB). That's acceptable per tile. Then each batch row can be processed individually. We can double buffer: while processing current batch row, prefetch next row's matmul input? Possibly.
+
+But given complexity, a simpler approach: perform the entire matmul first (using Matmul API) into a global output buffer (or local with double buffer?), then perform activation and group norm in a separate loop over batch rows using the same tiling. However, that would require two passes, which may be less fused. The fused kernel should ideally do it all in one pass: for each tile of batch, do matmul, then compute activations and group norm on that tile's output. Since group norm requires statistics across all channels for each batch, we need the whole row for a batch. So we can tile by batch: each tile is a subset of batch rows. For each row in the tile, we load the entire row from matmul output? But matmul output for that row is computed directly. So we can do:
+
+- Init matmul for A (batch, in) and B (in, out) with tiling.
+- For each batch row i (or small group), compute matmul for that row (using a sub-matrix of A). But matmul API typically processes whole matrices. However, we can use "split" functionality? In matmul_fused, they have splitRowNums. So we can split the matmul along M dimension. The Matmul API supports that via tiling parameters. In matmul_fused example, they have splitRowNums and splitRowSize. They process matmul in chunks. After matmul, they apply LeakyRelu. So we can adopt similar pattern: Process matmul in chunks of rows (tileM), then after each matmul chunk, apply bias addition (both lin_bias and second bias), hardtanh, mish, group normalization on that chunk. For group norm on a chunk of rows, we need to compute group stats for each row independently. So per row within the chunk, compute group mean/var and normalize. That is feasible.
+
+Thus we will follow matmul_fused kernel structure. We'll define class GemmBiasAddHardtanhMishGroupNormKernel. It will have matmulObj and additional processing. The process function will loop over split rows. For each split, after matmul compute, call a function to apply the activations and group norm on the output local tensor. Need to handle double buffer for matmul output? In matmul_fused, they have reluInQueue and reluOutQueue for the fused activation. We can adapt: after matmul, the output is in a local tensor (reluInLocal). Then we apply hardtanh, mish, group norm.
+
+For group norm, we need gamma and beta global tensors. We'll load them per channel. Since we process row by row, we can load gamma and beta into local buffers once (since they are the same for all rows). Then for each row, compute group norm.
+
+Compute mish: mish(x) = x * tanh(softplus(x)). softplus(x) = ln(1+exp(x)). In AscendC, we have Exp, Log, Tanh, Mul, Add, etc. We can implement mish using vector functions.
+
+Hardtanh: clamp to [-1,1]? Actually default hardtanh is min_val=-1, max_val=1. So we can use Min, Max.
+
+So kernel will have high complexity but possible.
+
+Given the instructions "just output the code", we need to produce the six strings. We'll write them accordingly.
+
+Let's produce the python output with the six strings. We'll use similar structure as leaky_relu example but adapted.
+
+For project_json_src: define inputs: x, weight, lin_bias, bias, gn_gamma, gn_beta. Output: y (after group norm). Attributes: none? Actually in_features, out_features, bias_shape, num_groups are from init? But in PyTorch model, they are passed as constructor arguments, but for the operator, they can be part of tiling. Since the operator is called with those tensors already shaped, we don't need attributes for shapes. Instead, the tiling will include those sizes. So JSON: input_desc for 6 inputs, output_desc for 1 output. No attr.
+
+But careful: The original forward takes x, weight, lin_bias, bias, gn_gamma, gn_beta. So we have 6 inputs. All are required. Formats ND, types float (or half?). Could use float for simplicity, or half. Let's use float.
+
+Output y: float.
+
+So project_json:
+
+[
+  {
+    "op": "GemmBiasAddHardtanhMishGroupNormCustom",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "x", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "weight", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "lin_bias", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "bias", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "gn_gamma", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "gn_beta", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "output_desc": [
+      {"name": "y", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ]
+  }
+]
+
+For host_tiling_src: define tiling data struct with fields needed: totalM (batch), totalN (out), totalK (in), tileM, tileN, tileK, blockDim, numGroups, epsilon, etc. We'll include a TCubeTiling inside? Actually TCubeTiling is a struct defined in AscendC. We cannot redefine it. Instead, we can have our own tiling data that mimics the needed fields for cube, but it's easier to pass two separate tiling buffers? But the kernel expects one tiling GM_ADDR. So we define a struct that contains a TCubeTiling as first field (or we can use a separate pointer). In the kernel, we can do:
+
+struct MyTiling {
+    TCubeTiling cubeTiling;
+    uint32_t numGroups;
+    float epsilon;
+    uint32_t blockDim;
+    // ...
+};
+
+But TCubeTiling is size of 128 bytes? Actually it's defined in AscendC. We can include "cube_tiling.h"? In kernel we can forward declare? Better to just use the built-in tiling for matmul and keep our own fields separately. Another approach: have two buffers: tilingGm for matmul and another for our params. But the kernel_entry only has one tiling argument. In the example, they used one. So we can embed our custom fields after the cube tiling. Since we control the host, we can write our struct with the cube tiling first. In kernel side, we cast to a struct that includes cube tiling. The AscendC header defines TCubeTiling; we can include it.
+
+Thus in host_tiling_src, we define:
+
+struct GemmBiasAddHardtanhMishGroupNormCustomTilingData {
+    TCubeTiling cubeTiling;
+    uint32_t numGroups;
+    float epsilon;
+    uint32_t blockDim;
+    uint32_t totalM; // maybe not needed
+};
+
+But we need to set all cube tiling fields correctly. The host tiling function will compute those. We can use AscendC::TCubeTiling from header. However, in the host code (C++) we need to set it, so we include "register/tilingdata_base.h" but also need cube tiling definition? The host can include "matmul_tiling.h"? Typically, the host tiling function for matmul sets the fields via Set* functions. The TCubeTiling has methods like SetM, SetN, SetK, etc. We can use those. So we include the appropriate headers.
+
+Given this is complex, we can simplify by using the matmul_fused approach where the host passes a custom tiling and the kernel uses REGIST_MATMUL_OBJ. In matmul_fused, they use TCubeTiling and CopyTiling. The host tiling function probably creates a TCubeTiling and saves it to buffer. So we can do the same: host tiling function creates a TCubeTiling and our custom tiling data. We can compose: create a buffer that first has TCubeTiling then our fields. Then in kernel, copy to a local struct.
+
+Thus in host_tiling_src, we define:
+
+using TCubeTiling = AscendC::TCubeTiling; // or just use
+
+Then create tiling struct:
+
+struct GemmBiasAddHardtanhMishGroupNormCustomTilingData {
+    AscendC::TCubeTiling cubeTiling;
+    uint32_t numGroups;
+    float epsilon;
+    uint32_t blockDim;
+};
+
+We will fill cubeTiling via its methods.
+
+Now host_operator_src: similar to leaky_relu but extended. We need InferShape, InferDataType, TilingFunc, and OpDef registration. The tiling function will compute tile sizes and cube tiling. Since we have matmul, we need to compute M, N, K, and maybe split row nums. We can set tilingData.cubeTiling.SetM(totalM); etc. We also need to set tileM, tileN, tileK based on UB budget. Use similar UB budget calculation but for matmul + activations. That's complex but we can approximate.
+
+We'll write a reasonable tiling function.
+
+For kernel_src: We'll write kernel class similar to matmul_fused with added activation and group norm. We'll use double buffer for input/output of matmul? In matmul_fused, they use a single buffer? Actually they use reluInQueue and reluOutQueue for the fused activation, and the matmul object produces output into reluInLocal. We'll adapt.
+
+We'll need to implement hardtanh: clamp to -1,1. mish: using exp, log1p (log(1+exp(x))). They have vector APIs: Exp, Log, Add, Mul, Sub, etc. We'll use AscendC::Exp, AscendC::Log, AscendC::Add, AscendC::Mul, AscendC::Tanh? Actually Tanh is not directly available as vector? There is Tanh in activation API? In advanced API, there is AIvectorComputeTanh? I think vector compute includes Tanh. We can use AscendC::Tanh. Let's assume it's available. For safety, we can use series of exp: tanh(x) = (exp(2x)-1)/(exp(2x)+1). But that's more ops. Use Tanh intrinsic if available. We'll assume.
+
+Group norm: For each row, compute mean per group, then var, then normalize. We'll need to compute sum across a group. We can use vector reduce sum per group. Since we have contiguous groups? For row of length C = out_features, groups of size G = C / numGroups. So we can divide into segments. Use vector operations with strides? Better: for each group, compute mean by sum of elements in that group using a loop over groups, using reduceAdd of a sub-tensor. But AscendC ReduceAdd works on the whole tensor. We could use MaskedReduceAdd with a mask that is 1 for group positions. That's complex. Simpler: use custom loop with a local buffer and manual accumulation using vector add? Could use a for loop over groups, compute sum by extracting sub-tensor? Not efficient. Alternatively, use the GroupNorm library impl if available. There is GroupNormImpl in retrieval but it's internal. We can replicate its logic: it uses a shared buffer and vector reduce. We'll write a simplified version: For each group, compute mean = sum(x[group_start:group_end]) / group_size. For each element in group, we accumulate to a scalar using vector adds of sub-tensors? Could use:
+
+LocalTensor<float> groupSum; pipe.InitBuffer(groupSum, 1); then loop over group length, add to sum. That's elementwise, not vectorized. Better: we can use a temporary buffer and do reduction with ReduceAdd? Suppose we create a mask (1 for elements in group, 0 otherwise), multiply x by mask, then ReduceAdd. But we need per group masks. That's heavy.
+
+Given the complexity and the size of output, we might simplify by not implementing group norm in the kernel but instead using external group norm? But the task says "replace relevant PyTorch operators", so we should fuse all. However, if too complex, we can split into two kernels: one for linear+bias+hardtanh+mish, and another for group norm. But the user request is to produce one fused kernel. Let's attempt to include group norm with a pragmatic approach: For each row, we can process groups in a loop, using vector operations on sub-tensors (using local offset). That is doable.
+
+In the compute function after mish, we have a local tensor for the row (tile length = out_features). Now we need group norm. We can allocate a temporary buffer for per-group mean and var. For each group index g, compute start = g * groupSize, end = start + groupSize. Use AscendC::ReduceAdd on a slice of the local tensor. But ReduceAdd operates on a contiguous tensor of length len. So we can:
+
+for (uint32_t g = 0; g < numGroups; g++) {
+    uint32_t offset = g * groupSize;
+    float sum = AscendC::ReduceAdd(tmpTensor[offset], groupSize); // but ReduceAdd returns a scalar? Actually AscendC::ReduceAdd returns a scalar of type T.
+}
+
+But ReduceAdd requires a LocalTensor as input and length. We can use:
+
+LocalTensor<float> sub = rowLocal[offset]; // offset in elements? We can use pointer arithmetic: use rowLocal[offset] as a new tensor? Not directly. We can use rowLocal as base and use SetGlobalBuffer? Actually LocalTensor is not contiguous like that; it's a view. We can use .operator[] to get reference, but for ReduceAdd we need a tensor. We can create a new LocalTensor that points to the same memory but with offset using .operator+()? LocalTensor has operator+ to get offset pointer. For example: auto subTensor = rowLocal + offset; Then ReduceAdd(subTensor, groupSize). That should work.
+
+So compute mean = ReduceAdd(subTensor, groupSize) / groupSize.
+
+Then compute variance as ReduceAdd((subTensor - mean)^2, groupSize) / groupSize.
+
+Then normalized = (x - mean) / sqrt(var + epsilon). Then multiply by gamma[channel] and add beta[channel].
+
+We need gamma and beta global tensors. Load them into local at init: gammaLocal and betaLocal. Then for each channel, we can access by index.
+
+Implementation details: We'll use a temporary buffer for submul, submul, etc. For efficient use, we can allocate a temporary buffer of size groupSize (max group size). But groupSize = out_features / numGroups = 8192/256 = 32. So small. So we can handle per group with small buffers.
+
+Thus kernel compute function will, after mish, perform group norm row by row (or row segment). Since we have tile of multiple rows (tileM rows), we can loop over rows within tile.
+
+We'll structure:
+
+- Matmul output for tile rows is in a local tensor (say matmulOutLocal) of size tileM * out_features.
+- Then for each row in the tile, we take a sub-tensor of length out_features starting at row * out_features.
+- Apply add bias (global bias_local? We have both biases: lin_bias is already added in matmul via bias parameter of Matmul? In matmul API, bias is added after matrix multiply. So we can pass lin_bias as bias to Matmul. The Matmul API supports bias input. So we don't need to manually add lin_bias. Then we add second bias (the bias tensor from forward). That can be added elementwise to each row.
+- Then hardtanh: clamp to -1,1.
+- Then mish.
+- Then group norm per row.
+
+We need to load bias and add it. That's straightforward.
+
+Now about double-buffer for matmul output: The matmul_fused uses a single buffer because they wait for matmul to complete. They have split rows processed sequentially. So we can follow similar pattern: process split rows one by one. For each split, after matmul, we apply activations and group norm. We don't need double buffer for those activations because they are compute-bound. But we can pipeline with data copy? Not necessary.
+
+Thus kernel_src will be large but doable.
+
+We'll write the six strings accordingly.
+
+Let's start writing.

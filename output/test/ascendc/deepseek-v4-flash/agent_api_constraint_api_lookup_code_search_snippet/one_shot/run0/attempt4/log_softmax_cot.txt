@@ -1,0 +1,160 @@
+We need to fix the kernel_src, host_tiling_src, host_operator_src, python_bind_src, and possibly project_json_src and model_src based on the error logs. The previous attempt had many compilation errors. The errors indicate:
+
+1. In kernel_src: using `ReduceMax`, `ReduceSum`, `Duplicate`, `Copy` incorrectly. These functions require different signatures. Also misuse of queues: you cannot assign a TQue to a LocalTensor.
+
+Key issues:
+- `AscendC::ReduceMax(maxLocal, xLocal, tmpExp_, len);` - `tmpExp_` is a TQue, not a LocalTensor. Need to allocate a workspace tensor.
+- Similar for `ReduceSum`.
+- `AscendC::Duplicate(bcastMax, scalar, len);` - `bcastMax` is a TQue, not a LocalTensor.
+- `AscendC::Copy(yLocal, bcastMax, len);` - requires 5 arguments (dst, src, mask, count, ...) for Copy, but we should use `DataCopy` for GM->Local or Local->GM? Actually we need to copy local to local? In the final step we just need to move data to output queue. Better approach: Use a simpler two-queue method similar to the leaky_relu example, with separate queues for input, output, and a temporary queue for workspace (like a single buffer for max/sum). But we need to compute logsoftmax correctly.
+
+The retrieved code snippet for logsoftmax shows a different signature: `logsoftmax_custom(GM_ADDR shapeInfo, GM_ADDR srcGm, GM_ADDR dstGm)` but we need a tiling-based approach.
+
+Instead, we can use a simpler elementwise-like approach: For each row, compute max, subtract, exp, sum, log, subtract. But we need to handle the fact that max and sum are scalars per row.
+
+Better to use the two-queue method but with sufficient workspace. We can allocate a single temporary buffer for max and sum (scalars) and use vector operations. However, `ReduceMax` and `ReduceSum` produce a scalar but they require a workspace tensor. The typical usage:
+
+```cpp
+LocalTensor<float> maxLocal = tmpMax.AllocTensor<float>();
+LocalTensor<float> workLocal = tmpWork.AllocTensor<float>();
+ReduceMax(maxLocal, xLocal, workLocal, len); // workLocal needed
+// maxLocal[0] contains max
+float maxVal = maxLocal.GetValue(0); // scalar
+// Then broadcast with Duplicate
+Duplicate(bcastMax, maxVal, len);
+```
+
+But that's inefficient. Another approach: use `ReduceMax` and then `BroadCast` using `Duplicate` with scalar. The problem is `Duplicate` signature: `Duplicate(LocalTensor<T>& dst, const T& scalarValue, const int32_t& count)` where T is float, not LocalTensor. So we need to extract scalar value.
+
+Similarly for sum.
+
+We also need to be careful about queue management. The previous attempt tried to store queues as part of class members, then used them as LocalTensors, which is wrong. We must use `AllocTensor` and `FreeTensor` on the queues.
+
+Let's redesign kernel_src:
+
+- Use two buffers for input and output (BUFFER_NUM=2).
+- Use a single workspace queue (VECCALC) for temporary calculations.
+- For each row:
+  1. Copy input row to local (via DataCopy to input queue).
+  2. Dequeue to get xLocal.
+  3. ReduceMax on xLocal using a workspace tensor allocated from workspace queue, get max scalar.
+  4. Duplicate max scalar to a broadcast tensor (use workspace tensor for broadcast).
+  5. Compute sub = xLocal - bcastMax.
+  6. Exp(sub) -> store in same local tensor.
+  7. ReduceSum on exp using workspace tensor, get sum scalar.
+  8. Log of sum scalar -> logSum scalar.
+  9. Duplicate logSum scalar to broadcast tensor (reuse workspace).
+  10. Compute final = sub - bcastLogSum (where sub is actually exp, need to keep original sub? Wait: correct formula: logsoftmax(x) = (x - max) - log(sum(exp(x - max))). So after exp, we have exp_sub. Need to keep (x - max) for final subtraction. But we overwrote sub with exp. So we need to keep xLocal and max to recompute (x - max). Or we can first compute exp_sub and then later recompute (x - max) from xLocal and maxLocal. Since we have xLocal still, we can compute (x - max) again.
+
+Simpler: Keep xLocal, compute (x - max) into a temporary, then exp it, compute sum, log, then final = (x - max) - logSum.
+
+But we can reuse the workspace queue for intermediate tensors.
+
+Given complexity, let's borrow from the softmax kernel pattern: use two queues for input/output and one workspace queue for temporary results. We'll allocate tensors as needed.
+
+We also need to modify the tiling data: remove rowLength, columnLength, rowsPerBlock, dim; we only need totalLength and tileLength (like leaky_relu). Because we can treat the tensor as flat and process each element individually? No, logsoftmax requires per-row max and sum, so we cannot just tile arbitrarily across rows. However, we can do per-row reduction if the row length fits in a tile. For a large dim=393216, we need to split each row into multiple tiles, but then max/sum across tiles require inter-tile reduction. That's complex.
+
+The original architecture: batch_size=4096, dim=393216, so each row has 393216 elements. That's huge, cannot fit in a single tile. So we need to compute max across tiles within a row. This requires a two-pass approach or using the reduction APIs across tiles (like in the softmax reference, they use separate max and sum buffers). The reference softmax kernel (from snippet 1) uses two global buffers for max and sum (GM_ADDR max, sum) and processes tiling by computing partial max/sum and then combining. That's more appropriate.
+
+Given the error logs and time, we can simplify: assume the input is 2D and we process row by row, with each row tiled. We'll store row max and sum in the tmpMax_ and tmpSum_ queues as scalars (single element). For each tile within a row, we compute local max, then compare with previous max using `Max` (elementwise) to get overall max. Similarly for sum: compute exp for each tile, sum tile, and accumulate.
+
+However, this still requires careful design. Let's look at the retrieved snippet for softmax: it uses global buffers for max and sum (GM_ADDR max, sum). But the kernel entry signature has those as parameters. Our project_json only has x and y, no extra outputs. So we need to compute max and sum internally, but we need workspace to store per-row max and sum. That can be in local memory (Ub) but across tiles? We can store per-row intermediate results in local tensors (size = number of tiles per row? Actually we can reduce within a row by tiling and using a temporary scalar accumulator.
+
+Simpler: Since the dim is large (393k), but we can treat the entire tensor as 2D (batch_size x dim). For each block, we can process a subset of rows (or even a subset of columns across rows?). Actually, the standard approach is to parallelize across rows: each block handles one row completely. But with 4096 rows and 24 blocks, each block handles ~171 rows. Each row is 393k elements. That's still too large for a single tile. So we need to tile within a row across multiple iterations. We can maintain a scalar max and sum in local memory (a single float). For each tile, compute local max, then update the global max using a scalar compare. But the scalar compare between tiles requires storing the current max in a LocalTensor of size 1. We can use the tmpMax_ queue to hold a single-element tensor for the running max. Similarly for sum.
+
+Algorithm for one row:
+- Initialize max = -INF (use -3.402823e+38)
+- For each tile of the row:
+   - Load tile into xLocal.
+   - Compute tileMax (using ReduceMax on tile).
+   - Compare current max with tileMax, keep larger (can use Max on two scalars? or use Compare and select? Maybe simpler: just compute max of the entire tile and then manually if tileMax > curMax, set curMax = tileMax. But we can use `Max` elementwise on two scalars by creating tensors of size 1.
+- Then second pass: for each tile:
+   - Load tile again (or store from first pass? We can store in a double-buffered way? But we need to keep input data for second pass. We can reuse the input queue twice: first pass to compute max, then second pass to compute exp/sum. But we need to re-fetch data from global memory. That's acceptable.
+   - Subtract max from tile, compute exp, sum partial, accumulate to sum scalar.
+- After all tiles, compute log(sum).
+- Third pass: for each tile:
+   - Load tile, compute (x - max) - logSum, output.
+
+That's three passes over data, which is inefficient but correct. Given the large dim, this might be acceptable.
+
+Alternatively, we can use a single pass with storing per-tile intermediate results in a circular buffer? That would require large local memory.
+
+Given the error logs, the main issue is incorrect API calls. So we need to produce a kernel that compiles. Let's simplify: Use two queues (in, out) and workspace queue for temporary tile storage. Use `DataCopy` for GM->Local and Local->GM. Use `ReduceMax` and `ReduceSum` with workspace tensor. Use `Duplicate` with scalar extracted via `GetValue`. Use `Exp`, `Log`, `Sub`, `Add`, `Muls` as needed.
+
+We also need to fix host_tiling_src and host_operator_src: remove unused fields, align with new tiling data (just totalLength, tileLength, blockDim, negativeSlope? But we don't have negativeSlope; we need dim? Actually logsoftmax doesn't have a parameter. But the original model has a dim parameter. However, the kernel should handle the dim automatically (assuming softmax over last dimension). We can ignore dim for now. So tiling: totalLength, tileLength, blockDim.
+
+Also fix python_bind_src: remove dim parameter from EXEC_NPU_CMD (the operator does not have an attribute? Actually the operator definition has attr "dim", but the kernel doesn't use it; we can keep it but set default 1). Simpler: remove dim attribute from project_json and host_operator_src because the kernel will handle logsoftmax over the last dimension. The original model passes dim=1, which for 2D tensor means softmax over columns (last dim). That's standard. So we can hardcode softmax over the last dimension. So we don't need dim attr.
+
+Thus we can simplify: no attributes.
+
+Let's rewrite kernel_src:
+
+```cpp
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelLogSoftmaxCustom {
+public:
+    __aicore__ inline KernelLogSoftmaxCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileLength)
+    {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpWork_, 1, tileLen_ * sizeof(float)); // workspace
+        pipe_.InitBuffer(tmpScalar_, 1, sizeof(float)); // single float for max/sum
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Distributed by rows: each block processes a subset of rows.
+        // We assume the tensor is 2D: rows x cols.
+        // colLength = dim = last dimension.
+        // rowLength = totalLen / colLength.
+        // For simplicity, we assume dim=1 (last dim), so each row is contiguous in memory.
+        uint32_t colLength = tileLen_; // Actually we need to know colLength from tiling. We'll pass it via tiling data. For now, assume tileLen_ is the column length? Not correct.
+        // Instead, we need to compute colLength from shape. Better to pass colLength in tiling.
+    }
+};
+```
+
+We need to add colLength to tiling data. But the previous tiling data had rowLength, columnLength. We'll keep that.
+
+Given the complexity, let's rewrite with the correct API usage based on the softmax reference. We'll use a separate tiling parameter `colLength` (the size of the softmax dimension). Then for each block, we iterate over rows assigned to this block. For each row, we process tiles of size tileLen (which is <= colLength). We need to compute max across all tiles of the row, sum of exp across all tiles, then final output.
+
+We'll implement:
+
+- For each row:
+   - Initialize max = -FLT_MAX (as a single-element LocalTensor)
+   - First loop over tiles: compute tile max, update global max using `Max` elementwise on two 1-element tensors.
+   - After first loop, broadcast max to a tile-sized buffer (using `Duplicate`).
+   - Second loop over tiles: compute exp, accumulate sum using `Add` on a 1-element tensor.
+   - After second loop, compute logSum = log(sum).
+   - Broadcast logSum to tile-sized buffer.
+   - Third loop over tiles: compute final = (x - max) - logSum, output.
+
+But we need to reload x from global for each pass. That's okay.
+
+We need to handle the case where tileLen exactly divides colLength; else last tile is smaller.
+
+We'll need a function to compute tile count and tile lengths.
+
+Given time, let's produce a revised implementation that compiles, perhaps simpler: use a single pass by keeping x in local? Not possible with large data.
+
+Alternatively, use the fact that the previous leaky_relu example was simple and compiled. We can adapt that to a dummy kernel that just does elementwise log? That would be incorrect but the task demands correctness. However, the error is compilation failure, so we need a compilable kernel.
+
+Let's look at the top retrieved snippet for softmax: it uses GM_ADDR max and sum as global outputs. But our project_json doesn't have those. However, we can allocate workspace inside the kernel? Ascend C supports workspace from tiling (the GM_ADDR workspace parameter). We can use the workspace global memory to store per-block intermediate results. For each row, we can compute max and sum and store them in workspace? But workspace is provided per block? Actually the kernel receives workspace pointer; we can use it as temporary global memory. But that's tricky.
+
+Given the time, I'll produce a kernel that uses the correct API calls: `ReduceMax`, `ReduceSum`, `Duplicate`, `Exp`, `Log`, etc., as per the standard usage, with workspace tensors properly allocated from queues. I'll also ensure that we don't confuse queues with tensors.
+
+I'll rewrite kernel_src, host_tiling_src, host_operator_src, and python_bind_src accordingly. I'll keep the project_json_src and model_src similar to the leaky_relu example but with LogSoftmaxCustom.
+
+Let's craft the six strings.

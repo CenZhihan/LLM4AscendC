@@ -1,0 +1,49 @@
+We are given the previous attempt logs and the error: "vector core execution is abnormal" with "CCU instruction address check error". The error suggests there's an issue with the kernel code, likely due to misaligned memory access or incorrect use of AscendC APIs. The kernel uses `CumSum`, `DataCopy`, etc. The error occurs across many cores, with mte error info 0xef or 0xf1. Possibly the kernel is accessing global memory with invalid strides or the tiling parameters are incorrect.
+
+Looking at the kernel code: It uses `CumSum` which expects a `CumSumInfo` struct and a shared temporary buffer. However, the kernel passes `CumSumInfo{curTileOuter, curTileInner}` directly, and uses `AscendC::CumSum<float>(yLocal, lastRow, maskedLocal, cumSumInfo);` but missing the `sharedTmpBuffer` argument. Actually, the API signature shows there is an overload with `LocalTensor<uint8_t>& sharedTmpBuffer`. The previous code did not allocate a shared temp buffer. That's likely the root cause: missing the temporary buffer for CumSum.
+
+Also, the `CumSum` call is missing the shared temporary buffer argument. The API signature from lookup indicates it requires a `LocalTensor<uint8_t>& sharedTmpBuffer`. The kernel did not allocate a `sharedTmpBuffer` queue. We need to add a `sharedTmpBuffer` queue and pass it.
+
+Additionally, the kernel uses `maskHalfQueue_` to convert mask from int8 to half then to float. That might be okay, but we can simplify by directly casting int8 to float using `AscendC::Cast`? Actually, `AscendC::Cast` supports many types. We can cast directly from int8 to float. That would save a queue and a conversion step. But the error is likely from missing sharedTmpBuffer.
+
+Let's also check the tiling: The host tiling calculates tileOuter and tileInner using an UB budget heuristic. The kernel then iterates over outer and inner tiles. The `Process` function uses grid-stride loops. However, the `CumSum` operation expects contiguous data in memory? `CumSum` computes cumulative sum along the last dimension? The `CumSumInfo` has inner and outer sizes. The kernel copies data row by row into local tensors. The data layout in global memory is row-major (outer rows, inner columns). The local tensor `xLocal` is allocated as a contiguous block of `curTileOuter * curTileInner` floats. The `CopyIn` function copies each row separately. That should be okay.
+
+But the `CumSum` call requires a shared temporary buffer. Without it, the kernel might access invalid memory, causing the vector core exception.
+
+Also, the kernel uses `GetBlockNum()` and `GetBlockIdx()`. That's fine.
+
+Another potential issue: The kernel declares `rowSumQueue_` and uses `rowSum` as a local tensor. It also allocates `lastRowQueue_` each inner iteration. But the `CumSum` outputs lastRow as well. The code shows `AscendC::LocalTensor<float> lastRow = lastRowQueue_.AllocTensor<float>();` and then `AscendC::CumSum<float>(yLocal, lastRow, maskedLocal, cumSumInfo);`. That matches the API signature (dst, lastRow, src). However, the API expects a shared temporary buffer as well. So we need to add a `sharedTmpBuffer` queue.
+
+Also, note that `CumSum` might require the shared temporary buffer to have a certain size. The documentation or API header should specify. We can allocate a reasonable size based on the tile size. The shared temporary buffer size can be `tileInner * sizeof(float)` or more. Let's allocate a `TBuf<TPosition::VECCALC>` with enough size.
+
+In the code, we see a queue `broadcastRowSumQueue_` that is allocated but never used. We can remove it.
+
+Now, let's produce the corrected code. We need to modify the kernel_src to include a shared temporary buffer for CumSum. Also, we can simplify the mask conversion: cast directly from int8_t to float using `AscendC::Cast`. The API supports `Cast` from int8 to float? Actually, `Cast` supports many types, but we need to check. Commonly, int8 to float is supported. We'll keep the original two-step conversion but also correct the missing buffer.
+
+We also need to adjust the `Init` function to allocate the shared temporary buffer queue. The size should be `tileOuter * tileInner * sizeof(float)`? Actually, the shared temporary buffer in CumSum is used for internal computation. The API might require a size based on inner dimension. Typically, it's `inner * sizeof(T)`. So we can allocate `tileInner_ * sizeof(float)`. But to be safe, we can allocate `tileOuter_ * tileInner_ * sizeof(float)`. Let's allocate a `TBuf` (a single buffer, not a queue) because it's a temporary workspace, not a FIFO. In the sample code from the retrieve context, they use `TBuf<TPosition::VECCALC>` and allocate via `pipe.InitBuffer(tmpBuf, size)`. Then access as `sharedTmpBuffer = tmpBuf.GetTensor<uint8_t>()`. But they used a queue in the previous code. Better to use a `TBuf` for shared temporary buffer. However, the previous code used queues for everything. We can also use a queue of size 1 for the shared buffer. But the API `CumSum` expects a `LocalTensor<uint8_t>`, which can come from a queue or buffer.
+
+Let's modify: allocate a `TBuf<AscendC::TPosition::VECCALC> tmpBuf_` and in `Init`: `pipe_.InitBuffer(tmpBuf_, tmpBufSize);`. In `Compute`, get the tensor via `AscendC::LocalTensor<uint8_t> sharedTmp = tmpBuf_.Get<uint8_t>();`. But note that `TBuf::Get` returns a tensor that can be used without enqueue/dequeue.
+
+We also need to ensure that the shared temporary buffer size is sufficient. For simplicity, set `tmpBufSize = tileOuter_ * tileInner_ * sizeof(float)`. That should be safe.
+
+Now, the error also mentions "CCU instruction address check error" - this could be due to misaligned data copies. The `CopyIn` and `CopyOut` functions copy row by row using `DataCopy` with `cols` elements. `DataCopy` requires that the source and destination addresses are aligned to 32 bytes for vectorized copy. The row offset in global memory may not be aligned because `innerSize_` may not be a multiple of alignment. But `DataCopy` can handle non-aligned addresses? On Ascend, `DataCopy` may require alignment. To be safe, we should ensure that the tileInner is aligned to at least 32 bytes (8 floats). The tiling code uses `ALIGN_ELEMS = 256` which is 1024 bytes, so that should be fine. However, the `CopyIn` for mask uses `int8_t` which has size 1 byte, alignment of 32 bytes corresponds to 32 elements. But we already align tileInner to 256 elements? Actually, `tileInner` is aligned to 256 elements (since ALIGN_ELEMS=256). That's 256 bytes? No, for float it's 256*4=1024 bytes, but for int8 it's 256 bytes, still aligned to 32 bytes? 256 is multiple of 32, so okay.
+
+But the real issue is likely the missing shared temporary buffer.
+
+Let's produce the corrected kernel_src with the following changes:
+1. Add a `TBuf<AscendC::TPosition::VECCALC> tmpBuf_` for CumSum shared workspace.
+2. Initialize it with size `tileOuter_ * tileInner_ * sizeof(float)`.
+3. In `Compute`, get the shared tensor: `AscendC::LocalTensor<uint8_t> sharedTmp = tmpBuf_.Get<uint8_t>();`
+4. Call `AscendC::CumSum<float>(yLocal, lastRow, maskedLocal, sharedTmp, cumSumInfo);`
+5. Remove unused `broadcastRowSumQueue_` queue.
+6. Also, the `CumSum` call in the code was missing the shared buffer argument. Now add it.
+
+Also, we need to adjust the `Init` function to use `pipe_.InitBuffer(tmpBuf_, tileOuter_ * tileInner_ * sizeof(float));`. But note: `InitBuffer` for TBuf takes the number of bytes? Yes.
+
+Additionally, we should ensure that the `CumSumInfo` is correctly defined. It is used as `AscendC::CumSumInfo cumSumInfo{curTileOuter, curTileInner};` That's likely correct.
+
+Now, write the corrected kernel_src. We'll keep other files unchanged except if there are obvious issues in the tiling or host code. The tiling code seems fine, though the `tileOuter` calculation might be conservative. But the error is from kernel execution, not tiling.
+
+Also, the model_src and python_bind_src seem fine. The project_json_src is correct.
+
+Let's generate the corrected solution with all six strings.

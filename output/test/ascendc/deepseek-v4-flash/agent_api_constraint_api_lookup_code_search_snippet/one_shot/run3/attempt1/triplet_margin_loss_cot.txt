@@ -1,0 +1,80 @@
+We need to produce six embedded Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src. The kernel name is triplet_margin_loss_custom, PascalCase TripletMarginLossCustom.
+
+The operation is triplet margin loss: given anchor, positive, negative (each shape (n, d)), and margin scalar. PyTorch's triplet_margin_loss computes: max(d(anchor, positive) - d(anchor, negative) + margin, 0) where d is pairwise distance (Euclidean distance by default, p=2). But the input includes margin as a tensor, we need to extract scalar.
+
+We need to implement a custom AscendC kernel that does: compute squared Euclidean distances: d_ap = sum((anchor_i - positive_i)^2) per sample (over d), similarly d_an. Then loss = max(d_ap - d_an + margin, 0). Output shape (n,).
+
+We need to design kernel: possibly using ReduceAdd or elementwise operations. The kernel must handle inputs: anchor, positive, negative each (n,d) float, margin scalar. Output (n) float.
+
+We can use tiling, tile along batch dimension n. For each tile, compute AP and AN differences, then reduce sum (squared diff), then compute loss. Use vector instructions: Sub, Mul, ReduceAdd/ReduceSum. For reduce sum, we can use AscendC::ReduceSum or manual loop with vector instructions.
+
+Based on retrieved context, we have examples of ReduceSum and binary ops. The API for Sub is available. Also we have reduce examples.
+
+We'll design kernel: class KernelTripletMarginLossCustom with Init(anchor, positive, negative, margin, totalN, totalD, tileBatch, tileFeature). Tiling: we need to decide tile sizes. Since each output element requires reduction over d, we can tile along n (batch) and also possibly split d if large. But d=128 small, can fit in UB. So we can tile along n, and for each batch element compute full d loop.
+
+Algorithm per batch element:
+- load anchor[i], positive[i], negative[i] vectors of length d.
+- compute tmp = anchor - positive
+- compute sq_ap = sum(tmp*tmp)
+- compute tmp = anchor - negative
+- compute sq_an = sum(tmp*tmp)
+- loss = max(sq_ap - sq_an + margin, 0)
+
+We can compute all in parallel using vector ops: Sub, Sub, Mul, Mul, ReduceSum (to scalar), output scalar.
+
+Implementation details: For each batch tile, we can load all three vectors, compute differences, then reduce sum using ReduceSum with mask = d (full mask). But ReduceSum requires mask to be multiple of 64? Actually mask depends on data type and shape. For float, mask is number of elements per repeat (256 bits => 8 floats). For full vector of length d=128, we need repeat = d/8 = 16. So we can use ReduceSum with mask=8, repeat=16, repStride=1. Alternatively, we can compute sum manually with vector Adds? But ReduceSum is efficient.
+
+We'll use AscendC::ReduceSum<float> as in reduce_computation example. Parameter: dst (scalar local tensor of size 16? Actually dst must be at least 32B aligned; for a scalar we need size 8? But API: dst must have enough space: if mask=8, dst size at least 8*sizeof? Actually ReduceSum stores results per repeat? In example, dstDataSize=16 (16 floats) for single result? Actually scenario 5: dstDataSize=16, but they store result in dst[0] and then use GetReduceRepeatSumSpr to get final sum? Hmm. Simpler: we can compute squared differences with elementwise Mul and then use ReduceAdd? But we saw no ReduceAdd signature. We can use vec_reduce_sum from vector library: AscendC::ReduceSum<T>(dst, src, tmp, srcSize) where srcSize is total elements, dst is scalar (1 element). That returns sum in dst[0]. Example: reduce_computation scenario 5 shows usage. That should work.
+
+We need to be careful with buffer sizes. We'll allocate local tensors for each batch element? Actually we can process multiple batch elements in one tile. If tileBatch = batchSizePerTile, we process them sequentially or parallel? Since d=128 small, we can process one at a time to reduce UB usage. Or we can process multiple in SIMD but careful with register pressure. Simpler: process one batch index at a time within a loop over tile. That avoids complex tiling.
+
+Thus kernel: For each batch index in tile (global block loop), compute loss.
+
+Pipeline: CopyIn of anchor, positive, negative for tile (size = tileBatch * d). Then for each index in tile, compute loss. CopyOut loss for tile.
+
+We'll use grid-stride loop over batch indices, as in leaky_relu example.
+
+Tiling: totalN = n, totalD = d. We'll set tileBatch (number of batch elements per iteration). UB budget: each batch element requires temporary: diff (d floats), diff_sq (d floats), scalars. About 3*d floats + overhead. For d=128, that's 384 floats = 1536 bytes per batch. With 192KB UB, we can have many. We'll set tileBatch such that total UB < 192KB/2. For safety, tileBatch = 32 (batch size) maybe? But n=32 small, so can do all at once? Actually n=32, d=128, total elements 4096 floats => 16KB per input, three inputs = 48KB. Output 32 floats = 128B. So all can fit in UB. So we can process all batch in one block. But to be general, we can set tileBatch = 32 (if n <= 32). Tiling algorithm: if n small, set tileBatch = n. Else tileBatch = maxTile based on UB.
+
+We'll compute maxTileBatch = floor(UB_BUDGET_BYTES / (3 * d * sizeof(float) + alignment)). But we'll keep simple.
+
+Kernel will use double buffering for inputs? Since we only have one tile per block, we can allocate local buffers for entire tile. Use single buffer for simplicity.
+
+We need to handle margin: scalar, stored in tiling.
+
+Now produce the six strings.
+
+We'll write project_json_src: op "TripletMarginLossCustom", input_desc: [x: anchor, positive, negative (format ND, type float), margin (optional, type float? But margin is a scalar tensor? Actually input format: anchor, positive, negative, margin (tensor scalar). We can define margin as optional attribute? Or as input? In original PyTorch, margin is argument, not tensor. But in get_inputs, margin is tensor. To match, we can treat margin as input with shape (1) and type float. But operator definition might want attr? The example leaky_relu used attr negative_slope. Here margin is tensor but only has one element. Safer to treat as input tensor (scalar). Then in kernel, we read its value. We'll define input_desc with four inputs: anchor, positive, negative, margin (shape [1]). Output y shape [n].
+
+However, note that in the original Python code, margin is a tensor, but we can convert to float in Python binding. We'll keep margin as input tensor to be consistent.
+
+Thus project_json_src: inputs: anchor, positive, negative, margin. output: y. types: float.
+
+Attr: none.
+
+We'll need to adjust host_operator_src InferShape and tiling accordingly.
+
+Host tiling: totalN, totalD, tileBatch (batch per tile), tileFeature (d), blockDim.
+
+Host operator: define TilingFunc.
+
+We'll follow leaky_relu pattern.
+
+Now kernel_src: class KernelTripletMarginLossCustom. Methods: Init, Process, ComputeBatch (compute per batch index within a local tile). Use AscendC::Sub, AscendC::Mul, AscendC::ReduceSum.
+
+Example ReduceSum usage: 
+
+AscendC::LocalTensor<float> src ... 
+AscendC::LocalTensor<float> dst ... 
+AscendC::LocalTensor<float> tmp ... 
+AscendC::ReduceSum<float>(dst, src, tmp, len); // len is number of elements
+
+Then after ReduceSum, we need to store dst[0] as scalar.
+
+But careful: dst must have size at least 8 * sizeof(float) aligned? Actually in example, dstDataSize=16 (16 floats) but they used dst[0] and dst[1]. We can allocate dst as LocalTensor<float> of size 16 (to be safe) and then read dst[0].
+
+Alternatively, use vec_reduce_sum? We'll use ReduceSum with length.
+
+Now code.
+
+We must produce exactly as required.

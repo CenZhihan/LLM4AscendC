@@ -1,0 +1,188 @@
+We need to fix the previous attempt. The error logs show two compilation errors:
+
+1. Line 63: `float bVal = bGm_[k * N_ + col];` — no viable conversion from `AscendC::GlobalTensor<float>` to `float`. This is because `bGm_[index]` returns a reference to a `GlobalTensor<float>` element? Actually `operator[]` on a `GlobalTensor` returns a `GlobalTensor` object (a sub-tensor) not a scalar. In AscendC, you cannot directly read a single element from a `GlobalTensor` in kernel code; you must use `DataCopy` to load a block into local memory. The previous attempt tried to read individual elements from global memory inside a loop, which is not allowed. For a matmul with small K (32), we should load entire rows/columns into local tensors and compute using vector instructions.
+
+2. Line 67: `cGm_[row * N_ + col] = sum;` — no viable overloaded '=' for `GlobalTensor` assignment. Similarly, you cannot assign a float directly to a `GlobalTensor` element; you must use `DataCopy` to write blocks back.
+
+The core issue: the previous kernel attempted to do scalar random-access reads/writes to global memory, which is not supported in AscendC kernel programming. Instead, we must use block-based loads and stores via `DataCopy`, and compute using vector operations.
+
+We need to redesign the kernel to be a proper AscendC matmul that uses tiling and vector compute. However, the original problem specifies "tall-skinny matrix multiplication" where M >> N (or N >> M). The shapes in the example are M=32768, N=32, K=32 (since A is M x N? Actually from get_inputs: A = torch.rand(M, N) and B = torch.rand(N, M) where M=32768, N=32. So A is (32768, 32), B is (32, 32768). The output is C = A * B, shape (32768, 32768)? That seems huge. Wait: torch.matmul(A, B) with A (M, N) and B (N, M) gives (M, M) = (32768, 32768). That's a huge output. But the description says "tall and skinny" meaning one dimension is much larger. Indeed M=32768, N=32. But matmul of (M, N) x (N, M) gives (M, M) which is not tall-skinny output; it's square. But maybe the user intended A (M, K) and B (K, N) with M >> N. In the get_inputs they used A=rand(M,N), B=rand(N,M). That gives output (M,M). That is huge (1B elements). This seems impractical. Perhaps the intention is to have A be (M, K) and B be (K, N) with M >> N, and output (M, N) tall-skinny. But the given code uses A (M,N) and B (N,M). We'll follow the original user input exactly. However, the error logs indicate the kernel tried to access bGm_[k * N_ + col] where N_ is the second dimension of B. In the given input, B is (N, M) so B's shape is (32, 32768), so k * N_ would be k * 32768? Actually in the kernel, they set N_ = N (output second dimension) which they set equal to N_ = M (the second dim of B). That seems confused. The tiling comments also mention confusion about dimensions.
+
+Given the complexity and the requirement to fix with minimal changes, we need to produce a working kernel that compiles. The key errors are the scalar accesses. In AscendC, we must use `DataCopy` to load blocks into LocalTensor, then use vector ops. For a matmul, we can use the `Matmul` class or implement a simple vectorized version using `Muls`, `Add`, etc. But given small K (32), we can load a whole row of A (K floats) and a whole column of B (K floats) and compute dot product using vector multiply and reduce.
+
+But vector reduce might not be straightforward; we can use `Mul` and `ReduceSum` or just do a loop with `MAD`? However, AscendC does not have a direct dot product instruction; we can use `Mul` then `ReduceAdd`. But `ReduceAdd` requires a tiling within local. An easier approach: since K is small (32), we can unroll and use `DataCopy` for both the row of A and the column of B, then use a custom loop with `LocalTensor` element access. However, `LocalTensor` does support `operator()` for reading individual elements (as shown in the code with `aRow(k)`). That is valid because `LocalTensor` has `__aicore__ inline T& operator()(uint32_t offset) const`. So reading from local tensor is fine. The error is only about global tensor reading/writing.
+
+So we can fix by:
+- Load entire row of A (size K) into a local tensor using `DataCopy`.
+- For each column of output, load the entire column of B (size K) into a local tensor using `DataCopy` (but note B is stored row-major, so a column is not contiguous in memory; we cannot do a single `DataCopy` for a column. We would need to load multiple fragments or use a different layout. To keep it simple, we can store B transposed in a local buffer? But B is large (32*32768). We cannot load whole B into local. Alternative: since K is small, we can load the entire B matrix into a local tensor? That would be 32*32768 floats = 1M floats, too large (4 MB). UB is limited to ~192KB, so not possible.
+
+We need a proper tiled approach. But the previous attempt's tiling used tileM=128 but still tried scalar global reads. The error is fundamental.
+
+Given the constraints (minimal changes, keep behavior), maybe we should use the AscendC `Matmul` API, which handles tiling and data movement automatically. The retrieved code blocks show examples using `MatmulKernel` and `REGIST_MATMUL_OBJ`. That is the proper way to implement matmul in AscendC. So we should replace the custom scalar loop kernel with a proper Matmul-based kernel. This will fix the compilation errors because the Matmul API internally uses DataCopy and Cube operations.
+
+We also need to adjust the tiling data to provide the necessary parameters for the Matmul. The tiling data should include baseM, baseN, baseK, etc., as used by `MatmulApiTiling`. The host operator should compute tiling using the Matmul API.
+
+But the user instruction says: "Keep behavior unchanged where not required by the fix." Changing from a handmade scalar kernel to a Matmul API kernel changes the implementation significantly but should produce correct results. The error logs indicate the compilation fails, so we must change the kernel to compile.
+
+Let's design a new kernel that uses `MatmulKernel`. We'll need to modify the host_tiling_src and host_operator_src to compute proper tiling parameters, and the kernel_src to use the Matmul API.
+
+We also need to adjust the project_json_src if needed? It's fine as is (inputs a, b; output c). The python_bind_src and model_src likely fine.
+
+Let's produce the corrected code.
+
+We'll follow the pattern from the retrieved code block `matmul_preload_custom`:
+
+Kernel:
+
+```
+__global__ __aicore__ void tall_skinny_matrix_multiplication_custom(GM_ADDR a, GM_ADDR b, GM_ADDR c,
+                                         GM_ADDR workspace, GM_ADDR tilingGm)
+{
+    if ASCEND_IS_AIV {
+        return;
+    }
+
+    TCubeTiling tiling;
+    CopyTiling(&tiling, tilingGm);
+    AscendC::TPipe pipe;
+
+    MatmulKernel<float, float, float, float> matmulKernel;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), matmulKernel.matmulObj, &tiling);
+    matmulKernel.Init(a, b, nullptr, c, tiling);
+    matmulKernel.Process(&pipe);
+}
+```
+
+Note: we set bias to nullptr.
+
+We need to include appropriate headers: `"kernel_operator.h"` should include matmul? Actually `kernel_operator.h` includes `matmul.h`? We'll include `"matmul.h"` explicitly.
+
+Tiling data: We need to define `TCubeTiling` which is a struct defined in `matmul_tiling_base.h`. We can use the `MatmulApiTiling` on the host side to compute tiling parameters, then store them in the tiling buffer as a `TCubeTiling` structure. The host tiling code should use `matmul_tiling::MatmulApiTiling` to fill the tiling. But that might be complex. Alternatively, we can define our own tiling data that includes baseM, baseN, baseK, etc., and then in the kernel use `SetTiling` manually? However, the MatmulKernel expects a `TCubeTiling` type. The simplest is to use the same pattern as the examples: on the host, use `MatmulApiTiling` to compute the tiling and then copy it to the tiling buffer. Since the host code is in the `host_operator_src`, we need to include `matmul_api.h` etc.
+
+To minimize changes, we can keep the existing tiling data structure (with M, K, N, tileM, blockDim) and then in the kernel we manually set up the MatmulKernel's parameters? But the MatmulKernel::Init takes a TCubeTiling, not our custom tiling. So we must provide a TCubeTiling.
+
+Let's look at the example code for matmul_preload: the tiling is of type `TCubeTiling` and is copied via `CopyTiling`. So we need to match that.
+
+We can change the host_tiling_src to not define a custom tiling data class, but instead just fill a `TCubeTiling` structure in the tiling buffer. However, the tiling data registration expects a custom class? Actually the `GET_TILING_DATA` macro in the kernel expects a specific tiling data structure. If we use `CopyTiling` with `TCubeTiling`, we need to ensure the tiling buffer contains a `TCubeTiling` object. The host operator can directly fill a `TCubeTiling` object and save it to the tiling buffer via `SaveToBuffer`? But `SaveToBuffer` expects a custom tiling data object. Alternatively, we can keep the custom tiling data but also include the necessary fields for the MatmulKernel? The MatmulKernel expects a `TCubeTiling` which has many fields (like baseM, baseN, baseK, etc.). We could embed a `TCubeTiling` inside our custom tiling data? That might be messy.
+
+Better approach: Follow the exact pattern from the example. In the example, the host_operator_src uses `MatmulApiTiling` to compute tiling and then copies the tiling object into the buffer using `SaveToBuffer(..., sizeof(TCubeTiling))`? Actually the example's host code is not shown fully, but from the kernel code we see `CopyTiling(&tiling, tilingGm)` which copies from global to local, and tiling is of type `TCubeTiling`. So on the host side, we must have placed a `TCubeTiling` object in the tiling global memory.
+
+Thus, we can modify the host_operator_src to compute tiling using `MatmulApiTiling` and then directly write the `TCubeTiling` to the tiling buffer, without a custom tiling data class. The tiling buffer size must accommodate `TCubeTiling`. In the project_json, we don't have a tiling input, but the runtime provides space. The typical approach is to use the tiling data blob that is passed as the last GM_ADDR argument. The host operator sets the tiling data via `context->GetRawTilingData()->GetData()` and sets capacity. So we can save a `TCubeTiling` object to that buffer.
+
+So we should:
+- Remove the custom tiling data definition (host_tiling_src) and replace with nothing? Actually we still need to include header for TCubeTiling. The host_tiling_src can be empty or define nothing. But the architecture expects a tiling data class registration? In the original leaky_relu example, they had a custom tiling data. For matmul, we don't need that; we can use the standard TCubeTiling. So we can set host_tiling_src to just include headers and maybe define nothing. However, the build system might expect a tiling data file. To be safe, we can keep the custom tiling data structure but also embed a TCubeTiling inside and override the kernel to unpack both? That's too complex. Since the error was compilation, we need a clean solution.
+
+Given the time, I'll produce a solution that uses the Matmul API and simplifies the tiling to just use TCubeTiling. We'll rewrite host_tiling_src to compute tiling using MatmulApiTiling and save TCubeTiling. The kernel will use the MatmulKernel. The host_operator_src will need to include matmul_api.h and call MatmulApiTiling. Also need to set workspace size if required (the Matmul may need workspace). We'll set workspace to appropriate size.
+
+Let's produce the corrected code. We'll keep project_json_src the same. host_tiling_src: we can keep it minimal or remove. But we need to provide a tiling data class for the build? Actually the build expects a tiling data header. However, if we don't use custom tiling, we can simply not include it. In the kernel we use CopyTiling which copies the tiling from global to a local TCubeTiling. The tiling data is just a blob. The host operator writes that blob. So we don't need a custom tiling data class at all. But the build might require it? Not necessarily; we can just not have a tiling data file. The build system generates a tiling data file from the host_tiling_src string. If we set host_tiling_src to empty string, it might cause issues. Better to keep a minimal tiling data that contains nothing? Or we can still define an empty tiling data class to satisfy registration? Let's see: In the leake_relu example, they defined a custom tiling data and used GET_TILING_DATA in the kernel. In our new kernel we use CopyTiling, which doesn't need a custom tiling data. However, the host operator still uses TilingFunc which is registered, and that function would write a TCubeTiling. But the tiling data registration expects a class. Actually the TilingFunc sets the tiling data via SaveToBuffer with a custom object. If we change to write a TCubeTiling, the tiling data class is not used. But the TilingFunc signature remains the same. So we can keep the custom tiling data class but not use it; we can just fill a TCubeTiling and save it with its raw bytes. However, the save requires knowing the size. We can do:
+
+```
+TCubeTiling matmulTiling;
+// ... fill
+std::memcpy(context->GetRawTilingData()->GetData(), &matmulTiling, sizeof(TCubeTiling));
+context->GetRawTilingData()->SetDataSize(sizeof(TCubeTiling));
+```
+
+That avoids needing a custom tiling data object. So we can keep the existing host_tiling_src (with the custom tiling data class) but not use it. But the kernel will use CopyTiling, which expects the tiling to be exactly a TCubeTiling. That is fine.
+
+To minimize changes, we'll keep host_tiling_src as is (the previous custom tiling data), but modify host_operator_src to compute and write a TCubeTiling instead of the custom tiling. And modify kernel_src to use MatmulKernel.
+
+Let's write the corrected code.
+
+We need to include <cube.h> or <matmul.h>. The kernel_operator.h might already include some, but we'll add explicit includes.
+
+Also need to handle workspace: the MatmulKernel may require workspace for internal buffers. In the example, they pass GetSysWorkSpacePtr() which returns a pointer to global memory workspace allocated by the runtime. The host operator should set the workspace size. In the TilingFunc, we need to set the workspace size for the kernel. For AscendC matmul, the workspace size can be computed by the MatmulApiTiling. We'll set a reasonable size, e.g., 100MB, but better to compute. Actually, the typical pattern is to set workspace to 0 and let the runtime allocate? Let's check the example: In the kernel entry, they use GetSysWorkSpacePtr(). The host operator sets workspace size via context->SetWorkSpaceSizes. In the provided examples, they set workspace size to 0? No, they don't set it. But the matmul kernel might need workspace. To be safe, we can set a large enough workspace, e.g., 100 * 1024 * 1024 (100MB). But that might be too much. Alternatively, we can use the MatmulApiTiling to get the workspace size. The MatmulApiTiling has a method GetWorkspaceSize. We'll include that.
+
+Let's design the host_operator_src:
+
+```cpp
+#include "register/op_def_registry.h"
+#include "matmul_api.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    // Get shapes
+    const uint32_t M = context->GetInputShape(0)->GetOriginShape().GetDim(0);
+    const uint32_t K = context->GetInputShape(0)->GetOriginShape().GetDim(1);
+    const uint32_t N = context->GetInputShape(1)->GetOriginShape().GetDim(1);
+
+    // Use MatmulApiTiling to compute tiling
+    auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    matmul_tiling::MatmulApiTiling matmulTiling(platform.GetAscendCLiteVersion());
+    matmulTiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    matmulTiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    matmulTiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    matmulTiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    matmulTiling.SetOrgShape(M, K, N);
+    matmulTiling.SetShape(M, K, N);
+    matmulTiling.SetBias(false);
+    matmulTiling.SetBufferSpace(-1, -1, -1);
+
+    TCubeTiling tiling;
+    if (matmulTiling.GetTiling(tiling) == -1) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Set block dim (maybe from tiling's core num)
+    context->SetBlockDim(tiling.coreNum);
+
+    // Save tiling data
+    context->SetRawTilingData((uint8_t*)&tiling, sizeof(TCubeTiling));
+
+    // Set workspace size (from tiling)
+    size_t workspaceSize = matmulTiling.GetWorkspaceSize();
+    context->SetWorkSpaceSizes(1, &workspaceSize);
+
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+```
+
+But need to include proper headers. Also note the platform detection: `platform_ascendc::PlatformAscendC`. This may require include. We'll include necessary.
+
+Also note that the host_operator_src must include the previous definitions for InferShape, InferDataType, and the OpDef class. We'll keep those.
+
+Now kernel_src:
+
+```cpp
+#include "kernel_operator.h"
+#include "matmul.h"  // for MatmulKernel, TCubeTiling, etc.
+
+extern "C" __global__ __aicore__ void tall_skinny_matrix_multiplication_custom(
+    GM_ADDR a, GM_ADDR b, GM_ADDR c, GM_ADDR workspace, GM_ADDR tilingGm)
+{
+    if ASCEND_IS_AIV {
+        return;
+    }
+
+    TCubeTiling tiling;
+    CopyTiling(&tiling, tilingGm);
+    AscendC::TPipe pipe;
+
+    MatmulKernel<float, float, float, float> matmulKernel;
+    REGIST_MATMUL_OBJ(&pipe, (__gm__ float*)workspace, matmulKernel.matmulObj, &tiling);
+    matmulKernel.Init(a, b, nullptr, c, tiling);
+    matmulKernel.Process(&pipe);
+}
+```
+
+Note: the workspace pointer should be cast to the appropriate type. In the example, they use `GetSysWorkSpacePtr()` which returns `void*`. But we have the workspace argument from the macro. We'll use `(void*)workspace` or `(__gm__ float*)workspace`. The REGIST_MATMUL_OBJ expects a `void*`. So we'll use `(void*)workspace`.
+
+We also need to adjust the python_bind_src and model_src if needed? They should remain similar.
+
+Now, we must ensure that the tiling data size is correct. In the TilingFunc, we use `context->SetRawTilingData((uint8_t*)&tiling, sizeof(TCubeTiling));`. But the typical method is `context->GetRawTilingData()->GetData()` and copy. We'll use that.
+
+Let's rewrite host_operator_src accordingly.
+
+Also need to set the workspace sizes correctly: `context->SetWorkSpaceSizes(1, &workspaceSize);`
+
+We'll also keep the InferShape and InferDataType functions.
+
+Now, we must ensure that the host_tiling_src is either empty or contains something harmless. To minimize changes, we can keep the existing custom tiling data class but not use it. However, the build will compile it and register it, but that's fine. Alternatively, we can remove it by setting host_tiling_src to an empty string. But the build may complain about missing tiling data header. To be safe, we keep the existing one but don't use its fields.
+
+We'll produce the final answer with all six strings.
+
+Let's write the complete corrected code.

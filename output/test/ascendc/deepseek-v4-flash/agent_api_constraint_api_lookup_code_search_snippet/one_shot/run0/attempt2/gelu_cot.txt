@@ -1,0 +1,140 @@
+We are asked to fix the previous attempt for the GELU custom kernel. The error log shows a vector core execution error: "VEC instruction error: the ub address out of bounds." The UB address out of bounds error typically indicates that the tile size or buffer sizes are incorrect relative to the actual data being processed. In the previous kernel, we used a simple grid-stride loop with double buffering but the tiling might be mismatched. The retrieved context shows that the AscendC Gelu API actually has an overload that takes a sharedTmpBuffer (for erf internal usage) or without. In the previous attempt, we used `AscendC::Gelu(yLocal, xLocal, len);` which uses the simpler overload that does not require a temporary buffer. However, the error message suggests that something is off with buffer addressing. Possibly the issue is that the tile length computed in tiling is not aligned to 32 or 64? Or the DataCopy length in elements might be mis-scaled? Looking at the tiling: we compute maxTile = UB_BUDGET_BYTES / 16 (since we only have 4 * tile floats? Actually we have inQueueX: 2 * tile, outQueueY: 2 * tile => 4 * tile floats => 16 * tile bytes). Then we align down to ALIGN_ELEMS (2048). That seems okay. But note that in the kernel, we set buffers with `tileLen_ * sizeof(float)`. When we call DataCopy, we pass `len` which is the number of elements. That should be fine.
+
+However, the error "ub address out of bounds" might occur if the tile length is larger than the actual buffer allocated. In the current code, we allocate `tileLen_ * sizeof(float)` for each buffer, and we use double buffering (BUFFER_NUM=2). The DataCopy calls use `len` which should be <= tileLen_. That seems consistent.
+
+But wait: in the Process loop, we do:
+```
+CopyIn(base, curLen);
+while (true) {
+    const uint32_t nextBase = base + strideElems;
+    uint32_t nextLen = 0;
+    if (nextBase < totalLen_) {
+        nextLen = totalLen_ - nextBase;
+        if (nextLen > tileLen_) nextLen = tileLen_;
+        CopyIn(nextBase, nextLen);
+    }
+    Compute(curLen);
+    CopyOut(base, curLen);
+    if (nextLen == 0) break;
+    base = nextBase;
+    curLen = nextLen;
+}
+```
+The issue is that after the first iteration, we call CopyIn for the next tile, but we haven't yet processed the current one. That is fine for pipelining. However, there is a subtle problem: We are using the same queue for both inQueueX and outQueueY with double buffering. In each iteration, we allocate a tensor for CopyIn, then enqueue it. Then in Compute, we dequeue one, allocate another for output, and enqueue output. Then in CopyOut, we dequeue output and free. The queue sizes are BUFFER_NUM=2. Overlap of two tiles should work.
+
+But note: In the first iteration, we call CopyIn for the first tile, and then inside the loop we call CopyIn for the next tile before Compute on the current. That means we enqueue two input tensors before any Compute, which is fine (double buffering depth 2). Then Compute dequeues one, processes, enqueues output. Then CopyOut dequeues output. That works.
+
+But what about the case where the last tile has length less than tileLen? That should be fine as we use curLen for DataCopy.
+
+The error might be due to misalignment of the tiling data: The Gelu API might require that dataSize is a multiple of some alignment, e.g., 32 or 64 bytes? The simple overload of Gelu does not have the sharedTmpBuffer, but internally it might need temporary storage. Looking at the API signature from retrieval: There are two overloads: one with sharedTmpBuffer and one without. The one without is defined as: `__aicore__ inline void Gelu(const LocalTensor<T>& dstLocal, const LocalTensor<T>& srcLocal, const uint32_t dataSize)`. That should not require extra memory, but it might internally allocate from some scratch? Actually, the implementation might use a static temporary buffer, but that's internal. So probably not the cause.
+
+Another possibility: The error is "VEC instruction error: the ub address out of bounds" combined with "CCU instruction address check error." This could indicate that the DataCopy addresses are out of bounds because the global tensor size is not set correctly. In Init, we set `xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);` That sets the size to totalLen_ elements. Then later we access `xGm_[gmOffset]` where gmOffset can be up to totalLen_ -1. That should be fine if the buffer is at least totalLen_ elements. But note that the input tensor might be larger? Actually, the input size is totalLength elements, so it's fine.
+
+Wait, look at the error: "the ub address out of bounds." UB is unified buffer, i.e., local memory. So it's the local tensor address that is out of bounds. That means either we allocated too little local memory for the tensor, or we are reading/writing beyond the allocated size. In Compute, we use `AscendC::Mins` etc. But for Gelu, we just call `AscendC::Gelu(yLocal, xLocal, len);`. The local tensors yLocal and xLocal are allocated with tileLen_ * sizeof(float) bytes. But len could be less than tileLen_ (for last tile). That should be fine because the tensor is allocated with full tileLen_ but we only use len elements. However, the API might assume the entire tensor is used? No, the dataSize parameter tells it how many elements to process. It should not access beyond that.
+
+But the error shows many cores failing, all at the same PC and with vec error info 0x200000034, which is typical of out-of-bounds access. Possibly the issue is that the tiling blockDim calculation sets blockDim too high, causing some blocks to have zero data but still execute? In the tiling, we set blockDim based on numTiles and then clamp to [8,24]. But we also have a check in Process: `if (base >= totalLen_) return;` So blocks with no work should return early. That should be safe.
+
+Maybe the problem is that we are using `strideElems = blockNum * tileLen_` and then computing `base = blockIdx * tileLen_`. But if blockDim is, say, 24, and totalLength is small, then for some blocks `base` might be beyond totalLen_, but we return. That's fine.
+
+Let's check the tiling more carefully. The UB budget calculation: we assumed 4 * tile floats = 16 * tile bytes. But we also have the tmpQueue_ in the previous leaky_relu example, but here we removed it. So indeed only 4 tiles worth of floats. UB_BUDGET_BYTES = 192 * 1024, so maxTile = 192*1024 / 16 = 12288 elements. That's less than HARD_CAP_ELEMS (32768). So tileLen = 12288, aligned down to 2048 => 12288 is already multiple of 2048? 12288 / 2048 = 6, so yes. Then blockDim = ceil(totalLength / tileLen). For totalLength = 256*65536 = 16777216, numTiles = ceil(16777216 / 12288) ≈ 1366. Then blockDim clamped to 24. So each block gets strideElems = 24 * 12288 = 294912 elements. That's fine. But then base = blockIdx * tileLen, and we add strideElems each iteration. So the number of iterations per block is about totalLength / (blockNum * tileLen) ≈ 16777216 / (24 * 12288) ≈ 56.9, so 57 iterations. That seems fine.
+
+But wait, the error "ub address out of bounds" could be because we are using double buffering and the queue size is 2, but we are enqueuing two inputs before computing the first? That is okay, but we must ensure that we don't exceed the queue depth. Actually, we have BUFFER_NUM=2, so we can have at most 2 tensors in queue at a time. In our loop: first CopyIn enqueues one. Then before Compute, we call CopyIn again for the next tile, so we enqueue a second one. That brings the queue to 2. Then Compute dequeues one, so queue goes to 1. Then CopyOut dequeues output, etc. That should be fine. However, there is a subtlety: The outQueueY is also double buffered. In the first iteration, we call CopyIn (enqueue input), then in the loop we call CopyIn (enqueue second input), then Compute (dequeue input, allocate output, enqueue output), then CopyOut (dequeue output, free). That leaves the queue states: inQueueX has 1 remaining (the second input), outQueueY has 0. Then we go to next iteration: we call CopyIn for the next tile (third), but we need to avoid enqueuing more than 2. At this point, inQueueX has 1 (from the second), so we can enqueue one more to make 2. That works.
+
+But wait, in the first iteration, we have already enqueued two inputs before any compute. That is the maximum. After compute, we dequeue one, so we have one left. Then in the next iteration, we call CopyIn again, making it two again. That pattern is correct.
+
+However, there is a potential race condition: The order of enqueue and dequeue must be correct. The code seems correct.
+
+Maybe the issue is that the Gelu API requires that the source and destination tensors are in different queues? Or that they must not overlap? We are using separate queues for input and output, so that's fine.
+
+Another thought: The error might be due to the fact that we are using `AscendC::Gelu` with a dataSize that is not a multiple of the vector length (e.g., 32 bytes). On AscendC, vector instructions often require alignment to 32 or 64 bytes. Our tileLen is aligned to 2048 elements, which is 8192 bytes (since float is 4 bytes, 2048*4=8192). That is a multiple of 32 and 64. So alignment is fine.
+
+But what about the last tile where len might not be a multiple of 2048? If totalLength is not a multiple of tileLen, then the last tile's length will be less than tileLen. But our tiling computes tileLen as fixed, and we use `curLen = totalLen_ - base` and if > tileLen_ set to tileLen_. So for the last tile, curLen could be any number. That might be a problem: if the last tile length is not a multiple of 32 or 64, then the Gelu API might still work? Actually, the API likely handles arbitrary lengths because it does elementwise operations. But the DataCopy might have alignment requirements? DataCopy uses DMA which requires 32-byte alignment for addresses? The global and local addresses should be aligned to 32 bytes if we allocate buffers that are multiples of 32 bytes. Since tileLen_ is aligned to 2048 (8192 bytes), the buffer is aligned. But when we do CopyIn and CopyOut with length `len` that might not be a multiple of 32, the DMA engine might still work but it might read/write beyond the boundary? Typically, DataCopy with a specified length in elements will copy exactly that many elements. The source and destination addresses are aligned to 32 bytes if the buffer base is aligned, but the offset inside the buffer might not be aligned if we use a non-aligned length for the first copy? Actually, the first copy starts at the beginning of the buffer, which is aligned. The length in bytes must be a multiple of 32 bytes for the hardware? AscendC DataCopy does require that the number of bytes is a multiple of 32. I think that is a common requirement. In the AscendC documentation, DataCopy for vector instructions typically requires 32-byte alignment and 32-byte granularity. If we pass a length that is not a multiple of 32 bytes, it might lead to out-of-bounds access because the hardware will round up to the next 32-byte boundary and copy extra bytes, potentially overflowing the buffer.
+
+Let's check: Our buffer is allocated with `tileLen_ * sizeof(float)` bytes, where tileLen_ is a multiple of 2048, so it's a multiple of 32. But if we copy only `len` elements, where `len` might be, say, 1000 elements (4000 bytes), that is not a multiple of 32 (4000/32 = 125; 32*125=4000, actually 4000 is a multiple of 32? 32*125=4000, yes it is. 1000*4=4000, which is a multiple of 32. But if len is 1001, that's 4004 bytes, not a multiple of 32. So it depends on the remainder. In our case, totalLength is 256*65536 = 16777216, which is a multiple of 2048 (since 65536 is multiple of 2048? 65536/2048=32, yes). So totalLength is a multiple of 2048, and tileLen is 12288 (also multiple of 2048). Therefore, the last tile length will be exactly tileLen (since 16777216 / 12288 = 1365.333... not integer). Let's compute: 16777216 / 12288 = 1365.333..., so remainder = 16777216 - 1365*12288 = 16777216 - 16773120 = 4096? Actually 1365*12288 = 1365*12288 = let's calculate: 12288*1000=12,288,000; 12288*300=3,686,400; total 15,974,400; plus 12288*65=798,720; total 16,773,120; subtract from 16,777,216 gives 4,096. So the last tile has 4096 elements, which is 16384 bytes, a multiple of 32. So that's fine. If totalLength were not a multiple of 32, we would need to pad. But here it is.
+
+Nevertheless, the error is "ub address out of bounds." Another possibility: the tiling data includes blockDim, but we are not using it in the kernel. The kernel uses GetBlockNum() which is the actual number of blocks launched. The tiling blockDim sets the number of blocks to launch. In the operator, context->SetBlockDim(blockDim) sets the block dimension for the kernel. So that should match.
+
+I suspect the problem is with the double buffering scheme and the fact that we are using a single pipe for both inQueue and outQueue. But that should be fine.
+
+Let's look at the retrieved code snippet for Gelu: It uses a single buffer for input and output with BUFFER_NUM=1. That is simpler. The error might be due to the double buffering with prefetch causing some overflow. In our current code, we allocate inQueueX with BUFFER_NUM=2 and outQueueY with BUFFER_NUM=2. The total number of tensors allocated at any time can be up to: 2 input tensors (in queue) + 2 output tensors (one in compute and one in copyout? Actually during Compute, we allocate an output tensor and enqueue it, so that makes one in outQueue. Then CopyOut dequeues it. So at most 2 input and 1 output? Actually Compute enqueues output, then before CopyOut, there is one output in queue. Then CopyOut dequeues it. So the maximum is 2 input (after two CopyIns) and 1 output (after Compute). That's 3 tensors, each of tileLen_ floats. Our UB budget calculation assumed 4 tiles (inQueue 2, outQueue 2). But we actually have 3, so it's within budget. However, we also have the temporary buffer needed by Gelu? The simple overload might internally allocate a temporary buffer from pipe memory? Not sure.
+
+Another possibility: The error might be due to the fact that we are not using the sharedTmpBuffer for Erf-based Gelu. The API has an overload that takes a sharedTmpBuffer for scratch. If we use the simpler overload without it, perhaps it still requires some scratch space internally, and if the UB is not large enough, it could cause out-of-bounds. But the UB budget we set should be enough.
+
+After reviewing the error and the code, I think the most likely issue is that the tiling blockDim is set too high, causing the kernel to be launched with more blocks than the data can support? Or the kernel is launched with a block dimension that is not what we think? The tiling code sets blockDim to min(max(numTiles,8),24). For totalLength=16777216, numTiles is large, so blockDim=24. That means 24 cores are used. But the kernel uses grid-stride so each core processes many tiles. That should be fine.
+
+Maybe the problem is that we are using `AscendC::Gelu` which might have a bug in the implementation? Or we need to use the version with sharedTmpBuffer? The retrieved code snippet for gelu.asc uses a simpler class with single buffering. Perhaps we should switch to that pattern: allocate only one input and one output buffer, and process in a straightforward loop without prefetching. The error might be due to the pipeline complexity.
+
+Given the error "ub address out of bounds" on all cores, it suggests that the local tensor addresses exceed the allocated buffer. This could happen if the tile length is larger than the buffer size. But we allocate tileLen_*sizeof(float) for each buffer, and we use len <= tileLen_. Unless there is an off-by-one somewhere.
+
+Let's examine the DataCopy call: `AscendC::DataCopy(xLocal, xGm_[gmOffset], len);` The third parameter is the number of elements to copy. The DataCopy function expects that the local tensor has enough space for len elements. We allocated tileLen_ elements, so it's fine if len <= tileLen_. But note that the local tensor xLocal is allocated from inQueueX_ with size tileLen_ * sizeof(float). So it's fine.
+
+Wait, but we are using `xGm_[gmOffset]` which returns a LocalTensor? Actually, `xGm_[gmOffset]` returns a GlobalTensor with offset, not a LocalTensor. The DataCopy signature: `void DataCopy(LocalTensor<T> &dst, const GlobalTensor<T> &src, uint32_t size)`. So we need to pass a GlobalTensor reference. `xGm_[gmOffset]` is a GlobalTensor? Actually, GlobalTensor::operator[] returns a reference to an element, not a tensor. That's incorrect! In the previous successful leaky_relu example, they used `xGm_[gmOffset]` in CopyIn? Let's check: In the leaky_relu kernel provided in the user instruction, they used `AscendC::DataCopy(xLocal, xGm_[gmOffset], len);`. So it seems that `xGm_[gmOffset]` is indeed used as a GlobalTensor? Actually, in AscendC, `GlobalTensor<T>::operator[]` returns a `GlobalTensor<T>` with an offset? I need to verify. In typical AscendC code, to get a global tensor starting at a specific offset, one can use `xGm_[gmOffset]` which returns a GlobalTensor that points to the offset. The DataCopy can accept that. So that should be fine.
+
+But the error might be because the offset is not aligned to 32 bytes? The global memory may need 32-byte alignment for DMA. Since tileLen_ is aligned to 2048 elements, the offset gmOffset is a multiple of tileLen_ which is a multiple of 2048, so it's multiples of 2048*4=8192 bytes, which is 32-aligned. So fine.
+
+Given the uncertainty, I will modify the kernel to use a simpler single-buffering approach without prefetching, and also ensure that the tiling aligns the tile length to at least 32 elements and that the last tile length is handled properly. Additionally, I will use the Gelu overload with sharedTmpBuffer to avoid internal scratch issues. But the sharedTmpBuffer needs a local tensor of uint8_t. We can allocate a temporary buffer from a separate queue or use a TBuf.
+
+Also, we need to ensure that the host tiling sets the blockDim correctly and that the kernel uses the same tiling data. The kernel currently receives totalLength and tileLength, but not blockDim. That's fine.
+
+Let's produce a minimal fix: Change the kernel to use single buffering (BUFFER_NUM=1) and process one tile at a time without prefetching. Also, add a sharedTmpBuffer for Gelu. I will also fix the tiling to ensure tileLen is a multiple of 32 (it already is due to ALIGN_ELEMS being 2048, but we should also enforce that the last tile length passed to Gelu is valid. Since we already align down, it's fine.
+
+But the user expects minimal changes. So we can keep the double buffering but maybe the issue is that we are missing a necessary temporary buffer for Gelu. Looking at the Gelu API signature with sharedTmpBuffer: `void Gelu(const LocalTensor<T>& dstLocal, const LocalTensor<T>& srcLocal, const LocalTensor<uint8_t>& sharedTmpBuffer, const uint32_t dataSize)`. So we need to allocate a temporary uint8 tensor of some size. The documentation says sharedTmpBuffer size should be at least calCount * sizeof(T) / 2? Not sure. But to be safe, we can allocate a temporary buffer of the same size as the data (tileLen_ * sizeof(float)). We'll add a TBuf for that.
+
+But that changes the buffer count and UB budget. We need to update the tiling UB budget calculation accordingly. Currently we had 4 * tile floats. With an additional temporary buffer, it becomes 5 * tile floats, same as leaky_relu. So we should adjust tiling.
+
+Given that the error is a vector execution error, it's plausible that Gelu's internal scratch is missing. So I'll add a sharedTmpBuffer.
+
+Let's make the changes:
+
+1. In host_tiling: add fields? No, we don't need new fields; the tiling already has totalLength, tileLength, blockDim. We'll keep that.
+
+2. In host_operator: adjust UB_BUDGET_BYTES to account for 5 * tile floats (20 * tile bytes). That's already the same as leaky_relu. So change UB_BUDGET_BYTES / 16 to UB_BUDGET_BYTES / 20. But note: in leaky_relu they had 5 * tile floats because they had tmpQueue. So we should do the same. So change the divisor to 20.
+
+3. In kernel_src:
+   - Add a `AscendC::TBuf<AscendC::TPosition::VECCALC> tmpBuf_` member.
+   - In Init, initialize `pipe_.InitBuffer(tmpBuf_, tileLen_ * sizeof(uint8_t));` Actually, the buffer must be of type uint8_t for sharedTmpBuffer. We can use a TBuf and then get a LocalTensor<uint8_t> from it.
+   - In Compute, get the temporary tensor from tmpBuf_ and call `AscendC::Gelu(yLocal, xLocal, tmpBuf, len);`
+   - Ensure to free the tmpBuf after use? Actually, TBuf is persistent, we can get and reuse.
+
+Also, we need to ensure that the buffer sizes are correct. We'll allocate tmpBuf_ with tileLen_ * sizeof(float) bytes, but since it's uint8, that means tileLen_ * sizeof(float) bytes. The Gelu sharedTmpBuffer probably needs at least that size. We'll use that.
+
+Additionally, we can simplify the kernel to use single buffering to reduce complexity. But let's first try to fix with double buffering and added tmpBuf. However, the error might also be due to the double buffering causing overlapping allocation issues. To be safe, I'll switch to single buffering (BUFFER_NUM=1) and no prefetching, just straightforward loop. That should reduce the chance of UB overflow.
+
+But the user's previous attempt had double buffering and they got the error. Switching to single buffering is a minimal change in kernel logic.
+
+Let's rewrite the kernel_src accordingly:
+
+- BUFFER_NUM = 1 (or even 2? but simpler with 1)
+- Use a single loop: for each tile assigned to this block, copy in, compute, copy out, then move to next tile.
+- No prefetching.
+
+Also, adjust the tiling to ensure tileLen is a multiple of 32 and the UB budget accounts for 5 tiles (including tmpBuf). We'll set UB_BUDGET_BYTES = 192*1024, divisor 20 for floats, so maxTile = 192*1024/20 = 9830.4, floor to 9830, but we align down to 2048, so 8192? Actually 9830 / 2048 = 4.79, floor = 4, so maxTile = 4*2048 = 8192. That's half of previous. That might be okay. But we can increase UB_BUDGET_BYTES? It's already at 192KB. Alternatively, we can use a larger divisor? Actually, we have 5 tiles: inQueueX: 1, outQueueY: 1, tmpBuf: 1? With single buffering, we only need 1 in, 1 out, 1 tmp = 3 tiles => 12 * tile bytes. But we set BUFFER_NUM=1, so inQueueX has 1 tile, outQueueY has 1 tile, plus tmpBuf 1 tile = 3 tiles. So we should use divisor 12. But the tiling currently assumes double buffering for input/output (2 each) plus tmp = 5 tiles. To be consistent, we can keep double buffering but it's causing issues. Let's go with single buffering and adjust the UB budget accordingly.
+
+Thus, new UB_BUDGET_BYTES divisor = 12 (since 3 * 4 = 12 bytes per element, but wait: each tile buffer is tileLen * sizeof(float) bytes, so total bytes = (BUFFER_NUM_in + BUFFER_NUM_out + 1) * tileLen * sizeof(float). With BUFFER_NUM=1 for both, total = 3 * tileLen * 4 = 12 * tileLen. So maxTile = UB_BUDGET_BYTES / 12. That gives 192*1024/12 = 16384, align down to 2048 gives 16384 (since 16384/2048=8). So tileLen = 16384. That's fine.
+
+We also need to change the tiling code to use divisor 12. In the host_operator, the comment says "UB model for this kernel: inQueueX: 1, outQueueY: 1, tmpQueue: 1 => Total floats = 3 * tile => bytes = 12 * tile". So update that.
+
+Also, ensure that in the kernel, we allocate buffers with tileLen_ * sizeof(float) for in and out, and tmpBuf with tileLen_ * sizeof(float) bytes (as uint8). The Gelu sharedTmpBuffer requires a LocalTensor<uint8_t> of size at least? We'll allocate tileLen_ * sizeof(float) bytes.
+
+Now, the kernel loop for single buffering: For each block, compute the tiles it processes using grid-stride without prefetching. Something like:
+
+```
+uint32_t base = blockIdx * tileLen_;
+if (base >= totalLen_) return;
+while (base < totalLen_) {
+    uint32_t curLen = totalLen_ - base;
+    if (curLen > tileLen_) curLen = tileLen_;
+    CopyIn(base, curLen);
+    Compute(curLen);
+    CopyOut(base, curLen);
+    base += blockNum * tileLen_;
+}
+```
+
+That is simple and avoids double buffering complexities.
+
+Let's also ensure that the tiling blockDim is set correctly. We'll keep the same logic.
+
+Now, generate the six strings with these changes.
+
+I'll produce the final answer with the updated code.

@@ -1,0 +1,123 @@
+We need to fix the previous attempt's errors. The main error from logs is a compilation error:
+
+```
+/usr/local/Ascend/ascend-toolkit/8.3.RC2/aarch64-linux/tikcpp/tikcfw/impl/kernel_tpipe_impl.h:200:5: error: static assertion failed due to requirement 'TBuf<AscendC::TPosition::VECCALC>::isTQue': TPipe::InitBuffer(T& que, uint8_t num, uint32_t len) not supports T as TBuf
+```
+
+This occurs at:
+```
+pipe_.InitBuffer(workBuf_, 1, workSize * sizeof(float));
+```
+
+The issue is that `workBuf_` is a `TBuf`, not a `TQue`. `InitBuffer` for TBuf should be called differently. According to AscendC API, to initialize a TBuf, you use `pipe.InitBuffer(buf, size);` (no num argument). The `num` argument is only for queues. So we need to change `pipe_.InitBuffer(workBuf_, 1, workSize * sizeof(float));` to `pipe_.InitBuffer(workBuf_, workSize * sizeof(float));` and similarly for `resBuf_`.
+
+Also, in the kernel, we need to ensure that we use proper API for argmax. The earlier kernel used `ReduceMax` which returns both value and index, but the index is float, we need int64. However, the error may also be about TBuf usage.
+
+Looking at the previous attempt full code, kernel_src had:
+```
+        // Workspace for ReduceMax: need 2 * ceil(reductionSize_/64) floats, aligned to 32 bytes
+        uint32_t repeat = (reductionSize_ + 63) / 64;
+        uint32_t workSize = 2 * repeat;
+        if (workSize % 8 != 0) workSize = ((workSize + 7) / 8) * 8;
+        pipe_.InitBuffer(workBuf_, 1, workSize * sizeof(float));
+        // Buffer for the ReduceMax result (2 floats: value and index)
+        pipe_.InitBuffer(resBuf_, 1, 2 * sizeof(float));
+```
+
+That's the problem. Also, `GetValue` for local tensor might not be correct; we need to read the index from the result. But first fix the compilation.
+
+Also, we need to ensure that the tiling data includes `dim` correctly, and that the host operator passes it. The previous attempt had `tiling.set_dim(static_cast<int32_t>(dim));` but the kernel Init didn't use dim. Actually the kernel doesn't need dim because it processes outer×reduction based on tiling data. But the kernel entry function `argmax_over_a_dimension_custom` calls `op.Init(x, y, tiling_data.totalOuter, tiling_data.reductionSize, tiling_data.tileOuter, 0.0f);` - it passes a dummy float. That's fine but the dim isn't used in kernel, only in tiling for shape inference.
+
+However, the runtime error in logs also shows vector core timeout. That might be due to the ReduceMax usage with large reduction size causing infinite loop or excessive runtime. The timeout happened because the kernel likely has an issue. The compilation error must be fixed first.
+
+Also, we need to ensure the kernel's `Process` uses grid-stride loop correctly. The previous attempt had:
+```
+        uint32_t idx = blockIdx;
+        while (idx < totalOuter_) {
+            CopyIn(idx);
+            Compute(idx);
+            CopyOut(idx);
+            idx += blockNum;
+        }
+```
+That is correct.
+
+But the `CopyIn` uses `AscendC::DataCopy(xLocal, xGm_[gmOffset], reductionSize_);` - this copies `reductionSize_` floats. That's fine.
+
+Now, the ReduceMax API: `AscendC::ReduceMax<float>(resBuf, xLocal, workBuf, reductionSize_, true);` - the last parameter `true` means `calIndex`. The result tensor `resBuf` must have at least 2 elements. That's fine. But we then use `float idxFloat = resBuf.GetValue(1);` to get index as float and cast to int64. That should work, but we need to ensure that `resBuf` is a local tensor with the data. However, after `ReduceMax`, the result is in `resBuf`. `GetValue` is a method on LocalTensor? Actually, to read a single element from a LocalTensor, we can use `AscendC::LocalTensor::GetValue` only if the tensor is in scalar memory? Not sure. Better approach: use `AscendC::SetFlag` and `AscendC::GetReduceRepeatSumSpr`? That's for sum. For ReduceMax with index, the result is two floats: first is max value, second is index as float. To read them, we can use `AscendC::Memcpy` to a scalar, or use `GetValue` which might be available. But let's check typical usage: In the provided example code (Block 1), they did:
+```
+AscendC::ReduceMax<T>(dstLocal, srcLocal, sharedTmpBuffer, srcDataSize, true);
+```
+And then they didn't read the index; they just output the dstLocal which has 16 floats (pad). But for argmax we need just the index. Actually the ReduceMax with calIndex=true produces output of size 2? In documentation, for `ReduceMax` with `calIndex=true`, the output `dst` should be of size at least 2. The first element is the max value, second is the index. To get the index, we can copy the second element to a scalar local tensor and then use `GetValue`. Alternatively, we can use the overload with masks? Simpler: use `AscendC::ReduceMax` with `calIndex=true` and then copy the second element to a scalar.
+
+Alternatively, we can avoid TBuf and use queues for work and result as well? Actually, for ReduceMax, the workspace must be a TBuf (VECCALC). The result can be a TBuf or a queue? The API expects `LocalTensor` for dst. So we can allocate a queue for result. But the issue is only with `InitBuffer` for TBuf.
+
+Let's change the code:
+- For `workBuf_` and `resBuf_`, use `pipe.InitBuffer(workBuf_, workSize * sizeof(float));` without the num argument.
+- For `resBuf_`, use `pipe.InitBuffer(resBuf_, 2 * sizeof(float));` without num.
+
+Also, ensure that the kernel entry function passes the correct tiling data. Currently, `GET_TILING_DATA(tiling_data, tiling);` expects the tiling struct defined in tiling header. The tiling struct must match the one from host_tiling_src. It should contain `totalOuter`, `reductionSize`, `tileOuter`, `blockDim`, `dim`. But the kernel only uses totalOuter, reductionSize, tileOuter. The entry passes 0.0f for the unused parameter; we can remove that parameter.
+
+Now, we also need to fix the issue that the kernel does not use `dim`; it relies on tiling to compute totalOuter and reductionSize correctly. That's fine.
+
+Now, the previous attempt also had a runtime timeout. That could be due to an infinite loop or very large reduction size causing the kernel to run too long. The timeout occurred during eval. Possibly the reduction size is huge (e.g., 4096*4095 ≈ 16M). The kernel does a ReduceMax on the entire reduction dimension per outer element. If reductionSize is large, it may exceed the 255 repeat limit? Actually ReduceMax can handle large count, but it uses loops internally. The UB budget might be insufficient for large reduction size. The tiling should ensure that the slice fits in UB. In the host tiling, they compute `bytesPerOuter` based on reductionSize and workSize, and then compute maxOuter. But they didn't actually limit the size of a single slice; they limited the number of outer elements per tile. However, the reduction size itself can be huge (e.g., 16M). That would require a huge UB buffer for a single slice. The host tiling should also check that the slice (reductionSize) fits in UB. The current calculation: `bytesPerOuter = (reductionSize + workSize + 2) * sizeof(float)`. For reductionSize=16M, that's huge, so maxOuter would be 0 or 1, but then the blockDim would be ceil(totalOuter/tileOuter) with tileOuter=1, so blockDim would be totalOuter which could be small (like 128). That might be okay, but the buffer allocation for a single slice would be huge (16M floats = 64MB), which exceeds UB (192KB). So the kernel will fail because pipe.InitBuffer for inQueueX will allocate too much. So we need to ensure that the reduction size per tile is limited. The correct approach is to split the reduction dimension itself into tiles if it is too large. In the previous attempt, they assumed reductionSize fits in UB. That's not always true.
+
+We need to revise the algorithm to handle large reduction dimensions by tiling the reduction axis. However, the instruction says "minimal and targeted changes". The primary error is the compilation error. The timeout could be due to that compilation error not being fixed yet, or due to the large allocation. But the compilation error prevented the kernel from being built, so the runtime timeout was from a previous run? The logs show both a build error (compilation) and a runtime error (timeout) in different logs. The eval log shows the runtime timeout, which suggests that previously there was a successful build but the kernel timed out. That indicates that the kernel had a bug even before the compilation error. But the previous attempt had the compilation error, so maybe the runtime error is from an even earlier attempt? The logs show both a build error and a runtime error. The build error is from the current attempt (attempt3). The runtime error log is from a different attempt (timestamp 20260503-130643). So the runtime error is from a previous attempt that didn't have the compilation error. So we need to fix both.
+
+Given the constraints, we need to provide a corrected set of six strings that fix the compilation error and also address the runtime timeout by ensuring the kernel handles large reduction sizes correctly. But minimal changes: we can adjust the kernel to tile the reduction dimension as well.
+
+However, the user instruction says "Prioritize resolving the concrete errors shown in logs." The concrete error in the build log is the TBuf InitBuffer error. So we must fix that. The runtime timeout error also appears, but it's from a different attempt; but we should still fix it to ensure correctness.
+
+Let's analyze the runtime timeout: Vector core execution timed out. That could be due to an infinite loop or very long execution. The grid-stride loop with `idx = blockIdx; while (idx < totalOuter_) { ... idx += blockNum; }` should terminate. But if `totalOuter_` is large and blockDim is 8, it will loop many times, but each iteration does reduceMax on a large slice. If the slice is huge, the reduceMax might take a long time and timeout. So we need to also tile the reduction dimension.
+
+We'll modify the kernel to also split the reduction dimension into tiles when it's too large. But that changes the algorithm significantly. Perhaps we can use a simpler approach: just compute argmax by iterating over the reduction dimension manually using scalar operations? That would be slow but avoid timeout. But we need to be portable.
+
+Alternatively, we can use the AscendC `ReduceMax` with the overload that takes `mask`, `repeat`, `repStride`? That requires 256-byte alignment. But the reduction size may not be aligned.
+
+Given the complexity, perhaps the simplest fix is to ensure that the reduction size per outer element fits in UB, and if not, we need to tile. But the host tiling should ensure that the slice size is within UB. In the current tiling, they compute `bytesPerOuter` using `reductionSize`. If `reductionSize` is too large, `bytesPerOuter` > UB_BUDGET_BYTES, then `maxOuter` would be 0, which is clamped to 1. So they would still try to allocate a huge buffer. We need to cap `reductionSize` itself to a maximum that fits in UB. So in tiling, we should also ensure that `reductionSize` (or the slice size) is not too large. We can set a max slice size, say `MAX_SLICE = UB_BUDGET_BYTES / (4 * sizeof(float))` (accounting for in, out, work, etc.). Then if reductionSize > MAX_SLICE, we need to split the outer loop further? Actually, for argmax, we can reduce in stages: first reduce tiles of reduction dimension, then take the max among those results with adjusted indices. That's more complex.
+
+Given time constraints and that the previous attempt's runtime error might be due to the allocation failure (because it still compiled somehow), the fix for the compilation will likely resolve the runtime error as well because the build will fail before running. But the runtime error is from a different attempt where the build succeeded. So we need to address the algorithm as well.
+
+However, the user instruction says "Keep behavior unchanged where not required by the fix." That suggests we should only fix the compilation error and not change the algorithm unless necessary. But the runtime error is a separate issue. However, it's in the logs. The eval summary shows correctness failed. So we need to fix both.
+
+Let's attempt a minimal fix for the runtime: ensure that the reduction dimension is tiled per outer element. We'll modify the kernel to process the reduction dimension in chunks. We'll add a `tileReduce` parameter to tiling data and use it. But that would require changes to tiling struct, host, and kernel. That is not minimal.
+
+Alternatively, we can use a different approach: since the input is float, we can convert to half? Not.
+
+Better: Use the AscendC API `ArgMax`? There is no direct ArgMax. But we can implement argmax by scanning: compare and keep max value and index. That would be linear and handle any size without large workspace. For each outer element, we can process the reduction dimension in blocks, each block up to UB size, and keep the current best. This is efficient and avoids large workspace. Let's implement that.
+
+We'll modify the kernel to not use ReduceMax but a manual reduction loop over tiles of the reduction dimension. The host tiling can provide `tileReduce` as a tiling field. But to keep changes minimal, we can set a fixed tile size for reduction (e.g., 8192 floats = 32KB) that fits in UB, and then iterate over the reduction dimension in blocks. That removes the need for a large workspace entirely. We'll only need a small buffer for the current best (max value and index) and a buffer for a block of the reduction axis. That is a minimal change to the kernel, but the host tiling needs to compute the number of reduction tiles. However, the tiling struct currently doesn't have a field for reduction tile size. We can reuse `tileOuter` for that? No, that's for outer. We'll add a new field `tileReduce` to tiling data. That requires changes to host_tiling_src and host_operator_src. That's acceptable.
+
+But the instruction says "minimal and targeted changes". The compilation error is the main blocker. Let's first fix the compilation error, and also address the runtime by adding reduction tiling.
+
+I'll produce a corrected set of strings that:
+1. Fix `InitBuffer` for TBuf: use single argument.
+2. In kernel, implement argmax by manual reduction over blocks of the reduction dimension, using a small buffer for the block and keeping running max.
+3. Update tiling data to include `tileReduce` and compute it from UB budget.
+4. Adjust host tiling and kernel accordingly.
+
+But we must keep naming contracts consistent. The kernel name is `argmax_over_a_dimension_custom`. The operator name in PascalCase: `ArgmaxOverADimensionCustom`.
+
+Let's write the corrected code.
+
+First, project_json_src unchanged? The previous one is fine.
+
+host_tiling_src: add a field `tileReduce` (uint32_t). Also keep others.
+
+host_operator_src: in tiling func, compute `tileReduce` based on UB. Use a conservative approach: for each outer element, we need a buffer of `tileReduce` floats for the slice, plus 2 floats for result (value and index). Total bytes per outer = (tileReduce + 2) * sizeof(float) plus some for work (we won't use ReduceMax; we'll do manual reduction with scalar). Actually we can implement manual reduction without extra workspace beyond the block buffer. So set `tileReduce` to a value that fits within UB: say UB_BUDGET_BYTES / (sizeof(float)*4) to leave room for other things. Then the reduction dimension will be processed in blocks of size `tileReduce`. The kernel will iterate over blocks and keep track of global max across blocks.
+
+We also need to compute the number of reduction tiles: `numRedTiles = CeilDiv(reductionSize, tileReduce)`. But we don't need to pass that to kernel; the kernel can compute on the fly.
+
+Kernel_src: rewrite to use block-wise argmax. We'll need an additional loop inside Compute for the reduction dimension. The CopyIn will now copy a block of size `tileReduce` from the reduction axis. But the data layout: for each outer element, the reduction dimension is contiguous. So we can process in blocks.
+
+We'll add a method `ProcessOuter` that iterates over blocks of the reduction dimension. We'll use a small queue for the block input. We'll also have a scalar local tensor for current best (value and index). But we need to store it across loops. We can use a TBuf for that (size 2 floats). We'll initialize best value to -FLT_MAX and index to 0. Then for each block, compute local max, compare, update.
+
+This avoids large workspace and is efficient.
+
+Let's craft the code.
+
+Also, need to ensure the kernel entry function correctly uses tiling data.
+
+Now, python_bind_src and model_src likely unchanged.
+
+Let's produce the final answer.

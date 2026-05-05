@@ -1,0 +1,183 @@
+We need to generate the six Python strings for the masked_cumsum_custom kernel. The kernel name is "masked_cumsum_custom" (PascalCase: MaskedCumsumCustom). The operator takes input x (float), mask (bool), and dim (int). The operation is torch.cumsum(x * mask, dim=dim). We need to implement a custom AscendC kernel that performs masked cumulative sum along a given dimension.
+
+We must follow the pattern from the example: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+First, define the operator in project_json_src. The inputs: x (float, ND), mask (bool, ND), output: y (float, ND). Attr: dim (int, default maybe 1? but it's required in forward, so make it required param, but in JSON we can make it attr or input? From the example, they used attr for float. Since dim is integer scalar, it's better to use attr. The example had "negative_slope" as attr. So we'll make "dim" an attr of type int.
+
+However, note that in the original PyTorch model, dim is passed as an argument, so we can treat it as an attr.
+
+Tiling data: We need to know the shape of x. For simplicity, assume 1D or 2D? The model uses input_shape=(32768,), batch_size=32768, so effectively 2D (batch_size, dim). But cumsum along dim=1 means along the last dimension. We need to handle general shapes. We'll design tiling for a 1D contiguous segment along the cumulative dim.
+
+Cumulative sum is a prefix sum operation. On AscendC, there is CumSum API (from code search snippets: KernelCumSum and cumsum_custom). We can leverage that. However, we need to apply mask first: x * mask. Then cumsum. We can combine in kernel: multiply x by mask (cast mask to float?), then cumsum.
+
+But we can also perform cumsum only on non-masked elements? The user specification is cumsum(x*mask). So we just multiply element-wise and then cumsum.
+
+We'll use AscendC::CumSum API. The snippet shows KernelCumSum class. We can adapt it. However, we need to incorporate masking.
+
+Simpler approach: Implement from scratch using vector operations. But the CumSum API is available. Let's use it.
+
+The CumSum API: AscendC::CumSum<T, CONFIG>(dstLocal, lastRowLocal, srcLocal, cumSumInfo) where cumSumInfo has outter, inner. outter is number of rows (batch dimension), inner is number of columns (cumulative dimension). For 2D with dim=1, outter = batch_size, inner = dim_size. For dim=0, we would need to swap.
+
+We need to consider tiling: The kernel should be tile-based, using double buffering, similar to the provided CumSum kernel.
+
+Let's design the kernel:
+
+- Inputs: x (float), mask (bool), output: y (float), attr: dim (int).
+- Tiling: need totalLength, tileLength (maybe tileInner), blockDim.
+- In kernel, we compute x_mask = x * mask (cast mask to float). Then cumsum along the specified dimension.
+
+To support arbitrary dim (0 or 1), we need to handle transposition? Possibly simpler: Assume dim=1 always? The user model uses dim=1. But to be generic, we can handle dim=0 or 1 by reordering loops. However, for simplicity and given the example, we can assume dim is the last dimension (contiguous). We can restrict to 2D tensors with dim=1. That matches the test case.
+
+But to be robust, let's design for general 2D with dim as attribute. We'll compute outer and inner accordingly: if dim=0, outer = number of cols, inner = number of rows? Actually for cumsum along dim=0, we sum columns: for each column, sum rows. So outer = cols (inner dim), inner = rows (outer dim). We'll handle by transposing conceptually. But for AscendC's CumSum, it expects contiguous inner dimension. So we can either copy and transpose, or use a different approach. Simpler: restrict to dim=1. The problem statement uses dim=1, and the kernel name "masked_cumsum_custom" may not need to handle generic dim. However, the forward function passes dim as argument. So we must support it.
+
+In the model, they pass dim=1. We can design the kernel to only support dim=1 (i.e., last dimension). But the attr "dim" will be used to verify. We could implement dim=0 by swapping outer/inner. Since tensor is 2D, we can treat outer/inner accordingly. For dim=0, we would need to iterate over columns and for each column, cumsum rows. That is not contiguous in memory. So we would need to transpose or use a different algorithm. For simplicity, we can only support dim=1 (the last dimension). But the user expects exactly the pattern. Perhaps we can implement a generic masked prefix sum that works on contiguous dimension. In most cases, the dimension is the last one for performance. We'll assume dim is the last dimension (i.e., inner dimension) and just ignore the dim value? But the model passes dim=1, so it is the last dimension.
+
+We'll design for 2D tensors with dim being the inner dimension (i.e., dim=1 for row-major). So outer = batch_size, inner = feature_dim.
+
+Now, let's craft the code.
+
+First, project_json_src: operator "MaskedCumsumCustom", inputs: x (float ND), mask (bool ND), output: y (float ND), attr: dim (int, default maybe 1?). Since it's optional, we'll set default 1.
+
+Second, host_tiling_src: TilingData with totalLength, tileInner, blockDim, dim (maybe not needed? we need dim to know how to compute outer/inner). We'll get shape from context: number of dimensions, shape[0], shape[1]. We'll compute outer = totalLength / inner if 2D, else maybe 1D. We'll assume 2D.
+
+Third, host_operator_src: define op with infer shape (same shape), infer dtype (same as x). Tiling function computes tileInner based on UB budget similar to example but accommodating CumSum's memory needs (src, dst, lastRow, work). The CumSum kernel from snippet uses buffer sizes: inQueueX (tileOuter*tileInner?), outQueue (tileOuter*tileInner), lastRowQueue (tileInner). Also maybe work buffer? The CumSum implementation might use internal buffers. From the CumSum example, they allocate inQueueX, outQueue, lastRowQueue. No extra work buffer externally. So UB budget: 3 * tileOuter*tileInner floats? But tileOuter is the number of rows per tile? Actually in their kernel, they process the entire outer dimension in one tile? They set outter=32, inner=160, and CopyIn copies the entire outer*inner contiguous? They use DataCopyPad to copy each row separately? Actually they have gmOutter and gmInner, and they allocate buffer of size outer*inner (which is 32*160). That's the tile size. So they process all rows in one tile. For large batch_size, we need to tile the outer dimension as well. The example CumSum kernel appears to process the entire matrix in one tile because they fix outer=32. For large batch_size (32768), we need to tile the outer dimension.
+
+We'll design tiling: we process chunks of rows (outerTile) and for each chunk, we process all inner columns. For each tile, we need to copy the chunk (outerTile * inner) floats, plus mask. Then compute x*mask, then cumsum on each row. We can use CumSum on each row individually? Or we can call CumSum with outer=outerTile, inner=inner. That would do cumsum on each row. So we need to allocate buffers: src (outerTile * inner), dst (outerTile * inner), lastRow (inner). That's 3 * outerTile*inner floats. We'll compute outerTile based on UB budget. Additionally, we need mask copy. But we can apply mask before cumsum, so we need space for mask as well. Or we can apply mask on the fly? Simpler: we can copy mask into a separate local tensor, then element-wise multiply. So we need extra buffer for mask of same size. So total buffers: src, mask, dst, lastRow. That's 4 * outerTile*inner floats. Possibly we can reuse src buffer after mask? But careful: we need to preserve x for mask? Actually we can compute x*mask into dst directly, then cumsum into dst? But CumSum needs separate src and dst. We can compute x*mask into a tmp buffer, then copy to cumsum src? That adds extra. Better to allocate two sets: one for x*mask (tmp), one for cumsum output. We'll allocate: maskLocal (outerTile*inner), tmpLocal (outerTile*inner), dstLocal (outerTile*inner), lastRowLocal (inner). That's 4 * outerTile*inner + inner floats. For simplicity, we can combine: after mult, we can use tmpLocal as src for cumsum, and dstLocal as dst. So we need mask, tmp, dst, lastRow. That's 3 * outerTile*inner + inner. Plus overhead.
+
+Use UB_BUDGET_BYTES = 240 * 1024 (maybe 240KB). For float, each float 4 bytes. So max elements = 240*1024/4 = 61440. With 3*outerTile*inner + inner <= 61440. For inner=32768, outerTile would be at most 0. So we need to tile inner dimension as well? The CumSum kernel from example handles inner up to 160 per tile. For large inner (32768), we need to tile inner dimension as well (i.e., process inner in chunks). The CumSum API might support tiling inner? The example uses outter=32, inner=160, so they do full inner. For large inner, we can split inner into segments. However, CumSum is designed for contiguous inner. For prefix sum, we can do segmented reduction? Actually we can compute cumsum on the whole inner by processing in segments using repeated CumSum with carry (last row). The CumSum API provides lastRow output for carry between tiles. That's exactly what the KernelCumSum example does: they have gmOutter and gmInner for global size, and outter and inner for tile size. So they tile inner dimension, process rows in chunks, and carry lastRow to next chunk. That works.
+
+So we need to tile both outer and inner. The tiling function will compute tileOuter and tileInner based on UB budget. For large inner, tileInner is smaller chunk. Then total tiles = ceil(inner/tileInner) * ceil(outer/tileOuter). We'll set blockDim based on number of tiles.
+
+But to simplify, given the example uses fixed sizes, and our input is 32768 batch, 32768 dim, that's huge. But for demonstration, we can assume the kernel is designed for small tiles. However, the user expects a generic solution. Let's design a tiling scheme that works for any size by tiling both dimensions.
+
+Alternatively, we can use a simpler approach: since the architecture is just a simple cumsum after masking, we could implement a naive per-row cumsum using vector operations (e.g., scan using Add loops). That would be easier to write and less reliant on CumSum API. But the example uses CumSum API. I'll follow the pattern of the CumSum kernel.
+
+Let's design the kernel class KernelMaskedCumsumCustom with Init that gets gm addresses, totalOuter, totalInner, tileOuter, tileInner, dim (maybe not needed if we always treat inner as cumulative dimension). Then in Process, we tile over outer and inner using double buffering? The example only uses single buffer (BUFFER_NUM=1? Actually they use BUFFER_NUM for inQueueX, outQueue, lastRowQueue. They have BUFFER_NUM=2? They define BUFFER_NUM but not shown? In kernel class they have "this->pipe->InitBuffer(inQueueX, BUFFER_NUM, ...);" but BUFFER_NUM is undefined? In kernel_entry they have a constant? I see in kernel class they don't define BUFFER_NUM, but in kernel_entry they did? Actually in the CumSum example, the kernel entry has a constant? The code snippet for kernel class doesn't show BUFFER_NUM definition. Probably it's defined elsewhere. We'll define BUFFER_NUM=2 for double buffering.
+
+We'll implement Process() with nested loops over outer tiles and inner tiles, using double buffering for inner tiles? To keep simpler, we can use single buffering but with prefetch? Like the leaky relu example uses prefetch. For cumsum, we need to carry lastRow between inner tiles. So we'll have a loop over outer tiles, and for each outer tile, loop over inner tiles. Since the inner tiles are dependent (carry forward), we can only process them sequentially. So for each outer tile, we process inner tiles in order, updating lastRow. We can do double buffering for the outer tile's data? We'll have a local buffer for the current outer tile's data (src, mask, dst). For inner tiles, we can reuse the same buffer for src and mask? But we need to copy only the relevant inner part. Alternatively, we can copy the entire outer tile's data (all inner) at once, then process inner tiles sequentially. That would require a large buffer. Given the constraints, we can adopt the same pattern as KernelCumSum: they copy the whole outer*inner tile (in their case the whole matrix) using DataCopyPad. That works for small total size. For larger, they would need to tile outer as well. So we need to adapt.
+
+Given the complexity, maybe for this task we can produce a simplified kernel that assumes the tensor is 1D (batch_size=1) or that we only process one row at a time (outer=1). But the model uses batch_size=32768, and dim=1. We need to handle that efficiently.
+
+Let's look at the provided leaky_relu example: they use grid-stride loop to process tiles of length tileLength. That works for element-wise. For cumsum, we need to accumulate across tiles, which is not element-wise. So we need a different approach.
+
+Perhaps we can implement the cumsum using a segmented scan: for each row, we can do a prefix sum in blocks, store partial sums, then add them. But that is complex.
+
+Given the user's instruction: "Replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels. Generate an optimized version named ModelNew, including the six Python strings listed above." They give an example of leaky_relu which is element-wise. The requested operation is cumsum, which is not element-wise. But they expect a similar pattern. The provided code snippets include a CumSum kernel example, so we can base on that.
+
+We can adopt the KernelCumSum class and adapt it to include masking. The KernelCumSum kernel from snippet is designed for fixed sizes (outer=32, inner=160). We can make it generic with tiling. But we need to produce a complete working kernel.
+
+Given the complexity, I will produce a kernel that works for 2D tensors with dim=1, tiling both outer and inner. I'll base the structure on the CumSum example but with proper tiling.
+
+Let's outline the kernel_src:
+
+- Define BUFFER_NUM=2.
+- Class KernelMaskedCumsumCustom with:
+  - Init: receives gm x, mask, y, totalOuter, totalInner, tileOuter, tileInner, dim (not used but accepted).
+  - Process: loops over outer tiles, for each outer tile, loops over inner tiles.
+  - For each outer tile, allocate local tensors: src (tileOuter*tileInner), maskLocal (same), dst (same), lastRow (tileInner), carry (tileInner) for current partial sums.
+  - Copy tile of x and mask from global.
+  - Multiply: x*mask into a tmp (or directly into dst then use cumsum? We'll do element-wise mul into tmp, then cumsum from tmp to dst, with lastRow carry from previous inner tile.
+  - Copy out dst.
+- Use AscendC::CumSum API with config? The example uses const config and cumSumInfo. We'll use CumSum with default config (maybe AscendC::CumSumConfig::DEFAULT). The API: AscendC::CumSum<T, CONFIG>(dst, lastRow, src, cumSumInfo). Where cumSumInfo = {outter, inner}. For inner tile, outter = tileOuter, inner = tileInner. The lastRow is output from previous tile? Actually the CumSum function computes cumsum on each row, and also outputs the final sum of each row (lastRow). For the next inner tile, we need to add the carry (previous lastRow) to each element of the new tile. The AscendC::CumSum does not handle carry automatically? In the KernelCumSum example, they only call CumSum once because they process full inner. For tiled inner, they would need to add the carry manually. The snippet didn't show that. So we need to implement carry accumulation ourselves: after each CumSum on inner tile, we get lastRow; then for the next inner tile, after computing CumSum on its data, we need to add the previous lastRow (broadcasted) to all rows of the new tile's result. That is: new_dst = cumsum(new_src) + prev_lastRow (added to each element? Actually prefix sum: if we have two segments, the prefix sum of concatenated segment is prefix sum of first segment, then for second segment, each element is prefix sum of second plus total of first. So we need to add the final sum of previous inner tile (i.e., the lastRow of previous) to every element of the current inner tile's cumsum result. But note: cumsum of a segment gives prefix sums within that segment assuming starting from zero. So to get global prefix sum, we add the total of all previous segments to every element of current segment. So we need to accumulate a running total per row (carry). So we maintain a vector rowSum of length tileOuter. Initially zero. For each inner tile, compute cumsum of current src -> temp; then add rowSum broadcast to each column: yLocal = temp + rowSum (broadcasted along inner dimension). Then after processing tile, update rowSum += lastRow (the total sums of each row from this tile). Then continue.
+
+Thus, we need AscendC::CumSum to compute within a tile. It returns lastRow. We must handle carry.
+
+Implementation plan:
+
+- Allocate srcLocal, maskLocal, tmpLocal (for mul), dstLocal, lastRowLocal (output of CumSum), rowSumLocal (carry, size tileOuter). 
+- Copy a tileOuter rows of x and mask from global.
+- Element-wise mul: tmp = x * mask (cast mask to float).
+- Call CumSum(tmp, lastRowLocal, tmp, cumSumInfo) ? Note: AscendC::CumSum can operate in-place? Probably yes. We'll use tmp as src and dst maybe? Need to check API. The example had separate src and dst. But we can use same tensor for src and dst? Might not be allowed. So we'll have separate src and dst. We'll compute mul into tmp, then call CumSum(dstLocal, lastRowLocal, tmpLocal, cumSumInfo). Then add carry: dstLocal = dstLocal + rowSumLocal (broadcast). Then update rowSumLocal += lastRowLocal.
+- Copy dstLocal to global.
+- Loop over inner tiles.
+
+We also need to handle last tile's padding? Since inner may not be divisible by tileInner, we need to handle boundaries. The CumSum API requires exact inner dimension? The example uses exact size. For partial tile, we can still use CumSum with the actual inner size (less than tileInner). But the buffer allocated is tileInner. We'll set inner = actual remaining elements.
+
+Now for tiling outer: we process batches of tileOuter rows. For each batch, we allocate buffers of size tileOuter*tileInner. We'll reuse across inner tiles? But the buffers are allocated per outer tile because we need to copy new data. So inside outer loop, we allocate tensors.
+
+To simplify, we can allocate maximum buffers once in Init: max tileOuter * max tileInner. But we don't know max at compile time. So we allocate per outer tile using pipe.InitBuffer inside loop? That would reinitialize? We can use TQue and AllocTensor/FreeTensor repeatedly. But each outer tile we need to allocate new tensors. We can use a pool: allocate the maximum size at Init and reuse slices. That's more efficient. We'll define maxTileOuter and maxTileInner from tiling data (they are fixed per kernel run). So in Init, we allocate buffers sized maxTileOuter*maxTileInner for src, mask, dst, lastRow (size maxTileOuter? Actually lastRow size maxTileOuter), rowSum (maxTileOuter). Then in Process, we use sub-tensors for the actual tileOuter and tileInner.
+
+That works.
+
+Now, we need to handle mask: mask is bool. We'll cast to float: option: use Cast to convert mask from bool to float. But easier: we can do Mul using mask as float by reinterpreting? We'll cast mask to float using AscendC::Cast with RoundMode::CAST_NONE. Ensure mask is uint8_t? Actually bool in global memory is uint8_t? Typically bool is 1 byte. We'll treat mask as uint8_t? But better to pass mask as int8_t? In the project_json, we specify mask type as "bool". In kernel, we can declare GlobalTensor<bool>? But AscendC's data types support int8_t for bool? We'll use int8_t. The input_desc in JSON should be "bool" but when cast to kernel, we can treat as int8_t.
+
+Simplification: we can define mask as Int8 in kernel. We'll cast to float using Cast with type conversion.
+
+We'll need to handle the multiplication.
+
+Let's write the kernel code.
+
+We'll produce the six strings in the response.
+
+Note: The user said "Just output the code, no other text, and NO testing code!" So we must output only the six strings in a single message.
+
+We need to format them as Python strings exactly like in the example.
+
+I'll generate the content.
+
+First, project_json_src:
+
+```
+[
+  {
+    "op": "MaskedCumsumCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "mask",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["bool"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "dim",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "1"
+      }
+    ]
+  }
+]
+```
+
+Second, host_tiling_src:
+
+We need a tiling data struct with totalElements, outerSize, innerSize, tileOuter, tileInner, blockDim, dim. But to match the pattern, we can have totalLength, tileOuter, tileInner, blockDim. We'll also include dim.
+
+We'll define MaskedCumsumCustomTilingData.
+
+In tiling function, we get input shape, assume 2D (maybe more? we'll handle general). Extract outer = shape[0], inner = shape[1] (since dim is the last dimension? we may need to swap if dim is not last). We'll assume dim is the cumulative dimension, which we assume is the last dimension. The tiling function will compute tileOuter and tileInner based on UB budget.
+
+We'll compute max elements per tile: maxTileElements = (UB_BUDGET_BYTES / sizeof(float)) / (3 + 1/n?? Actually we need buffers: src, mask, dst, lastRow (outerTile), rowSum (outerTile). The largest are src, mask, dst: each outerTile * innerTile. For innerTile = inner? If inner is large, we need to tile inner as well. So we need to decide tileInner first: we can set tileInner = 256 (or some power of 2) and then compute tileOuter = (UB_BUDGET_BYTES / sizeof(float)) / (3*tileInner + 2) (since rowSum and lastRow are per outer). Then ensure tileOuter >=1. If inner <= tileInner, we set tileInner=inner. Otherwise, tileInner is a chunk.
+
+We'll compute tileInner = min(inner, 256) (or a parameter). Let's use 256. Then tileOuter = (UB_BUDGET_BYTES / 4) / (3*tileInner + 2). Then clamp to outer.
+
+We'll set blockDim based on number of tiles: totalTiles = ceil(outer/tileOuter) * ceil(inner/tileInner). BlockDim = min(blockDim, 24) etc.
+
+I'll provide a generic implementation.
+
+Third, host_operator_src: Define op class with InferShape (copy shape), InferDataType (float), tiling, and registration.
+
+Fourth, kernel_src: Implement KernelMaskedCumsumCustom as described.
+
+Fifth, python_bind_src: Similar to leaky_relu but for masked_cumsum_custom.
+
+Sixth, model_src: Use custom_ops_lib and call masked_cumsum_custom.
+
+Let's write the code.

@@ -1,0 +1,99 @@
+We need to fix the masked_cumsum kernel. The error shows output mismatch: the custom kernel is producing incorrect cumulative sums because it is not correctly handling the masked cumsum along the last dimension (dim 1) for batches. The kernel uses a sequential element-by-element loop in Compute, which is inefficient and may be buggy. The issue is that the kernel is processing each row sequentially per block, but the mask is applied incorrectly or the carry is not being reset per row correctly. Actually the code processes per block index (row), but then inside Compute does a for loop over elements. The error pattern shows that after some point the cumulative sums are resetting (e.g., values become 0 when they should be non-zero). It looks like the carry is not being preserved correctly across tiles? Or perhaps the mask is int8_t but the condition `m != 0` may work but the computation is correct? Let's examine the output: Reference vs New: At row 2 (0-indexed), reference starts with 0.0 then continues, but new output has many zeros after some index. This suggests that after a certain point, the cumulative sum resets. This could be because the block dimension (batchSize) is being used but the kernel's Process() sets base = blockIdx * rowSize and processes all tiles for that row. That should be correct. But the error indicates that the carry across tiles is not working: within a row, the cumulative sum is resetting at tile boundaries. In Compute, the carry is passed as reference and updated in the loop. However, note that Compute is called for each tile, but the carry is passed by reference and should persist across tiles. But look at the code: in Process(), `carry` is declared as `float carry = 0.0f;` per row. Then for each tile, `Compute(curLen, carry)` is called. That should work. However, the error shows that at some point the output becomes zero after a certain index. That suggests maybe the tile loop is processing incorrectly: `remaining` is decremented but `tileOff` is incremented, but `curOff` is computed as `rowBase + tileOff`. That's fine. But the issue might be that the `CopyIn` and `CopyOut` use the same tile size, but `DataCopy` expects the number of elements as the third argument? In AscendC, DataCopy takes (dst, src, len) where len is the number of elements (for float) or bytes? Actually, DataCopy for local to global etc.: The third argument is the number of elements of the tensor type. Since we used `len` which is number of elements, it's correct.
+
+But the mismatch pattern: For row 0, the first few elements match, but after tile boundary, the cumulative sum seems to start from zero. For example, for batch 0, reference shows ... 8.1440e+03, 8.1446e+03, 8.1446e+03,... and new shows ... 8.1440e+03, 8.1446e+03, 8.1446e+03,... until some point? Actually the printed tensors are truncated, but the mismatch occurs at later indices. The new output for batch 1 after some index becomes 0.0000e+00 etc. It seems the carry is not being carried across tiles. Let's check the Compute function: It takes `carry` by reference, and updates it in the loop. But note: after each tile, the carry is updated. However, the loop in Compute uses `for (uint32_t i = 0; i < len; i++)`. This is a scalar loop - very inefficient but should still be correct. But there is a subtle bug: In AscendC kernel, using `maskLocal(i)` and `xLocal(i)` for element access might not be valid for local tensors? Actually, local tensors support operator() for element access, but it is slow and may cause sync issues? However, it is allowed. But the problem might be that the mask tensor is of type int8_t, and DataCopy copies from global int8_t to local int8_t. That should work.
+
+Wait: Could the issue be that the mask is being read as bool, but we use int8_t? In PyTorch, mask is bool (stored as uint8). In the kernel, we treat it as int8_t. That is fine as long as the values are 0/1. But the error shows that for some rows, the cumulative sum becomes zero after a tile boundary. That could be due to the carry not being passed correctly because the `Compute` function does not return the updated carry properly? Actually, it is passed by reference and modified inside the loop. That should work.
+
+Alternatively, the problem could be in the tiling: `tileLen` is set too small or blockDim is wrong. In the tiling, we set blockDim = batchSize (capped to 24). For batch_size=32768, blockDim is capped to 24. So we have 24 blocks. Each block processes a range of rows? No, the kernel assigns each block a specific row: `if (blockIdx >= batchSize_) return;`. So each block processes exactly one row. But with 24 blocks, only the first 24 rows are processed; the rest are not? That would cause all other rows to be zero? But the output shows rows beyond 24 have non-zero values? Actually, the output tensors are 32768x32768? Wait, batch_size=32768, input_shape=(32768,), so the tensor is 32768x32768. That's huge. With 24 blocks, we only process rows 0-23, and the rest rows remain zero because they are not assigned. But the reference output shows all rows are non-zero. The new output shows rows after 24 become zero? The error shows that for rows after the first few, the output becomes zero at many places. For example, for row 2 (third row), it starts with 0.0 (reference also 0.0 at first element), but then it continues but later zeros appear. Actually, looking at the output: For row index 3 (0-indexed), the reference shows 0.0000e+00, 9.5238e-01, 1.3234e+00,... but new shows 0.0000e+00, 9.5238e-01, 1.3234e+00,... up to some point then zeros. The error appears after the first few rows? The printed output only shows first three rows, and for those rows there is no zero at the beginning. But the mismatch is that later rows are zero. So it's likely that rows beyond blockDim are not processed.
+
+In the tiling, blockDim is set to batchSize or 24, whichever is smaller. So with batchSize=32768, blockDim=24. But the kernel uses `if (blockIdx >= batchSize_) return;` to guard, but it processes only one row per block. So only the first 24 rows get processed. The rest of the 32768 rows are left with zeros in the output tensor (since result is initialized as zeros by EXEC_NPU_CMD). That matches the error: the first three rows are correct? Actually, the first three rows seem correct in the output? The new output shows for row 0: all elements match? Let's check: reference for row0 starts 8.0896e-01, 8.0896e-01,... new row0 also starts the same. Row1: both start 6.8643e-01, 1.2504e+00,... Row2: both start 0.0000e+00, 9.5238e-01,... So the first three rows match. But then rows after 24 are not processed, causing mismatch. The error output only shows the first three rows, and they match. The mismatch is detected by the test comparing all elements; the test probably compares the whole tensor, and rows beyond 24 are all zeros in new output, causing mismatch.
+
+Thus the fix is to ensure all rows are processed. The kernel should process multiple rows per block, not just one. Since blockDim is limited to 24, we need to tile along the batch dimension as well. Given the large batch size (32768), each block should handle multiple rows. We can do grid-stride looping over rows: with blockIdx and blockDim, we can iterate over rows with stride blockDim. For each row, process its rowSize with tiles.
+
+Also, the tiling should set blockDim to something like 24 (or maybe more if supported, but 24 is used for 910b). We should change the kernel to loop over rows with stride blockDim.
+
+Additionally, the tiling data should include the total batch size and row size, and the kernel should compute its own row range.
+
+Also, the mask data type: we used int8_t but DataCopy works with int8_t. However, the mask in pytorch is bool (uint8). That's fine.
+
+Let's fix the kernel and possibly the tiling to set blockDim as a reasonable number (e.g., 24). The tiling already sets blockDim capped to 24. That's fine.
+
+Modify kernel: in Process(), compute the number of rows this block should handle: start = blockIdx, stride = blockNum. Iterate for r = start; r < batchSize; r += stride. For each row, compute cumulative sum with carry and tiles.
+
+We also need to update the Init to store batchSize, rowSize, tileLen.
+
+Also, the maskGm_.SetGlobalBuffer needs to be set with the correct size? Actually, it's fine to set without size, as long as we index correctly.
+
+Note: In the current kernel, we set `xGm_.SetGlobalBuffer((__gm__ float*)x);` without size. That is okay.
+
+Now, we must also adjust the CopyIn and CopyOut: they use `xGm_[gmOff]` which works with SetGlobalBuffer.
+
+But careful: The global tensors are set to point to the start of the global memory. When we do `xGm_[gmOff]`, it will access at offset gmOff. That is correct.
+
+Now, the kernel currently assumes that the global memory is linear: batchSize * rowSize elements. That is correct.
+
+So we need to modify the kernel's Process to loop over rows with stride blockNum.
+
+Also, we must ensure that the carry is reset for each row.
+
+Implementation:
+
+__aicore__ inline void Process()
+{
+    if (batchSize_ == 0 || rowSize_ == 0 || tileLen_ == 0) return;
+
+    uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+    uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+
+    for (uint32_t r = blockIdx; r < batchSize_; r += blockNum) {
+        uint32_t rowBase = r * rowSize_;
+        float carry = 0.0f;
+        uint32_t remaining = rowSize_;
+        uint32_t tileOff = 0;
+        while (remaining > 0) {
+            uint32_t curLen = (remaining > tileLen_) ? tileLen_ : remaining;
+            uint32_t curOff = rowBase + tileOff;
+            CopyIn(curOff, curLen);
+            Compute(curLen, carry);
+            CopyOut(curOff, curLen);
+            tileOff += curLen;
+            remaining -= curLen;
+        }
+    }
+}
+
+Now, we should also ensure that the tiling: blockDim is set to something like 24. That is fine.
+
+But note: The test uses input with batch_size=32768, rowSize=32768. With blockDim=24, each block will process about 32768/24 ≈ 1365 rows. That is fine. However, each block iterates over those rows, and for each row it copies tiles. The per-block work is huge, but it should still be correct.
+
+Another potential issue: The tile length computation in tiling uses UB_BUDGET_BYTES / 12. 12 = 3*4 bytes (x, mask, y). That seems reasonable. But we might also need to account for the fact that we have 2 buffer copies (BUFFER_NUM=2), so UB budget should be doubled? Actually, the pipe buffers are allocated at Init, so UB usage is roughly BUFFER_NUM * (tileLen * (sizeof(float)+sizeof(int8_t)) + output buffer). So we need to ensure not to exceed UB. The tiling computes tiltLen based on UB_BUDGET_BYTES / 12, which assumes one copy. With BUFFER_NUM=2, we might exceed. But it's probably okay as we have a hard cap. To be safe, we could divide by 2. But let's adjust: UB_BUDGET_BYTES / (2 * (4+1+4))? Actually, we have inQueueX, inQueueMask, outQueueY each with BUFFER_NUM=2 tiles, so total UB = 2*(tileLen*4 + tileLen*1 + tileLen*4) = 2*9*tileLen = 18*tileLen. So maxTile = UB_BUDGET_BYTES / 18. Let's correct that. Also, we might want to align to 32 bytes.
+
+We'll change the tiling calculation: `uint32_t maxTile = UB_BUDGET_BYTES / 18;` and align down.
+
+Also, the ALIGN_ELEMS can be 32 (or 64). We'll keep 64.
+
+Now, also need to update the python_bind_src: it uses `aclnnMaskedCumsumCustom` which expects self, mask, dim, result. That is correct.
+
+But note: The project_json_src uses `"dim"` attribute with `"param_type": "required"` and `"default_value": "1"`. The host_operator_src uses `this->Attr("dim").AttrType(OPTIONAL).Int(1);`. That matches.
+
+Now, ensure that the kernel entry uses the correct number of parameters: void masked_cumsum_custom(GM_ADDR x, GM_ADDR mask, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling). That matches the previous.
+
+One more issue: In the kernel, we read mask as int8_t, but the global tensor is set as int8_t. However, the mask data from PyTorch is bool, which is 1 byte. That's fine. But the DataCopy copies int8_t, so it should work.
+
+But note: In CopyIn, we use `AscendC::DataCopy(maskLocal, maskGm_[gmOff], len);` - this copies elements of type int8_t. Good.
+
+Now, we must also update the tiling struct to include blockDim? It already has blockDim, but we don't use it in kernel? Actually, we don't need it because the kernel gets blockDim from hardware. But we store it anyway. That's fine.
+
+We also need to ensure that the tiling data is correctly populated. The tiling function sets blockDim, but then the kernel uses AscendC::GetBlockNum() which should match that. So we don't need to pass blockDim in tiling data, but it's okay.
+
+Now, we will produce the corrected code blocks.
+
+Let's write the corrected kernel_src, host_tiling_src, host_operator_src with modified UB calculation.
+
+I'll provide the entire set of six strings.
+
+Also note: The model_src and python_bind_src seem fine. But ensure that the python_bind_src's function name `masked_cumsum_impl_npu` matches the TORCH_LIBRARY_IMPL registration. It does.
+
+Now, the python_bind_src uses `EXEC_NPU_CMD(aclnnMaskedCumsumCustom, self, mask, dim, result);`. This assumes that aclnn header is generated with that name. Since the project_json defines op name as "MaskedCumsumCustom", the aclnn function should be `aclnnMaskedCumsumCustom`. That should be auto-generated. So fine.
+
+Now, we output the corrected code.
