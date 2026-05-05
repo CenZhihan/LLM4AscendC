@@ -158,6 +158,7 @@ def generate_kernel_with_agent(
     attempt_id: int = 1,
     repair_error_logs_raw: str = "",
     previous_attempt_code: str = "",
+    ascend_search_version_filter: Optional[str] = None,
 ) -> AgentGenerationResult:
     """
     Generate kernel code using the integrated agent with KB, WEB, and Code RAG.
@@ -167,6 +168,8 @@ def generate_kernel_with_agent(
         tool_mode: Tool mode (``frozenset`` of tool keys or string like ``\"kb_only\"``, ``\"kb,web\"``, ``\"all\"``)
         retriever: Optional pre-loaded CodeRetriever for Code RAG
         llm_config: Optional LLM config (api_key, base_url, model)
+        ascend_search_version_filter: Optional substring for Ascend docs ``version`` field filtering;
+            ``None`` or empty means no restriction.
 
     Returns:
         AgentGenerationResult with generated_code, reasoning, and tool_usage
@@ -192,6 +195,7 @@ def generate_kernel_with_agent(
         tool_mode=parsed_mode,
         llm_config=llm_config,
         code_retriever=retriever,
+        ascend_search_version_filter=ascend_search_version_filter,
     )
 
     # 3. Create initial state

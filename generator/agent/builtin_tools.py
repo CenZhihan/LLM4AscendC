@@ -217,8 +217,9 @@ def _meta() -> Dict[str, Dict[str, Any]]:
             "parameter_docs": 'Use "query" in Chinese only (关键词必须中文).',
             "examples": ['{"tool":"ascend_search","query":"AscendC DataCopy 对齐约束","args":null}'],
             "usage_guidance": (
-                "Put **Chinese keywords only** in `query`. `lang`, `doc_type`, and `version` are fixed "
-                "server-side — **do not** invent them in `args`."
+                "Put **Chinese keywords only** in `query`. `lang` and `doc_type` are fixed server-side. "
+                "Document **version** filtering (if any) is configured by the runner — **do not** invent "
+                "version strings in `args`."
             ),
         },
         "ascend_fetch": {
@@ -252,6 +253,7 @@ def _handler_for(
     kb_shell_retriever: Any,
     ascend_search_retriever: Any,
     ascend_fetch_retriever: Any,
+    ascend_search_version_filter: Optional[str] = None,
 ) -> ToolHandler:
     def h(state: Dict[str, Any]) -> Dict[str, Any]:
         if name == "kb":
@@ -287,7 +289,11 @@ def _handler_for(
         if name == "kb_shell_search":
             return kb_shell_search_node(state, kb_shell_retriever)
         if name == "ascend_search":
-            return ascend_search_node(state, ascend_search_retriever)
+            return ascend_search_node(
+                state,
+                ascend_search_retriever,
+                version_filter=ascend_search_version_filter,
+            )
         if name == "ascend_fetch":
             return ascend_fetch_node(state, ascend_fetch_retriever)
         raise KeyError(name)
@@ -325,6 +331,7 @@ def register_builtin_tools_for_mode(
     kb_shell_retriever: Any = None,
     ascend_search_retriever: Any = None,
     ascend_fetch_retriever: Any = None,
+    ascend_search_version_filter: Optional[str] = None,
     plugin_snapshot: Optional[Dict[str, RegisteredToolSpec]] = None,
 ) -> None:
     """
@@ -361,6 +368,7 @@ def register_builtin_tools_for_mode(
                     kb_shell_retriever,
                     ascend_search_retriever,
                     ascend_fetch_retriever,
+                    ascend_search_version_filter,
                 ),
                 examples=list(m.get("examples") or []),
                 usage_guidance=str(m.get("usage_guidance") or ""),

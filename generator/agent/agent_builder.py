@@ -89,6 +89,7 @@ def build_agent_app(
     kb_retriever: Optional[KBRetriever] = None,
     web_retriever: Optional[WebRetriever] = None,
     code_retriever: Optional[CodeRetriever] = None,
+    ascend_search_version_filter: Optional[str] = None,
 ):
     """
     Build LangGraph StateGraph for kernel generation agent.
@@ -99,6 +100,8 @@ def build_agent_app(
         kb_retriever: Optional pre-initialized KB retriever
         web_retriever: Optional pre-initialized Web retriever
         code_retriever: Optional pre-initialized Code retriever
+        ascend_search_version_filter: Optional substring filter on Ascend docs ``version`` field
+            for ``ascend_search``; ``None`` means no restriction.
 
     Returns:
         Compiled StateGraph application
@@ -166,6 +169,7 @@ def build_agent_app(
         kb_shell_retriever=_kb_shell_retriever,
         ascend_search_retriever=_ascend_search_retriever,
         ascend_fetch_retriever=_ascend_fetch_retriever,
+        ascend_search_version_filter=ascend_search_version_filter,
         plugin_snapshot=plugin_snapshot,
     )
 

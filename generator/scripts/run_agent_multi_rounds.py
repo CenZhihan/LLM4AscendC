@@ -43,6 +43,13 @@ def _write_text(path: pathlib.Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _normalize_ascend_search_version(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    t = str(value).strip()
+    return t or None
+
+
 def _artifact_group_rel_from_txt_path(txt_path: pathlib.Path) -> Optional[pathlib.Path]:
     txt = txt_path.resolve()
     out_root = OUTPUT_ROOT.resolve()
@@ -224,6 +231,7 @@ def _generate_one_attempt(
     attempt_id: int,
     repair_error_logs_raw: str = "",
     previous_attempt_code: str = "",
+    ascend_search_version_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     from generator.agent.agent_runner import KernelGenerationTask, generate_kernel_with_agent
 
@@ -240,6 +248,7 @@ def _generate_one_attempt(
         attempt_id=attempt_id,
         repair_error_logs_raw=repair_error_logs_raw,
         previous_attempt_code=previous_attempt_code,
+        ascend_search_version_filter=ascend_search_version_filter,
     )
     paths = _save_generation_outputs(
         out_dir=out_dir,
@@ -275,6 +284,7 @@ def run_multi_attempt_for_op(
     max_attempts: int,
     eval_workers: int,
     eval_npu: int,
+    ascend_search_version_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     if max_attempts < 2:
         raise ValueError("max_attempts must be >= 2")
@@ -324,6 +334,7 @@ def run_multi_attempt_for_op(
                 attempt_id=attempt_id,
                 repair_error_logs_raw=repair_logs_raw,
                 previous_attempt_code=previous_attempt_code,
+                ascend_search_version_filter=ascend_search_version_filter,
             )
             outcome.generated = True
             outcome.txt_path = str(gen["txt_path"])
@@ -413,6 +424,7 @@ def _run_single_op_job(
     eval_workers: int,
     eval_npu: int,
     op_slot: int,
+    ascend_search_version_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     device_id = op_slot % eval_npu
     os.environ["ASCEND_VISIBLE_DEVICES"] = str(device_id)
@@ -430,6 +442,7 @@ def _run_single_op_job(
         max_attempts=max_attempts,
         eval_workers=eval_workers,
         eval_npu=eval_npu,
+        ascend_search_version_filter=ascend_search_version_filter,
     )
 
 
@@ -534,6 +547,15 @@ def main() -> int:
     parser.add_argument("--parallel-ops", type=int, default=1, help="Number of ops to run in parallel.")
     parser.add_argument("--eval-workers", type=int, default=1, help="Pass-through eval workers per attempt.")
     parser.add_argument("--eval-npu", type=int, default=1, help="Pass-through eval npu count per attempt.")
+    parser.add_argument(
+        "--ascend-search-version",
+        default=None,
+        metavar="SUBSTRING",
+        help=(
+            "Ascend 官网文档搜索：按返回条目的 version 字段子串过滤（如 9.0.0）；"
+            "省略则不限制版本。适用于 ascend_search + ascend_fetch 组合。"
+        ),
+    )
     args = parser.parse_args()
     if args.max_attempts < 2:
         raise ValueError("--max-attempts must be >= 2")
@@ -554,6 +576,16 @@ def main() -> int:
     llm_config = get_llm_config_compatible(cli_model=args.model)
     resolved_model = llm_config["model"]
     model_slug = model_slug_for_path(resolved_model)
+    ascend_vf = _normalize_ascend_search_version(args.ascend_search_version)
+    if ascend_vf is not None:
+        from generator.agent.agent_config import has_ascend_fetch, has_ascend_search, parse_tool_mode
+
+        _tm = parse_tool_mode(args.tool_mode)
+        if not (has_ascend_search(_tm) and has_ascend_fetch(_tm)):
+            print(
+                "[WARN] --ascend-search-version 建议在同时启用 ascend_search 与 ascend_fetch 时使用；"
+                f"当前 ascend_search={has_ascend_search(_tm)}, ascend_fetch={has_ascend_fetch(_tm)}。"
+            )
     out_run_dir = pathlib.Path(args.out_dir) if args.out_dir else _default_run_dir(
         model_slug=model_slug,
         tool_mode=args.tool_mode,
@@ -596,6 +628,7 @@ def main() -> int:
     all_summaries: Dict[str, Any] = {
         "model": resolved_model,
         "tool_mode": args.tool_mode,
+        "ascend_search_version_filter": ascend_vf,
         "strategy": args.strategy,
         "eval_mode": args.eval_mode,
         "clean_policy": args.clean_policy,
@@ -630,6 +663,7 @@ def main() -> int:
                 eval_workers=args.eval_workers,
                 eval_npu=args.eval_npu,
                 op_slot=op_slot,
+                ascend_search_version_filter=ascend_vf,
             )
             results.append({"op": op, "summary": summary})
     else:
@@ -654,6 +688,7 @@ def main() -> int:
                     eval_workers=args.eval_workers,
                     eval_npu=args.eval_npu,
                     op_slot=op_slot,
+                    ascend_search_version_filter=ascend_vf,
                 )
                 fut_to_op[fut] = op
             for fut in concurrent.futures.as_completed(fut_to_op):
