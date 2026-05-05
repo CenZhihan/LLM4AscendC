@@ -1,0 +1,76 @@
+We need to fix the kernel_src to use proper AscendC APIs. The errors show: "no member named 'AllocTensor' in 'AscendC::TPipe'". The correct pattern is to use TPipe::InitBuffer with TQue and then allocate tensors from queues, not directly from pipe. Also, we need to handle the masked cumulative sum operation correctly.
+
+Looking at the error logs, the key issue is in kernel_src: using pipe_.AllocTensor and pipe_.FreeTensor, which don't exist. Instead, we should use the TQue API for double buffering, similar to the leaky_relu example.
+
+In the previous successful leaky_relu example, they used:
+- pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+- Then CopyIn: inQueueX_.AllocTensor<float>() then DataCopy, then EnQue.
+- Compute: DeQue from inQueueX_, AllocTensor for outQueueY_, compute, then EnQue, FreeTensor from inQueueX.
+- CopyOut: DeQue from outQueueY_, DataCopy to global, FreeTensor.
+
+So we need to follow that pattern. However, masked cumsum is more complex because we need to carry accumulator across tiles within a row. Also we need to multiply x by mask before cumsum.
+
+We should design the kernel to process each row independently. Each block handles multiple rows (grid-stride). Within a row, we process tiles sequentially, maintaining a running sum across tiles. For each tile, we need to load x and mask (both as float), multiply, then do prefix sum with carry, then store output. We need at least two buffers for double buffering? Actually, we can process sequentially without double buffering because the operation is inherently serial within a row. But for performance, we can still use double buffering for loading next tile while computing current tile? However, the prefix sum depends on previous tile's output, so we cannot overlap compute of next tile until we have the final carry. So we can avoid double buffering and just use a single set of queues.
+
+But to keep it simple and correct, we can allocate local tensors for x and mask each tile, do the multiply and prefix sum, then store. We'll need a local tensor for the temporary multiplier result, and we can reuse xLocal. We'll have one input queue, one output queue, but for mask we need another queue or we can load mask into a separate local tensor after dequeue? Actually, we can have two input queues: inQueueX and inQueueMask. But the original example only used one input queue. We can add another queue for mask. However, the pipe has limited number of queues. We can also load mask into the same queue? No, we need both. Let's add a second input queue.
+
+Alternatively, we can embed the mask into the same data? No, better to have separate queues.
+
+Let's design:
+
+- BUFFER_NUM = 2 (double buffering) for both input queues and output queue.
+- pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+- pipe_.InitBuffer(inQueueMask_, BUFFER_NUM, tileLen_ * sizeof(float));
+- pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+
+But note: the original leaky_relu also had a tmpQueue_ for temporary storage. We might need a temporary for multiply result, but we can compute in-place: after multiplying, xLocal becomes masked_x, then we can do prefix sum on it. So no extra temp needed.
+
+However, we need to be careful: after we DeQue from inQueueX_, we get xLocal. We can also DeQue from inQueueMask_ to get maskLocal. Then multiply xLocal = xLocal * maskLocal, then free maskLocal. Then do prefix sum with carry. Then EnQue yLocal. But we need to allocate yLocal from outQueueY_. So the pattern:
+
+CopyIn: for each tile, allocate xLocal and maskLocal from respective queues, DataCopy from global, then EnQue both.
+Compute: DeQue xLocal and maskLocal, allocate yLocal, multiply xLocal and maskLocal into xLocal (or use separate tmp), then prefix sum into xLocal, then assign to yLocal? Actually, we want to output the result, so we can just EnQue xLocal as output? But we need a separate output queue. We can EnQue xLocal into outQueueY_ after computation, but then we lose xLocal for next tile? That's fine because we dequeue and process each tile sequentially. However, we need to free xLocal only after we are done with it. Since we are reusing the same xLocal (after compute) as output, we can EnQue it into outQueueY_ and later free after copy out. That's consistent with pattern.
+
+So process:
+
+In Process:
+- For each row assigned to block:
+  - For each tile in that row:
+    - CopyIn: allocate xLocal and maskLocal, DataCopy from global, EnQue.
+    - Compute: dequeue xLocal and maskLocal, multiply, free maskLocal, do prefix sum on xLocal, then EnQue xLocal into outQueueY_.
+    - CopyOut: dequeue from outQueueY_, DataCopy to global, FreeTensor.
+
+But note that CopyIn and Compute can be overlapped with double buffering: while computing tile i, we can load tile i+1. However, because the prefix sum is serial, we cannot start compute on tile i+1 until we have the carry from tile i. So double buffering doesn't help for compute, but it can still overlap copy of next tile with compute of current tile, but the compute of current tile needs to finish before we can start compute of next tile. So we can still prefetch next tile during compute, but we must wait for carry before starting compute of next tile. That's fine: we can load next tile while computing current tile, then after finishing compute, we wait for the loaded data to be ready. But the compute of current tile uses xLocal and maskLocal from previous load, so we can overlap load of next tile with compute of current tile. This is typical double buffering.
+
+So we need a loop with prefetch. We'll adapt the pattern from leaky_relu.
+
+Let's write kernel_src accordingly.
+
+Also need to adjust tiling data: we have rowLength and tileLength; we also need to pass negative slope? No, we need dim? Actually, dim is handled by tiling: rowLength is the size of the dimension we are cumsumming along. The tiling already computes that. So kernel just uses rowLength and tileLength.
+
+In kernel Init, we set totalLen_, rowLen_, tileLen_, blockDim_ (but blockDim_ not needed maybe). Also we need to set xGm_, maskGm_, yGm_.
+
+In Process, we use blockIdx and blockNum to iterate over rows.
+
+We also need to handle 1D case: rowLen_ equals totalLen_, seqCount = 1.
+
+Now, we must ensure that the tiling data is correctly passed from host to kernel. The host_tiling_src currently has totalLength, rowLength, tileLength, blockDim. That matches.
+
+Now, fix kernel_src to avoid pipe_.AllocTensor errors.
+
+Also, the error logs show the build failed because of missing binary/config. That's a packaging issue that occurs because kernel compilation failed. Once we fix kernel, it should succeed.
+
+Also check host_operator_src: there is a potential issue with shape access. They used GetInputShape(0) and then GetOriginShape. That should be fine. But note that they used const gert::Shape &originShape = storageShape->GetOriginShape(); but GetOriginShape returns a Shape object, it's fine.
+
+Also, in python_bind_src, the function masked_cumsum_impl_npu takes self, mask, dim. But EXEC_NPU_CMD expects aclnnMaskedCumsumCustom. We need to ensure the aclnn function exists. The operator name is MaskedCumsumCustom, so aclnn function is aclnnMaskedCumsumCustom. That should be auto-generated.
+
+Also, mask input in project_json_src should be of type "float"? Actually, mask is bool in PyTorch, but we convert to float in python_bind. The operator expects float. That's fine.
+
+Now, we need to output the corrected six strings. Only change the ones that need fixing. The error is in kernel_src, but we may also need to adjust host_operator_src to ensure tiling works for 2D case? Already done. However, there is a potential issue: in host_operator_src, they compute rowLength from shape. For 1D, dim can be 0 or 1? The original model has dim=1 for 1D tensor? Actually, input shape is (32768,) and dim=1. For 1D tensor, dim=1 is out of range? In PyTorch, cumsum with dim=1 on a 1D tensor is valid and behaves like dim=0. So we should treat dim=1 for 1D as rowLength = totalLength. Our tiling already does that: if numDims==1, rowLength=totalLength. That's fine.
+
+Also, we need to set mask type in project_json_src: currently it's "float" but in Python we convert bool to float. That's okay.
+
+Now, produce final answer with corrected kernel_src and any other minimal changes.
+
+I'll rewrite kernel_src following the double buffer pattern, using queues and no direct pipe alloc/free.
+
+Let me write the corrected kernel_src.

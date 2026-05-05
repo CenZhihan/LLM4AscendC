@@ -28,6 +28,7 @@ from generator.agent.agent_config import (
 
 from generator.agent.retrievers.code_retriever import CodeRetriever
 from generator.dataset import dataset
+from generator.test_set_ops import TEST_SET_CATEGORY, select_ops_by_categories
 from generator.config import rag_index_path, rag_embedding_model
 
 
@@ -128,7 +129,7 @@ def main():
         "--categories",
         nargs='+',
         default=['all'],
-        help="算子类别列表 (默认: all)"
+        help="算子类别列表 (默认: all)。可使用虚拟类别 test_set 表示固定的 12 个评测算子（见 generator/test_set_ops.py）"
     )
     parser.add_argument(
         "--runs",
@@ -191,17 +192,28 @@ def main():
     print(f"[INFO] Workers: {workers}")
     print(f"[INFO] Categories: {args.categories}")
 
-    # Get operator list
-    all_ops = list(dataset.keys())
-    if args.categories != ['all']:
-        all_ops = [op for op in all_ops if dataset[op]['category'] in args.categories]
+    if (
+        args.categories != ["all"]
+        and TEST_SET_CATEGORY in args.categories
+        and len(args.categories) > 1
+    ):
+        print(
+            "[WARN] --categories 含 test_set 且还有其他类别名；仅使用 test_set 固定的算子列表，其它类别名忽略。"
+        )
+
+    # Get operator list（test_set 保持定义顺序，其余按字母序）
+    all_ops, preserve_order = select_ops_by_categories(args.categories, dataset)
 
     if args.kernelbench102:
         from generator.kernelbench102_ops import KERNELBENCH102_OP_SET
-        all_ops = [op for op in all_ops if op in KERNELBENCH102_OP_SET]
+        if preserve_order:
+            all_ops = [op for op in all_ops if op in KERNELBENCH102_OP_SET]
+        else:
+            all_ops = sorted([op for op in all_ops if op in KERNELBENCH102_OP_SET])
         print(f"[INFO] KernelBench102 filter: {len(all_ops)} ops")
 
-    all_ops = sorted(all_ops)
+    if not preserve_order:
+        all_ops = sorted(all_ops)
     print(f"[INFO] Total ops to generate: {len(all_ops)}")
 
     # Pre-load Code RAG retriever if needed

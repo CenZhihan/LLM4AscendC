@@ -1,0 +1,146 @@
+We need to produce six Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+The kernel name is "triplet_margin_loss_custom", PascalCase operator name "TripletMarginLossCustom". The operator takes three tensors (anchor, positive, negative) of shape (n, d) and a scalar margin. It computes triplet margin loss: max(0, d(anchor, positive) - d(anchor, negative) + margin). Typically, distance is Euclidean squared? Actually F.triplet_margin_loss uses squared Euclidean distance? Let's check PyTorch docs: torch.nn.functional.triplet_margin_loss(anchor, positive, negative, margin=1.0, p=2, eps=1e-06, swap=False, reduction='mean') by default p=2 (Euclidean distance). However, the input model uses margin as a scalar tensor, and they extract margin value. The forward computes F.triplet_margin_loss(anchor, positive, negative, margin=m) with default p=2. So we need to implement the computation: for each triplet, compute d_a = ||anchor - positive||_2, d_b = ||anchor - negative||_2, then loss = max(0, d_a - d_b + margin). Then reduction='mean' by default? Actually original code uses F.triplet_margin_loss, which defaults to reduction='mean'. But in the custom kernel we can assume the output is a scalar (mean). However, the operator will output a tensor of shape ()? Or we need to design the kernel to compute the mean over the batch.
+
+But note: The input tensors are (n, d). We need to compute triplet margin loss for each row, then average. The kernel could compute the mean internally and output a scalar. Alternatively, we could output a tensor of per-sample losses and then the host or Python does the mean. But to replace the operator, we want the custom kernel to replicate the exact functionality. The original model returns a scalar (since reduction='mean' by default). So the custom kernel should output a scalar. However, in Ascend C, it's easier to output a tensor (maybe of shape (1,) or scalar). But the host operator and tiling need to handle this.
+
+Let's design: We'll compute per-sample pairwise distances, then compute loss per sample, then sum and divide by n, output a single value. The kernel will have input tensors anchor, positive, negative of shape (n, d), and a scalar margin (float). Output is a scalar tensor y (float). We'll use tiling to handle large sizes.
+
+Tiling: total length? The total number of elements is 3 * n * d? That's huge. But for computation, we process one sample at a time? Actually we need to compute distances per sample. Each sample uses d elements from each of three tensors. So we can tile over samples. Let totalSamples = n, and featureDim = d. We can process multiple samples per tile. We'll design tiling data to include totalSamples, featureDim, tileSamples (how many samples per iteration), and margin.
+
+We need to allocate UB for intermediate distances, etc. The kernel will compute for each sample: for i in range(tileSamples): compute diff vector, square, sum, sqrt? Actually default p=2 means Euclidean distance: sum((a-p)^2) then sqrt? No, PyTorch uses p-norm: if p=2, it's Euclidean distance = sqrt(sum((a-p)^2)). But the loss function uses squared distance? Wait, PyTorch's triplet_margin_loss uses squared Euclidean distance by default? Let's check: In PyTorch documentation: "The loss function for each sample in the mini-batch is: L(a, p, n) = max(0, d(a, p) - d(a, n) + margin) where d(x_i, x_j) = ||x_i - x_j||_p" If p=2, it's Euclidean distance (not squared). But often in practice they use squared distance for efficiency? Actually the formula uses distance, not squared. But PyTorch default p=2, so it's sqrt of sum of squares. However, to avoid sqrt, we could compute squared distances and then adjust margin? But that changes the loss. So we must implement Euclidean distance exactly.
+
+But in terms of Ascend C kernel, sqrt can be done with AscendC::Sqrt. We'll compute squared distances, then sqrt. The loss per sample: pos_dist = sqrt(sum((a-p)^2)), neg_dist = sqrt(sum((a-n)^2)), loss = max(0, pos_dist - neg_dist + margin). Then sum and divide by n.
+
+We need to handle reduction='mean'. So output scalar.
+
+Now design tiling: We'll tile over samples. Feature dimension d can be large; we can also tile over features? But with Ascend C vector instructions, we can process whole feature vectors in one go as long as they fit in UB. We'll compute for each sample: compute diff, square, reduce sum, sqrt. This requires temporary vectors of size d. So tileSamples must be limited by UB budget: each sample needs maybe 3 * d floats? Actually we can use in-place or reuse buffers. We'll design: For each sample, we have anchor, pos, neg. We can compute diff1 = anchor - pos, diff2 = anchor - neg, then square and sum reduce. We'll need temporary buffers for diff1, diff2, and maybe one for squared values. So per sample, say 2*d floats + reduce sum temp. So for tileSamples samples, we need (2*d + reduce_temp) * tileSamples floats. Also output sum of losses. We'll set tileSamples such that total UB fits.
+
+Simpler: We can process one sample at a time in kernel loop. But then we miss vectorization across samples? Actually we can process multiple samples in one kernel invocation by using vector instructions on flattened arrays? But sample dimension is not contiguous? The inputs are separate tensors, each of shape (n,d). To compute per-sample loss, we can use a loop over samples, and for each sample process d features. We can pipeline: prefetch next sample's anchor, pos, neg while computing current. This is feasible.
+
+Given the complexity, we can design kernel that processes one sample per tile iteration, but uses double buffering for the next sample. The output is accumulated sum of losses per block. Then after all iterations, we need to sum across blocks and divide by n. That can be done in the kernel or host? The kernel can output a per-block partial sum, and then a host reduction? But Ascend C kernel can output a single scalar by using atomic operations? Usually for reduction, we can have the kernel output a local sum, and then do a second kernel to reduce? Or we can use workspace for partial sums and then a host reduction. But the example kernel outputs a tensor with same shape as input, not a scalar. Here we need a scalar. We could design the operator to output a tensor of shape (n,) with per-sample losses, and then have the host or Python do the mean. But the original model returns a scalar, so the custom operator should also return a scalar. In Ascend C, we can write a kernel that outputs a scalar by having the host set output shape to (1,) and the kernel writes the final mean. But to compute mean across all samples and blocks, we need to accumulate and then divide, which requires synchronization. Simpler: Let the kernel compute per-sample losses and output an array of size n (losses), and then the host does the mean. That matches the example where the output is same shape as input. In the example, the output is same shape as input, not a scalar. However, the original model returns a scalar. But the user task says "Replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels." They expect to replace the entire F.triplet_margin_loss call with a custom kernel that returns a scalar. But in the example, the kernel output is same shape as input (element-wise). So maybe for this loss, we should output a scalar. But the example's project_json defines y as float tensor with shape inferred from x. For this, we need to define output as scalar (shape [1]?). We can set output_desc as shape [1] or dynamic. Simpler: Let's output a tensor of shape (n,) with per-sample losses, and then the model does the mean. That would be more aligned with the pattern (output same as input shape? Not exactly). Alternatively, we could output a scalar by having the kernel compute mean internally using inter-block synchronization via workspace. But that's complex.
+
+Given the user's instruction: "Replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels." The original model uses F.triplet_margin_loss which returns a scalar. The replacement should behave identically. So the custom kernel must return a scalar. We'll design the kernel to output a scalar: it will compute the sum of losses, then divide by n, and write to a single-element output tensor. For this, we can use block-level parallelism: each block processes a subset of samples, computes partial sum, and then we need to reduce across blocks. This can be done using workspace and a second pass or using atomic adds. Ascend C supports atomic operations? Possibly, but we can avoid complexity by doing the reduction in the tiling host or using a separate kernel. However, the example kernel has only one kernel function. So we need to do the reduction within the same kernel. We can use a shared workspace in global memory for partial sums, and then have the last block (or all blocks) do a reduction. But that requires barrier synchronization, which is not easy.
+
+Alternative: Since the number of samples n might be moderate (e.g., 32 in get_inputs), we can simply have a single block that processes all samples. Or we can set the block dimension to 1 and process all samples in one block. That would be simplest. But for larger n, we may need multi-block. We can set blockDim = 1 for simplicity, as the example uses multiple blocks but here n is small. We'll design to support arbitrary n by using multiple blocks and then having the host do a final reduction? But the operator returns a tensor, so the host can do reduction after the kernel. Actually the operator output is a tensor, and the model can then do .mean()? But the model should be end-to-end. Let's see the original model forward: it returns F.triplet_margin_loss which is a scalar. So the replacement model must also return a scalar. We can have the custom kernel output a scalar tensor (shape [1]), and then the model just returns that tensor. The kernel will compute the final mean.
+
+To compute the mean across blocks, we can have each block compute its local sum and write to a workspace array of size blockDim. Then the kernel can have a second phase where block 0 (or all blocks) reduces the partial sums. We'll use a simple approach: The kernel launches with blockDim >= 1. Each block computes partial sum of losses for its assigned samples. Then block 0 reads all partial sums from workspace, computes total sum, final mean, and writes to output. This requires synchronization, which we can achieve by using the fact that all blocks complete before block 0 reads (since they are in same kernel launch, no guarantee? In Ascend C, blocks execute in order? Actually they are independent. To synchronize, we can use a global memory flag or just rely on the fact that the kernel is launched with thread blocks and they all run concurrently but we cannot order. So we need a different approach: Use a single block to process all samples. This is safe if total samples is small (like 32). The example used batch_size=4096, dim=393216, so large. But here n=32, d=128, small. So we can set blockDim=1 and process all samples in one block. That simplifies.
+
+Thus, we design for blockDim=1, tiling over samples within the block. The kernel will iterate over all samples (n), compute loss per sample, accumulate, then divide by n and output. UB budget must accommodate d floats for diff vectors. Since d=128, fitting in UB is easy.
+
+Now produce all six strings.
+
+project_json_src: define operator with inputs anchor, positive, negative (float ND), output y (float ND? Actually shape [1] scalar). But to be consistent with dynamic shape, we can set output shape to [1] fixed? Or use dynamic. We'll set output to be a tensor of shape [1]. In input_desc, we also need margin as attribute? The original model passes margin as a tensor of scalar, but we can accept it as an attribute (float) to simplify kernel. In the example, negative_slope is an attribute. The original model extracts margin value from tensor. So we can have margin as an attribute in operator, and the host code will extract it. In the model, we'll modify forward to pass margin as a float (not tensor). Actually the original forward receives margin tensor and extracts scalar. In the new model, we can pass that scalar directly to the custom op. So the operator will have an attribute "margin" of type float. The input tensors are anchor, positive, negative.
+
+Thus project_json_src:
+
+[
+  {
+    "op": "TripletMarginLossCustom",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "anchor", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "positive", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "negative", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "output_desc": [
+      {"name": "y", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "attr": [
+      {"name": "margin", "param_type": "optional", "type": "float", "default_value": "1.0"}
+    ]
+  }
+]
+
+host_tiling_src: Define TilingData with totalSamples, featureDim, margin, blockDim. Since we set blockDim=1, we can keep it simple. Also maybe tileSamples (how many samples per iteration). But since n is small, we can process all at once. But for generality, we can have tileSamples. We'll design tiling to compute optimal tile size based on UB budget. FeatureDim d may be large. So we need to tile over features? Actually we need to compute per sample distances which involve all d features. So tile over features is not straightforward. We'll process one sample at a time, but we can process multiple samples per iteration if UB fits. Let's compute UB budget: For each sample, we need temporary vectors of size d (for diff and diff2). If we process k samples at a time, we need 2*k*d floats. Also output sum. We'll set tileSamples such that 2*tileSamples*d*4 <= UB budget. For d=128, we can do many samples. But n is only 32, so we can set tileSamples = n. So in tiling, we set tileSamples = n. That's fine.
+
+Define in host_tiling_src:
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(TripletMarginLossCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalSamples);
+  TILING_DATA_FIELD_DEF(uint32_t, featureDim);
+  TILING_DATA_FIELD_DEF(uint32_t, tileSamples);
+  TILING_DATA_FIELD_DEF(float, margin);
+END_TILING_DATA_DEF;
+REGISTER_TILING_DATA_CLASS(TripletMarginLossCustom, TripletMarginLossCustomTilingData)
+}
+
+host_operator_src: Include tiling header, define TilingFunc that calculates tiling data. Set blockDim to 1 (since we use single block). Set workspace size 0? Actually we don't need workspace for reduction. The kernel will output scalar, so no workspace needed. The output shape is [1]. InferShape: set output shape to [1]. InferDataType: float.
+
+We'll adapt from the example but change accordingly.
+
+kernel_src: Write kernel class KernelTripletMarginLossCustom. It will have Init with GM_ADDR for anchor, positive, negative, y, and tiling data. In Init, set totalSamples, featureDim, tileSamples, margin. We'll use double buffering for prefetching next sample's anchor, positive, negative? Actually we can load all samples at once? Since n is small, we can load all into UB? But UB may not hold all three tensors. For n=32, d=128, total floats = 3*32*128=12288 -> 49152 bytes, fits in UB (192KB). So we can load all at once. But for generality, we'll tile over samples: In Process(), we loop over sample indices, load anchor row, pos row, neg row. Use vector instructions to compute diff1 = anchor - pos, then square each element, then reduce sum (vector reduce?), compute sqrt, then diff2 = anchor - neg, similarly, then loss = max(0, pos_dist - neg_dist + margin). Accumulate. After loop, write mean to output (single float). We'll use AscendC operations: Sub, Mul (for square), ReduceAdd? Actually we can use AscendC::Square, then AscendC::ReduceSum to scalar. But we can compute sum via vector reduction with AscendC::ReduceAdd? We'll use AscendC::ReductionSum? Let's look at common patterns: For computing sum of vector elements, we can use AscendC::ReduceSum? There is AscendC::ReduceSum? Actually in AscendC, there is AscendC::ReduceAdd? I recall using AscendC::VecReduce? We can use a loop with pipelining? Or we can use the built-in vec_reduce_add. We'll do: compute square elements into a local vector, then reduce using AscendC::ReduceAdd? Simpler: After computing square, we can use AscendC::Sum? There is AscendC::Sum but that's for two vectors? I think we can use AscendC::ReduceAdd to compute sum of elements. We'll write as: 
+AscendC::LocalTensor<float> tmp1 = ...; // square diff
+float sumSq = AscendC::ReduceAdd(tmp1, featureDim); // Not sure exact API. Alternatively, we can use a vector of size 1 and accumulate in loop? That would be slow.
+
+Better to use AscendC's vector reduction: There is AscendC::VecReduceAdd? Actually I think the correct approach is to use AscendC::ReduceSum in the VECCALC area? Let's search memory: In many Ascend C examples, they use AscendC::ReduceSum? There is a func. For simplicity, we can compute sum using a manual loop with scalar? But that defeats vectorization. We'll assume we have a function like AscendC::ReduceAdd(vec, len) that returns float. For kernel code, we can declare extern "C" __aicore__ void? But we need to implement. I'll use the pattern: compute squared diff vector, then use AscendC::ReduceAdd to get sum, then sqrt. We'll write:
+
+AscendC::LocalTensor<float> diff = ...;
+AscendC::LocalTensor<float> sq = ...;
+AscendC::Sub(diff, anchorRow, posRow, featureDim);
+AscendC::Mul(sq, diff, diff, featureDim); // square
+float posSqSum = AscendC::ReduceAdd(sq, featureDim); // not sure if this exists
+float posDist = sqrtf(posSqSum);
+Similarly for neg.
+
+Then loss = fmaxf(0.0f, posDist - negDist + margin);
+
+We'll accumulate into a float localSum.
+
+After processing all samples, output mean = localSum / totalSamples.
+
+We'll use double buffering for loading next sample's rows. We'll have three inQueues for anchor, positive, negative. And one outQueue for output? Since output is single float, we can just write after loop.
+
+Because n small, we can load all rows at once? But for large n, we need tiling.
+
+We'll implement Process() with loop over tileSamples. We'll prefetch next tile's data.
+
+Implementation details: We'll use GetBlockIdx and GetBlockNum (which we set to 1). So blockIdx=0, blockNum=1.
+
+Kernel class:
+
+__aicore__ inline void Init(...) {
+    // set pointers, tiling data, inQueues with BUFFER_NUM = 2 (double buffer for each input)
+}
+
+__aicore__ inline void Process() {
+    uint32_t samplesProcessed = 0;
+    float totalLoss = 0.0f;
+    while (samplesProcessed < totalSamples) {
+        uint32_t cur = tileSamples;
+        if (cur > totalSamples - samplesProcessed) cur = totalSamples - samplesProcessed;
+        // Load cur samples of anchor, pos, neg rows (each row is featureDim floats)
+        // Use double buffering: load first, then load second while computing.
+        // We'll implement simple loop over samples within tile to avoid complex pipelining.
+        // For each sample:
+        for (uint32_t i = 0; i < cur; i++) {
+            uint32_t idx = samplesProcessed + i;
+            // Load row from global memory.
+            // Since we need to compute diff, we can load the three rows into local tensors.
+            // We'll allocate local tensors for each row (size featureDim) and compute.
+            // But we need to reuse buffers. We'll have pre-allocated tensors in Init: anchorBuf, posBuf, negBuf (size tileSamples * featureDim? Actually we can allocate for one sample at a time.
+            // Simpler: For each sample, allocate temporary tensors, compute, free.
+            // Use pipe_.InitBuffer for each? But that's inefficient. We'll allocate in Init a large buffer for one sample: anchorVec, posVec, negVec of size featureDim.
+            // Then for each sample, we copy from global to these local vectors.
+            // We'll use DataCopy.
+            // Then compute.
+            // We'll need temporary vectors for diff and sq. We can reuse the same vectors.
+        }
+        samplesProcessed += cur;
+    }
+    // Write mean to y[0]
+    y[0] = totalLoss / totalSamples;
+}
+
+But note: The kernel signature: extern "C" __global__ __aicore__ void triplet_margin_loss_custom(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling). The y is a single float, so we cast and write.
+
+We also need to handle the case where totalSamples=0.
+
+Now let's produce the code.
+
+python_bind_src: similar to example but adapted.
+
+model_src: import custom_ops_lib, call the function with anchor, positive, negative, margin. But note: In model forward, we have margin as tensor originally. We'll extract scalar and pass as attribute? Actually the custom operator takes margin as attribute, not input. So in model, we need to call the custom op passing the tensors and the margin as an argument? The custom op expects three inputs and an attribute. In the bind, we can create a function that takes the three tensors and margin (float) and calls the NPU op. So in model, we call custom_ops_lib.triplet_margin_loss_custom(anchor, positive, negative, margin=float(margin.item())). So we'll modify forward accordingly.
+
+Now produce final answer.

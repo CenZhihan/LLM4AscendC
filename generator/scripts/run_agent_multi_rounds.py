@@ -448,12 +448,79 @@ def _all_ops_summary_filename(max_attempts: int) -> str:
     return f"attempts{max_attempts}_summary_all_ops.json"
 
 
+def _resolve_ops_for_multi_round(
+    *,
+    ops_explicit: Optional[List[str]],
+    categories: List[str],
+    kernelbench102: bool,
+    dataset: Dict[str, Any],
+) -> List[str]:
+    """
+    Align with generator/scripts/generation/generate_agent.py:
+    supports virtual category test_set (固定列表见 generator/test_set_ops.py)，否则按 dataset.category 过滤，
+    再可选 intersect KERNELBENCH102_OP_SET。
+    When ops_explicit is given, use that list (order preserved, duplicates dropped); unknown keys raise.
+    """
+    from generator.kernelbench102_ops import KERNELBENCH102_OP_SET
+    from generator.test_set_ops import TEST_SET_CATEGORY, select_ops_by_categories
+
+    if ops_explicit is not None:
+        seen: set[str] = set()
+        ordered: List[str] = []
+        for op in ops_explicit:
+            if op not in dataset:
+                raise ValueError(f"Unknown operator key: {op!r}")
+            if op not in seen:
+                seen.add(op)
+                ordered.append(op)
+        return ordered
+
+    if (
+        categories != ["all"]
+        and TEST_SET_CATEGORY in categories
+        and len(categories) > 1
+    ):
+        print(
+            "[WARN] --categories 含 test_set 且还有其他类别名；仅使用 test_set 固定的算子列表，其它类别名忽略。"
+        )
+
+    all_ops, preserve_order = select_ops_by_categories(categories, dataset)
+    if kernelbench102:
+        if preserve_order:
+            all_ops = [op for op in all_ops if op in KERNELBENCH102_OP_SET]
+        else:
+            all_ops = sorted([op for op in all_ops if op in KERNELBENCH102_OP_SET])
+    if not preserve_order:
+        return sorted(all_ops)
+    return all_ops
+
+
 def main() -> int:
     from vendor.mkb.dataset import dataset
     from generator.agent.agent_config import get_llm_config_compatible, model_slug_for_path
 
     parser = argparse.ArgumentParser(description="Automated multi-attempt agent generation + eval + repair.")
-    parser.add_argument("--ops", nargs="+", required=True, help="Operator keys to run.")
+    parser.add_argument(
+        "--ops",
+        nargs="+",
+        default=None,
+        metavar="OP",
+        help="Explicit operator keys. If omitted, derive from --categories and optional --kernelbench102 "
+        "(same rules as generator/scripts/generation/generate_agent.py).",
+    )
+    parser.add_argument(
+        "--categories",
+        nargs="+",
+        default=["all"],
+        metavar="CATEGORY",
+        help="When --ops is omitted: filter by category (default: all). "
+        "虚拟类别 test_set 表示固定 12 个评测算子，见 generator/test_set_ops.py。",
+    )
+    parser.add_argument(
+        "--kernelbench102",
+        action="store_true",
+        help="When --ops is omitted: keep only operators in the kernelbench102 102-op validated set.",
+    )
     parser.add_argument("--tool-mode", type=str, default="all", help="Tool mode string.")
     parser.add_argument("--strategy", type=str, default="one_shot", help="Prompt strategy.")
     parser.add_argument("--run", type=int, default=0, help="Run index for output path.")
@@ -496,6 +563,36 @@ def main() -> int:
     )
     out_run_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.ops is not None and args.kernelbench102:
+        print(
+            "[INFO] Explicit --ops is set; --kernelbench102 does not filter the list "
+            "(only applies when --ops is omitted)."
+        )
+
+    try:
+        resolved_ops = _resolve_ops_for_multi_round(
+            ops_explicit=args.ops,
+            categories=list(args.categories),
+            kernelbench102=args.kernelbench102,
+            dataset=dataset,
+        )
+    except ValueError as e:
+        print(f"[ERROR] {e}")
+        raise SystemExit(2) from e
+    if not resolved_ops:
+        print(
+            "[ERROR] No operators to run after applying --categories / --kernelbench102. "
+            "Relax filters or pass explicit --ops."
+        )
+        raise SystemExit(2)
+
+    print(
+        f"[INFO] Operators to run ({len(resolved_ops)}): "
+        f"selection={'explicit --ops' if args.ops is not None else 'categories/kernelbench102'}"
+    )
+    if len(resolved_ops) <= 30:
+        print(f"[INFO] op list: {resolved_ops}")
+
     all_summaries: Dict[str, Any] = {
         "model": resolved_model,
         "tool_mode": args.tool_mode,
@@ -507,12 +604,16 @@ def main() -> int:
         "eval_workers": args.eval_workers,
         "eval_npu": args.eval_npu,
         "run_dir": str(out_run_dir),
+        "categories": list(args.categories),
+        "kernelbench102": args.kernelbench102,
+        "ops_resolution": "explicit" if args.ops is not None else "from_categories",
+        "operator_keys": resolved_ops,
         "ops": {},
     }
 
     if args.parallel_ops == 1:
         results = []
-        for op_slot, op in enumerate(args.ops):
+        for op_slot, op in enumerate(resolved_ops):
             category = dataset.get(op, {}).get("category", "activation")
             print(f"[RUN] op={op} category={category} strategy={args.strategy} tool_mode={args.tool_mode}")
             summary = _run_single_op_job(
@@ -535,7 +636,7 @@ def main() -> int:
         results = []
         with concurrent.futures.ProcessPoolExecutor(max_workers=args.parallel_ops) as ex:
             fut_to_op = {}
-            for op_slot, op in enumerate(args.ops):
+            for op_slot, op in enumerate(resolved_ops):
                 category = dataset.get(op, {}).get("category", "activation")
                 print(f"[RUN] op={op} category={category} strategy={args.strategy} tool_mode={args.tool_mode}")
                 fut = ex.submit(
@@ -572,7 +673,8 @@ def main() -> int:
                     }
                     results.append({"op": op, "summary": err_summary})
 
-    for item in sorted(results, key=lambda x: args.ops.index(x["op"])):
+    order_index = {op: i for i, op in enumerate(resolved_ops)}
+    for item in sorted(results, key=lambda x: order_index.get(x["op"], 10**9)):
         op = item["op"]
         summary = item["summary"]
         all_summaries["ops"][op] = summary

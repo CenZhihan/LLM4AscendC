@@ -9,13 +9,91 @@ from unittest.mock import patch
 from generator.scripts.run_agent_multi_rounds import (
     _attempt_failed,
     _build_repair_error_context,
+    _resolve_ops_for_multi_round,
     _run_eval_for_txt,
     _select_error_logs,
     run_multi_attempt_for_op,
 )
+from generator.test_set_ops import TEST_SET_OP_KEYS, select_ops_by_categories
 
 
 class TestTwoRoundRunnerHelpers(unittest.TestCase):
+    def test_resolve_ops_activation_kernelbench102_is_twelve(self):
+        from vendor.mkb.dataset import dataset
+
+        ops = _resolve_ops_for_multi_round(
+            ops_explicit=None,
+            categories=["activation"],
+            kernelbench102=True,
+            dataset=dataset,
+        )
+        self.assertEqual(len(ops), 12)
+        self.assertEqual(
+            ops,
+            sorted(
+                [
+                    "elu",
+                    "gelu",
+                    "hardsigmoid",
+                    "hardtanh",
+                    "leaky_relu",
+                    "log_softmax",
+                    "min_gpt_new_gelu",
+                    "relu",
+                    "selu",
+                    "softmax",
+                    "softplus",
+                    "swish",
+                ]
+            ),
+        )
+
+    def test_resolve_ops_explicit_order_and_dedupe(self):
+        from vendor.mkb.dataset import dataset
+
+        ops = _resolve_ops_for_multi_round(
+            ops_explicit=["softmax", "gelu", "softmax", "relu"],
+            categories=["all"],
+            kernelbench102=False,
+            dataset=dataset,
+        )
+        self.assertEqual(ops, ["softmax", "gelu", "relu"])
+
+    def test_resolve_ops_unknown_key_raises(self):
+        from vendor.mkb.dataset import dataset
+
+        with self.assertRaises(ValueError):
+            _resolve_ops_for_multi_round(
+                ops_explicit=["not_a_real_op_key_xxx"],
+                categories=["all"],
+                kernelbench102=False,
+                dataset=dataset,
+            )
+
+    def test_resolve_ops_test_set_matches_canonical_list(self):
+        from vendor.mkb.dataset import dataset
+
+        ops = _resolve_ops_for_multi_round(
+            ops_explicit=None,
+            categories=["test_set"],
+            kernelbench102=False,
+            dataset=dataset,
+        )
+        self.assertEqual(ops, list(TEST_SET_OP_KEYS))
+
+    def test_select_ops_test_set_matches_multi_round(self):
+        from vendor.mkb.dataset import dataset
+
+        from_select, preserve_order = select_ops_by_categories(["test_set"], dataset)
+        from_runner = _resolve_ops_for_multi_round(
+            ops_explicit=None,
+            categories=["test_set"],
+            kernelbench102=False,
+            dataset=dataset,
+        )
+        self.assertTrue(preserve_order)
+        self.assertEqual(from_select, from_runner)
+
     def test_select_error_logs_prefers_build_and_eval(self):
         logs = {
             "01-msopgen": "/tmp/01.log",

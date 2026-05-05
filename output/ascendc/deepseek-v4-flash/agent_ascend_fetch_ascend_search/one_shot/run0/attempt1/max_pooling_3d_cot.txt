@@ -1,0 +1,107 @@
+We need to generate the six Python strings for a custom Ascend C kernel replacing `nn.MaxPool3d`. The kernel name is `max_pooling_3d_custom`, PascalCase `MaxPooling3dCustom`. The input is 5D tensor (batch, channels, D, H, W). Attributes: kernel_size (int), stride (int or None), padding (int), return_indices=False (we can ignore, not needed), ceil_mode=False (we can ignore, but need to handle). For simplicity, we assume kernel_size is a single int (uniform across dimensions), stride same as kernel if None, padding same. We'll implement a naive 3D max pooling on AscendC. Need to be careful with tiling, UB budget, etc.
+
+We'll produce the six strings: project_json, host_tiling, host_operator, kernel_src, python_bind, model_src. Follow the LeakyReLU example structure.
+
+First, project_json: op name "MaxPooling3dCustom", input "x" (float, ND), output "y" (float, ND), attributes: kernel_size (int), stride (int), padding (int), ceil_mode (bool, default false). But note: In PyTorch, stride can be None. We'll treat it as required with default -1 indicating same as kernel. But better to have two attributes: kernel_size, stride (int, optional, default -1), padding (int, default 0), ceil_mode (bool, default false). For simplicity we'll use kernel_size, stride, padding as ints, and ceil_mode as bool. But the original Model uses init args: kernel_size, stride (optional), padding (optional). We'll pass them as attributes.
+
+Actually in the host code, we'll have tiling data include shape and attributes. Need to compute output shape based on input shape, kernel, stride, padding, ceil_mode. That will be done in InferShape.
+
+Host tiling data: includes total input length, output length? Actually we need to process tiles per block. Since it's 5D, we need to tile along spatial dimensions or batch*channels? We'll treat as flat array but need to handle windows. Better to do grid-stride over output elements? Or tile over input slices? For simplicity, we can process one output element per thread? That's inefficient. We'll design a kernel that processes a tile of input, performing max pooling for all windows in that tile. But for a custom kernel, we can implement a straightforward approach: each block handles a portion of batch*channels, and for each spatial position, computes max over kernel window. That would be like CPU style but parallelized. For AscendC, it's vectorized? We need to use vector instructions for efficiency. 3D max pooling can be implemented using sliding window with data copy and vector max reduction. But that's complex. Given the example LeakyReLU is simple, but the instruction says "Replace relevant PyTorch operators". Likely we need a simple implementation. I'll assume we can use the built-in AscendC operations for max pooling? Actually we can implement a naive version: for each output element, we load a window of size K^3 into local memory and compute max. That can be done with vector operations if we load all elements and use vecmax, but the window size may be small (3x3x3=27). So we can use scalar ops in a loop? Better to use vectorized approach: we can load the entire input slice for a batch/channel and compute max pooling efficiently? But that's heavy.
+
+Given the example is just for demonstration, we might produce a simpler kernel that does max pooling using a loop over window elements, using local tensors and compute. It's acceptable to show understanding.
+
+Let's design:
+
+project_json: 
+- op: "MaxPooling3dCustom"
+- input_desc: name "x", type float, format ND
+- output_desc: name "y", type float, format ND
+- attr: 
+  - name "kernel_size", param_type "optional", type "int", default_value "3"
+  - name "stride", param_type "optional", type "int", default_value "0" (0 means same as kernel)
+  - name "padding", param_type "optional", type "int", default_value "0"
+  - name "ceil_mode", param_type "optional", type "bool", default_value "false"
+
+But note: In the original model init, stride defaults to None, which in our operator we can treat as 0 (meaning use kernel). Padding defaults to 0. Ceil_mode defaults to false. We'll handle.
+
+Host tiling data: We need to pass input shape dimensions (N, C, D, H, W) and parameters. Actually we can compute output shape on host and pass as part of tiling data. Tiling data struct: inputShape[5], kernel, stride, padding, ceilMode, outputShape[5], totalInputLength, totalOutputLength, blockDim, tileLength? For simplicity, we can just compute output shape on device using the shape from tiling. But tiling data is defined as fields. Let's define:
+
+struct MaxPooling3dCustomTilingData {
+  int32_t inputDimD, inputDimH, inputDimW;
+  int32_t kernelD, kernelH, kernelW; // but we assume same
+  int32_t strideD, strideH, strideW;
+  int32_t paddingD, paddingH, paddingW;
+  bool ceilMode;
+  int32_t outputDimD, outputDimH, outputDimW;
+  int32_t totalInputSize; // total elements
+  int32_t totalOutputSize;
+  int32_t blockDim;
+  int32_t tileLength; // number of output elements per block
+};
+
+But we can simplify: only kernel_size (int), stride, padding. Since spatial dims are 3, we can treat them same for all three dims. But input shape can be different per dim. We'll pass inputD, inputH, inputW (ignore batch and channels? actually we need them). Actually the input is 5D: N, C, D, H, W. N and C are batch and channels. We'll treat them as batch dimensions; each channel independently pooled. So kernel applies to D, H, W only. So we need N, C.
+
+So tiling fields:
+- int32_t N, C, D, H, W
+- int32_t kernel, stride, padding
+- bool ceilMode
+- int32_t outD, outH, outW (computed)
+- int32_t totalInputSize = N*C*D*H*W
+- int32_t totalOutputSize = N*C*outD*outH*outW
+- int32_t blockDim
+- int32_t tileLength (number of output elements per block)
+
+Host operator: register op, define infer shape to compute output shape using formula: 
+  outDim = ceil((inputDim + 2*padding - (kernel-1) - 1)/stride + 1) if ceil_mode else floor? Actually PyTorch formula: 
+  For each dim: 
+  out = floor((in + 2*pad - dilation*(k-1) - 1)/stride + 1) if ceil_mode=False, 
+  else ceil(...). With dilation=1:
+  out = floor((in + 2*pad - (k-1) - 1)/stride + 1) = floor((in + 2*pad - k)/stride + 1)
+  = floor((in + 2*pad - k)/stride) + 1
+  Ceil: = ceil((in + 2*pad - k)/stride) + 1
+
+We'll compute in InferShape.
+
+Tiling function: set blockDim based on total output size, tileLength based on UB budget (each output element processing requires loading kernel volume, so we need to estimate). Let's say each output element needs to load up to kernel*sizeof(float) = 27*4=108 bytes. But since we use vectorized, we'll load a tile of input and compute multiple output elements. For simplicity, we'll set tileLength = number of output elements each block processes per iteration. UB budget: 192KB. For floats, we need to load a window for each output, but we can reuse input data. We'll adopt a simple approach: each block processes contiguous output elements in flat order. To compute each output element, we need to read the corresponding input window. That reading may not be contiguous; but we can still perform data copy of entire input for the tile? That would be too large. Instead, we can process each output element by loading the window using DataCopy of small pieces. That might be inefficient but works. Or we can use the fact that windows overlap, so we can stream input and compute. For a demonstration kernel, we can just do scalar loops on local memory. AscendC allows scalar loops in vector pipelines? Probably not optimal but okay.
+
+Given the complexity, I'll produce a simpler kernel that for each block, loops over its assigned output elements, and for each, loads the window elements into a local tensor and uses a scalar reduction (or vector max). Since the window size is small, we can use a for loop. AscendC supports scalar operations. We'll use a temporary buffer of size kernel^3.
+
+Thus UB budget: per iteration we need: input window buffer (kernel^3 floats), output buffer (1 float), plus some overhead. That's small. So we can set tileLength to a large number, e.g., 1024 output elements per block per tile. But we must align.
+
+Set tileLength = min( totalOutputSize, some value like 2048 ) and blockDim = ceil(totalOutputSize / tileLength) clamped to reasonable range.
+
+We'll also need to pass the shape dimensions via tiling data.
+
+Kernel implementation:
+
+class KernelMaxPooling3dCustom {
+public:
+  __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, MaxPooling3dCustomTilingData tiling) {
+    xGm_.SetGlobalBuffer((__gm__ float*)x, tiling.totalInputSize);
+    yGm_.SetGlobalBuffer((__gm__ float*)y, tiling.totalOutputSize);
+    // store tiling data
+    ...
+    // Initialize pipe with buffers: one for input window, one for output? We'll allocate a local tensor for window each time? Easier: allocate a fixed-size buffer per block for window (max kernel^3). But kernel size may vary. We'll allocate dynamically per iteration. Simpler: use pipe with a single buffer that can hold max window size (say 343 for 7x7x7). But we can limit kernel to small sizes. We'll allocate a buffer of size maxKernelCube = 27? Actually kernel size is attribute, we can allocate on stack? Not possible in aicore? We can use LocalTensor with dynamic size in Process by AllocTensor. We'll do that.
+
+    // Set up queues for input and output? Not needed if we do direct DataCopy.
+  }
+
+  __aicore__ inline void Process() {
+    // compute block range of output elements
+    // for each output element: compute its coordinates, then loop over kernel window to find max.
+  }
+};
+
+But to adhere to the example pattern with CopyIn/Compute/CopyOut, we need to use queues. However, since each output element requires scattered reads, we can't easily use contiguous data copy. I think it's okay to show a simpler kernel without double buffering, but the example used it. We can adapt: we can treat the input as flat and for each tile of output, we preload the necessary input region? That's complex.
+
+Alternatively, we can implement the kernel using a grid-stride loop where each block processes a contiguous chunk of output elements, and for each output element, we use DataCopy to load the window from global memory (scatter) into a local tensor, compute max, then write output. This is not efficient but demonstrates concept. We'll still use pipe but not for input queue; we'll allocate temporary tensors directly.
+
+Given the time, I'll produce a solution that follows the pattern but with a simpler kernel that just does direct global loads and stores using DataCopy for each window. The example's kernel was carefully structured with double buffering; for 3D pooling, we can still use double buffering for output tiles? Not needed.
+
+I think the answer expects a similar structure, so I'll replicate the pattern but with appropriate modifications.
+
+I'll generate the six strings accordingly.
+
+Note: The host_operator_src includes the op registration and tiling. The kernel_src includes the kernel function with name `max_pooling_3d_custom`. The python_bind_src should call aclnnMaxPooling3dCustom? Actually we use custom op, so we need to call a custom op. We'll follow the pattern using EXEC_NPU_CMD with "aclnnMaxPooling3dCustom". We need to create an .so that registers the custom op. The python_bind_src is for PyTorch integration. The model_src uses the custom_ops_lib.
+
+I'll output only the code blocks.

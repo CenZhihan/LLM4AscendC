@@ -1,0 +1,84 @@
+We need to generate the six Python strings for the masked_cumsum_custom kernel. The original model does torch.cumsum(x * mask, dim=dim). The custom kernel should do masked cumulative sum along a given dimension. We need to design the AscendC kernel, tiling, host operator, etc.
+
+The kernel name is masked_cumsum_custom, PascalCase: MaskedCumsumCustom.
+
+We need to handle float input, mask (bool), and dim attribute. The output is same shape as x.
+
+We must produce:
+
+- project_json_src: operator description
+- host_tiling_src: tiling data definition
+- host_operator_src: tiling function, infer shape, op registration
+- kernel_src: the actual kernel code (must have function name masked_cumsum_custom extern "C")
+- python_bind_src: pybind and NPU bridge
+- model_src: ModelNew using the custom op
+
+We need to design an efficient kernel. Since cumsum is along a dimension, we need to handle arbitrary dim. However, for simplicity and efficiency, we might restrict to the last dimension? Or support any dim? The original model uses dim=1 with 1D input (batch_size, input_shape) so dim=1 is the last dimension. But we can make it general: we can treat the input as a 2D tensor where dim is the inner/outer. But tiling needs to know shape. We'll assume the tensor is contiguous ND. The cumsum along a dimension requires sequential dependencies. We can parallelize across other dimensions. For example, if shape is (B, N) and dim=1, we can have each core handle one batch. We need to handle arbitrary dim: we can reshape to 2D where the cumsum dimension is the last dimension, and the rest are flattened to batch. That's a common approach.
+
+We'll design tiling to compute totalLength, tileLength (but cumsum is not purely element-wise, so tiling might just be about data movement). The kernel will do a sequential scan per row. Use vectorized operations? AscendC has vectorized primitives but cumsum is not simply vectorized due to carry. We can use a loop with vectorized add? Actually we can use AscendC's CumSum instruction? There might be a built-in, but we are writing custom kernel. We can implement a simple loop for each row using local memory.
+
+Better: For each row (batch), we load the row into local buffer, compute cumulative sum in place, then store. Since each row can be large, we need to tile each row as well. But to keep it simple, we can handle each row as one tile? If row length <= max tile size, fine. Else we need to tile within the row, but that's complex. Let's assume typical sizes: batch_size=32768, input_shape=(32768,) so each row length 32768. That's up to 128KB for float. UB budget ~192KB, so we can fit one row per core? Actually we need double buffering. But 32768 floats = 131072 bytes, plus mask (bool? Actually mask is bool but we can cast to float? We'll multiply x*mask before cumsum? The original does x*mask then cumsum. We can combine: for each element, compute x*mask, then accumulate. So we need to load both x and mask.
+
+We'll design kernel to accept x, mask, and output y. The dim parameter tells which axis. We can compute offsets and strides. But for simplicity, we'll assume the input is 2D (batch, dim_len) and dim is the last dimension (1). However, the operator should support any dim. We'll handle generic case: Flatten all dimensions before dim to batch, and the dim itself as row length. The shape after that: batch_size = total_size / dim_length. We'll compute this in tiling.
+
+In tiling, we can set totalLength, tileLength (row length), batchSize (number of rows). Actually row length is the dimension size for the cumsum axis. We'll call it seqLen. The number of sequences (batch) = totalLength / seqLen.
+
+The kernel: Each block processes a set of sequences (grid-stride). For each sequence, load x and mask (mask can be loaded as bool, but we can cast to float on the fly: mask as uint8? Actually mask is bool, but we can load as float by using AscendC::Cast? Or we can load as int8 and convert. We'll assume mask is float with 0/1? But the problem uses bool tensor. In op definition, we can accept mask as bool. But in AscendC, we can treat it as uint8 and convert. To simplify, we can require mask to be float (0/1) input? The original uses torch.randint(0,2).bool() which yields bool. In custom op, we can accept bool and convert inside kernel to float. But output is float. We'll define mask as float in op definition? Actually we need to match the PyTorch contract: mask is bool. We'll support bool as input, but in our op we can accept bool. In the op definition, we can set type for mask as BOOL or FLOAT? The example used float. For simplicity, we'll accept mask as float (since that's easier for AscendC). But to align with original, we can accept bool and convert. However, AscendC may not have direct bool data type. We'll define mask as float with format ND. The Python side can pass a float mask (0/1). But the original model passes bool. We can modify model_src to convert mask to float before calling custom op. That's acceptable.
+
+Alternatively, we can accept bool in the operator (type: "bool"). AscendC supports bool? Possibly. We'll use float for simplicity.
+
+Now, tiling data fields: totalLength, seqLen (length of cumsum axis), batchSize, blockDim, maybe a flag for dim. Also negativeSlope? No.
+
+Host tiling: compute totalLength from input shape, seqLen from shape[dim], batchSize = totalLength/seqLen. Then set blockDim as min(batchSize, 24) or something. tileLength per iteration: we can process one sequence per iteration. So tileLen = seqLen? But if seqLen is too large, we need to split. For simplicity, we'll assume seqLen <= UB budget / (2 * sizeof(float)) for double buffer? Actually we need to load x and mask (maybe combined as product? We can compute product on the fly). We'll load xLocal and maskLocal, then compute cumsum. So we need 2 * seqLen floats for x and mask, plus output buffer. So ~3*seqLen*sizeof(float). UB ~192KB, so seqLen max ~ 192KB/(12B) = 16384? Actually 3*4=12 bytes per element, 192*1024/12=16384 elements. Our seqLen is 32768, which is double. So we need to tile within the sequence as well. That's more complex. We can do a two-level tiling: outer over batches, inner over segments of the sequence. But for kernel simplicity, we can implement a simple linear scan per batch but limited to maxSeqLen. We'll set maxSeqLen = 16384. If seqLen > maxSeqLen, we need to split into multiple blocks? Actually we can handle one row per block but tile the row into chunks, with carry. That is plausible but adds complexity.
+
+Given the user expects a working example, we can design for the given dimensions where seqLen=32768, which exceeds simple buffer. We'll adopt a tile-based approach within each row: each block processes a contiguous segment of the row, but we need the cumulative sum from previous segment. That would require cross-block communication (not feasible). Better to have each block handle one row entirely, but we may need to split row into multiple iterations within the same block using double buffering and a running sum. We can load a segment, compute partial cumulative sum, store output, then continue with next segment. That's doable.
+
+Thus, kernel: For each assigned row, we iterate over segments of the row. Use a local variable curSum = 0. For each segment of length tileLen (smaller than UB), load x and mask (as float), compute product temp = x * mask, then for i in range(tileLen): curSum += temp[i]; store curSum to output. This is sequential but vectorized loading and storing. We can use vectorized multiplication and then a loop for accumulation? But accumulation must be sequential. That's fine, we can do a loop.
+
+We can also use the fact that we can load both x and mask, then compute product with vector Muls, then do a vectorized cumsum? There is no direct instruction. We'll just do a loop.
+
+To pipeline, we can use double buffering: while processing one segment, load the next. But the accumulation is sequential across segments, so we need to finish one segment before starting the next because curSum carries. So we can do: load first segment, compute, store, then load next segment, compute, store, etc. That's fine, no need for double buffer. However, we can overlap compute with load? With sequential dependency, we can't overlap compute of segment N with load of segment N+1 because we need curSum from segment N to start segment N+1. But we can load segment N+1 while computing segment N? The load is to local, compute uses local, so we could load segment N+1 into a different buffer while computing segment N. Then after compute, we swap. That is double buffering. We'll implement double buffer for x and mask.
+
+Given the complexity, we'll aim for a simpler kernel that processes each row as a whole if it fits, else we split row. But to keep code readable, we can assume seqLen <= tileLen (where tileLen is from tiling, which we set to seqLen if it fits UB). For the given dimensions, seqLen=32768 => 3*32768*4 = 393216 bytes > 192KB. So we need to tile. We'll design with tiling within row.
+
+We'll set tiling data fields: totalLength, seqLen, tileLen (segment length), blockDim. tileLen is derived from UB budget: we need space for xLocal (tileLen floats), maskLocal (tileLen floats), and output buffer? Actually we can store output directly to global? But we need local to accumulate? We can accumulate in a scalar, no need to store intermediate sums. We can just load x and mask, compute product, then in a loop add to curSum and store to global. So we need local buffers for x and mask, each tileLen. That's 2*tileLen floats. UB budget: 192KB => max tileLen = 192KB/(8B) = 24576 floats? Actually 2*4=8 bytes per element, so tileLen <= 24576. But we also need some for other variables, so safe tileLen = 16384. So for seqLen=32768, we need 2 tiles of 16384 each. Good.
+
+We can set tileLen = 16384 (or compute dynamically).
+
+Now, kernel: For each row, we loop over segments. For each segment, load x and mask from global to local, compute product in local (we can multiply elementwise using Muls on mask? Actually we need x * mask, so we can do vector Muls: tempLocal = xLocal * maskLocal. Then we loop over indices in that segment, updating curSum and storing to output.
+
+But we need to load both x and mask for each segment. We can load them separately. Use double buffer? We'll keep it simple: process segment by segment, loading both arrays each time.
+
+We'll try to pipeline: load next segment while computing current? Since computing is a loop over tileLen (16384) which is fast, maybe not needed. But we'll do double buffer to show optimization.
+
+Double buffer: we have two sets of buffers for x and mask. We can alternate. We'll use a queue-based approach similar to the example. But that adds complexity. For this answer, we can provide a straightforward sequential version without double buffering within the row, but using double buffering for rows? Since each block processes multiple rows, we can pipeline row loading. But we'll keep it simple: each block iterates over its assigned rows, for each row, process all segments sequentially.
+
+Given the instruction's example used double buffering, we should also use double buffering. But we can adapt.
+
+Let's design a kernel that uses double buffering for loading segments of a row. We'll use Queues: inQueueX, inQueueMask, outQueueY. But note we need to compute x*mask first, then cumsum. So we can combine: we can load both, compute product, then do cumsum. But the cumsum needs to be done sequentially, so we can do it directly in a loop.
+
+Better approach: Since we need to store output for each segment, we can compute the product and cumulative sum on the fly. We'll have two local tensors: one for x and one for mask. We'll load them, compute product in place? We'll have a third tensor for product? Or just compute in loop.
+
+Simplification: We can combine x and mask into product before storing to local? Actually we can load x and mask, then do an element-wise multiplication, then cumsum loop. This uses two input buffers and one output buffer for product? We can reuse one buffer for product. We'll allocate three buffers: xLocal, maskLocal, prodLocal. Then compute prodLocal = xLocal * maskLocal using vector Muls. Then loop over prodLocal to accumulate to curSum and store to output.
+
+We can reduce to two buffers if we do product in place on xLocal then cumsum loop. That's fine. So we have xLocal, maskLocal, and we do xLocal = xLocal * maskLocal, then loop accumulate. Then we don't need extra product buffer.
+
+Thus we need double buffer for x and mask. We'll use two inputs queues.
+
+Given time, we'll produce a kernel that is reasonable but may not be fully optimized. The key is to produce the six strings.
+
+Let's write the code.
+
+We'll need to define the op in project_json: input x (float), mask (float? or bool?), output y (float). Attribute dim (int). For simplicity, we'll make mask float. We'll also have attr negative_slope? No, we need dim.
+
+In host_operator_src, we need to compute tiling data: totalLength, seqLen, tileLen, blockDim.
+
+We'll compute tileLen = min(seqLen, maxTile), but we also need to consider that if seqLen > maxTile, we need multiple segments. We'll set tileLen as a fixed constant like 8192? But we need to ensure it aligns. Use dynamic: maxTile = UB_BUDGET_BYTES / (2*sizeof(float))? Actually we need two buffers (x,mask) each tileLen floats, so 2*tileLen*4 bytes. Set maxTile = (192*1024) / (2*4) = 24576. But align to 2048: 23552. We'll use that. But for simplicity, we can set tileLen = 8192 (common). We'll compute based on UB.
+
+We'll write the code accordingly.
+
+Now, produce the six strings.
+
+Make sure to match the kernel name: masked_cumsum_custom.
+
+Let's start.

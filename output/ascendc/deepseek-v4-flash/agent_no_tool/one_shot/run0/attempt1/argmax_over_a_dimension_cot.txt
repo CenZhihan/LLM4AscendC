@@ -1,0 +1,101 @@
+We need to replace `torch.argmax` with a custom AscendC kernel. The kernel name is `argmax_over_a_dimension_custom` (PascalCase: `ArgmaxOverADimensionCustom`). The original model does argmax over a specified dimension (dim=1 in example). We need to create an AscendC kernel that computes argmax along a given dimension. The input is 3D (batch, dim1, dim2), output is 2D (after reducing dim).
+
+We must generate the six strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+First, understand the operator: argmax returns the index of the maximum value along a dimension. The dimension can be any axis. The output tensor shape is the same as input but with the specified dimension removed. Data types: input float, output int64 (since torch.argmax returns int64). The kernel must handle arbitrary dim.
+
+Given constraints: need to implement efficient AscendC kernel. The tiling and kernel design must handle multi-dimensional tensors. Typically, AscendC kernels handle ND tensors with tiling. We'll use the shape information to compute strides.
+
+In the project_json_src, we need input_desc for x (float ND) and output_desc for y (int64? Actually torch.argmax returns torch.int64, so output type should be int64). Also attr for dim (int). Default? The dim is provided as argument in forward, so it should be an attribute.
+
+For tiling, we need to compute tileLength and blockDim. Since the operation is reduction along one dimension, the total number of elements is product of all dimensions except the reduced one. Each element in output corresponds to a slice along the reduced dimension. We can parallelize across the output elements.
+
+The kernel needs to handle any dim. We can use the shape shape, strides, and dim to compute offsets. The kernel will load a slice of the input (all elements along the reduced dim for a given output index), compute argmax, write index.
+
+Because the dim can be large, we may need to tile the reduced dimension if it exceeds UB. We'll design tiling that splits the reduced dimension into chunks, but that complicates argmax. Simpler: if the reduced dimension size is small enough to fit in UB, we can load entire slice. Otherwise, we need to do multiple passes? But argmax is associative, we can do two-pass: first find local max in each tile, then combine. However, to keep simple, we can assume the reduced dimension is moderate (like up to 4096) and tile the output dimensions. Let's design:
+
+- totalLength: number of output elements = product of all dims except the reduced dim.
+- tileLength: number of output elements per tile. We'll set UB budget accordingly.
+- For each output element, we need to load all elements along the reduced dim. So we need a temporary buffer of size reducedDim * sizeof(float) to store the slice, and then compute argmax. But we can also load in chunks if needed. For simplicity, we'll assume reduced dim is not too large (e.g., < 65536) so we can allocate a buffer per thread. If larger, we may need to iterate.
+
+Given typical sizes: dim2=4095, batch=128, dim1=4096 (dim=1). So reduced dim size = 4096. That's manageable. Each output element (batch*dim2) = 128*4095 ≈ 524k outputs. So we can tile over those outputs.
+
+Better: we can use grid-stride loops over output elements, and for each output, load the corresponding slice of size reducedDim and compute argmax. The slice loading can use DataCopy with vectorized copy if contiguous? The slice may not be contiguous if reduced dim is not the last dim? Actually, for argmax along a given dim, the slice is contiguous along that dim if the tensor is stored row-major? For a 3D tensor with dim=1 (the middle), the slice for a fixed batch (dim0) and dim2 is not contiguous because dim1 is the second axis. In row-major, the innermost dimension is the last. So if dim=1, elements along dim1 are spaced by dim2. So we cannot do a single contiguous copy. We need to do strided copy or use indexing. This is complex. 
+
+Alternative: Instead of writing a kernel that handles arbitrary dim, we could reshape the tensor to 2D: flatten axes before dim and after dim? But argmax along a specific dim can be done by permuting axes to make dim the last axis, then using contiguous kernel. However, AscendC kernels might not handle arbitrary dim easily. We can design the kernel to accept the dim as attribute, and the host side will compute the shape and strides and pass them to kernel. The kernel will then use a loop with strided loads.
+
+Because the complexity, maybe we can limit to a specific dim (like dim=1) as in the example? The user instruction says "argmax_over_a_dimension_custom" and the model has dim as init input (dim=1). However, the model's forward calls torch.argmax(x, dim=self.dim) where dim is passed at init. So the kernel should support any dim, but the tiling can compute based on actual shapes.
+
+Given the constraints of this exercise, we need to produce a working kernel that is plausible. We can assume the input is at most 3D, and the dim is 0,1,2. We'll compute strides accordingly.
+
+In kernel, we can:
+- Obtain the shape of input from tiling data (we need to pass shape and dim). We'll add fields for input shape (at most 4 dims) and dim.
+- For each output element, compute the coordinate in the input tensor, then iterate over the reduced dim.
+
+We need to store output indices as int64.
+
+To keep code manageable, we'll design tiling to tile over output elements. Each block handles a chunk of output elements. For each output element, we need to read all elements along reduced dim. If reduced dim size is too large, we may UB overflow. We'll impose a max reduced dim size (e.g., 65536) and assert.
+
+Given the typical size (4096), it's fine.
+
+Now we write the six strings.
+
+project_json_src: operator definition with input x (float ND), output y (int64 ND), attr dim (int, required? but default? We'll make it optional with default -1? Actually, dim must be specified. We'll set "param_type": "optional" but default -1. The host will pass it.)
+
+host_tiling_src: include tiling data with fields: totalLength (output elements), tileLength (output elements per tile), blockDim, reducedDim, dim, and shape[]. We'll define shape as an array? TILING_DATA_FIELD_DEF(uint32_t, shape0) etc. But we don't know max rank. We can define shape[8]? However, TILING_DATA_FIELD_DEF only allows scalar fields, not arrays. So we need to pass shape as multiple fields or use a struct. We can define max rank = 4 and add fields shape0, shape1, shape2, shape3 and numDims.
+
+But simpler: we can pass the input tensor's total elements, the reduced dim size, and the stride for that dimension. Actually, for argmax, we need the strides to calculate offset of each slice. We can compute strides from shape on host and pass them.
+
+Let's define:
+- totalElems: product of all dims.
+- outputElems: totalElems / reducedDim.
+- reducedDim: size of the reduction dimension.
+- stride: the stride of the reduced dimension in elements (i.e., number of elements between consecutive elements along that dim in memory). For row-major, stride = product of dimensions after that dim. For dim=1 in shape [128,4096,4095], stride = dim2=4095.
+- outerSize: product of dims before reduced dim (for dim=1, outerSize = dim0=128)
+- innerSize: product of dims after reduced dim (for dim=1, innerSize = dim2=4095)
+- outputStride: stride of output elements? Actually output is 2D with shape [outerSize, innerSize] after removal. But we can just compute indices.
+
+To simplify, we can pass the input shape (size_t shape[8]) and dim, and let the kernel compute things. But TILING_DATA only supports scalar fields. So we can pass the three numbers: outerSize, innerSize, reducedDim. That's enough for computing offsets. For dim=0, outerSize=1, reducedDim=dim0, innerSize=product of rest. For dim=last, outerSize=product of all before last, reducedDim=last, innerSize=1. So we can pass outer, inner, redDim.
+
+Also we need stride of reduced dim: stride = innerSize (since row-major, after reduced dim, the inner dimensions product is the stride). Yes, for dim=k, stride = product of dims after k.
+
+Thus tiling fields:
+- outputElems (uint32)
+- tileLen (uint32)
+- blockDim (uint32)
+- outerSize (uint32)
+- reducedDim (uint32)
+- innerSize (uint32)
+- dim (int32) -- optional but can be used for verification.
+
+Now host_tiling_src: define tiling data class with those fields. Tiling function will compute from input shape: get shape size, compute dim (from attr), then compute outerSize, reducedDim, innerSize, outputElems. Then compute tileLen based on UB budget. We'll set a conservative UB budget.
+
+host_operator_src: define op, shape inference, data type inference. Output shape is input shape with dim removed. Output type is int64.
+
+kernel_src: implement kernel. Use class KernelArgmax, with Init receiving tiling data. Process: grid-stride loop over output elements. For each output element index (i), compute input base offset: offset = (i / innerSize) * reducedDim * innerSize + (i % innerSize) (since outerSize blocks of reducedDim*innerSize, then inner offset). That's for dim=1, but generalized: offset = (i / innerSize) * (reducedDim * innerSize) + (i % innerSize). Then iterate over j=0..reducedDim-1, compute val = xGm_[offset + j*innerSize], keep max and arg. Write arg (int32? but we need int64) to yGm_[i]. Use int64 for output.
+
+But careful: innerSize is the stride of reduced dim. So loop: for (k=0; k<reducedDim; k++) { idx = offset + k * innerSize; val = xGm_[idx]; update max, arg }.
+
+We'll use local tensors to load chunks? Since we are reading scattered elements (stride innerSize may be large), we cannot do vector copy. We'll do scalar loads directly from global memory. That is inefficient but acceptable for demonstration. Alternatively, we can load a block of contiguous memory if innerSize=1 (i.e., dim is last). But here dim=1 not last. So we'll do scalar.
+
+But AscendC supports vectorized loads only for contiguous blocks. For strided, we can use DataCopy with strides? Not directly. So we'll use simple scalar loads for each element. That will be slow but works.
+
+To improve, we could permute the tensor on host before kernel to make reduced dim last, but that would require host op. Not needed for illustration.
+
+Given this is a model answer, we can keep simple.
+
+kernel_src will include a for loop with vectorization? Not possible. So we'll write the kernel as above.
+
+python_bind_src: similar to leaky_relu but with aclnnArgmaxOverADimensionCustom call. We'll need to assume the custom operator is registered.
+
+model_src: same pattern.
+
+Now produce the six strings.
+
+Note: In project_json_src, output type should be "int64" because torch.argmax returns int64.
+
+In host_operator_src, InferDataType: input float, output int64.
+
+In kernel_src: need to load tiling data; we'll have fields as defined.
+
+We'll write code accordingly.

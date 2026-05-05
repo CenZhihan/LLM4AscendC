@@ -462,7 +462,7 @@ python3 tools/test_ascend_docs_tools.py \
 
 ### 3.7 多轮自动修复脚本（按轮次命名汇总）
 
-`generator/scripts/run_agent_multi_rounds.py` 现已支持 **可配置轮次**（`--max-attempts >= 2`）与 **算子级并行**（`--parallel-ops`）。
+`generator/scripts/run_agent_multi_rounds.py` 现已支持 **可配置轮次**（`--max-attempts >= 2`）与 **算子级并行**（`--parallel-ops`）。算子列表可与单轮脚本对齐：**显式传 `--ops`**，或 **省略 `--ops` 并用 `--categories` + 可选 `--kernelbench102`** 从数据集中展开（规则同 `generator/scripts/generation/generate_agent.py`；例如 `--categories activation --kernelbench102` 对应 12 个激活类算子）。虚拟类别 **`test_set`** 表示学长指定的固定 12 个评测算子，列表维护在 `generator/test_set_ops.py`。
 
 示例：
 

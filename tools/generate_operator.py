@@ -27,6 +27,7 @@ from generator import (
     rag_code_dir, rag_file_extensions, ref_impl_base_path,
     temperature, top_p
 )
+from generator.test_set_ops import TEST_SET_CATEGORY, select_ops_by_categories
 from generator.rag import EmbeddingRetriever, CodeIndexer
 
 
@@ -85,11 +86,17 @@ def generate_with_rag(model: str, categories: list, workers: int, output_dir: st
     top_k = top_k or rag_top_k
     max_chars = max_chars or rag_max_chars
 
-    # Get operator list
-    all_ops = list(dataset.keys())
-    if categories != ['all']:
-        all_ops = [op for op in all_ops if dataset[op]['category'] in categories]
-    all_ops = sorted(all_ops)
+    if (
+        categories != ["all"]
+        and TEST_SET_CATEGORY in categories
+        and len(categories) > 1
+    ):
+        print(
+            "[WARN] --categories 含 test_set 且还有其他类别名；仅使用 test_set 固定的算子列表，其它类别名忽略。"
+        )
+    all_ops, preserve_order = select_ops_by_categories(categories, dataset)
+    if not preserve_order:
+        all_ops = sorted(all_ops)
 
     print(f"[INFO] Total ops to generate: {len(all_ops)}")
     print(f"[INFO] Categories: {categories}")
