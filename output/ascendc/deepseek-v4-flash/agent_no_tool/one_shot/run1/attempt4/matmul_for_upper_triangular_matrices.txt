@@ -1,0 +1,287 @@
+```python
+project_json_src='''
+[
+  {
+    "op": "MatmulForUpperTriangularMatricesCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "A",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "B",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "C",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulForUpperTriangularMatricesCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, tileWidth);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulForUpperTriangularMatricesCustom,
+                           MatmulForUpperTriangularMatricesCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+#include "matmul_for_upper_triangular_matrices_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+// UB budget: A_row (tileWidth floats), B_rows (tileWidth * (tileWidth+1)/2? we just load one row at a time)
+// We need for each column tile: temp for one row of B (tileWidth floats), temp for C tile (tileWidth floats)
+// Also a scalar a per iteration.
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
+static constexpr uint32_t ALIGN_ELEMS = 32;               // alignment for DMA
+static constexpr uint32_t HARD_CAP_TILE_WIDTH = 4096;    // maximum tile width
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) {
+    return (x / a) * a;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context) {
+    MatmulForUpperTriangularMatricesCustomTilingData tiling;
+    const uint32_t N = static_cast<uint32_t>(
+        context->GetInputShape(0)->GetOriginShape().GetDim(0));
+
+    // Estimate tile width from UB: we need 2* tileWidth floats (one row B + one row C) = 8* tileWidth bytes
+    // Plus a scalar, so 8 * tileWidth <= UB_BUDGET
+    uint32_t maxTileWidth = UB_BUDGET_BYTES / 8;
+    maxTileWidth = AlignDown(maxTileWidth, ALIGN_ELEMS);
+    if (maxTileWidth < ALIGN_ELEMS) maxTileWidth = ALIGN_ELEMS;
+    if (maxTileWidth > HARD_CAP_TILE_WIDTH) maxTileWidth = HARD_CAP_TILE_WIDTH;
+    uint32_t tileWidth = (N < maxTileWidth) ? N : maxTileWidth;
+
+    // blockDim: one block per row of the upper triangle (grid stride inside kernel)
+    // We can set blockDim to number of rows / some factor, but keep moderate.
+    uint32_t blockDim = (N + tileWidth - 1) / tileWidth;
+    if (blockDim < 8) blockDim = 8;
+    if (blockDim > 24) blockDim = 24;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_N(N);
+    tiling.set_tileWidth(tileWidth);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context) {
+    const gert::Shape *a_shape = context->GetInputShape(0);
+    gert::Shape *c_shape = context->GetOutputShape(0);
+    *c_shape = *a_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context) {
+    const ge::DataType a_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, a_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class MatmulForUpperTriangularMatricesCustom : public OpDef {
+public:
+    explicit MatmulForUpperTriangularMatricesCustom(const char* name)
+        : OpDef(name) {
+        this->Input("A")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("B")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("C")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulForUpperTriangularMatricesCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelMatmulUpperTriangular {
+public:
+    __aicore__ inline KernelMatmulUpperTriangular() {}
+
+    __aicore__ inline void Init(GM_ADDR A, GM_ADDR B, GM_ADDR C,
+                                uint32_t N, uint32_t tileWidth) {
+        N_ = N;
+        tileW_ = tileWidth;
+        stride_ = N; // row-major, leading dimension = N
+
+        A_gm_.SetGlobalBuffer((__gm__ float*)A, N_ * N_);
+        B_gm_.SetGlobalBuffer((__gm__ float*)B, N_ * N_);
+        C_gm_.SetGlobalBuffer((__gm__ float*)C, N_ * N_);
+
+        // Buffers: one row of B, one partial C tile, one scalar
+        pipe_.InitBuffer(inBufB_, BUFFER_NUM, tileW_ * sizeof(float));
+        pipe_.InitBuffer(outBufC_, BUFFER_NUM, tileW_ * sizeof(float));
+        pipe_.InitBuffer(tmpScalarQue_, 1, 1 * sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        const uint32_t blockIdx = AscendC::GetBlockIdx();
+        const uint32_t blockNum = AscendC::GetBlockNum();
+
+        // Each core processes rows with stride blockNum
+        for (uint32_t i = blockIdx; i < N_; i += blockNum) {
+            // For each row i, process column tiles from i to N_ step tileW_
+            for (uint32_t j0 = i; j0 < N_; j0 += tileW_) {
+                uint32_t j1 = j0 + tileW_;
+                if (j1 > N_) j1 = N_;
+                uint32_t colLen = j1 - j0;
+
+                // Initialize C tile to zero
+                AscendC::LocalTensor<float> cTile = outBufC_.AllocTensor<float>();
+                AscendC::Muls(cTile, cTile, 0.0f, colLen); // garbage * 0 = 0
+                outBufC_.EnQue(cTile);
+
+                // Loop over k from i to j1-1
+                uint32_t k0 = i;
+                uint32_t k1 = j1;
+                for (uint32_t k = k0; k < k1; k++) {
+                    // Load scalar A[i][k] into a 1-element tensor
+                    AscendC::LocalTensor<float> aScalar = tmpScalarQue_.AllocTensor<float>();
+                    AscendC::DataCopy(aScalar, A_gm_[i * stride_ + k], 1);
+
+                    // Get scalar value from the 1-element tensor
+                    float a = aScalar.GetValue(0);
+
+                    tmpScalarQue_.FreeTensor(aScalar);
+
+                    // Load B[k][j0:j1] row
+                    AscendC::LocalTensor<float> bRow = inBufB_.AllocTensor<float>();
+                    AscendC::DataCopy(bRow, B_gm_[k * stride_ + j0], colLen);
+                    inBufB_.EnQue(bRow);
+
+                    // Multiply-add: C[j] += a * B[k][j] for j in [j0, j1)
+                    cTile = outBufC_.DeQue<float>();
+                    bRow = inBufB_.DeQue<float>();
+                    AscendC::Muls(bRow, bRow, a, colLen);  // bRow = a * bRow
+                    AscendC::Add(cTile, cTile, bRow, colLen);
+                    outBufC_.EnQue(cTile);
+                    inBufB_.FreeTensor(bRow);
+                }
+
+                // Write back C tile to global memory
+                cTile = outBufC_.DeQue<float>();
+                AscendC::DataCopy(C_gm_[i * stride_ + j0], cTile, colLen);
+                outBufC_.FreeTensor(cTile);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inBufB_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outBufC_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpScalarQue_;
+
+    AscendC::GlobalTensor<float> A_gm_;
+    AscendC::GlobalTensor<float> B_gm_;
+    AscendC::GlobalTensor<float> C_gm_;
+
+    uint32_t N_ {0};
+    uint32_t tileW_ {0};
+    uint32_t stride_ {0};
+};
+
+extern "C" __global__ __aicore__ void matmul_for_upper_triangular_matrices_custom(
+    GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulUpperTriangular op;
+    op.Init(A, B, C, tiling_data.N, tiling_data.tileWidth);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor matmul_upper_triangular_impl_npu(
+    const at::Tensor& A, const at::Tensor& B) {
+    at::Tensor C = at::empty_like(A);
+    EXEC_NPU_CMD(aclnnMatmulForUpperTriangularMatricesCustom, A, B, C);
+    return C;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_for_upper_triangular_matrices_custom",
+           &matmul_upper_triangular_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_for_upper_triangular_matrices_custom",
+          &matmul_upper_triangular_impl_npu,
+          "Matrix multiplication for upper triangular matrices (custom AscendC)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'matmul_for_upper_triangular_matrices_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(*inputs)
+'''
+```

@@ -1,0 +1,86 @@
+We are given a task to replace the PyTorch Softplus operation with a custom AscendC kernel. The kernel name is "softplus_custom" (PascalCase: "SoftplusCustom"). We need to produce six embedded Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, and model_src. We must follow the pattern from the example (LeakyReLU custom kernel) but adapt it for Softplus.
+
+Softplus function: f(x) = log(1 + exp(x)). Numerically stable implementation: f(x) = x > threshold ? x : log(exp(x) + 1) where threshold is usually 20 (log of float max?). But we can use the AscendC built-in functions? We need to write a kernel that computes softplus element-wise.
+
+We need to design tiling data, host tiling function, operator definition, kernel code, Python binding, and model.
+
+First, define the op in project_json: input x, output y (float, ND). No extra attributes (since softplus has no parameters? Actually PyTorch's softplus has beta and threshold, but the model uses default: beta=1, threshold=20). The instruction says "Softplus activation" with no extra parameters. So we can have no attributes, or we can include beta and threshold as optional attrs to be generic. The example leaky_relu had negative_slope attr. For softplus, default beta=1, threshold=20. But the model simply calls torch.nn.functional.softplus(x) with defaults. So we can either hardcode or make configurable. To match the example pattern, we can define attrs for beta and threshold with defaults (beta=1.0, threshold=20.0). However the user might expect no attrs. Let's see the example: they defined negative_slope attr because leaky_relu needs it. For softplus, if we want to be exactly the same as PyTorch default, we can hardcode in kernel. But to be flexible, include attrs. The instruction says "generate an optimized version named ModelNew, including the six Python strings". The model_src will call the custom op with inputs only (no attrs). So we should have default attrs in the op definition, and the kernel will use them. For simplicity, we can have no attrs and just compute log1p(exp(x)). But the threshold is needed for numerical stability. We'll include beta and threshold as attrs with defaults.
+
+Softplus formula: f(x) = (1/beta) * log(1 + exp(beta * x)). With default beta=1, threshold=20. So we can compute: y = (1/beta) * log(1 + exp(beta * x)). For efficiency, we can compute: t = beta * x; if t > threshold: y = x (since (1/beta)*t = x)? Actually when beta=1, log1p(exp(x)) ~ x for large x. More precisely: if beta*x > threshold, then exp(beta*x) is large, log(1+exp(beta*x)) ≈ beta*x, so y = (1/beta)*beta*x = x. So we can clamp. So kernel can use conditional.
+
+In AscendC, we can use functions like Exp, Log, Add, Muls, etc. The best approach: compute t = beta * x; then use an exp, then add 1, then log, then multiply by 1/beta. But we need to avoid overflow for large negative? exp of negative large is fine. But for large positive, exp(beta*x) may overflow; we can use the threshold to avoid it.
+
+We need to design tiling similar to leaky_relu: tiling data includes totalLength, tileLength, blockDim, beta, threshold. The kernel will process tiles.
+
+Let's write the code.
+
+First, project_json_src: define op SoftplusCustom with inputs x (float, ND), output y (float, ND), and attrs beta (float, default 1.0) and threshold (float, default 20.0).
+
+Second, host_tiling_src: define tiling data struct SoftplusCustomTilingData with fields: totalLength (uint32_t), tileLength (uint32_t), blockDim (uint32_t), beta (float), threshold (float). Register using REGISTER_TILING_DATA_CLASS.
+
+Third, host_operator_src: similar to leaky_relu but with SoftplusCustom. The tiling function should compute tileLen from UB budget. For softplus, we need to consider the buffer usage: we need inQueueX (2 tiles), outQueueY (2 tiles), and temp buffers for exp, log, etc. In leaky_relu they used tmpQueue for one tile. For softplus, we might need more temp space. For simplicity, we can use a single temp buffer of tile size for intermediate results. The UB budget: we need to allocate 2 tiles for input, 2 tiles for output, and 1 tile for temp = 5 tiles * tileLen * sizeof(float). So same formula as leaky_relu. However, the actual implementation may need more local memory if we do operations in place. But we can design it similarly: in Compute, we dequeue x, allocate y, and use a temp tensor. We'll compute t = beta * x; then for each element, if t > threshold, y = t/beta? Actually we want y = (1/beta)*log(1+exp(beta*x)). But if beta*x > threshold, y = x. So we can compute m = max(beta*x, -threshold?) Not exactly. We'll do: t = beta * x; if t > threshold: y = x; else: exp_t = exp(t); y = (1/beta) * log1p(exp_t). So we need exp and log1p. AscendC has Log1p? There's Log: log(x). So we can compute y = (1/beta) * log(1+exp(t)). We'll compute exp(t), then add 1, then log. So we need a temporary for exp_t. We'll use the tmpQueue for that.
+
+Thus buffer requirement: inQueueX (2 tiles), outQueueY (2 tiles), tmpQueue (1 tile). Same as leaky_relu. So UB budget same.
+
+But note: we also need to compute beta * x, which we can do in place on x or on y? We'll allocate temp from tmpQueue for exp. Actually we can use xLocal for multiplication to produce t? But we need to keep x? Since we need x for the final assignment if condition holds. We can compute t = beta * x and store in a temp, then use that. We'll use the tmpQueue to store t (beta*x), then compute exp in another temp? Or we can do stepwise: first compute t = beta * x (store in tmp), then for threshold, we need to compare t with threshold. Then for those t <= threshold, compute exp(t) and then log1p and scale. But since we are vectorized, we can use vector operations with masks? AscendC supports vector conditional operations using Mask? The simpler approach: compute y = (1/beta) * log(1+exp(beta*x)) for all, but to avoid overflow for large positives, we can set a maximum t value by clamping beta*x to threshold before exp. i.e., t = min(beta*x, threshold). That is stable because exp(threshold) is about e^20 ~ 4.85e8, manageable. Then compute exp(t), add 1, log, scale by 1/beta. That yields y ~ x for large x? Actually if beta*x > threshold, we set t=threshold, then exp(threshold) is huge, log(1+exp(threshold)) ≈ threshold, so y ≈ threshold/beta = x? Not exactly equal but close? For beta=1, threshold=20, y≈20 for x>20, but actual softplus(x) ≈ x for x>20. So using clamp to threshold will give wrong result for large x. So we need the conditional: if beta*x > threshold, y = x (since log1p(exp(beta*x)) ≈ beta*x, so y = (1/beta)*beta*x = x). So we must implement a conditional assignment.
+
+We can use vector select or Compare + Select operations. AscendC has VCMP, VSEL? Actually in AscendC we can use functions like Compare, Select, etc. But to keep it simple, we can compute both branches and then mask? That's heavy.
+
+Alternative: use the formula: y = (1/beta) * (log(1+exp(-|beta*x|)) + max(beta*x, 0)). More stable: log1p(exp(x)) = log(1+exp(x)) = max(0,x) + log(1+exp(-|x|)). So for beta*x = z, y = (1/beta)*(max(0,z) + log1p(exp(-abs(z)))). That avoids overflow for large positive z because we use exp(-abs(z)). For large negative, exp(-abs(z)) = exp(z) (since z negative, -abs(z)=z), so it's fine. So we can implement without conditional threshold. That is numerically stable and doesn't require clamping. Let's use that.
+
+So algorithm: for each element:
+  z = beta * x
+  y = (1/beta) * (max(0,z) + log1p(exp(-abs(z))))
+
+Because log1p(exp(-abs(z))) is always small (≤ log2 ≈ 0.693). So no overflow.
+
+Thus in kernel:
+  t = beta * x
+  abs_t = abs(t)
+  exp_neg_abs = exp(-abs_t)  # using AscendC::Exp(neg_abs_t)
+  log1p_exp = log(1 + exp_neg_abs)  # AscendC::Log1p? Not available, so compute: temp2 = exp_neg_abs + 1; log_temp = log(temp2)
+  max0 = max(t, 0)
+  y = (1/beta) * (max0 + log_temp)
+
+We need temporary tensors: for t, for abs_t, for exp_neg_abs, for log_temp, etc. But we can reuse temporaries. For simplicity, we can use two temp tensors: one for t (beta*x) and one for other intermediates. Since we only have one tile of tmpQueue, we need to manage carefully. We'll allocate one temp tensor from tmpQueue for t. Then we can compute in-place on y? Actually we can compute the final y into yLocal directly by steps. But we need to compute t first, then compute max0 and abs_t, etc. We can use tLocal for t, then compute max0 = max(t, 0) and store in yLocal, then compute log1p_exp into tLocal again, then add and scale. So we need two temporaries: tLocal and maybe another. But we have only one tmpQueue with one tile. So we can reuse: compute t into tLocal; then compute abs(t) into yLocal? But we need y for final result. Alternatively, we can compute everything using the input xLocal and tLocal and then output to yLocal. Let's think step by step.
+
+We have:
+- xLocal (from input)
+- yLocal (output)
+- tLocal (from tmpQueue)
+
+Steps:
+1. tLocal = beta * xLocal (element-wise multiply)
+2. Compute max0 = AscendC::Max(tLocal, 0.0f) and store in yLocal (temporary, will be overwritten)
+3. Compute abs_t = AscendC::Abs(tLocal) and store back to tLocal (overwrite)
+4. Compute exp_neg_abs = AscendC::Exp(-abs_t) -> store to tLocal? But we need abs_t for the next step. Actually we can compute exp(-abs_t) directly: AscendC::Exp(-tLocal) (since tLocal now holds abs_t). So tLocal = -tLocal, then exp = AscendC::Exp(tLocal) -> tLocal = exp(-abs_t).
+5. Add 1: tLocal = tLocal + 1.0f
+6. Log: tLocal = AscendC::Log(tLocal)
+7. yLocal = yLocal + tLocal (yLocal holds max0, tLocal holds log(1+exp(-abs(z))))
+8. yLocal = yLocal * (1/beta) (element-wise multiply)
+
+Thus we only need tLocal as temporary, and we can use yLocal for max0. The tLocal is reused throughout. So buffer requirement: inQueueX (2 tiles), outQueueY (2 tiles), tmpQueue (1 tile). Same as leaky_relu. So tiling calculation stays same.
+
+Now write kernel_src with similar structure: class KernelSoftplusCustom with Init, Process, CopyIn, Compute, CopyOut. In Compute, we implement the steps.
+
+We also need to handle the tiling data: we will have beta and threshold in tiling data, but threshold is not needed in the stable formula. We can still include it in tiling data for consistency but not use it in Compute. Or we can remove threshold attr. Since the model doesn't specify threshold, and we are using stable formula, we can omit threshold. But the op definition might still include it for flexibility. But the user's model_src will call the custom op with only x as input. So the host tiling function must set beta from attrs (if attrs exist). If we don't have threshold attr, we can just have beta. Let's keep beta only. Project_json: attr "beta" with default 1.0. No threshold. Then in kernel, we use beta from tiling.
+
+Now write the host_operator_src: similar to leaky_relu but with SoftplusCustom. The tiling function will get totalLength from input shape, compute tileLen, set blockDim, set beta from attrs. Because we don't have threshold, we don't need it in tiling data. So we can remove threshold field from tiling data. Let's define tiling data with totalLength, tileLength, blockDim, beta.
+
+Now python_bind_src: similar to leaky_relu but with softplus_custom and aclnnSoftplusCustom. Also need to register TorchScript or custom op. We'll follow pattern: define a function softplus_impl_npu that takes tensor self and double beta? But the op has no attrs in call? Actually we need to pass beta as a scalar? The model_src will call custom_ops_lib.softplus_custom(x). The op has default beta=1.0, so we don't need to pass it. But the python binding file should call aclnnSoftplusCustom with default beta? The EXEC_NPU_CMD macro expects to call the operator with the given inputs and attrs. We need to define aclnnSoftplusCustom that takes tensor and optional attrs. However, for simplicity, we can call aclnnSoftplusCustom with just the tensor, and the framework will use default attrs. Or we can pass beta as an optional parameter. The example for leaky_relu passed negative_slope as a double. For softplus, we can also pass beta as optional double with default 1.0. But the user's model_src calls fn(*inputs) where inputs is [x], so only one argument. So we need to define the Python binding function that accepts x and returns y, and behind the scenes it calls aclnnSoftplusCustom with default beta. So we can define softplus_impl_npu(self, beta=1.0) but then we need to make it optional. In the example, they used double negative_slope, but the model_src passed *inputs which included negative_slope as second argument. For softplus, get_inputs returns [x] only, so we should not require extra args. So we can either ignore beta or set default in the binding. Since the op defines default beta=1.0, we can just call aclnnSoftplusCustom(self, 1.0, result) but that would require a scalar. Better to have the binding function accept only self, and internally use default beta=1.0. So we can write:
+
+at::Tensor softplus_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnSoftplusCustom, self, 1.0, result);
+    return result;
+}
+
+And then TORCH_LIBRARY_IMPL and PYBIND11_MODULE as in example.
+
+Now model_src: similar to example but with softplus_custom.
+
+Let's write all six strings.
+
+We must ensure naming: kernel function in kernel_src is "softplus_custom". The operator definition in project_json and host_operator_src uses PascalCase "SoftplusCustom".
+
+Now produce the code.

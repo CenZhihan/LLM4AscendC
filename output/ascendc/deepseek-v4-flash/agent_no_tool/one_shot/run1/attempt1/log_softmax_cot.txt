@@ -1,0 +1,197 @@
+We need to generate custom Ascend C kernel for log_softmax_custom. The original model uses torch.log_softmax(x, dim=1). We need to implement a custom AscendC kernel that computes log_softmax along dim=1 (the second dimension). The kernel should be named log_softmax_custom (function name) and PascalCase operator name LogSoftmaxCustom. Input is float ND tensor. Output is float. We need to handle tiling, host operator, kernel code, python binding, and model.
+
+We must consider that the input is (batch_size, dim) with dim=393216, batch_size=4096. That's a large 2D tensor. LogSoftmax along dim=1 (columns) requires computing maximum and sum of exponentials along each row. We need to design an efficient kernel. Since the tensor is large, we'll process each row independently. For each row, we need to compute max, then subtract max, exp, sum, log(sum), then subtract log(sum) from (x - max). The kernel should be vectorized. We'll use UB buffer for intermediate calculations.
+
+We'll define tiling data: totalLength (number of elements), rowLength (number of columns), rowCount (number of rows). We'll process multiple rows per block. But careful: the kernel should work for any shape, but we assume 2D. Actually the dim=1 is a specific axis, but the operator should generalize: given input tensor, apply log_softmax along the last dimension? Actually typical log_softmax in PyTorch is along specified dim. For simplicity, we assume dim=1 for 2D, but we can make it generic: treat the tensor as (batch_size, feature_dim) and compute along the last dimension. However, the operator definition in op_def should specify that it works on ND tensors? The project_json should define input x with format ND, type float. The dim attribute could be added, but the user instruction only says log_softmax_custom without dim attribute. In original model, dim=1 is hardcoded. We can incorporate dim as an attribute to match PyTorch behavior. But user's model uses dim=1. Let's include dim as an attribute (int) with default 1. However, the example leaky_relu had negative_slope attr. So we can add dim attribute. The tiling will need to know the shape dimensions. We'll need to pass shape information. We could pass totalLength, rowLength, rowCount, and dim. But dim is just an axis. Since we are processing along the last dimension (or given dim), we can compute the max, sum, etc. For simplicity, let's assume dim=1 (the last dimension) and tensor is 2D. But to be robust, we can pass rowLength (size of the dimension along which softmax is computed) and rowStride (product of dimensions before that axis) and totalLength. Actually we need to know the shape to compute per-row operations. The host tiling can compute row size and number of rows based on shape.
+
+Let's define tiling data: totalLength (total elements), rowLength (number of elements in the dim to softmax over), rowCount (number of rows = totalLength / rowLength). We'll process tiles of multiple rows? Each row is large (393216 elements). That's too large for a single tile. So we need to process each row in chunks. Actually the row is 393216 floats, which is about 1.5 MB. UB is 192 KB. So we need to tile each row into smaller tiles. We can process each row in multiple iterations, each iteration handles a tile of rowLength. We can have a double buffer for row-wise processing. But we need max and sum across the entire row. To compute max, we can process the row tile by tile, compute local max, then reduce. But that would require multiple passes. Alternatively, we can compute max first by scanning all tiles, then compute the rest. But that would require storing intermediate results. Since the row is large, we can do it in two passes: first pass compute max (store in UB buffer? No, we need to store max per row). We can have a block handle multiple rows, but each row is large, so we might process one row per block. With 24 blocks, we can process 24 rows concurrently. But we have 4096 rows, so 4096/24 ≈ 171 iterations. That's fine.
+
+For each row, we need to compute row-wise max, then subtract, exp, sum, then compute log of sum, then subtract. We can do it in one pass if we store the max and then second pass? Actually we need to compute max first, then compute the rest. Since we have to read the row twice, we can do pipelined double buffering: load one tile, compute local max, then later when we know the global max, we can recompute the read? Better to do two-pass: first pass compute max and store it in UB (small, one float per row). Then second pass compute the final output. For each row, we can do:
+
+1. Load row in tiles, compute local max, update global max.
+2. After finishing row, we have max.
+3. Then load row again in tiles, compute (x - max), exp, accumulate sum.
+4. After finishing row, compute log(sum) and then write output: (x - max - log(sum)).
+
+But this requires reading each row twice. That's acceptable.
+
+Alternatively, we can use a two-pass approach but with more sophisticated pipelining? For simplicity, we'll implement row-by-row processing with two passes. We'll keep a temporary buffer for one row's data? UB is limited. We can't hold a full row (393k elements). So we process in tiles. For each tile, we compute local max, then after getting global max, we need to recompute. So we must store the tile data? Or we can load tile once, compute local max, store the tile in a local buffer (in UB) and then after we have global max, we can process the stored tile. But a tile size is limited (say 8192 elements). UB has 192KB = 48k floats. For a tile size of 8192, we need space for one tile for x, one for y, plus temps. That's fine. We can allocate a buffer for one tile (x). Then we load tile, compute local max, store the tile in buffer, and after we have global max, we process that buffer. This way we only read each tile once. However, we need to accumulate max across tiles – we need to store the max from each tile temporarily? Actually we can compute global max incrementally: as we load each tile, we compute local max and update global max. Then after reading all tiles, we have global max. Then we can process the stored tiles? But we stored only one tile at a time? We need to store all tiles of the row to process them later. But UB is not enough to store all tiles of a row (393k floats). So we can't store all. Therefore we must read twice.
+
+Thus, the two-pass approach: first pass compute max (read row, no need to store data). Second pass compute exp and sum, then apply log and write output.
+
+We can pipeline: for each row, do pass1 (max) using one set of buffers, then pass2 (final) using another set. But we can interleave rows: while one row is in pass2, another row can start pass1. However, that adds complexity. For simplicity, we can process each row sequentially with two passes.
+
+But we need to consider performance. The bottleneck is memory bandwidth. Two passes double the reads, but it's acceptable.
+
+Alternatively, we can compute stable log_softmax using an on-chip reduction: load entire row into UB? Not possible due to size. So two-pass is fine.
+
+We need to design tiling: for each row, we process tiles of size tileLen. totalLength = rowCount * rowLength. We'll iterate over rows. For each row, we process tiles.
+
+Better: Let each block handle a contiguous chunk of rows. For each chunk, we process rows one by one. Each row: pass1: iterate over tiles, compute max. Then pass2: iterate over tiles, compute exp, accumulate sum, then after sum is computed, we can compute log(sum) and then write output. But to write output, we need to know log(sum) at the end of the row. So we can do pass2 in two phases: first accumulate sum while reading, then after sum is known, recompute output? That would require another read. Alternatively, we can compute sum in a first sub-pass, then compute log(sum), then in second sub-pass compute output. That's three passes. Better: use two passes as described: pass1 max, pass2 compute exp and accumulate sum, then after pass2, compute log(sum) and then we still need to write output. But to write output, we need to compute (x - max - log(sum)). We have x from pass2 but we have already processed it. We could store the x values in a local buffer during pass2? But we can't store all tiles. Alternative: in pass2, we can compute both exp and also store the x values? No.
+
+Another approach: use a single pass with reduction tree. For each tile, we compute local max, store x in UB buffer, then compute local sum after subtracting local max? But then global max is not known. We could do two-phase within each tile: first compute local max, then shift and compute local sum, then combine with other tiles? This requires inter-tile communication. We could use a vector reduce across tiles using a global memory reduce? That would be complex.
+
+Simpler: three passes: pass1 max, pass2 compute sum of exp(x-max), pass3 compute output using x and max and log(sum). That means three reads of the input. That's inefficient but maybe acceptable given the constraints. However, we can optimize: pass2 can also store x in UB if tile size is small enough. But if tile size is 8192 floats (32KB), we can store one tile of x in UB. Then after pass2 we have sum, but we need to write output. We can then load the same tile from UB and compute output. So we need a buffer for one tile of x. In pass2, we load x into a buffer, compute exp(x-max), accumulate sum, and store x in buffer. Then after processing all tiles of the row, we compute log(sum), then we can iterate over stored tiles again? But we only stored one tile at a time. We could store multiple tiles? Not enough UB. So we would need to reload x for the third pass. That's three reads again.
+
+We can combine pass2 and pass3: after computing the sum, we can immediately compute the output for that tile if we have the sum of the entire row. But we don't have the sum until the end. So we could do: for each tile, compute exp and accumulate sum, but also store the exp values? Then after sum is known, we can compute output by multiplying by exp and dividing by sum? Actually log_softmax = x - max - log(sum). So we need x. If we store x in UB for the tile (one tile), we can recompute output after knowing sum. But we need to store x for every tile? For a row, we have many tiles. If tile size is 8192, row length 393216 => 48 tiles. We cannot store 48 tiles in UB (48*32KB=1.5MB > UB). So we can't.
+
+Thus, three passes seems necessary. But we can reduce to two passes if we use a two-step approach: first pass compute max and also compute exp and sum using a temporary local max (the tile's local max) and then later correct? That would be unstable. Alternatively, we can use a parallel reduction: each block handles one row, and we use device-level synchronization to compute global max and sum? Not feasible in AscendC.
+
+Given the complexity, perhaps we can design an optimized kernel that does the following for each row:
+- Phase 1: Load row in tiles, compute max, store the max in a scalar.
+- Phase 2: Reload row in tiles, compute exp(x-max) and accumulate sum, store this sum in a scalar.
+- Phase 3: Reload row in tiles, compute (x - max - log(sum)) and write output.
+
+Three passes, each pass reads the entire row. That's 3x memory traffic. But we can pipeline: while processing one row, we can overlap reads with compute using double buffers. For each pass, we can have double buffers for input and output. However, since we have three passes, we need to manage.
+
+Maybe we can combine phase 2 and phase 3 by computing and writing output in the same pass using a reduction across tiles? That would require maintaining a running sum and then after the last tile, we compute log(sum), then we need to go back and adjust previous output? Not possible.
+
+Another idea: Use atomic operations? Not available in AscendC for float.
+
+Maybe we can use the fact that log_softmax(x) = x - logsumexp(x). So we can compute logsumexp first (two passes: max and sum of exp), then subtract. That's still three passes.
+
+Given the constraints, we'll implement a three-pass kernel for each row. But we can optimize by processing multiple rows in parallel across blocks. Each block handles a set of rows. For each row, we do three passes. This is simple but not optimal.
+
+We can also note that the input shape is (batch_size, dim) with dim large. The kernel will be memory-bound. Three passes might still be acceptable.
+
+Alternatively, we could use a single pass with a vector reduction that computes max and sum in one go using a shuffle-like reduction across vector lanes? Not possible because we need global reduction across tiles.
+
+Given the time, we'll go with a simpler approach: For each block, process a contiguous range of elements, but since softmax requires per-row statistics, we need to process whole rows. So each block should handle one or more entire rows. With 24 blocks and 4096 rows, each block handles ~171 rows. For each row, we do three passes. That is fine.
+
+We need to design tiling to pass: totalLength, rowLength, tileSize (for per-pass tiles), blockNum, blockIdx. Block will process rows from startRow to endRow. We'll compute startRow = blockIdx * rowsPerBlock, etc.
+
+Let's define tiling data:
+- totalLength
+- rowLength (number of columns)
+- rowCount
+- tileLen (for each pass tile)
+- negative? Not needed.
+
+But for log_softmax, we don't need attr. The dim is implicitly the last dimension? We can add dim attr but not needed for operation if we assume row major. In original model, dim=1, which for 2D is columns. So we'll compute along columns per row.
+
+We need to be careful about shape: if input is 1D, then rowCount=1, rowLength=totalLength. If input is high dimensional, we need to compute over the specified dim. But to keep simple, we assume the tensor is 2D and dim=1 (the second axis). The operator definition can specify that it applies log_softmax along the last dimension (or the second dimension for 2D). But to match PyTorch, we can accept an optional dim attribute. However, the user's model hardcodes dim=1. So we can ignore dim attribute in kernel and just treat the input as 2D. But to be general, we can add dim in tiling and compute accordingly. For simplicity, I'll assume the tensor is of shape (batch, features) and we operate on features. That matches the model.
+
+Now, let's write the code.
+
+First, project_json: operator "LogSoftmaxCustom" with input x (float, ND), output y (float, ND). Attr: "dim" (int, optional, default 1). But we might not need dim in kernel if we assume last dimension. But for correctness, we can include.
+
+Host tiling: Include totalLength, rowLength, rowCount, tileLen, blockDim.
+
+Host operator: Tiling function calculates: totalLength from shape, then rowLength = shape.GetDim(shape.GetDimNum()-1) (last dimension if we assume dim=-1) or we can use attr dim to get the axis. For simplicity, we can compute rowLength as shape.GetDim(1) if shape is 2D. But we need to handle variable dimensions. We'll compute based on dim attr: rowLength = shape.GetDim(dim). Then rowCount = totalLength / rowLength. tileLen from UB budget: we need buffers for x, y, and temps like exp, etc. We'll estimate: we need x buffer (1 tile), y buffer (1 tile), and some temps (exp, etc.). Let's allocate 4 tiles of floats: x, y, exp, tmp. So 4 * tileLen * 4 bytes = 16 * tileLen bytes. UB budget 192KB => maxTile = 192*1024/16 = 12288 elements. Also we need alignment. We'll set tileLen = min(maxTile, rowLength). Also we might need to align to 32 or 64. We'll align to 2048 as example.
+
+BlockDim: we can set to number of rows / something? We'll set to something like min(24, rowCount) but also based on output size. For large rowCount, blockDim can be up to 24.
+
+Kernel code: Implement three-pass per row.
+
+Let's write kernel_src:
+
+Class KernelLogSoftmaxCustom with Init, Process.
+
+Init receives x, y, totalLength, rowLength, rowCount, tileLen, blockDim? Actually we need to pass tiling data. We'll get from tiling struct.
+
+We'll define tiling struct struct { uint32_t totalLength; uint32_t rowLength; uint32_t rowCount; uint32_t tileLen; }.
+
+In Process, we compute rows per block: rowsPerBlock = rowCount / blockDim, remainder. We'll distribute rows evenly.
+
+For each row, three passes.
+
+We need double buffering for each pass. We can use separate queues for input and output. But since passes are sequential, we can reuse same buffers.
+
+Implementation details:
+
+Pass1: for tile in row: load x tile, compute local max (using Muls and Max? Actually we need max. We can use AscendC::Max or compute manually. AscendC has Max? There's vector MAX with two inputs. But we need max over a vector. We can use Compare and Select. Simpler: we can use a reduction function. AscendC provides ReduceMax? Not sure. We can implement: set scalar max = -inf, then for each element, compare. But we need vectorized. We can use vector min/max functions. AscendC has Max with two inputs but not reduction. We can compute max by using a local tensor, then use vector reductions? There is a function "tin" for reduction? Actually AscendC has vector reduction intrinsics like ReduceMax. I think we can use "AscendC::ReduceMax" but need to check. Alternatively, we can do a tree reduction using vector operations. For simplicity, we can load tile and then iterate over elements in a loop? That would be slow. Better to use built-in reduction: In AscendC, we can use "AscendC::LocalTensor<float> maxVal; maxVal.SetValue(0, 0); then for each tile we compute local max using "AscendC::Max(...)"? But we need a fast way.
+
+We can use the "AscendC::Muls" to subtract? Not.
+
+Actually AscendC has a function "Max" that returns the maximum of two tensors element-wise. To get a scalar max, we can do a reduction loop: for each tile, we compute local max using a reduction kernel? That would be complex.
+
+Another approach: we can use the "AscendC::ReduceMax" intrinsic (maybe from <reduce>). But I'm not sure of the exact API. Let's check typical AscendC kernel examples. There is a function "AscendC::ReduceMax" that takes a tensor and returns a scalar. Yes, I believe AscendC provides vector reduction operations. For example, in the leaky_relu example, they used Mins and Muls. For max, we have Max and ReduceMax. We'll use ReduceMax.
+
+Similarly, for sum, we can use ReduceSum.
+
+Thus, for each tile, we can compute tile's max using ReduceMax, then store in a scalar local variable, and then compare with global row max. After processing all tiles, we have rowMax.
+
+For pass2: we load tile, compute exp(x - rowMax), accumulate sum using ReduceSum.
+
+For pass3: we load tile, compute output = x - rowMax - log(rowSum), write to y.
+
+We can try to combine pass2 and pass3 into one pass if we store x in UB for the tile, but then we need to reload for output. However, we can do pass2 and pass3 in the same load of x if we compute exp and sum, then after the tile we already have x in UB (since we loaded it). But we need the global sum before we can compute output. So we would have to wait until all tiles are processed. We could process the entire row in one pass: for each tile, store x in UB, compute exp and accumulate sum, then after all tiles, compute log(sum), then for each tile, load x from UB in reverse? But we only have one tile buffer. We could reuse the same buffer for all tiles by overwriting. Then we lose previous x. So we cannot.
+
+Thus three passes.
+
+We'll implement:
+
+Pass1: for tile in row: load x, compute local max, update global max.
+Pass2: for tile in row: load x, compute exp(x-max), accumulate sum.
+Pass3: for tile in row: load x, compute output = x - max - log(sum), write y.
+
+We'll use double buffering for each pass to overlap transfers and compute.
+
+We need to manage multiple rows. For each row, we do three passes. We'll write a helper function for each pass that processes all tiles of a row.
+
+Let's write kernel code.
+
+We'll allocate:
+- inQueueX (for loading x)
+- outQueueY (for output)
+- tmpQueue (for intermediate temps like exp values, etc.)
+
+We'll need one buffer for x, one for y, and one for exp. So three buffers.
+
+In each pass, we queue and dequeue.
+
+Let's write pseudo:
+
+For each row in rows_assigned:
+  // Pass1: compute max
+  max = -inf
+  for each tile:
+    CopyIn(x, tile)
+    ComputeLocalMax: load x from queue, compute local max using ReduceMax, store in scalar, then Free.
+    update max = std::max(max, localMax)
+  // Pass2: compute sum
+  sum = 0
+  for each tile:
+    CopyIn(x, tile)
+    ComputeLocalExpSum: load x, subtract max, exp, accumulate sum using ReduceSum, then Free.
+    update sum += localSum
+  // Pass3: write output
+  logSum = log(sum)
+  for each tile:
+    CopyIn(x, tile)
+    ComputeOutput: load x, subtract max, subtract logSum, write to y (CopyOut)
+  // note: we reuse inQueueX for each pass; need to ensure queue is empty before each pass.
+
+We need to reset queues between passes.
+
+We'll implement a function ProcessRow(GM_ADDR rowX, GM_ADDR rowY, uint32_t rowLength).
+
+We'll use tileLen. For each tile, we copy in and out.
+
+We need to handle the last tile which may be smaller than tileLen. We'll pass actual copy length.
+
+Now, let's write kernel_src.
+
+We'll also need to handle the scenario where rowLength is 0? No.
+
+Now, host_operator_src: we need to include leal_relu? No, we need log_softmax_custom. We'll write operator LogSoftmaxCustom with input x, output y, and optional attr dim (int). Tiling function will compute totalLength, rowLength (from shape based on dim attr), rowCount, tileLen, blockDim. We'll set tileLen as described.
+
+For blockDim, we can base on number of rows: min(24, rowCount). But we can also consider that each block processes multiple rows. We'll set blockDim = min(24, rowCount). The tiling data also stores tileLen.
+
+Now, python_bind_src: similar to leaky_relu, but for log_softmax. We'll call aclnnLogSoftmaxCustom.
+
+model_src: use custom_ops_lib with log_softmax_custom.
+
+Now, we need to generate the six strings.
+
+Let's write them.
+
+Note: For project_json, we need to define input desc with type float. Attr dim, type int, optional, default 1. Output y.
+
+Host tiling header and source.
+
+I'll produce the code.
+
+Important: The kernel function name must be exactly "log_softmax_custom". The operator name "LogSoftmaxCustom".
+
+Let's write.

@@ -1,0 +1,57 @@
+We need to fix the correctness issue. The output mismatch indicates that the custom AscendC kernel for matmul with small K dimension is producing incorrect results. The reference output is from torch.matmul on CPU (or NPU?), but the new output on NPU differs significantly. Likely the kernel has bugs: data copy patterns, indexing, or the matmul algorithm itself.
+
+Key issues from previous code:
+
+1. Data copy for B tile: `AscendC::DataCopy(bLocal[k * tileN_], bGm_[k * N_ + jStart], curTileN);` This attempts to copy from global to local using a stride? DataCopy expects contiguous data. But bGm_ is a GlobalTensor, and bLocal is a LocalTensor. The offset `k * tileN_` in bLocal is within the allocated buffer (size K_ * tileN_). However, the source `bGm_[k * N_ + jStart]` is correct for global memory row-major. But DataCopy copies contiguous elements. Since bLocal is a flat buffer, we need to copy each row of the B tile separately. The code copies `curTileN` elements from global row `k` starting at column `jStart` into local buffer at offset `k * tileN_`. That's correct if the local buffer is linear.
+
+But there is a potential issue: DataCopy requires that the source and destination addresses are aligned? Typically it works for any address. However, the more serious problem might be in the outer product loop: `AscendC::Muls(tmpLocal, bLocal[k * tileN_], aScalar, curTileN);` This uses bLocal with an offset. But `bLocal` is a LocalTensor, and `bLocal[k * tileN_]` likely returns a SubTensor starting at that offset. However, `Muls` expects a tensor and a scalar. The syntax `bLocal[k * tileN_]` may not be valid; we need to create a sub-tensor. Typically in AscendC, you use `bLocal[k * tileN_]` to get a reference to the element at that index? Actually, LocalTensor supports indexing to get a reference to a single element, not a sub-tensor. We need to use `bLocal[k * tileN_]` as a pointer to the start of that row. But AscendC API: `LocalTensor::operator[]` returns a reference to a single element. For vector operations, we need to pass a tensor slice. The correct way is to use `bLocal.Slice(k * tileN_, curTileN)` or simply pass the offset within the tensor using `bLocal[k * tileN_]` but that gives a scalar. So the code is buggy: `Muls(tmpLocal, bLocal[k * tileN_], aScalar, curTileN)` is invalid because the second argument should be a tensor, not a scalar.
+
+We need to fix the kernel to properly use vector operations. For small K, we can either use scalar multiplication per element, or use a more optimized approach. Given small K (64 max), we could unroll loops or use broadcast. But the simplest fix: instead of using Muls on the whole B row, we can do element-wise multiplication using `Mul` with a broadcasted scalar? Actually, AscendC has `Mul` for tensor-tensor and `Muls` for tensor-scalar. To multiply a vector by a scalar, `Muls(dst, src, scalar, len)` does dst = src * scalar. So we need to provide the src tensor (the B row). The correct way is to create a sub-tensor view: `AscendC::LocalTensor<float> bRow = bLocal.Slice(k * tileN_, curTileN);` Then `Muls(tmpLocal, bRow, aScalar, curTileN);`. Similarly, after loop, we need to free sub-tensor? Actually Slice returns a view, no allocation. So we can use that.
+
+2. Also, the kernel uses single buffer for B tile, but loops over rows and columns. Within the inner loop over K, we are reusing the same B tile across rows (different i). That's correct because B tile is constant for each column tile. However, we need to ensure that the B tile is fully loaded before processing rows.
+
+3. Data copy for A row: `AscendC::DataCopy(aLocal, aGm_[i * K_], K_);` That's fine.
+
+4. Duplicate cLocal to zero: `AscendC::Duplicate(cLocal, 0.0f, curTileN);` That's fine.
+
+5. The tmpBuf_ and outBufC_ are allocated each iteration inside the row loop. But they are local tensors from queues. The code calls `outBufC_.AllocTensor<float>()` which allocates from the queue, and later frees. That's okay. However, the queue sizes are 1, so only one tensor can be allocated at a time.
+
+6. Potential issue: In the inner loop, we allocate aLocal, cLocal, tmpLocal each iteration, but we free them before the next row. That's okay.
+
+But the main correctness bug is the misuse of Muls with a scalar index. Also, we need to convert the floating-point scalar properly: `aScalar` is obtained from `aLocal(k)`. That should work.
+
+Let's rewrite the kernel's inner computation more carefully.
+
+Also, check tiling: coreRows and blockDim might be computed incorrectly? The tiling sets blockDim based on M and coreRows such that each core processes roughly coreRows rows. That seems okay.
+
+But the output mismatch is large, so likely the kernel is not computing matmul correctly. Let's fix the kernel.
+
+Additionally, the DataCopy for B tile: we copy each row from global to local. But we need to ensure that the source and destination are aligned? Not necessary. However, the loop `for (uint32_t k = 0; k < K_; k++)` inside the column tile loop loads the entire B tile. That's fine.
+
+But there is a subtle bug: we are using `bLocal[k * tileN_]` as the destination for DataCopy. That is a reference to a single element, not a pointer to the start of the row. DataCopy expects a pointer-like argument. In AscendC, DataCopy signature: `void DataCopy(LocalTensor<T>& dst, const GlobalTensor<T>& src, uint32_t size)`. The dst must be a LocalTensor, not a scalar reference. So using `bLocal[k * tileN_]` is incorrect. We need to use a slice or offset. The correct way is to use `bLocal.Slice(k * tileN_, curTileN)` as the destination. But DataCopy expects a LocalTensor, and Slice returns a LocalTensor view. So we can do:
+
+`AscendC::DataCopy(bLocal.Slice(k * tileN_, curTileN), bGm_[k * N_ + jStart], curTileN);`
+
+Similarly, for the Muls, we need to pass a tensor slice.
+
+Also, for the final DataCopy of C row to global: `AscendC::DataCopy(cGm_[i * N_ + jStart], cLocal, curTileN);` That's correct because cLocal is a LocalTensor.
+
+Now, let's rewrite the kernel with these fixes.
+
+Also, we need to consider that the temporary buffer tmpBuf_ is used inside the loop. We should allocate and free properly.
+
+Let's also consider using a more efficient approach: since K is very small (<=64), we can just do a naive loop over K with scalar multiplication and addition, but using vector operations for each row of B. Alternatively, we can use the `Mul` and `Add` with broadcast? But Muls is fine.
+
+I'll rewrite the kernel class with proper sub-tensor usage.
+
+Also, note that the kernel uses `AscendC::GetBlockNum()` and `AscendC::GetBlockIdx()` but in the Init we don't compute anything based on blockIdx. That's fine.
+
+Potential issue: The kernel uses `coreRows_` and `blockDim_` but these are passed from tiling. However, the number of blocks actually launched is set by context->SetBlockDim. The kernel can use AscendC::GetBlockNum() which should equal blockDim. So using blockDim_ is redundant but okay.
+
+Now, let's produce the corrected code. Only the kernel_src needs fixing; other parts are probably fine. But we should also check host_tiling_src and host_operator_src for any issues. The tiling seems okay. The python_bind_src and model_src seem fine.
+
+I'll output the six strings with only the kernel_src changed.
+
+But ensure consistency: the kernel function name must remain `matmul_with_small_k_dimension_custom`. The class name can be anything.
+
+I'll provide the corrected full six strings.
