@@ -39,6 +39,41 @@ conda activate czh_environ
 
 ---
 
+## 批量生成入口（与 `run_agent_multi_rounds.py` 对照）
+
+独立脚本：**[`generator/scripts/run_agent_cuda_agent_multi_rounds.py`](../../generator/scripts/run_agent_cuda_agent_multi_rounds.py)**（不落盘修改单算子入口）。流程为多轮 **生成 → `eval_cuda_agent_operator` → 修复上下文**，与 [`generator/scripts/run_agent_multi_rounds.py`](../../generator/scripts/run_agent_multi_rounds.py) 对齐；评测子进程调用 **`tools/eval_cuda_agent_operator.py`** 并传入 **`--dataset-path`** + **`--row-index`**（与 jsonl 行一致）。
+
+| 项目 | 单算子 MKB | CUDA-Agent-Ops-6K |
+|------|------------|-------------------|
+| 脚本 | [`run_agent_multi_rounds.py`](../../generator/scripts/run_agent_multi_rounds.py) | [`run_agent_cuda_agent_multi_rounds.py`](../../generator/scripts/run_agent_cuda_agent_multi_rounds.py) |
+| 输出根 | `output/ascendc/...` | `output/cuda_agent_ops_6k/...`（`--test` → `output/test/cuda_agent_ops_6k/...`） |
+| 任务 ID | MKB `op` key | `ca6k_{row_index:05d}`（与 [`suggested_op_key_ca6k`](constants.py) 一致） |
+| 评测 | `eval_operator.py --txt` | `eval_cuda_agent_operator.py --txt` + 数据集行号 |
+
+**任务选择**（**必须**指定其一，避免误跑 6000 行）：`--indices N ...`、`--range START END`（**闭区间**）、或 `--all`。可选 **`--op-counts K ...`**：只保留 `ops` 数组长度为 `K` 之一的行。默认 **`--dataset-path`** 为 `data/external/CUDA-Agent-Ops-6K/cuda_agent_ops_6k.jsonl`。
+
+**Prompt 策略（仅此脚本）**：**`--strategy one_shot|none`**（默认 **`one_shot`**）。**`one_shot`** 插入与单算子 **`ascendc` + `one_shot`** 相同的 **`leaky_relu`** 示例对；**`none`** 不插入示例块。产物路径中含该段（`…/one_shot/runN` 或 `…/none/runN`）。
+
+**环境变量**（子进程 `env=os.environ`，与单算子生成/评测一致，请在外层 shell `export`）：
+
+- **`USE_API_CONFIG=1`** + `generator/local_api_config.py`：见 [`generator/llm_config.py`](../../generator/llm_config.py)
+- **`LLM4ASCENDC_REF_ON_CPU=1`**：参考 `Model` 在 CPU 上（[`vendor/mkb/correctness.py`](../../vendor/mkb/correctness.py)）
+- **`LLM4ASCENDC_CUDA_AGENT_ART_ROOT`**：多算子评测产物根（本页「产物目录」）
+- **`LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH`**：自定义 OPP 可写根；**多进程并行**时与 `eval_operator --txt-dir --workers>1` 一样建议显式设置，见 [`tools/common/env.py`](../../tools/common/env.py)
+
+示例（仅构建、不跑 NPU 数值）：
+
+```bash
+cd LLM4AscendC
+python3 generator/scripts/run_agent_cuda_agent_multi_rounds.py \
+  --indices 55 \
+  --op-counts 2 \
+  --strategy one_shot --tool-mode all \
+  --eval-mode build-only
+```
+
+---
+
 ## 命令行入口（与 `eval_operator.py` 对齐）
 
 **算子来源二选一**（与单算子一致）：
@@ -131,7 +166,7 @@ python3 tools/eval_cuda_agent_operator.py --op output/cuda_agent_ops_6k/ca6k_rh_
 
 ## 与批量任务的关系
 
-并行或「6000 行 → 多目录」的批量调度 **未** 在本仓库单独实现；当前约定为：**每个材料化算子目录调用一次** `eval_cuda_agent_operator.py`。后续若增加队列/worker，应对齐 [`eval_operator.py`](../eval_operator.py) 中 `--txt-dir` 与 `LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH` 的多进程策略。
+**生成 + 多轮修复**：见上文 **「批量生成入口」**（`run_agent_cuda_agent_multi_rounds.py`，支持 `--parallel-ops` 与 `eval_npu` 轮询 `ASCEND_VISIBLE_DEVICES`）。**仅评测**时仍可直接对每个 `*.txt` 调用 `eval_cuda_agent_operator.py`；多进程纯评测应对齐 [`eval_operator.py`](../eval_operator.py) 中 `--txt-dir` 与 `LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH` 的约定。
 
 ---
 

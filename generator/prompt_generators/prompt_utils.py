@@ -33,6 +33,31 @@ Output format (strict, no examples given here—follow these rules only):
 """
 
 
+def load_ascendc_example_pair(*, example: str, language: str = "ascendc") -> tuple[str, str]:
+    """
+    Load only the few-shot pair (CUDA reference arch + AscendC six-string bundle) from generator/prompts/.
+    Does not read vendor/mkb/reference (unlike read_relavant_files).
+
+    Parameters
+    ----------
+    example:
+        Basename such as ``leaky_relu`` → ``cuda_model_leaky_relu.py`` and
+        ``ascendc_new_model_leaky_relu.py``.
+    """
+    prompts_dir = REPO_ROOT / "generator" / "prompts"
+    example_arch_path = prompts_dir / f"cuda_model_{example}.py"
+    example_new_arch_path = prompts_dir / f"{language}_new_model_{example}.py"
+
+    if not example_arch_path.is_file():
+        raise FileNotFoundError(f"Example architecture file not found: {example_arch_path}")
+    if not example_new_arch_path.is_file():
+        raise FileNotFoundError(f"Example new architecture file not found: {example_new_arch_path}")
+
+    example_arch = read_file(str(example_arch_path))
+    example_new_arch = read_file(str(example_new_arch_path))
+    return example_arch, example_new_arch
+
+
 def read_relavant_files(language: str, op: str, example: str) -> tuple[str, str, str]:
     category = dataset[op]["category"]
     prompts_dir = REPO_ROOT / "generator" / "prompts"
