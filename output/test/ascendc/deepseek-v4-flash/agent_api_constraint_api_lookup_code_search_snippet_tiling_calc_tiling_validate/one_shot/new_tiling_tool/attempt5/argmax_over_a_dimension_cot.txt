@@ -1,0 +1,120 @@
+We need to fix the previous attempt. The correctness output shows that the kernel is producing wrong results: the output values are alternating between 2 and 2487 (or 2441), which suggests the argmax is not computing correctly. The kernel implementation used a strided DataCopyPad with srcStride, but that might be incorrect. Moreover, the kernel is computing argmax per slice by iterating over elements in a loop, which is inefficient but could be correct. The error seems to be in the data copy or in the index calculation.
+
+Looking at the kernel_src: It tries to copy a strided slice (dimSize elements with stride innerSize) into a contiguous local buffer using DataCopyPad. The copyParams srcStride is set to (innerSize - 1) * sizeof(float). However, DataCopyPad's srcStride is interpreted as the number of bytes between consecutive rows. For a row of size 1 float, the gap between rows is (innerSize - 1) floats, so srcStride = (innerSize - 1) * sizeof(float). That seems correct. But there might be alignment issues or the DataCopyPad API usage might be incorrect. The previous attempt's kernel also uses DataCopyPadExtParams with padParams {false, 0, 0, 0}. That should be fine.
+
+The real issue is probably in the index computation: the yGm_.SetValue(sl, ...) writes the index to global memory at position sl (slice index). But the output tensor is supposed to have shape (outerSize, innerSize) after reduction, i.e., numSlices = outerSize * innerSize. The slice index sl corresponds to (outerIdx, innerIdx) as computed. That seems correct.
+
+But the output shows values like 2 and 2487, which are large numbers, not the correct argmax indices. The correct output from reference shows indices like 719, 71, etc. So the kernel is computing garbage.
+
+Possible causes:
+1. DataCopyPad not working correctly for strided copy, leading to wrong data.
+2. The reduction loop using GetValue/SetValue may not work as expected because the data in local tensor may not be contiguous.
+3. The alignedDimSize_ may be wrong: (dimSize + 7) / 8 * 8 aligns to 8, but DataCopyPad expects alignment to 32 bytes? Actually, local tensor buffers must be aligned to 32 bytes. The DataCopyPad copies into the local tensor which has alignedDimSize_ elements. If dimSize is not a multiple of 32/sizeof(float)=8, there will be padding. But the copy should work.
+
+Better approach: Instead of using DataCopyPad for strided copy, we could simply use a loop to copy each element from global to local. That would be simpler and avoid potential bugs. Or we could use a more efficient vectorized approach using AscendC's built-in reduce operations. Given the errors, we need to fix the kernel.
+
+We should rewrite the kernel to use a straightforward element-wise copy using DataCopy for contiguous chunks if possible, or use a loop with SetValue/GetValue for strided access. Since the dimension along which argmax is taken could be large (e.g., 4096), we should still use vectorized loads where possible.
+
+Alternatively, we can use the AscendC library's reduce operations (e.g., ReduceMax) which can return indices. However, ReduceMax works on contiguous data. We could copy the strided slice into a contiguous buffer, then use ReduceMax with indexing.
+
+Looking at the API snippets, there are examples using ReduceMax with workspace and calIndex parameter. For example: ReduceMax(dst, src, tmpBuf, count, true) returns both value and index. That's exactly what we need. So we can: for each slice, copy the strided data (dimSize elements) into a local buffer, then call ReduceMax with calIndex=true, and the index is the argmax.
+
+But we must ensure the copy is correct. The previous attempt's DataCopyPad might be failing due to alignment or stride parameters. Let's simplify: use a for-loop to copy each element using DataCopy for each row? Or we can use DataCopy for the whole row if the stride between rows is constant and we use the correct DataCopyExtParams.
+
+Actually, for a slice where we need dimSize elements spaced innerSize apart, we can treat it as a matrix of rows with 1 column. DataCopyPad with rowNum=dimSize, colBytes=sizeof(float), srcStride=(innerSize-1)*sizeof(float) should work. But maybe the srcStride is wrong: in DataCopyPad, srcStride is the number of bytes between consecutive rows in the source. For a row of 1 float, the next row starts at offset innerSize floats later, so the gap is (innerSize - 1) floats. So srcStride = (innerSize - 1) * sizeof(float). That seems correct.
+
+However, there is also a parameter padParams for the destination. The destination buffer size is alignedDimSize_ * sizeof(float). The copy will pad to alignment. That should be fine.
+
+Maybe the problem is that the local tensor buffer is not properly initialized or the queue management is flawed. The kernel uses inQueueSrc and outQueueDst. But in Process(), it calls CopyIn, then immediately does Compute and CopyOut. That's fine.
+
+Another potential issue: the global tensor xGm_[base] is used as the source address for DataCopyPad. base is the starting index for the first element of the slice. But note that the memory layout is: for a given outerIdx and innerIdx, the element at position (outerIdx * dimSize + d) * innerSize? Actually, the input shape is outerSize * dimSize * innerSize. For a given outerIdx and innerIdx, the first element of the slice is at index: outerIdx * (dimSize * innerSize) + innerIdx. Because the data is row-major: outerIdx is the slowest, then dimSize, then innerSize. So the offset for element (outerIdx, d, innerIdx) = outerIdx * dimSize * innerSize + d * innerSize + innerIdx. So for d=0, base = outerIdx * dimSize * innerSize + innerIdx. That's what we computed: base = outerIdx * dimSize_ * innerSize_ + innerIdx. This is correct.
+
+But when we do DataCopyPad from xGm_[base], we are copying from consecutive addresses? No, because the slice is strided: we need elements at base, base+innerSize, base+2*innerSize, etc. DataCopyPad with rowNum=dimSize and srcStride=(innerSize-1)*sizeof(float) should achieve that: first row (1 float) at base, then next row at base + srcStride + colBytes? Actually, in DataCopyPad, after copying a row of colBytes, the source pointer advances by srcStride to the next row. So if colBytes = sizeof(float) and srcStride = (innerSize-1)*sizeof(float), then the total advance between rows is colBytes + srcStride = innerSize*sizeof(float). That's exactly what we want: skip innerSize elements between rows. So the copy should be correct.
+
+Maybe the issue is that the local buffer is aligned to 32 bytes, but the alignedDimSize_ might be too small? For dimSize up to 4095, alignedDimSize_ = (4095+7)/8*8 = 4096. That's fine.
+
+Let's examine the error output: the new output shows values like 2, 2487 in alternating pattern. That suggests the indices are not random but follow some pattern. Possibly the kernel is incorrectly writing to the output tensor or the index is being computed from wrong data.
+
+I suspect the kernel is not handling the output tensor correctly. The output tensor has shape (outerSize, innerSize). yGm_ is set with size outerSize_ * innerSize_. In the loop, we set yGm_.SetValue(sl, ...). But SetValue expects an offset within the tensor. That should be fine. However, the output tensor's data type is int64, and SetValue should work.
+
+Another issue: in the kernel, we use outQueueDst buffer with 1 element (int64). That's fine. But we copy out using SetValue, not DataCopy. Should be okay.
+
+Let's rewrite the kernel more robustly: instead of using DataCopyPad which might be tricky, we can use a loop to copy each element explicitly using DataCopy from the global tensor to local, but that would be inefficient for large dimSize. Actually, we can use DataCopy for each element? Not good.
+
+Better: we can use the AscendC's built-in strided copy API if available. But we don't have that.
+
+Given the time, let's fix by using a simpler approach: for each slice, we can copy the entire slice contiguously? No, it's strided.
+
+Actually, we can transpose the problem: since we are reducing over a dimension, we can reorganize the data so that the reduction dimension becomes contiguous. But the kernel expects the input as is.
+
+Maybe we can use the library's ReduceMax function on a contiguous local buffer after copying. The copy with DataCopyPad should work, but we need to ensure the buffer is properly aligned and the parameters are correct. Let's double-check DataCopyPad signature.
+
+From the API: DataCopyPad(srcLocal, srcGlobal, copyParams, padParams). The copyParams: rowNum, colBytes, srcStride, dstStride, reserved. For our case: rowNum=dimSize, colBytes=sizeof(float), srcStride=(innerSize-1)*sizeof(float), dstStride=0, reserved=0. For float, sizeof(float)=4. So srcStride is (innerSize-1)*4. This should work.
+
+But wait: the DataCopyPad API may require that the srcStride is a multiple of 32? I'm not sure. Also, the dst buffer size must be aligned to 32 bytes. Our alignedDimSize_ is aligned to 8 floats = 32 bytes, good.
+
+Maybe the issue is that we are using DataCopyPadExtParams with padParams = {false, 0, 0, 0}. That should be fine.
+
+Let's try a different approach: instead of using DataCopyPad, we can copy each row (one float) individually using DataCopy for each row in a loop. That would be simpler and less error-prone. For dimSize up to 4096, that's 4096 DataCopy calls per slice, which is okay for correctness. But performance might suffer. However, for the purpose of fixing correctness, it's acceptable.
+
+Let's modify the kernel to use a loop:
+
+for (uint32_t d = 0; d < dimSize_; ++d) {
+    uint32_t gmIdx = base + d * innerSize_;
+    float val = xGm_.GetValue(gmIdx);
+    srcLocal.SetValue(d, val);
+}
+
+But SetValue on global tensor is not allowed? Actually, global tensor .GetValue() and .SetValue() are allowed but slow. However, for debugging we can use that. Better to use DataCopy for each element? We can use DataCopy for a single element: DataCopy(srcLocal[d], xGm_[gmIdx], 1). But that requires the local tensor to have proper offset. Alternatively, we can use AscendC::DataCopy for a single element by setting the local address.
+
+Given the complexity, maybe we can avoid the strided copy entirely by using the library's reduce with strided input? I'm not aware of that.
+
+Let's keep DataCopyPad but add debugging or check the values. Since we cannot run, we need to make a logical fix.
+
+Another possibility: the previous kernel had an error in the CopyIn function: it uses DataCopyPad with srcStride, but the srcGm_ is a GlobalTensor<float>, and we use xGm_[base] which returns a referenence to the element at base. But DataCopyPad expects a global tensor address, not a reference to a single element. Actually, xGm_[base] returns a GlobalTensor<float> that points to the address at base. The DataCopyPad signature expects a GlobalTensor<float> as the second argument. So that should be fine.
+
+I think the problem might be the interpretation of the output tensor shape. In the model_src, the forward returns the fn result directly. The python_bind function creates an empty tensor with shape computed by removing the dim dimension. That matches the InferShape. But the kernel output tensor size is outerSize * innerSize, which is correct.
+
+However, the kernel writes to yGm_ using SetValue for each slice. The output tensor, when passed to the kernel, is allocated as a 1D tensor of size outerSize*innerSize. That's fine.
+
+Let's examine the incorrect output: it shows alternating values of 2 and 2487 (or 2441). That suggests that the kernel is writing the same index for many positions. For example, for slice 0, it writes 2, for slice 1, 2487, etc. That pattern might indicate that the kernel is reading data from the wrong slice due to pointer arithmetic error.
+
+Maybe the base calculation is wrong: outerIdx * dimSize_ * innerSize_ + innerIdx. Since dimSize_ and innerSize_ are uint32_t, multiplication could overflow? For large sizes (batch_size=128, dim1=4096, dim2=4095), outerSize = 128, dimSize = 4096? Actually, axis=1 (the second dimension), so outerSize = batch_size = 128, dimSize = dim1 = 4096, innerSize = dim2 = 4095. Then outerIdx * dimSize * innerSize = 128 * 4096 * 4095 ~ 2.1e9, which fits in uint32_t (max 4.29e9). So no overflow.
+
+But wait: the input shape is (batch_size, dim1, dim2) = (128, 4096, 4095). totalLength = 128*4096*4095 = 2,147,482, ? approx 2.1e9, fits in uint32_t. So totalLength is about 2.1e9. That's within 32-bit unsigned.
+
+Now, the output tensor has shape (128, 4095) = 524160 elements. So the output is large but fits.
+
+Given the pattern of output (2, 2487, 2, 2487,...), it looks like the kernel might be computing the argmax for only the first two slices and then repeating them? That could happen if blockDim is incorrectly set or the slice distribution is wrong. The blockDim is set to min(numSlices, 24) in tiling. But in kernel, we compute slicesPerBlock = (numSlices + blockDim - 1) / blockDim. For numSlices=524160 and blockDim=24, slicesPerBlock = 21840. Each block processes a range of slices. Could there be a bug where only the first block produces correct results and others produce garbage due to uninitialized buffers? Or maybe the kernel writes to wrong offsets because of mismatched block size? But the output shows values like 2487, which is greater than dimSize (4096)? Actually 2487 is less than 4096, so it could be a valid index. But 2 and 2487 alternating suggests the kernel is only computing two different indices and repeating.
+
+Maybe the DataCopyPad is failing silently, causing the local buffer to contain uninitialized data. Then ReduceMax? Wait, the previous kernel does not use ReduceMax; it does a manual loop. That loop uses src.GetValue(i) to read from the local tensor. If the local tensor is not properly filled, we get garbage.
+
+Let's replace the manual loop with the AscendC ReduceMax API, which is more reliable. Use workspace buffer and call ReduceMax with calIndex=true. That will compute the max and its index in one go. This is a standard pattern.
+
+We need a workspace buffer for ReduceMax. The workspace size should be at least (dimSize + 7) / 8 * 8 maybe? Actually, ReduceMax requires a workspace of size at least (count + 63) / 64 * 64? No, the documentation says workspace size is (count + 63) / 64 * 64 bytes? For float, the workspace size is (count + 63) / 64 * 64? That's for max? Wait, the API says workspace: LocalTensor<T>&, inout, used as temporary buffer. The size is not specified but typically it should be large enough to hold intermediate results. In the example code, workspace is of size 16 bytes? Actually, in the reduce_computation example, workSize is computed as RoundUp(repeat * 2, elePerBlock) for ReduceMax with index. That suggests workspace size is repeat * 2 elements of T. For one call with count=dimSize, mask=64 (for float), repeat = RoundUp(dimSize, mask). So workspace size = repeat * 2 elements of float.
+
+But since we only call ReduceMax once per slice with count=dimSize, we can compute the required workspace size. Let's simplify: allocate a workspace buffer of size (alignedDimSize_*2) because the worst case is if dimSize is large. That is safe.
+
+We'll modify the kernel:
+
+- Add a workspace queue.
+- After copying the slice into srcLocal (contiguous), call ReduceMax with srcLocal and workspace, get dst (max value and index). Then extract the index.
+
+But note: ReduceMax returns two values: the max and the index (if calIndex=true). The output tensor (dst) should have size 2 * (repeat) for multiple repeats? Actually, for a single call with count, ReduceMax returns a single value and index. The dst tensor should have size 2 (one max, one index). So we can allocate dstLocal of 2 floats (or int64 for index? Actually, index is returned as float? No, the index is of type int32? In the API, for ReduceMax<T>, the index is returned as T for half/float? Usually index is int32. But in the example, dstLocal is of type T and size 16 (aligned). For ReduceMax with calIndex, the output format is [val0, idx0, val1, idx1, ...] for multiple repeats. For a single repeat, it's [val, idx]. So we need dstLocal of at least 2 elements of T. For float, that's 8 bytes, but we align to 32 bytes.
+
+Thus, we can allocate:
+- inQueueSrc: for the slice data.
+- outQueueDst: for the result pair (max and index).
+- tmpQueue: workspace.
+
+We'll use DataCopyPad to copy the strided slice into srcLocal. Then call ReduceMax. Then extract the index (the second element of dstLocal) and write to global.
+
+The previous kernel used a manual loop, which is error-prone. Switching to ReduceMax should be more reliable.
+
+Also, we need to fix the tiling to provide adequate UB budget for workspace. The tiling in host_operator_src doesn't use UB budget for workspace; it just sets blockDim based on numSlices. That's fine.
+
+Let's rewrite kernel_src accordingly.
+
+Additionally, ensure that the python_bind_src uses the correct function name and the model_src passes the dim correctly. In model_src, self.dim is used in forward, but the original Model's forward only takes x, not dim. The init takes dim. So ModelNew's forward should call fn(x, self.dim). That's done.
+
+Now, implement the fix.

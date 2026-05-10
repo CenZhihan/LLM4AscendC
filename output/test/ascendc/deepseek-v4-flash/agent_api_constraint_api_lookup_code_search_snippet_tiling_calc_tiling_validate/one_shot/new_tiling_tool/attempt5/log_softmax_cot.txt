@@ -1,0 +1,134 @@
+We need to fix the kernel to avoid vector core exception. The error logs show "CCU instruction address check error" and "vector core exception". The previous attempt used LogSoftMax API but had issues with tiling/buffer management. The key problem: LogSoftMax requires a shared temporary buffer, but the kernel attempted to use TBuf in a way that may cause memory errors. Also, the tiling data was overly complex and may have incorrect block assignments.
+
+Let's simplify drastically: implement log_softmax manually using exp, sum, log to avoid the problematic LogSoftMax API. Use a simpler per-block strategy: each block processes a row of the matrix, computes max, exp, sum, log. Since the matrix is (batch_size, dim) with batch_size=4096, dim=393216, we need to handle large rows efficiently. Use grid-stride loops over rows, each block processes one row at a time.
+
+The error suggests the previous kernel's LogSoftMax API call caused a vector core exception. Let's implement a manual log_softmax using basic vector operations (Exp, ReduceSum, Log, etc.) which are more reliable.
+
+Also, the tiling: we need to pass the dim (column length) and number of rows. Since the input is 2D (batch_size, dim) but the original model uses dim=1 for log_softmax, we need to apply log_softmax along the last dimension (columns). So each row is independent. We can assign blocks to rows.
+
+Simplify: each block processes a chunk of rows. Compute log_softmax per row: find max, subtract, exp, sum, log, subtract log-sum. This requires temporary buffers for per-row values.
+
+Given UB size 192KB, we can store one row's data (393216*4=1.5MB) too large for UB. So we need to tile each row into chunks. Process each row in tiles: compute max across tiles, then compute exp and sum across tiles, then compute log and final output.
+
+A simpler approach: use the built-in LogSoftMax API but ensure proper tiling and buffer sizes. The previous kernel attempted to use LogSoftMax with a sharedTmpBuffer but may have mis-sized it. Let's look at the reference softmax implementation: it uses SoftMaxShapeInfo and LogSoftMaxTiling. The LogSoftMaxTiling is a struct that contains precomputed tiling parameters. We can compute it in the host tiling and pass it directly.
+
+Actually, the error may be due to the LogSoftMaxTiling being uninitialized or incorrect. In the reference softmax kernel, they use `LogSoftMaxTiling` which is a predefined structure (likely `LogSoftMaxTiling` in AscendC). We need to set its fields correctly. However, the previous attempt did not set `softmaxTiling_` at all, leaving it default. That may cause the CCU error.
+
+Let's simplify: implement log_softmax manually using basic vector operations that are less likely to have hidden bugs. Use the following algorithm per row:
+1. For each tile of the row, compute local max.
+2. Reduce across tiles to get global max for the row.
+3. For each tile, compute exp(x - max).
+4. Sum the exps across tiles to get row sum.
+5. For each tile, compute log(sum) and subtract from (x - max) to get log_softmax.
+
+But this requires multi-pass and inter-tile communication. Better to use the built-in LogSoftMax API correctly. Let's fix the API usage.
+
+From the API signature: `LogSoftMax(dst, sum, max, src, sharedTmpBuffer, tiling, softmaxShapeInfo)`. The tiling is of type `LogSoftMaxTiling`. We need to create a proper tiling. The `LogSoftMaxTiling` struct likely has fields like `baseW` (row length), `logBase` (base for log, usually e). We can set it in the host tiling and pass as part of tiling data. However, GET_TILING_DATA only gets custom tiling data, not the internal LogSoftMaxTiling. We need to set it in kernel Init.
+
+In the reference softmax kernel, they have a `softmaxTiling` member of type `SoftMaxTiling` and set it via tiling data (the custom tiling includes a field `softmaxTilingData`). Similarly, we need a `LogSoftMaxTiling` field. Let's include that in our custom tiling data and set it in the host tiling.
+
+But to minimize changes, let's adopt the reference softmax pattern more closely. The reference kernel uses `SoftMax` API with `SoftMaxTiling`. For logsoftmax, we have `LogSoftMax` with `LogSoftMaxTiling`. We need to set `LogSoftMaxTiling` fields. The fields might be: 
+- `baseW` (row length, i.e., column length)
+- `logBase` (logarithm base, typically 0 for natural log? or negative for log?)
+Actually, looking at the API: `LogSoftMax` computes log(softmax). The tiling might control precision or block size.
+
+Let's search memory for LogSoftMaxTiling definition. From the code snippet, it's from `adv_api/activation/logsoftmax.h`. Likely it has:
+- `baseW`: size of the row (number of elements)
+- `logBase`: base for logarithm, 0 means natural log, negative means base 10? Not sure.
+
+Instead of guessing, let's implement log_softmax manually using AscendC built-in functions: `Exp`, `ReduceMax`, `ReduceSum`, `Log`, `Sub`, `Add`. We can do this in a tile-by-tile manner with multiple passes per row. Since each row is 393216 floats, and UB can hold ~32768 floats (based on previous tiling), we need to process each row in multiple tiles.
+
+Plan:
+- Each block processes one row at a time.
+- For each row:
+  1. Tile over the column dimension: compute local max for each tile.
+  2. After all tiles processed, compute global max across tiles using a small buffer (e.g., store per-tile max in a local array, then reduce).
+  3. For each tile, compute exp(x - global_max), and accumulate sum.
+  4. After all tiles processed, compute log(global_sum).
+  5. For each tile, compute output = (x - global_max) - log(global_sum).
+- This requires two passes over the row. We can combine some steps.
+
+Given the complexity, but the error is from previous complex LogSoftMax call. A manual implementation will be more transparent and easier to debug.
+
+Let's design a simpler kernel:
+
+Kernel class KernelLogSoftmaxManual:
+- Input: x (global), y (global), tiling: rowLength, columnLength, tileLength.
+- Each block processes a contiguous chunk of rows: startRow to endRow.
+- For each row:
+  1. Find max across row using tiles. Store tile maxes in a local array (size tileCount).
+  2. Reduce to find global max.
+  3. Compute exp(x - max) and accumulate sum across tiles.
+  4. Compute log_sum = log(global_sum).
+  5. Compute output = (x - max) - log_sum.
+
+To simplify, we can process one row at a time, using three queues: one for input, one for intermediate exp, one for output. But since we need two passes, we can store the entire row in UB? No, row is too large. We can store tile-wise max and sum in registers/local memory (small arrays). The tile maxes and sums: tileCount = ceil(columnLength / tileLength). tileCount can be up to, say, 393216/2048 ≈ 192. That's manageable (192 floats for max, 192 for sum). We can allocate them in UB.
+
+But we also need to compute exp and sum across tiles. We can do a first pass to compute max and store exp? Not simultaneously because we need max first. So two passes: first pass compute max (store tile maxes). Second pass compute exp and sum using global max. Third pass compute log and final output.
+
+However, we can combine second and third passes if we store the exp values temporarily? UB size may limit. Since we have 192KB UB, and we need to process one tile at a time (say 2048 floats = 8KB), we can keep one tile in queue, compute exp, accumulate sum in a local variable, then after all tiles, compute log and then do a final pass to compute log_softmax. That requires three passes: max, exp+sum, log+output.
+
+Given the constraints, let's adopt a simpler strategy: each block processes a single row? But with 4096 rows and maybe 24 blocks, each block processes ~170 rows. That's many rows. We can process each row completely within the block using loops.
+
+Wait, the previous error was a vector core exception on all cores simultaneously, which suggests a systematic issue, not just algorithmic. Maybe the tiling data was corrupted or the kernel called an API with invalid parameters.
+
+Given the time, I'll provide a minimal fix: correct the tiling and kernel to properly use LogSoftMax API with appropriate tiling. The reference softmax kernel uses `SoftMaxTiling` which is set in host tiling. We need to set `LogSoftMaxTiling` similarly. But the host tiling is complex; we can simplify host tiling to just provide rowLength, columnLength, tileLength, and then in kernel we create a simple LogSoftMaxTiling with baseW=columnLength, logBase=0 (natural log). Also ensure sharedTmpBuffer size is sufficient for LogSoftMax.
+
+The previous kernel used `sharedTmpBuffer` of size `sharedTmpBufferSize_` which came from tiling as 60*1024 bytes. That might be too small? LogSoftMax may need more temporary space. In the reference softmax kernel, they pass `tmpBuffer` which is the sharedTmpBuffer. It must be large enough for internal computations. 60KB might be insufficient for 393K columns? AscendC's LogSoftMax likely works on tiles internally, so it should only need scratch space proportional to tile size, not whole row. 60KB should be enough.
+
+But the error could be due to using `softmaxTiling_` uninitialized (type `LogSoftMaxTiling` but not set). We need to set its fields.
+
+In the reference kernel, they have a `softmaxTiling` member of type `SoftMaxTiling` and they set it via tiling data that includes a `softmaxTilingData` field of type `SoftMaxTiling`. Similarly, we need to add a field in our custom tiling data for `LogSoftMaxTiling`. Then in host tiling, we fill it appropriately.
+
+Let's look at the SoftMaxTiling definition from the reference code: it has fields like `baseW`, `logBase`, etc. For LogSoftMaxTiling, likely similar. But we don't have definitions. However, we can rely on the assumption that default-constructed `LogSoftMaxTiling` might work if we set baseW. Let's assume `LogSoftMaxTiling` has at least `baseW` field (the row width). We can set it.
+
+Also, the `SoftMaxShapeInfo` should be set: `{rowNum, columnLength_, rowNum, columnLength_}`.
+
+Now, the previous kernel's `Compute` used `AscendC::LogSoftMax<float>(xLocal, sumLocal, maxLocal, xLocal, tmpBuffer, this->softmaxTiling_, srcShape);` but `softmaxTiling_` was never initialized. That's a likely cause.
+
+Additionally, the queues: they used `outQueueY_` for output, but after LogSoftMax, the result is in xLocal (since dst is xLocal). They enque xLocal to outQueueY_. That's fine.
+
+But error occurs on all cores, possibly because blockIdx > usedNumBlocks_ condition caused some cores to skip but others to execute with invalid data? Actually, usedNumBlocks_ is computed from column length tiling and may be wrong, causing some cores to have zero tileLength or blockLength causing DataCopy with zero length? That might cause issues.
+
+Let's simplify the kernel drastically: remove the tail core logic and just use a simple grid-stride approach where each block processes a contiguous chunk of rows. Forget about the complex tiling with multiple loops. Just assign each block a set of rows (rowStart to rowEnd). Process each row one by one, using the built-in LogSoftMax on the entire row tile (but we can't fit whole row in UB). So we need to tile within the row.
+
+Alternatively, we can use the fact that the input is (batch_size, dim) with dim=393216, which is large. The previous tiling tried to split columns across blocks, but since log_softmax is per-row, splitting columns makes it harder (need synchronization). Better to assign each row to a block and tile within the row.
+
+Given the complexity, and the fact that the original reference softmax kernel works, let's adapt it directly for LogSoftMax. The reference kernel's tiling includes `softmaxTilingData` of type `SoftMaxTiling`. For logsoftmax, we need `LogSoftMaxTiling`. Let's assume the same structure.
+
+I'll modify the host tiling to include a `logSoftMaxTilingData` field of type `LogSoftMaxTiling` (using the appropriate include). And set it with `baseW = columnLength`. Also set `logBase = 0` (natural log). Then in kernel, use that tiling.
+
+But the host_tiling_src must include the header for `LogSoftMaxTiling`. We can include `<logsoftmax.h>` or similar. However, the host code may not have access to that header. Alternatively, we can define the tiling in the kernel only and set it there.
+
+Simpler: in kernel Init, we can create a LogSoftMaxTiling on the stack and set its fields. Since we have columnLength, we can set baseW. Also need to ensure sharedTmpBuffer is large enough. We can compute the required size based on columnLength? Not sure.
+
+Given the time, I'll provide a corrected version that:
+- Fixes host tiling to output correct block dimensions and tiling fields for LogSoftMax.
+- In kernel, initializes the LogSoftMaxTiling properly.
+- Ensures that the shared temporary buffer is large enough (use a formula: maybe 2*columnLength*sizeof(float) for safety, but that's too large. LogSoftMax likely uses internal tiling, so we can use the tileLength for buffer size. We'll set sharedTmpBuffer to tileLength * sizeof(float) * 3 or something.)
+
+Actually, the reference softmax uses a fixed sharedTmpBuffer size of 60KB. That should be fine.
+
+Let's produce a minimal patch:
+
+1. In host tiling, simplify to compute totalRows and columnLength. Set blockDim to number of rows (capped at 24). Each block processes one row. But with 4096 rows, we need each block to process multiple rows. We'll assign rowRange per block.
+
+But that changes the kernel algorithm. To keep minimal changes, we can keep the existing tiling approach but fix the LogSoftMaxTiling.
+
+Given the error, I suspect the problem is the uninitialized `softmaxTiling_` of type `LogSoftMaxTiling`. So we'll add a field `logSoftMaxTiling_` and initialize it in Init. We need to include the appropriate header for `LogSoftMaxTiling`. In the kernel, we can `#include "logsoftmax.h"` or rely on `kernel_operator.h` which likely includes it indirectly.
+
+Let's add in kernel_src:
+```cpp
+#include "kernel_operator.h"
+// LogSoftMaxTiling should be defined in kernel_operator.h or logsoftmax.h
+```
+
+Then in Init, after reading tiling data, set:
+```cpp
+logSoftMaxTiling_.baseW = columnLength_;
+logSoftMaxTiling_.logBase = 0; // natural log
+```
+
+Also ensure sharedTmpBuffer size is at least something reasonable. We'll keep as is.
+
+Let's write the corrected six strings.

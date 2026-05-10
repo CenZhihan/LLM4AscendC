@@ -13,13 +13,11 @@ from ..agent_state import GeneratorAgentState
 from ..retrievers.tiling_retriever import TilingRetriever
 
 
-def _parse_tiling_input(query: str) -> dict:
-    """Parse tiling calculation input from query."""
+def parse_query_fallback(query: str) -> dict:
+    """Parse unstructured tiling input from query as a last resort."""
     # Defaults
     params = {
-        "total_elements": 1024,
         "dtype": "float",
-        "op_type": "elementwise",
         "intermediate_buffers": 0,
     }
 
@@ -35,7 +33,7 @@ def _parse_tiling_input(query: str) -> dict:
             break
 
     # Extract op type
-    for op in ["elementwise", "reduce", "broadcast"]:
+    for op in ["elementwise", "reduce", "reduction", "broadcast", "normalization", "pooling", "matmul", "conversion", "random", "convolution"]:
         if op in query.lower():
             params["op_type"] = op
             break
@@ -48,23 +46,126 @@ def _parse_tiling_input(query: str) -> dict:
     return params
 
 
+def _num_elements_from_shape(shape: Any) -> int | None:
+    if not isinstance(shape, (list, tuple)) or not shape:
+        return None
+
+    total = 1
+    for dim in shape:
+        try:
+            dim_int = int(dim)
+        except (TypeError, ValueError):
+            return None
+        if dim_int <= 0:
+            return None
+        total *= dim_int
+    return total
+
+
+def resolve_tiling_request(state: GeneratorAgentState) -> dict:
+    """Merge structured tiling inputs before falling back to query parsing."""
+    query = state.get("current_query", "")
+    tool_choice_args = state.get("tool_choice_json", {}).get("args")
+    structured_args = dict(tool_choice_args) if isinstance(tool_choice_args, dict) else {}
+    params = parse_query_fallback(query)
+    params.update({
+        key: value
+        for key, value in structured_args.items()
+        if key in {
+            "total_elements",
+            "dtype",
+            "op_type",
+            "intermediate_buffers",
+            "ub_capacity_bytes",
+            "op_name",
+            "input_shapes",
+            "input_shape",
+            "output_shape",
+            "permutation",
+            "reduction_axes",
+            "keepdim",
+            "track_index",
+            "output_count",
+            "algorithm_hint",
+            "precision_sensitive",
+            "chip",
+        }
+        and value not in (None, "")
+    })
+    inferred_total_elements = _num_elements_from_shape(structured_args.get("output_shape"))
+    if inferred_total_elements is None:
+        inferred_total_elements = _num_elements_from_shape(structured_args.get("input_shape"))
+    if inferred_total_elements is None:
+        input_shapes = structured_args.get("input_shapes")
+        if isinstance(input_shapes, (list, tuple)) and len(input_shapes) == 1:
+            inferred_total_elements = _num_elements_from_shape(input_shapes[0])
+    if inferred_total_elements is not None and structured_args.get("total_elements") in (None, ""):
+        params["total_elements"] = inferred_total_elements
+    params["op_name"] = str(
+        structured_args.get("op_name")
+        or state.get("op_name")
+        or ""
+    )
+    params["state_category"] = str(
+        structured_args.get("state_category")
+        or state.get("category")
+        or ""
+    )
+    params["query"] = query
+    params.setdefault("total_elements", 0)
+    return params
+
+
 def _format_for_display(result) -> str:
-    """Format TilingParamsResult for display."""
-    if hasattr(result, "tile_length"):
-        lines = [f"Tiling 计算结果:"]
-        lines.append(f"  block_num = {result.block_num}")
-        lines.append(f"  num_per_core = {result.num_per_core}")
-        lines.append(f"  tail_num_last_core = {result.tail_num_last_core}")
-        lines.append(f"  tile_length = {result.tile_length}")
-        lines.append(f"  repeat_times = {result.repeat_times}")
-        lines.append(f"  UB 使用量 = {result.ub_usage_bytes}B ({result.ub_usage_pct}%)")
-        lines.append(f"  约束满足 = {result.constraints_met}")
-        lines.append(f"  公式: {result.formula_used}")
-        if result.warnings:
-            for w in result.warnings:
-                lines.append(f"  ⚠ {w}")
-        return "\n".join(lines)
-    return str(result)
+    """Format TilingParamsResult for display with a stable summary."""
+    summary = dataclasses.asdict(result) if dataclasses.is_dataclass(result) else {"value": str(result)}
+    ordered_keys = [
+        "status",
+        "supported",
+        "operator_class",
+        "strategy_kind",
+        "algorithm_kind",
+        "load_mode",
+        "reason",
+        "required_inputs",
+        "block_num",
+        "num_per_core",
+        "tail_num_last_core",
+        "tile_length",
+        "repeat_times",
+        "ub_usage_bytes",
+        "ub_usage_pct",
+        "output_count",
+        "output_elements",
+        "workspace_bytes",
+        "group_count",
+        "chunk_size",
+        "chunk_count",
+        "last_chunk_size",
+        "tile_a0_len",
+        "aligned_cols",
+        "collapsed_pattern",
+        "normalized_shape",
+        "normalized_axes",
+        "stage_summaries",
+        "constraints_met",
+        "formula_used",
+        "warnings",
+    ]
+
+    def _stringify(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if value is None:
+            return "null"
+        if isinstance(value, list):
+            return "[" + ", ".join(_stringify(item) for item in value) + "]"
+        return str(value)
+
+    lines = ["TILING_CALC_SUMMARY", "summary_version=1"]
+    for key in ordered_keys:
+        lines.append(f"{key}={_stringify(summary.get(key))}")
+    return "\n".join(lines)
 
 
 def tiling_calc_node(
@@ -86,7 +187,7 @@ def tiling_calc_node(
         tiling_retriever = TilingRetriever()
 
     query = state.get("current_query", "")
-    params = _parse_tiling_input(query)
+    params = resolve_tiling_request(state)
     result = tiling_retriever.compute_tiling(**params)
 
     round_num = state.get("query_round_count", 0) + 1

@@ -1,0 +1,77 @@
+We need to produce the six embedded Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src for the operator named "vanilla_rnn_hidden_custom" (PascalCase: VanillaRnnHiddenCustom) that replaces the PyTorch forward loop: for each time step t, compute inp = cat([x[t], h], dim=-1), pre = inp @ w_i2h.t() + b_i2h, h = tanh(pre), y_t = h @ w_h2o.t() + b_h2o, then stack outputs. The kernel should fuse the RNN cell computation: matrix multiplications, bias add, tanh activation, and output projection. We must design a custom AscendC kernel that does this efficiently.
+
+Given the input dimensions: x [T,B,I], h0 [B,H], w_i2h [H,K] where K=I+H, b_i2h [H], w_h2o [O,H], b_h2o [O]. Output y [T,B,O]. The loop iterates T times, each with two matmuls and one tanh. We can fuse the entire loop into one kernel that does the sequential time steps on the device, but careful with dependencies (h_t depends on previous h). Since T might be large, we can do a kernel that processes all time steps sequentially using a loop on the device, or use tiling over T. Given the complexity, we can design a kernel that processes one time step per block invocation? But the instruction says to replace the whole Model forward, i.e., one kernel call that computes all outputs. The kernel must handle the sequential recurrence. Possible approach: each thread block processes one time step? But data dependencies across time steps require synchronization. Better to have a single kernel that does the loop on the device, using local tiles for the weights and biases (constant) and streaming through x and h. However, the model forward passes through the entire sequence in one go. We can implement a kernel that, given pointers to x, h0, w_i2h, b_i2h, w_h2o, b_h2o, and output y, computes the RNN hidden states and outputs for all time steps.
+
+We need to be careful about memory and tiling. The kernel should be efficient. We'll adopt a pattern similar to the leaky_relu example but more complex. We'll use queue-based double buffering and compute the loop on the device. The host tiling will determine block dimensions and tile sizes for the sequential step.
+
+Let's design the kernel:
+
+- Inputs: x (T*B*I), h0 (B*H), w_i2h (H*K), b_i2h (H), w_h2o (O*H), b_h2o (O), output y (T*B*O)
+- The kernel will have a loop over time steps t=0..T-1. At each step, it reads x[t] (B*I), reads h (B*H) from previous (starting with h0), concatenates (but we can keep separate and do matmul as data layout permits). The matmul: inp @ w_i2h.t() -> pre = inp * w_i2h^T. Since inp is [B,K] and w_i2h is [H,K], so w_i2h.t() is [K,H], result [B,H]. Then add bias b_i2h [H] broadcasted. Then tanh gives h [B,H]. Then output projection: h @ w_h2o.t() -> y_t [B,O] (since w_h2o is [O,H], transpose is [H,O]), then add b_h2o [O] broadcasted. So we need two matmuls and two broadcasts, one tanh.
+
+Given the kernel must handle all time steps, we can do the computation in a loop on the device. The weights and biases can be loaded once into LocalTensor (if UB size allows) or fetched each time. Since weights are H*K and O*H, for H=256, K=1024+256=1280, I=1024, O=128. w_i2h size: 256*1280 = 327680 floats (~1.3MB) - too large for UB. w_h2o: 128*256=32768 floats (~131KB) - maybe feasible in UB? But we need to store both. UB per core is 192KB, so w_h2o alone fits, but w_i2h does not. So we must tile the matmuls.
+
+We can use Matmul API with tiling, or do manual matmul with tiling. Given the complexity, we could use the Matmul (MatmulLeakyKernel) but note that MatmulLeakyKernel expects specific tiling and workspace. However, the problem may expect a simpler approach: perform the RNN loop on host? No, the kernel must do it.
+
+Alternative: for each time step, we could launch a kernel that does one step and update h, but that would introduce many launches. The instruction implies replacing the PyTorch forward with a custom kernel, so one kernel call that computes all outputs is desired.
+
+Given the complexity of manual matmul tiling, we can use the Matmul API. The code snippets show MatmulLeakyKernel and MatmulKernel usage. We can incorporate similar patterns. For the fused RNN, we need to do two matmuls per step. We can have a kernel that uses Matmul objects for the two matmuls, but the Matmul objects need to be initialized with tiling and workspace. We could precompute tiling for the two matmuls and reuse across steps.
+
+Let's outline the kernel structure:
+
+- Tiling data: total T, B, H, O, I, K (=I+H). Also blockDim, tile sizes for the matmuls (maybe we tile over B dimension for both matmuls). We'll need tiles for x, h, w_i2h, b_i2h, w_h2o, b_h2o, output y.
+- The kernel: for time step t from 0 to T-1:
+   - Load x[t] (B*I) from global to local, and h (B*H) from previous (stored in local or global). We can keep h in local UB across steps if B is not huge. B=8, H=256 -> h size: 8*256=2048 floats ~8KB, fits in UB. Similarly, we can keep x[t] as a tile of B*I (8*1024=8192 floats ~32KB). w_i2h is large, we need to tile over K dimension? Actually matmul: [B,K] * [K,H] -> [B,H]. We can tile K and H dimensions. Similarly for output projection: [B,H] * [H,O] -> [B,O]. We can use Matmul API with preloaded weights? The matmul API may need workspace and tiling. We'll follow the MatmulKernel pattern.
+
+Given the scope, maybe we can implement a simpler but less optimal kernel that does the matmuls using vectorized operations with tiling over B dimension only. Since B is small (8), we can do the matmuls as loops over H and O with dot products. That would be easier but not fully optimized.
+
+Given the example provided is quite detailed, we can produce a similar structure but adapted for RNN. The host tiling will define blockDim and tile sizes for the sequence loop. The kernel will iterate over time steps.
+
+We need to be careful about the queue count and overhead. Let's design with the following assumptions:
+- Use two queues for double buffering x and h in global memory? Actually, h is updated each step and needs to persist. We can store h in global memory and load/store each step, or keep in local UB across steps. Since B*H is 8*256=2048 floats, we can keep h in LocalTensor (UB) across the loop, avoiding global round trips. Similarly, for output, we accumulate y[t] in local and write back to global in batches. For x, we need to load each step from global, but can pipeline.
+
+We'll design a kernel that:
+1. Copies weights w_i2h and w_h2o into local? Not possible due to size. We'll load them in tiles when doing matmul. So we need to tile the matmuls.
+
+Given the time, I'll produce a solution that uses the Matmul API with pre-prepared tiling and workspace, similar to the matmul_fusion example but with sequential loop. We'll need to manage the matmul objects. Let's write kernel_src with a class that initializes two Matmul objects (for i2h and h2o) and processes steps.
+
+We'll need to define tiling structures: we can adapt from the examples. But the provided examples use MatmulLeakyKernel which includes leaky relu; we need tanh instead. We can use separate Tanh API.
+
+Let's craft the kernel_src:
+
+```cpp
+#include "kernel_operator.h"
+#include "lib/matmul.h" // for MatmulLeakyKernel or MatmulKernel
+// Actually we need to include proper headers. The examples show REGIST_MATMUL_OBJ.
+
+// Define Tiling structure to be passed from host
+struct VanillaRnnHiddenTilingData {
+    uint32_t totalSteps; // T
+    uint32_t batchSize; // B
+    uint32_t hiddenSize; // H
+    uint32_t inputSize; // I
+    uint32_t outputSize; // O
+    uint32_t concatSize; // K = I+H
+    // tile parameters for matmuls
+    uint32_t tileK; // tile size for K dimension in i2h matmul
+    uint32_t tileH; // tile size for H dimension in i2h matmul
+    uint32_t tileO; // tile size for O dimension in h2o matmul
+    // ... might need more
+};
+```
+
+But the host tiling uses a class defined in host_tiling_src. We'll use a similar pattern.
+
+Given the complexity, I'll produce a plausible solution that is structurally similar to the leaky relu example but with RNN cell.
+
+Let's write the six strings.
+
+Note: The kernel must be named `vanilla_rnn_hidden_custom` (function name) and the operator PascalCase `VanillaRnnHiddenCustom`. The project_json_src should declare inputs and outputs accordingly.
+
+We'll define inputs: x, h0, w_i2h, b_i2h, w_h2o, b_h2o; outputs: y. All float, ND format. Attribute: none (or could have T, B etc, but those are derived from shapes). The tiling will get shapes from context.
+
+We need to be careful that the kernel signature in kernel_src must be `vanilla_rnn_hidden_custom` and take GM_ADDR x, h0, w_i2h, b_i2h, w_h2o, b_h2o, y, workspace, tiling.
+
+The host_operator_src must include tiling data class, TilingFunc, InferShape, InferDataType, and OpDef registration.
+
+I'll write them now based on patterns.

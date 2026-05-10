@@ -308,6 +308,64 @@ def _tool_choice_already_seen(
     return False
 
 
+def _tiling_calc_result_is_unsupported(state: GeneratorAgentState) -> bool:
+    result = state.get("tiling_calc_result")
+    return (
+        isinstance(result, dict)
+        and str(result.get("status") or "").strip().lower()
+        == "unsupported_without_operator_specific_strategy"
+    )
+
+
+def _map_tiling_class_to_code_search_family(operator_class: str) -> str:
+    normalized = str(operator_class or "").strip().lower()
+    if normalized == "reduction":
+        return "reduce"
+    if normalized == "matmul":
+        return "matrix"
+    if normalized == "nn":
+        return "normalization"
+    if normalized == "convolution":
+        return "convolution"
+    if normalized in {"broadcast", "conversion", "random", "unknown"}:
+        return "elementwise"
+    return normalized
+
+
+def _redirect_after_unsupported_tiling(
+    state: GeneratorAgentState,
+    tool_mode: AgentToolMode,
+    current_query: str,
+) -> tuple[str, str, Dict[str, Any]] | None:
+    if not _tiling_calc_result_is_unsupported(state):
+        return None
+
+    tiling_result = state.get("tiling_calc_result") or {}
+    operator_class = _map_tiling_class_to_code_search_family(tiling_result.get("operator_class"))
+    op_name = str(state.get("op_name") or "").strip()
+
+    if "code_search_snippet" in tool_mode:
+        redirected_query = (
+            f"operator-specific tiling strategy for {op_name}"
+            if op_name
+            else (current_query or "operator-specific tiling strategy")
+        )
+        redirected_args: Dict[str, Any] = {
+            "source": "asc_devkit",
+            "artifact_types": ["tiling", "kernel"],
+        }
+        if operator_class in _CODE_SEARCH_OPERATOR_FAMILIES:
+            redirected_args["operator_families"] = [operator_class]
+        return "code_search_snippet", redirected_query, redirected_args
+
+    api_name = extract_api_name(current_query, args=None)
+    if api_name != "unknown" and "api_lookup" in tool_mode and not _tool_has_nonempty_result(state, "api_lookup"):
+        return "api_lookup", api_name, {"api_name": api_name}
+    if api_name != "unknown" and "api_constraint" in tool_mode and not _tool_has_nonempty_result(state, "api_constraint"):
+        return "api_constraint", f"check constraints for {api_name}", {"api_name": api_name}
+    return None
+
+
 def _registry_tools_for_prompt(tool_mode: AgentToolMode) -> List[Any]:
     reg = get_tool_registry()
     out: List[Any] = []
@@ -383,6 +441,7 @@ def _build_tool_selection_prompt(
         f"Repeat only when you are adding genuinely new structure (for example, `api_constraint` after `api_lookup`, or a narrower `kb_shell_search` after an empty broad search).\n\n"
         "If only one tool is enabled for this session and it already returned a non-empty, task-relevant result, prefer `ANSWER` instead of burning more rounds on paraphrased repeats.\n\n"
         "When `api_lookup` returns a concrete API and constraints still matter, prefer `api_constraint` next instead of asking `api_lookup` again.\n\n"
+        "If `tiling_calc` already returned `unsupported_without_operator_specific_strategy`, do not call `tiling_calc` again in this or later rounds. Switch to operator-specific tools such as `code_search_snippet`, `api_lookup`, or `api_constraint`.\n\n"
         "**ANSWER is a last resort.** Output ANSWER only when:\n"
         "  (a) the retrieved content already comprehensively covers the task, OR\n"
         "  (b) you have no rounds left.\n\n"
@@ -793,6 +852,12 @@ def choose_tool_node(
 
     next_action, current_query, tjson = _resolve_json_choice(choice, tool_mode, user_question)
     normalized_args = tjson.get("args") if isinstance(tjson.get("args"), dict) else None
+    if next_action == "tiling_calc":
+        redirected = _redirect_after_unsupported_tiling(state, tool_mode, current_query)
+        if redirected is not None:
+            next_action, current_query, redirected_args = redirected
+            normalized_args = _normalize_choice_args(next_action, current_query, redirected_args)
+            tjson = {"tool": next_action, "query": current_query, "args": normalized_args}
     enabled_tools = list(tool_mode)
     repeated_choice = next_action != "ANSWER" and _tool_choice_already_seen(state, next_action, current_query, normalized_args)
     single_tool_repeat = (

@@ -1,0 +1,114 @@
+We need to generate the six Python strings for the custom AscendC kernel replacing the triplet margin loss. The kernel name is `triplet_margin_loss_custom`. The operator name in PascalCase is `TripletMarginLossCustom`. The input is anchor, positive, negative (all tensors), and margin (a scalar but passed as tensor? In the original model, margin is a tensor with single element). The output is a scalar loss? Actually `F.triplet_margin_loss` returns a scalar (0-dim tensor). So we need to compute the triplet margin loss: loss = max(d(anchor, positive) - d(anchor, negative) + margin, 0). Where d is Euclidean distance squared? Actually `F.triplet_margin_loss` uses squared Euclidean distance? In PyTorch, triplet margin loss uses p=2 (Euclidean distance) by default. The formula: loss = max(||anchor - positive||_p - ||anchor - negative||_p + margin, 0). But with p=2, the distances are squared? No, `torch.nn.functional.triplet_margin_loss` computes the loss as: loss = max(||anchor - positive||_p - ||anchor - negative||_p + margin, 0). Actually it computes the squared distance? Checking PyTorch docs: For triplet margin loss, the formula is `max(d(ap) - d(an) + margin, 0)`, where `d` is the pairwise distance function, by default `p=2` which is Euclidean distance (not squared). But the reduction='mean' by default. In the forward, they only pass anchor, positive, negative, margin, so it uses default reduction='mean'. But they do `m = float(margin.reshape(-1)[0].item())` to extract scalar. The output is a scalar tensor.
+
+We need to implement the custom kernel that computes this loss for a batch of triplets. The input tensors are of shape (N, D). Output is a scalar (0-dim tensor). We need to do:
+
+1. Compute diff_ap = anchor - positive
+2. Compute squared norm of diff_ap? Actually we need Euclidean distance, not squared. To compute Euclidean distance, we need to compute sqrt of sum of squares. However, AscendC might not have sqrt in vector compute? We can compute squared distance and then take sqrt? But maybe we can compute the loss differently: The loss involves sqrt distances, but we can compute the squared distances and then compare? Actually we need the actual distances. However, the AscendC reduce API can compute sum of squares, but sqrt is not directly available? There is a `Sqrt` API? I think there is `Sqrt` in AscendC. Or we can use `VectorSqrt`? Let's assume we can compute sqrt.
+
+But the kernel must be efficient. Since this is a per-batch reduction to a scalar, the tile size and compute need careful handling. We'll follow the pattern from the leaky relu example: use grid-stride tiling, double-buffering, etc.
+
+The operator inputs: anchor, positive, negative (float tensors shape (N, D)), margin (float scalar). Output: scalar (float). The tiling struct should include totalLength (N*D? Actually we need to process each triplet independently). More efficient: compute per triplet loss sequentially. We can compute for each triplet: compute anchor-positive diff, compute its squared norm, compute sqrt, same for anchor-negative, then combine and reduce. But we need to handle large N and D.
+
+We can design the kernel to compute the loss for a block of triplets and then reduce across blocks? The output is a single scalar, so we need a global reduction. The example doesn't show global reduction. We can use a two-step kernel: first compute per-element losses? Actually each triplet produces a scalar loss, then we take mean of all losses. That is a two-stage reduction: first reduce per triplet to a scalar (by summing over D dimensions), then reduce over N to get mean. This is similar to a reduce operation.
+
+Given complexity, we can implement the kernel as a single pass that accumulates the total loss using atomic operations? Or use a workspace for partial sums and then combine in the host? But the example uses a single kernel call. The host operator can set blockDim and tiling.
+
+We need to produce kernel_src, host_tiling_src, host_operator_src, project_json_src, python_bind_src, model_src.
+
+Let's design:
+
+- Tiling data: totalTriplets (N), featureDim (D), tileTriplets (how many triplets to process per iteration per block), blockDim. Also include margin.
+
+- Kernel: For each block, iterate over its assigned triplets in tile granularity. For each triplet, compute:
+  1. diff_ap = anchor - positive (vector of D)
+  2. diff_an = anchor - negative
+  3. norm_ap_sq = sum(diff_ap^2) (via ReduceSum)
+  4. norm_ap = sqrt(norm_ap_sq)
+  5. similarly norm_an
+  6. loss = max(norm_ap - norm_an + margin, 0)
+Then sum all losses across blocks using atomicAdd on global memory? Or accumulate in a local scalar and write to output at end? Since output is scalar, we need to combine across blocks. We can use a workspace array of size blockDim for partial sums, then do a final reduction on the host? But the kernel is called once. Better: have each block compute its partial sum of losses, then do a second kernel for reduction? That's complex. The example leaky_relu is elementwise, no reduction. For reduction, we might need a separate kernel stage. But the instruction says "Replace relevant PyTorch operators". We can use a two-kernel approach? But the output is a single string for kernel_src. Maybe we can implement the reduction within the same kernel using shared memory? On AscendC, we can use an atomic add on a global variable? Yes, we can use AtomicAdd for float on global memory. However, we need to ensure atomic operations are supported. They are supported on NPU. So each block can compute its local sum and then atomically add to a global output variable.
+
+Design:
+- Input: anchor, positive, negative (global tensors), output: scalar (global tensor)
+- Workspace: we may not need extra workspace if we compute in registers/local memory.
+- In the kernel, we need to access data of shape (N, D). Tiling: each block processes a set of triplets. We can have tileTriplets * D elements per iteration. Use double buffering for each of the three inputs and compute distances. But we can compute per triplet sequentially and reuse the same local buffer? To reduce memory, we can process one triplet at a time, loading its D elements for anchor, positive, negative, compute distances, accumulate loss, then move to next triplet. That avoids large local buffers. Since D can be large, we need to tile the feature dimension as well. So we have two levels of tiling: over triplets and over features.
+
+Better: For a given block, we iterate over its assigned triplets. For each triplet, we iterate over feature tiles. We'll have a local buffer for one tile of anchor, positive, negative. Compute diff, square, sum to get partial distance, then accumulate across tiles. Then after all tiles, we have norm for that triplet. That's a reduction across features (sum of squares). Then we compute sqrt (use sqrt from local scalar), then compute loss. Then accumulate into local loss sum. After all triplets, we atomically add local loss to global output. Then at end, output scalar is total sum. But the loss function typically uses mean, not sum. So we need to divide by N at the end. That division can be done on the host or in the kernel. We can do it in the kernel after final atomic add? The block that does the atomic add can divide by N after the atomic? But atomic adds are cumulative. We need to know total N. Simpler: have each block compute sum of losses, then after all blocks, run a second kernel to compute mean? But we can also have the host do the division: return the sum, and then in the python binding, divide by N. But the operator should output the mean loss. So we need to incorporate the division. We can do the division in the kernel after summing all losses: use a barrier? Not possible across blocks. Instead, we can have a separate kernel for reduction, but the task expects a single kernel. We can use a single kernel with an atomic add to a workspace for partial sums, then after the kernel, the host reads and computes mean? The operator's output is a tensor, so the kernel must produce the final value. We can have the last block (or block 0) perform the division after all blocks have finished? That requires synchronization which is not available. So we must compute the mean within the kernel using a reduction across blocks. On AscendC, we can use a shared memory buffer for atomic adds and then have the last block divide? But we don't know when others finish. Another approach: have each block write its partial sum to a global array, then call a second kernel to reduce that array. But that's two kernels. The problem statement shows an example with a single kernel. However, for a reduction operation, it's common to have two kernels or use the tiling to compute the entire reduction in one block. We can set blockDim=1 and process all data in one block. That would be simple: single block processes all triplets, accumulates local sum, then writes final scalar. For large N, this may exceed local memory? But we can tile over triplets and features. With blockDim=1, we use one AI core. That's acceptable for demonstration. The operator can set blockDim=1. Alternatively, we can use multiple blocks and then use atomic add for final sum, and after kernel, host divides by N. The output tensor should contain the mean, so we can adjust after kernel in the host? But the operator is supposed to produce the output directly. The example leaky_relu does elementwise, so no issue. For triplet loss, we need a reduction. The simplest is to use a single block.
+
+Let's go with blockDim=1 for simplicity. Then we can compute the sum of losses and then divide by N inside the kernel. That will work for any size with tiling.
+
+Thus tiling data: totalTriplets (N), featureDim (D), tileTriplets (number of triplets to process per iteration), tileFeatures (number of features per tile). But we can process one triplet at a time and tile features. So tileTriplets=1 is fine. We'll have local buffers for one tile of feature dimension.
+
+Let's define:
+- totalTriplets = N
+- featureDim = D
+- tileDimF = 1024? (from leaky relu they use 2048 alignment). We'll align to 32 bytes. For float, 32 bytes = 8 floats. We'll use tileDimF = 1024 (aligned to 8). 
+- buffer size: 3 * tileDimF for inputs, plus workspace for reduction (maybe additional for sum of squares). We also need temporary for computing loss. We can do: for each triplet:
+   - dequeue tile of anchor, positive, negative.
+   - compute diff_ap, square, reduce sum over tile to get partial sum, add to running sum_ap.
+   - similarly diff_an, square, reduce sum, add to sum_an.
+   - reuse buffers.
+   - after all feature tiles, compute norm_ap = sqrt(sum_ap), norm_an = sqrt(sum_an)
+   - loss = max(norm_ap - norm_an + margin, 0)
+   - add to totalLoss.
+After all triplets, totalLoss = totalLoss / N (mean). Write to output.
+
+We need to handle sqrt of scalar: we can use sqrt via `AscendC::Sqrt` but on scalar? Or we can compute via vector sqrt of a local tensor of size 1. Simpler: use `sqrt()` from math.h? On AscendC, we can use `AscendC::Sqrt` on local tensor. We can create a 1-element tensor and do sqrt.
+
+Alternatively, we can compute loss without sqrt: Actually the loss uses Euclidean distance, but if we use squared distances, the loss function is different. But we need to match PyTorch's triplet_margin_loss which uses sqrt? PyTorch uses p=2 Euclidean distance by default: `torch.cdist` with p=2 then mean. Yes. So we must compute sqrt.
+
+But sqrt is available in AscendC as an API: `Sqrt`. Or we can use `VecSqrt`.
+
+Now, we need to generate the six code strings.
+
+Let's write them step by step.
+
+project_json_src: define TripletMarginLossCustom with three inputs (anchor, positive, negative) all float ND, output scalar (shape [1]? Actually scalar can be shape [1] or []? In AscendC, we can output a 1-element tensor. We'll set output shape to {1}? But the original loss is a 0-d tensor. In AscendC, we can output a scalar tensor of size 1. We'll use shape [1] and format ND. Also attr for margin (float, default 1.0). We'll include "type": ["float"] for all inputs and output.
+
+host_tiling_src: Define TilingData struct with totalTriplets, featureDim, tileTriplets, tileDimF, blockDim, margin. We'll compute tileDimF based on UB budget. We'll use ALIGN_ELEMS=8 (float) for alignment. UB budget: we need local buffers for three inputs of tileDimF each (3 * tileDimF * 4 bytes), plus workspace for reduction (maybe 1 * tileDimF for diff?). Actually we need temp for diff? We can compute diff and square in place on one of the input buffers? Better to have separate temp. We'll have 4 buffers: anchor, positive, negative, diff. That's 4 * tileDimF * 4 bytes. Also maybe extra for reduction. We'll set UB budget to 192KB, so max elements per buffer: 192KB / (4*4) = 12KB / 4 = 3072 floats? Actually 192KB / (4 buffers * 4 bytes) = 192*1024 / 16 = 12288 floats. So tileDimF can be up to 12288. We'll use a safe value like 2048 or 1024. We'll align to 8.
+
+host_operator_src: Similar structure to leakey relu, but with three inputs, one output, tiling function, infer shape (anchor shape copied to output? Output shape is [1] constant). We'll set output shape to {1}. InferDataType: all float.
+
+kernel_src: Implement KernelTripletMarginLossCustom class with Init, Process, and private methods. Use grid-stride with one block (blockDim=1). Actually we set blockDim=1 in tiling, but the kernel can handle multiple blocks if we want. We'll code it to support multiple blocks by using atomic add to a global sum, then after all blocks done, block 0 divides by N. But that requires global synchronization. Better to just use one block. We'll set blockDim=1 in tiling, so each kernel invocation uses one block. In the kernel, we process all triplets, compute sum, divide, write output.
+
+But the kernel entry argument includes tiling; we can get totalTriplets, featureDim, tileDimF, margin from tiling.
+
+CopyIn: we need to load part of input data. Since we have three separate global tensors, we'll access them with offsets.
+
+In Process: loop over triplets, and within each triplet, loop over feature tiles. For each feature tile, load anchor, positive, negative into local buffers. Then compute diff_ap = anchor - positive; square each element (Mul with itself? Actually square: we can compute both diff and square in one step: compute diff, then compute diff*diff. Or use `Mul` on diff with itself. Then reduce sum the squared differences. Similarly for diff_an. We'll need temporary for diff. We'll reuse one buffer for diff_ap and diff_an? Can do sequentially.
+
+After all tiles, we have sum_ap and sum_an (scalars). Compute sqrt: we can use `AscendC::Sqrt` on a 1-element local tensor. Then compute loss = max(sum_ap - sum_an + margin, 0). Accumulate totalLoss.
+
+After all triplets, divide totalLoss by totalTriplets. Write to output (global scalar).
+
+We need to handle potential non-aligned sizes; we can pad with zeros using DataCopyPad? But we can just do loop for exact lengths, not pad.
+
+We'll use buffers of size tileDimF. For the last tile, we may have less than tileDimF elements. We'll use actual length.
+
+Now, let's write the code.
+
+We'll follow the exact style from the leaky relu example, with comments.
+
+python_bind_src: similar to leaky relu but with different operator name and inputs. We'll define a function that takes four tensors (anchor, positive, negative, margin) returns loss tensor. Use aclnnTripletMarginLossCustom? We'll follow the pattern: EXEC_NPU_CMD with that name. Also include headers.
+
+model_src: import custom_ops_lib, call the function. Note: The original forward takes anchor, positive, negative, margin. But margin is a tensor; we need to pass the float value? In the kernel, margin is an attribute, not an input. In the PyTorch model, margin is a tensor, but we need to convert to float. In the forward, they already extract margin value. So in model_src, we should extract margin as float and pass to custom op. The custom op expects margin as attribute? Actually in the project_json, we defined margin as an attr (optional float). So the Python binding should be a function that receives anchor, positive, negative, margin_value (float) and calls the custom op with that attribute. The PyTorch forward can extract the float from the tensor. So in model_src, we will do something like:
+
+```
+def forward(self, anchor, positive, negative, margin):
+    margin_val = margin.reshape(-1)[0].item()
+    return custom_op_fn(anchor, positive, negative, margin_val)
+```
+
+But the custom op expects three tensors and an attribute. In the python binding, we need to create a function that calls the operator with attribute. The example leaky_relu used a single function that takes the tensor and the negative_slope directly. So we should create a Python function that takes three tensors and a float, and invokes the custom op via the extension module. The extension module (python_bind_src) will implement a function like:
+
+```
+at::Tensor triplet_margin_loss_impl_npu(const at::Tensor& anchor, const at::Tensor& positive, const at::Tensor& negative, double margin) {
+    // call the custom op with attr margin
+}
+```
+
+We'll follow the pattern.
+
+Now, generate all strings. Ensure kernel function name exactly "triplet_margin_loss_custom" in the kernel entry.
+
+Let's produce the final answer.

@@ -167,26 +167,30 @@ def _meta() -> Dict[str, Dict[str, Any]]:
         },
         "tiling_calc": {
             "display_name": "Tiling calculation",
-            "description": "Propose tiling parameters from operator shape / element counts.",
-            "parameter_docs": 'Use "query" with sizes and operator kind.',
+            "description": "Compute tiling and return either `numeric_ok` for a fully numeric candidate or `planner_ok` for route/planning metadata. Covers generic elementwise sizing, structured broadcast planning, limited transpose conversion, and reduction planning across AR/ARA, split/full-load, with-index, global, and collapsed multi-axis cases.",
+            "parameter_docs": 'Prefer structured args such as {"total_elements":1024,"dtype":"float","op_name":"relu","op_type":"elementwise"}. For broadcast planning, pass {"op_type":"broadcast","input_shapes":[[m,1],[m,n]],"output_shape":[m,n],"chip":"DAV_2201"}. For transpose conversion partial support, pass {"op_type":"conversion","op_name":"transpose","input_shape":[m,n],"output_shape":[n,m],"permutation":[1,0]}. For reduction support, pass {"op_type":"reduction","input_shape":[a,r],"reduction_axes":[1],"keepdim":false}. Optional reduction args: {"track_index":false,"output_count":1,"algorithm_hint":"","precision_sensitive":false}. Query-only parsing is deliberately conservative now; if critical size/shape fields are missing, the tool returns unsupported instead of inventing a default workload.',
             "examples": [
-                '{"tool":"tiling_calc","query":"tiling for 1024 float elements elementwise","args":null}'
+                '{"tool":"tiling_calc","query":"tiling for 1024 float elements elementwise","args":{"total_elements":1024,"dtype":"float","op_name":"relu","op_type":"elementwise"}}',
+                '{"tool":"tiling_calc","query":"tiling for layer_norm","args":{"op_name":"layer_norm","op_type":"normalization"}}',
+                '{"tool":"tiling_calc","query":"tiling for broadcast add","args":{"dtype":"float32","op_name":"broadcast_add","op_type":"broadcast","input_shapes":[[13,1],[13,37]],"output_shape":[13,37],"chip":"DAV_2201"}}',
+                '{"tool":"tiling_calc","query":"tiling for transpose","args":{"dtype":"float16","op_name":"transpose","op_type":"conversion","input_shape":[64,128],"output_shape":[128,64],"permutation":[1,0]}}',
+                '{"tool":"tiling_calc","query":"tiling for reduce_sum over last axis","args":{"dtype":"float32","op_type":"reduction","input_shape":[128,64],"reduction_axes":[1],"keepdim":false}}'
             ],
             "usage_guidance": (
-                "Include element counts, dtypes, operator kind, and chip hint in `query` so tiling can be "
-                "grounded."
+                "Use this for generic elementwise sizing, structured broadcast sizing, structured transpose conversion sizing, or structured reduction sizing. Prefer structured `args` so `op_type`/`op_name` are preserved. "
+                "Interpret `status=numeric_ok` as a numeric tiling candidate and `status=planner_ok` as route/planning metadata that still needs operator-specific kernel realization. For broadcast support, pass `input_shapes` plus `output_shape`, and optionally `chip`; keyword-only broadcast requests are now rejected. For conversion support, pass `input_shape` and `permutation`; only 2D transpose or swapping the last two dimensions is supported generically. For reduction support, pass `input_shape` and `reduction_axes`; the planner covers AR/ARA, full-load/split, with-index, global, and collapsed multi-axis routing. Welford, Group Reduce, dichotomy, and multi-output behaviors currently surface as `planner_ok` rather than a fully executable numeric tiling."
             ),
         },
         "tiling_validate": {
             "display_name": "Tiling validation",
-            "description": "Validate tiling parameters against UB capacity and hardware rules.",
-            "parameter_docs": 'Use "query" with tiling JSON or parameters.',
+            "description": "Validate numeric tiling parameters against UB capacity and hardware rules; skips unsupported or planner-only tiling results.",
+            "parameter_docs": 'Pass numeric tiling JSON in `args` or `query`, including `chip` when relevant. If upstream `tiling_calc` returned `planner_ok` or any unsupported status, this tool returns skipped instead of forcing validation.',
             "examples": [
-                '{"tool":"tiling_validate","query":"validate tiling chip=DAV_2201 block_num=4","args":null}'
+                '{"tool":"tiling_validate","query":"validate tiling chip=DAV_2201 block_num=4","args":{"status":"numeric_ok","chip":"DAV_2201","block_num":4,"tile_length":2048,"repeat_times":32,"ub_usage_bytes":65536,"dtype":"float"}}',
+                '{"tool":"tiling_validate","query":"validate layer_norm tiling result","args":{"status":"unsupported_without_operator_specific_strategy","operator_class":"normalization"}}'
             ],
             "usage_guidance": (
-                "Paste or describe the proposed tiling parameters and target chip in `query` so rules can "
-                "be checked."
+                "Use this only after you already have a numeric tiling candidate, typically `status=numeric_ok`. If tiling_calc returned `planner_ok` or explicitly refused, do not invent zeros to validate; pass through the structured status or move on to operator-specific tools."
             ),
         },
         "npu_arch": {

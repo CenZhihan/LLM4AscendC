@@ -1,0 +1,90 @@
+We need to fix the previous attempt. The error shows:
+```
+fatal error: 'adv_api/math/cumsum.h' file not found
+#include "adv_api/math/cumsum.h"
+```
+
+The header is missing. The correct header path might be different. According to API lookup, the CumSum signature is found in `adv_api/math/cumsum.h`. The issue is that the build environment cannot find it. Possibly the path is not in the include path, or the header doesn't exist. Since we are using Ascend C, we need to use a different approach: implement cumulative sum manually without relying on advanced API that may not be available. Or we can use the built-in `CumSum` but ensure the header exists. The error indicates it's not found, meaning the environment might not have that header. The safe approach is to manually implement prefix sum using vector operations.
+
+Given the constraints: "Prioritize resolving the concrete errors shown in logs." and "Keep behavior unchanged where not required by the fix." We should avoid using `adv_api/math/cumsum.h` and instead implement the cumulative sum manually per row using a loop of additions.
+
+Also, note the previous attempt used `adv_api/math/cumsum.h` and `CumSum` API. Since the header is missing, we need to change the implementation.
+
+Additionally, the kernel entry function signature had `dim_gm` as GM_ADDR for dim input, but in operator definition dim is an input tensor. That should be fine. But kernel_src was wrong: it used `dim_gm` but the entry function must match the expected signature. The operator definition has three inputs: x, mask, dim. But the kernel is called with `x, mask, dim_gm, y, workspace, tiling`. That matches the autogen? Actually, the python bind expects `aclnnMaskedCumsumCustom(self, mask, dim_tensor, result)`. The kernel should have `GM_ADDR x, GM_ADDR mask, GM_ADDR dim, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling`. That's okay.
+
+But the main error is the missing cumsum header. We will rewrite the kernel to implement cumulative sum manually.
+
+We need to produce the six strings. Minimal changes: modify kernel_src to not use adv_api/math/cumsum.h. Implement a manual cumulative sum using a loop. The kernel operates per row: each row length = dimSize. We have rows = totalLength/dimSize. We need to compute masked_cumsum = cumsum(x * mask) along the row dimension (axis dim). The row is contiguous? Since we are doing ND, we need to treat the data as a 2D matrix where rows = totalLength/dimSize and columns = dimSize. The cumulative sum is along the last dimension? The original PyTorch: `torch.cumsum(x * mask, dim=dim)`. dim is variable. However, the tiling assumes the data is reshaped to 2D where the cumsum is along the second dimension (dimSize). This is valid if dim is constant? But the user passes dim as input. The tiling computes dimSize from shape, so if dim=1 for a 1D tensor of size N, then rows = N, dimSize = 1? Actually for 1D tensor, dim=1 is invalid? The example: input_shape = (32768,), batch_size=32768, dim=1. That means input is (32768, 32768)? Wait, the get_inputs: x = torch.rand(batch_size, *input_shape) => shape (32768, 32768). So it's 2D. original model forward: `torch.cumsum(x * mask, dim=dim)` with dim=1. So cumulative sum along columns. So our 2D view is correct.
+
+Thus, we can implement manual cumulative sum per row: for each row, compute prefix sum. We can use vectorized prefix sum. Since tile size is rows * dimSize, we can process multiple rows. For each row, we can do a sequential add using `Add` operations. Since the dimension may be large (32768), using a single thread to iterate over columns might be okay, but we can also use vectorized approach. But to avoid advanced API, we can implement a simple loop: for each element in row, y[i] = y[i-1] + x[i], with the initial y[0] = x[0]. However, we must also apply mask: first multiply x * mask, then cumsum. That multiplication can be done via `Mul` before cumsum.
+
+Thus, kernel can be:
+- Multiply x with mask to get masked_x.
+- Then for each row:
+  - y[0] = masked_x[0]
+  - for i from 1 to dimSize-1:
+      y[i] = y[i-1] + masked_x[i]
+But this is sequential within a row. However, if dimSize is large (32768), this loop may be slow. But we are constrained to not use advanced API. An alternative is to use vectorized prefix sum using `Add` with offsets, but that is more complex. For correctness, we can implement a simple loop. Given typical Ascend C constraints, the issue is compile error, not runtime performance. So we can use a simple loop.
+
+Wait, the error says the header is not found, so we can remove the include and implement our own logic. We also need to remove any usage of `CumSumInfo`, `CumSum`, etc. So the entire kernel_src must be rewritten.
+
+Let's produce a minimal fix: change kernel_src to manually compute cumulative sum per row, with loop.
+
+Also check the piping: we need to ensure we still use double buffering and proper queue management.
+
+In the previous attempt, we had `lastRowBuf_` which was used only if we used the CumSum API; we can remove it.
+
+Let's rewrite the Compute method:
+
+```
+__aicore__ inline void Compute(uint32_t rows)
+{
+    AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+    AscendC::LocalTensor<uint8_t> maskLocal = inQueueMask_.DeQue<uint8_t>();
+    AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+    AscendC::LocalTensor<float> tmpLocal = tmpQueue_.AllocTensor<float>();
+
+    uint32_t totalElems = rows * dimSize_;
+
+    // convert mask from bool (uint8) to float, then multiply x
+    AscendC::Cast(tmpLocal, maskLocal, 1.0f, (*AscendC::GetRoundMode()), totalElems);
+    AscendC::Mul(yLocal, xLocal, tmpLocal, totalElems);
+
+    // manual cumulative sum per row
+    for (uint32_t r = 0; r < rows; ++r) {
+        uint32_t rowOffset = r * dimSize_;
+        // first element of row stays
+        for (uint32_t c = 1; c < dimSize_; ++c) {
+            uint32_t idx = rowOffset + c;
+            float prev = yLocal.GetValue(idx - 1);
+            float curr = yLocal.GetValue(idx);
+            yLocal.SetValue(idx, prev + curr);
+        }
+    }
+
+    tmpQueue_.FreeTensor(tmpLocal);
+    outQueueY_.EnQue<float>(yLocal);
+    inQueueX_.FreeTensor(xLocal);
+    inQueueMask_.FreeTensor(maskLocal);
+}
+```
+
+But note: `SetValue` and `GetValue` are element-wise operations, which may be inefficient but correct. Ascend C provides these. However, we must ensure they are available. They are common in kernels.
+
+Alternatively, we can use vector operations to shift and add. But simpler to just use scalar loop. However, the tile size might be large (rows * dimSize up to tileRows * dimSize). TileRows was computed up to 128, dimSize=32768, that's ~4 million elements. A loop with two scalar ops per element might be okay for a single core? Actually each core handles multiple rows. The loop is sequential inside each core, but we have multiple cores. Still, the performance may be poor but correctness is the goal.
+
+Given the constraints to fix the compilation error, we just need to remove the include and replace the CumSum call with manual implementation. We can keep the same structure. Also need to remove `lastRowBuf_` usage since we no longer need it.
+
+Let's produce the fixed kernel_src.
+
+Also ensure that `tileRows` in tiling is computed correctly. The previous tiling code might be okay, but we need to ensure that the kernel can handle any dimSize. The manual loop assumes dimSize > 0.
+
+We also need to adjust the Init: remove lastRowBuf_ init.
+
+Now produce full six strings.
+
+Important: Keep naming/contracts consistent. The python bind and model src likely remain unchanged as they do not reference the missing header. The host_operator_src remains unchanged. Tiling data structure unchanged.
+
+Thus, only kernel_src needs modification.
+
+Now write the corrected kernel_src.

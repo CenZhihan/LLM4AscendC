@@ -22,6 +22,7 @@ def _extract_tiling_params(query: str) -> dict:
         "ub_usage_bytes": 0,
         "block_num": 1,
         "dtype": "float",
+        "chip": "DAV_2201",
     }
 
     # Try to parse JSON-like dict
@@ -46,11 +47,32 @@ def _extract_tiling_params(query: str) -> dict:
             params["dtype"] = dtype
             break
 
+    match = re.search(r"\b(DAV_\d{4})\b", query, re.IGNORECASE)
+    if match:
+        params["chip"] = match.group(1).upper()
+
     return params
+
+
+def resolve_validation_request(state: GeneratorAgentState) -> dict:
+    """Resolve structured validation input before parsing the query."""
+    upstream = state.get("tiling_calc_result")
+    if isinstance(upstream, dict) and upstream:
+        return dict(upstream)
+
+    tool_choice_args = state.get("tool_choice_json", {}).get("args")
+    if isinstance(tool_choice_args, dict) and tool_choice_args:
+        return dict(tool_choice_args)
+
+    return _extract_tiling_params(state.get("current_query", ""))
 
 
 def _format_for_display(result) -> str:
     """Format TilingValidationResult for display."""
+    if getattr(result, "status", "") != "ok":
+        lines = [f"Tiling 验证结果: {result.status}"]
+        lines.append(f"  reason = {result.reason}")
+        return "\n".join(lines)
     if hasattr(result, "is_valid"):
         lines = [f"Tiling 验证结果: {'通过' if result.is_valid else '失败'}"]
         for check_name, passed in result.checks.items():
@@ -85,8 +107,9 @@ def tiling_validate_node(
         tiling_retriever = TilingRetriever()
 
     query = state.get("current_query", "")
-    params = _extract_tiling_params(query)
-    result = tiling_retriever.validate_tiling(params)
+    params = resolve_validation_request(state)
+    chip = str(params.get("chip") or "DAV_2201")
+    result = tiling_retriever.validate_tiling(params, chip=chip)
 
     round_num = state.get("query_round_count", 0) + 1
     display_text = _format_for_display(result)
