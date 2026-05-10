@@ -4,7 +4,7 @@ Agent runner: high-level API for kernel generation with agent.
 Provides generate_kernel_with_agent() function for easy integration.
 """
 from dataclasses import dataclass
-from typing import Dict, List, Any, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from langchain_core.messages import HumanMessage
 
@@ -24,9 +24,12 @@ from .retrievers import KBRetriever, WebRetriever, CodeRetriever
 class KernelGenerationTask:
     """Task definition for kernel generation."""
     language: str           # Target language: "ascendc", "cuda", "triton"
-    op: str                 # Operator name: "gelu", "softmax"
-    strategy_name: str      # Prompt strategy: "add_shot", "add_shot_with_code"
+    op: str                 # Operator name: "gelu", "softmax" (or ca6k_00055 for CUDA-Agent)
+    strategy_name: str      # Prompt strategy (MKB: add_shot…; CUDA-Agent script: one_shot|none)
     category: str           # Operator category: "activation", "matmul"
+    # When set, prompt is built from CUDA-Agent-Ops-6K row (fused task); op should be ca6k_XXXXX.
+    cuda_agent_row: Optional[Dict[str, Any]] = None
+    cuda_agent_row_index: Optional[int] = None
 
 
 @dataclass
@@ -164,6 +167,7 @@ def generate_kernel_with_agent(
     attempt_id: int = 1,
     repair_error_logs_raw: str = "",
     previous_attempt_code: str = "",
+    ascend_search_version_filter: Optional[str] = None,
 ) -> AgentGenerationResult:
     """
     Generate kernel code using the integrated agent with KB, WEB, and Code RAG.
@@ -173,6 +177,8 @@ def generate_kernel_with_agent(
         tool_mode: Tool mode (``frozenset`` of tool keys or string like ``\"kb_only\"``, ``\"kb,web\"``, ``\"all\"``)
         retriever: Optional pre-loaded CodeRetriever for Code RAG
         llm_config: Optional LLM config (api_key, base_url, model)
+        ascend_search_version_filter: Optional substring for Ascend docs ``version`` field filtering;
+            ``None`` or empty means no restriction.
 
     Returns:
         AgentGenerationResult with generated_code, reasoning, and tool_usage
@@ -190,14 +196,24 @@ def generate_kernel_with_agent(
     # Parse tool mode if string
     parsed_mode = parse_tool_mode(tool_mode) if isinstance(tool_mode, str) else tool_mode
 
-    # 1. Build base prompt using existing prompt_generators
-    base_prompt = _build_base_prompt(task.language, task.strategy_name, task.op)
+    # 1. Build base prompt
+    if task.cuda_agent_row is not None:
+        from generator.prompt_generators.cuda_agent_fused import build_cuda_agent_fused_prompt
+
+        base_prompt = build_cuda_agent_fused_prompt(
+            task.strategy_name,
+            task.cuda_agent_row,
+            task.op,
+        )
+    else:
+        base_prompt = _build_base_prompt(task.language, task.strategy_name, task.op)
 
     # 2. Build and invoke agent
     app = build_agent_app(
         tool_mode=parsed_mode,
         llm_config=llm_config,
         code_retriever=retriever,
+        ascend_search_version_filter=ascend_search_version_filter,
     )
 
     # 3. Create initial state

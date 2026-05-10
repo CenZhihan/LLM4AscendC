@@ -1,0 +1,162 @@
+We need to fix the previous attempt. The kernel output is all zeros, indicating the kernel is not computing correctly. The problem likely lies in the kernel logic: the computation for upper triangular matrix multiplication is wrong. Also, the kernel uses `Muls` to initialize C tile to zero on uninitialized memory (garbage * 0 = 0 may work but not guaranteed). More critically, the loop over k only goes from i to j1-1, but for upper triangular matrices, A and B are upper triangular, so A[i][k] = 0 for k < i? Actually upper triangular means non-zero only if i <= j. For matrix multiplication C = A * B, we need sum_{k} A[i][k] * B[k][j]. Since A is upper triangular, A[i][k] = 0 for k < i. Since B is upper triangular, B[k][j] = 0 for j < k. So for C[i][j] with i <= j (we only compute upper triangle), non-zero contributions only for k in [i, j]. That's correct: k from i to j. But in the kernel, for each row i, the column tile j0 to j1, the inner loop over k runs from i to j1-1. But for a given column j, only k up to j matters. The kernel sums over all k from i to j1-1, but for j < k, B[k][j] = 0. That's fine because those contributions are zero. However, the kernel is summing over all k in that range, but it's loading B[k][j0:j1] each time and multiplying by scalar A[i][k]. For k > j, B[k][j] = 0, so the multiplication is zero. That's correct. So why all zeros?
+
+Possible issues:
+- The kernel initializes cTile with `Muls(cTile, cTile, 0.0f, colLen)` where cTile is uninitialized. This might produce NaN or zeros? Actually Muls on uninitialized may produce garbage, but multiplied by 0 should yield 0. However, some AscendC operations may not work as expected on uninitialized tensors. Better to use `AscendC::SetZero` or a proper initialization. But we can also just allocate and then add from zero, but we need to zero it first. Use `AscendC::Muls(cTile, cTile, 0.0f, colLen)` may not be safe.
+- The scalar `a = aScalar.GetValue(0)` is used. But after freeing the tensor, is the value still accessible? The FreeTensor may release memory, but we already copied value to local variable, so it's fine.
+- The DataCopy for scalar: we copy 1 element from global to local, then read it. That's okay.
+- The main issue: The loop for k goes from i to j1-1, but for each k, we load B[k][j0:j1] and multiply by A[i][k]. However, the accumulation is done with `AscendC::Add(cTile, cTile, bRow, colLen)` after modifying bRow in-place. That's okay.
+- However, we are modifying bRow in place with `Muls(bRow, bRow, a, colLen)`. Then we add to cTile. After that we free bRow. That's fine.
+- The issue might be that `Muls` on bRow modifies it, but we are also using bRow for the next iteration? No, we free it.
+- Another problem: The accumulation is done per tile, but the tile size may be small? Actually tileW_ is determined by tiling. From tiling, tileWidth is at most UB_BUDGET_BYTES / 8 = 24576, but HARD_CAP_TILE_WIDTH is 4096, so it's okay.
+- The kernel doesn't handle the case where N is not multiple of tileW_? It does with j1 = min(j0+tileW_, N) and colLen.
+- The major problem: The kernel uses a grid-stride for rows i = blockIdx, i += blockNum. That's fine. But for each row, it processes column tiles from i to N_ step tileW_. However, for the upper triangle, the columns start at i (since j >= i). That's correct.
+- However, the loop over k from i to j1-1 is incorrect because for a given column tile, the contributions from k > j1-1 are zero because B[k][j] is zero for j < k, but we are only summing up to j1-1, missing contributions from k in [i, j1-1]? Wait, we are summing exactly k from i to j1-1, which is the correct range because B[k][j] for j in [j0, j1) is non-zero only if j >= k. But if k > j1, then j < k for all j in tile, so those B entries are zero. So the range k from i to j1-1 captures all non-zero contributions. For k > j1-1, B[k][j] = 0. So that's fine.
+- But what about k from i to j1-1, but for j >= k? That's fine.
+- The real bug: For each column tile, we are summing over k but we never reset cTile to zero between column tiles? Actually we allocate and initialize a new cTile for each column tile, then after loop we write it out and free it. So that's fine.
+
+Let's examine the initialization of cTile: 
+```
+AscendC::LocalTensor<float> cTile = outBufC_.AllocTensor<float>();
+AscendC::Muls(cTile, cTile, 0.0f, colLen);
+outBufC_.EnQue(cTile);
+```
+Then later:
+```
+cTile = outBufC_.DeQue<float>();
+```
+This expects the tensor to be in the queue. That's fine.
+
+But note: after the inner loop over k, we do `cTile = outBufC_.DeQue<float>();` to get the tensor from the queue. Then we write back and free. That seems correct.
+
+What if `Muls(cTile, cTile, 0.0f, colLen)` does not zero the memory because cTile is uninitialized and the operation may read garbage and multiply by 0, which may produce 0 but maybe the hardware does not guarantee that? It should, but safer to use `AscendC::SetZero(cTile, colLen)`. Let's check if AscendC has SetZero. It does: `AscendC::SetZero(cTile, colLen);`. We'll use that.
+
+Another potential issue: The scalar extraction `float a = aScalar.GetValue(0);` might be inefficient but should work.
+
+But the output is all zeros, meaning the kernel never writes any non-zero values. Could be that the data copy from global to local for B row is not working? Or the Muls with a is zero? Let's check the data: A and B are upper triangular matrices with random values. So A[i][k] should be non-zero for i <= k. The scalar a should be non-zero if A[i][k] != 0. But note: In the loop over k, we load A[i][k] from global. However, for k < i, A[i][k] = 0 (upper triangular). But we start k from i, so that's fine. For k = i, A[i][i] is non-zero. So the scalar should be non-zero. Then we multiply B row by a and add to cTile. Should yield non-zero.
+
+Maybe the issue is that the kernel is not being executed at all? But the log shows it compiled and ran (since output is all zeros and not NaN). So it ran but produced zeros.
+
+Let's look at the tiling: tileWidth could be too large causing UB overflow? UB budget: 192KB, we estimated 8 bytes per element for two tensors (B row and C tile) = 2 * tileW * 4 bytes = 8 * tileW. So tileW max = 24576. But we have also scalar queue with 1 element, negligible. So tileW could be 24576 AlignDown to 32, but HARD_CAP_TILE_WIDTH is 4096, so tileW <= 4096. That's fine.
+
+But note: The kernel uses two buffers in queue for inBufB_ and outBufC_ each with BUFFER_NUM=2, so total memory for B and C is 2 * tileW * 4 * 2 = 16*tileW bytes? Actually each queue has 2 tensors of tileW floats. So total for B and C: 2 * (tileW*4) * 2 = 16*tileW. Plus scalar queue: 4 bytes. So UB usage = 16*tileW + 4. For tileW=4096, that's 65540 bytes, well under 192KB. So fine.
+
+Maybe the bug is in the DataCopy for the scalar: `AscendC::DataCopy(aScalar, A_gm_[i * stride_ + k], 1);` This copies 1 element. That should work.
+
+Another thought: The kernel uses `AscendC::Muls(bRow, bRow, a, colLen);` This multiplies each element of bRow by scalar a. But bRow is a tensor of length colLen, and a is a float. That's correct.
+
+But then `AscendC::Add(cTile, cTile, bRow, colLen);` adds bRow to cTile. That's correct.
+
+Potential issue: The order of dequeuing and enqueuing might be wrong. We dequeue cTile, then dequeue bRow, then do operations, then enqueue cTile and free bRow. That's fine.
+
+Let's consider the possibility that the kernel is not reading the correct global memory locations due to stride calculation. We use stride_ = N_, which is correct for row-major.
+
+Wait: In the kernel, we have `A_gm_.SetGlobalBuffer((__gm__ float*)A, N_ * N_);` and then `A_gm_[i * stride_ + k]`. That's correct.
+
+Maybe the problem is that we are using the same queue for multiple purposes? The kernel uses inBufB_ for loading B rows, and during the loop, we dequeue and free each time. That should be fine.
+
+Another possible issue: The kernel does not wait for data copy to complete before reading the scalar? DataCopy is blocking? In AscendC, DataCopy is asynchronous, and we must ensure the tensor is in the queue and then dequeue to get it ready. For the scalar, we allocate a tensor from tmpScalarQue_, copy data, then immediately read via GetValue(0). Is GetValue safe after DataCopy? The DataCopy might not have completed before we read. We need to ensure synchronization. The correct pattern is to enqueue the tensor after DataCopy, then dequeue to wait for completion. But here we are not enqueuing/dequeuing for the scalar. Instead, we should use a pipe or wait. Actually, in AscendC, after DataCopy, the data is available if we use the same tensor without enqueue? The typical pattern is: allocate tensor, DataCopy into it, then enqueue, then later dequeue. But for immediate use, we can use `AscendC::MemSet`? There's `AscendC::DataCopy` which is asynchronous, so we need to wait. We can use `AscendC::SetFlag` or use the pipe. Safer to use a small buffer with queue.
+
+But for a scalar, we can use `AscendC::LocalScalar` or just load via `AscendC::LoadScalar`. Actually, AscendC provides `AscendC::LoadScalar` to load a single element from global to a register. That would be simpler and avoid UB issues. Similarly, we can use `AscendC::DataCopy` with a 1-element tensor and then enqueue/dequeue to synchronize. Let's change to using `AscendC::DataCopy` with proper enqueue/dequeue.
+
+Better: use `AscendC::LocalTensor<float> aScalar = tmpScalarQue_.AllocTensor<float>(); AscendC::DataCopy(aScalar, A_gm_[i*stride_+k], 1); tmpScalarQue_.EnQue(aScalar);` then later `aScalar = tmpScalarQue_.DeQue<float>(); float a = aScalar.GetValue(0); tmpScalarQue_.FreeTensor(aScalar);` That ensures synchronization.
+
+But note: we are inside a triple loop, and we allocate/deallocate many times. That's okay.
+
+However, even without synchronization, GetValue might still give correct value because the hardware may have implicit sync? Not guaranteed.
+
+Let's also check the tiling: The tiling sets blockDim, but in the kernel, we use `AscendC::GetBlockNum()` and `AscendC::GetBlockIdx()`. That's correct.
+
+Another possibility: The kernel is compiled but the operator does not actually call the kernel? But the output is zeros, so it did call and wrote zeros.
+
+Maybe the issue is that the output tensor C is initialized to zeros by the framework? But we write into it explicitly.
+
+Let's re-examine the kernel logic with a concrete small N=4. Suppose N=4, tileW=2 (for simplicity). A and B are 4x4 upper triangular. For blockIdx=0 (first core), process row i=0. Column tiles: j0=0, j1=2. Accumulate cTile for columns 0,1. Loop k from 0 to 1 (since j1-1=1). For k=0: load A[0][0], load B[0][0:2], multiply add. For k=1: load A[0][1], load B[1][0:2], multiply add. Then write cTile to C[0][0:2]. For next column tile j0=2, j1=4. Loop k from 0 to 3? Actually j1-1=3, k from 0 to 3. But A[0][2] and A[0][3] are non-zero (upper triangular), B[2][2:4] and B[3][2:4] are upper triangular, so contributions. That should work.
+
+But what about row i=1? It will be processed by some block (maybe blockIdx=1 if blockNum=2). For row i=1, the first column tile j0=1 (since start at i), j1=3 (tileW=2). Loop k from 1 to 2. That's correct.
+
+So the logic seems correct.
+
+Maybe the problem is the use of `AscendC::Muls(cTile, cTile, 0.0f, colLen);` where cTile is uninitialized. If the memory contains NaN, multiplication by 0 gives NaN. But the output is zero, not NaN. So maybe the memory is zero-initialized? Not guaranteed.
+
+Let's replace initialization with `AscendC::SetZero(cTile, colLen);` and also ensure proper sync for scalar.
+
+Also, note that in the inner loop, we are doing `AscendC::Muls(bRow, bRow, a, colLen);` which modifies bRow in place. Then `AscendC::Add(cTile, cTile, bRow, colLen);` uses the modified bRow. That's fine.
+
+But we also need to ensure that after the inner loop, we write back the correct cTile. The current code dequeues cTile after the loop, writes and frees. That's fine.
+
+Let's also consider the possibility that the tiling data has tileWidth=0 or something. In tiling, we set tileWidth to at least ALIGN_ELEMS (32). But if N is small, tileWidth could be N, which is fine.
+
+Another major issue: The kernel uses a double buffer for B rows (inBufB_ with BUFFER_NUM=2). In the inner loop, we allocate a B row, enqueue, then later dequeue. But we also have a scalar that uses a separate queue. That's fine.
+
+Now, the actual error from the eval log: The reference output is non-zero, the new output is all zeros. So the kernel wrote zeros. Could be that the kernel never wrote to C because the condition `if (totalLen_ == 0 || tileLen_ == 0)` in the leaky relu kernel? No, this is a different kernel. Here we have no such check.
+
+Maybe the kernel is not writing because the blocks are not covering all rows? With grid-stride, each block processes rows i = blockIdx, i += blockNum. If blockNum > N, then some blocks have no rows, but at least blockIdx=0 will process row 0. So row 0 should have non-zero. But output is all zeros, so even row 0 is zero.
+
+Possible that the global memory write is not happening due to overflow? Or the DataCopy from local to global is not working? Or the DataCopy for B row is not loading correctly?
+
+Let's rewrite the kernel more robustly. I'll simplify: Instead of double buffering, use single buffer for simplicity. Also, avoid using inline assembly complex queues. Use a straightforward approach with a single compute loop.
+
+But the task requires minimal and targeted changes. So I'll fix the kernel to use proper initialization and scalar loading.
+
+Also, note that the kernel name in `kernel_src` is `matmul_for_upper_triangular_matrices_custom`, which matches the expected function name. Good.
+
+I'll modify the kernel_src:
+- Replace `AscendC::Muls(cTile, cTile, 0.0f, colLen);` with `AscendC::SetZero(cTile, colLen);`
+- For scalar loading, use a local variable and `AscendC::LoadScalar` if available, or use a single-element queue with proper enqueue/dequeue.
+- Also, ensure that we don't use uninitialized memory.
+
+I'll also add a check for tileW_ == 0.
+
+Additionally, I notice that the kernel uses `tmpScalarQue_` with queue but doesn't enqueue/dequeue. I'll change to a simpler method: allocate a 1-element tensor, DataCopy, enqueue, then dequeue, get value, free.
+
+But to minimize changes, I'll refactor the inner loop to:
+```
+for (uint32_t k = k0; k < k1; k++) {
+    // Load scalar
+    AscendC::LocalTensor<float> aScalar = tmpScalarQue_.AllocTensor<float>();
+    AscendC::DataCopy(aScalar, A_gm_[i * stride_ + k], 1);
+    tmpScalarQue_.EnQue(aScalar);
+    aScalar = tmpScalarQue_.DeQue<float>();
+    float a = aScalar.GetValue(0);
+    tmpScalarQue_.FreeTensor(aScalar);
+
+    // Load B row
+    AscendC::LocalTensor<float> bRow = inBufB_.AllocTensor<float>();
+    AscendC::DataCopy(bRow, B_gm_[k * stride_ + j0], colLen);
+    inBufB_.EnQue(bRow);
+    bRow = inBufB_.DeQue<float>();
+    // Multiply-add
+    AscendC::Muls(bRow, bRow, a, colLen);
+    cTile = outBufC_.DeQue<float>();
+    AscendC::Add(cTile, cTile, bRow, colLen);
+    outBufC_.EnQue(cTile);
+    inBufB_.FreeTensor(bRow);
+}
+```
+Note: We need to dequeue cTile before each addition. But we already dequeued once after initialization? Actually, after initialization, we enqueued cTile. So before the loop, cTile is in the queue. In the loop, we need to dequeue it first, then after add, enqueue again. That's what we have.
+
+But careful: The first iteration, we need to dequeue cTile from the queue. In the code above, we do `cTile = outBufC_.DeQue<float>();` inside the loop before add. That's fine because we enqueued it after init. So we need to ensure that before the loop, we have enqueued the initialized cTile. That is done.
+
+After the loop, we dequeue and write back. That matches.
+
+However, we also need to allocate bRow and enqueue/dequeue. The buffer inBufB_ has BUFFER_NUM=2, so we can allocate and enqueue, then dequeue. That's fine.
+
+Now, the scalar queue: we allocate, copy, enqueue, dequeue, free. That works.
+
+I'll implement these changes.
+
+Also, I'll add a check if tileW_ is 0 or N_ is 0, return early.
+
+Let's produce the corrected kernel_src.
+
+Also, check the host_operator_src: the tiling function calculates tileWidth based on UB budget. That seems fine.
+
+Now, I'll output the six strings with the corrected kernel_src only. Other files remain mostly same.
+
+One more thing: In the kernel, we used `AscendC::Muls(bRow, bRow, a, colLen);` which modifies bRow in place. But after that, we add to cTile. That's fine. However, note that we are using the same bRow tensor for each k, but we allocate a new one each time. So no conflict.
+
+Now, the python_bind_src uses `EXEC_NPU_CMD(aclnnMatmulForUpperTriangularMatricesCustom, A, B, C);` That expects the aclnn function to be generated by the framework. That should work.
+
+I'll provide the corrected code.
+
+Let's write the final answer.

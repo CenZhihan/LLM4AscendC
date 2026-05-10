@@ -1,0 +1,206 @@
+We need to generate the six Python strings for a custom AscendC kernel for softmax. The kernel name is softmax_custom (PascalCase: SoftmaxCustom). The original model uses torch.softmax(x, dim=1). We need to implement a softmax along the last dimension (dim=1) for a 2D tensor of shape (batch_size, dim) where dim is large (393216). The kernel should be efficient.
+
+We need to produce:
+- project_json_src: operator definition for SoftmaxCustom.
+- host_tiling_src: tiling data structure for SoftmaxCustom.
+- host_operator_src: tiling function, infer shape, operator registration.
+- kernel_src: actual AscendC kernel implementation.
+- python_bind_src: PyTorch binding using aclnn or custom ops.
+- model_src: new model class using the custom kernel.
+
+Key considerations:
+- Softmax: For each row (batch element), compute exp(x_i - max) / sum(exp(x_i - max)). Need to handle large dim, using tiling to fit UB (local memory). Typically we need to compute max, then exp and sum, then divide. Because dim is large, we need to tile along the row dimension. Each block can handle multiple rows, or we split rows among blocks. Better to assign groups of rows to blocks, and for each row, tile along the feature dimension to compute max, then compute exp and sum, then normalize. However, the kernel must be efficient.
+
+Given the original model uses dim=1 (last dim for 2D), we can treat each row independently. The kernel can be launched with blockDim equal to number of rows? But rows are 4096, which is moderate. However, each row has 393216 elements, which is huge. So we need to tile along the feature dimension within each row. The tiling strategy: each block processes a contiguous chunk of rows? But number of rows (batch_size) is 4096, which can be handled by multiple blocks. However, each block has limited UB, so we need to tile the feature dimension. A common pattern: each block processes one row at a time, but uses multiple iterations to compute softmax over the row. However, we also need to store intermediate results (e.g., exp values) to later divide. That would require a large buffer. Instead, we can compute softmax in two passes: first pass compute max and sum (or sum of exp after max subtraction), second pass compute output. For tiling, we can compute partial max and sum per tile, then combine across tiles. But that requires synchronization between tiles? Since each row is independent, we can process one row per block and tile the feature dimension, storing partial results in UB? Actually, we can do a two-pass approach within a block: first tile through entire row to compute row max and sum (after exp of (x - max)) by accumulating per tile. But we need the final max to compute exp, so we need to first compute global max per row. That can be done by iterating over tiles, computing local max, and then combining? But we cannot easily combine without cross-tile communication. However, for a single block processing a row, we can first iterate to find max (store in register/local), then second pass to compute exp and accumulate sum, then third pass to normalize. That works, but requires multiple passes over the data, increasing memory traffic. Alternatively, we can compute max on the fly and then adjust the sum later? More complex.
+
+Given the large dim, a common approach in AscendC for softmax is to use the online-softmax algorithm: compute max and sum incrementally, then at the end compute normalized values. But that still requires a second pass if we want to output normalized values. However, we can use a single pass if we store intermediate exp values? Not possible due to large dim.
+
+Given the user is an expert, they likely expect an efficient kernel using two passes: first pass compute max and sum, second pass compute output. Within each block, we can process a chunk of rows. For each row, we tile the feature dimension. In the first pass, for each tile, we compute local max and then update global max and sum (with adjustments). After first pass, we have max and sum. Then second pass compute output. The block can process multiple rows interleaved? But each row is independent, so we can assign each block a set of rows and process them sequentially or in parallel using vector units.
+
+Given the large dim (393216), we need to tile. The UB budget: we can load a tile of data, compute max, then adjust sum. However, we need to keep the global max and sum for each row. That can be stored in UB (float variables). Then for second pass, we reload the tile, compute exp(x - max) / sum.
+
+The kernel must be efficient: use double buffering to overlap data copy and compute. We can have two passes with separate loops, but we can also combine them using a single pass if we store the adjusted exp values? Not straightforward.
+
+Given the example leaky_relu had a single pass. Softmax is more complex.
+
+Let's design a kernel:
+
+Input: 2D tensor of shape (B, D). Output: same shape.
+
+We will use block dim equal to number of blocks, each block processes a subrange of rows (e.g., block0 processes rows 0..n-1, etc). Within each block, we process rows sequentially. For each row, we have two phases: first phase compute max and sum; second phase compute output.
+
+To reduce global memory accesses, we can use double buffering for each phase. But we need to keep the computed max and sum for each row during second phase. Since we process rows sequentially, we can store max and sum in local registers (for current row). Then for second phase, we load the same tile again.
+
+Because the row is large, we need to tile. Tile length should be chosen to fit UB: we need space for input tile, output tile, and temporary buffers (exp, maybe). For softmax, we need to compute exp(x - max) and then divide. We can do it in place: load tile, subtract max, compute exp, multiply by inv_sum. That requires a temporary for exp (or we can use a vector operation). Typically, we can use local tensors for input, output, and a temporary.
+
+UB budget: 192KB, each float 4 bytes, so about 49152 floats. We need to accommodate double buffering: 2 input tiles, 2 output tiles, and some temporaries. Let's allocate 2 * tileLen floats for input, 2 * tileLen for output, and maybe 1 * tileLen for temporary. So total 5 * tileLen floats => 20*tileLen bytes. With 192KB, max tileLen = 192KB/20 = 9830.4 -> about 8192 to be safe (aligned). That is fine for dim 393216 (about 48 tiles). Actually 393216/8192 = 48, so 48 tiles per row.
+
+We can also adjust tileLen to be larger if possible.
+
+Now, the tiling function: similar to leaky_relu but with totalLength = B*D. However, we need to treat each row separately. The kernel will receive totalLength and tileLength, but also need to know number of rows (B) and feature dimension (D). We can pass B and D via tiling data.
+
+Alternatively, the kernel can compute row dimension from totalLength and blockDim? Actually, the input shape is (B, D). We can pass B and D as separate fields in tiling data.
+
+Better: pass totalLength = B*D, and also pass D (feature dim). Then the kernel can iterate over rows.
+
+So tiling data: totalLength, tileLength, blockDim, D. Also maybe negativeSlope not needed. Also we need to determine blockDim: we can set blockDim to number of rows? But B is 4096, which is huge. Actually, we can assign each block a contiguous range of rows. The total work is B*D. We can set blockDim to a reasonable number, say 24 (up to 24 cores), and evenly distribute rows among blocks. Each block will process a set of rows. The number of rows per block = ceil(B / blockDim). But if B is large (4096) and blockDim=24, each block processes ~171 rows, each of D=393216 elements, which is a lot of work but fine. However, the tiling for each row is D/tileLen tiles.
+
+A more efficient approach: each block processes a subset of rows, but within each row uses the same tile-based two-pass method.
+
+We also need to consider that the exp function might have large values causing overflow. Use maximum subtraction.
+
+Now, for the kernel implementation:
+
+- Use double buffering for input and output queues. But since we have two passes, we need to load data twice. To avoid reloading, we could store the input data in UB if tile length is small? But UB is limited. We can use a single pass with online softmax? There is algorithm: compute max and sum online, then in same pass, compute normalized values by storing the previous adjustments? Not straightforward for large tile.
+
+Given the complexity, we can implement two-pass approach:
+
+First pass: for each row, for each tile: load tile, compute local max (max of tile values), then combine local max with current row max (max of previous tiles). Then compute sum of exp of (values - row_max_after_combining) adjusting for previous contributions? Actually, when we have a new max, the previous exp contributions need to be multiplied by exp(old_max - new_max). So we can maintain a running max and a running sum that is adjusted.
+
+Simpler: compute global max first by scanning all tiles, storing tile maxes, then combine them (but that requires storing tile maxes). Alternatively, we can do two passes as described.
+
+Two-pass approach:
+
+1. For each row:
+   - Initialize row_max = -inf, row_sum = 0.
+   - For each tile:
+       load tile, compute local_max (max of tile).
+       if local_max > row_max:
+           row_sum = row_sum * exp(row_max - local_max) (adjust previous contributions)
+           row_max = local_max
+       else:
+           row_sum += sum(exp(tile - local_max? Actually, we need to compute exp(tile - row_max) for each element and add to row_sum. But we haven't normalized yet? We can compute sum of exp on the fly using the current row_max. So for each tile, we compute:
+           tile_exp_sum = sum(exp(tile - row_max))  (using current row_max)
+           row_sum += tile_exp_sum
+       But if we later get a larger max, we need to adjust the previous contributions. So we need to keep track of the sum of exp contributions that were computed with a smaller max. That's messy.
+
+Better to do two separate loops:
+
+First loop: compute row_max (global max). For each tile, compute local max, and update global max.
+
+Second loop: compute row_sum. For each tile, compute sum of exp(tile - row_max). Accumulate.
+
+Third loop: compute output. For each tile, compute output = exp(tile - row_max) / row_sum.
+
+This requires reading data three times. But we can combine the second and third loops if we store the exp values? Not needed.
+
+Alternatively, we can compute max and sum in one loop using the online technique:
+
+Initialize row_max = -inf, row_sum = 0.
+For each tile:
+   old_max = row_max
+   local_max = max(tile)
+   row_max = max(old_max, local_max)
+   if row_max != old_max:
+       row_sum = row_sum * exp(old_max - row_max) // adjust previous contributions by scaling them down
+   // Now compute contribution of current tile: sum of exp(tile - row_max)
+   tile_sum = sum(exp(tile - row_max))
+   row_sum += tile_sum
+
+At the end, we have row_max and row_sum. Then second pass: for each tile, output = exp(tile - row_max) / row_sum.
+
+This requires only two passes.
+
+To implement this in AscendC, we need to be careful about precision and overflow. We can use float.
+
+Now, the kernel code:
+
+We'll define a class KernelSoftmaxCustom.
+
+Init: receive x, y, totalLength, tileLength, D (feature dimension), also number of rows (B = totalLength / D). We'll compute B.
+
+Process:
+- blockIdx, blockNum.
+- Compute rows per block: rowsStart = blockIdx * (B / blockNum), rowsEnd = min(B, (blockIdx+1)* (B / blockNum)). Actually better to distribute evenly: each block gets roughly B/blockNum rows.
+- For each row in [rowsStart, rowsEnd):
+     ProcessRow(rowIdx)
+
+ProcessRow:
+   float row_max = -1e38f;
+   float row_sum = 0.0f;
+   // First loop: compute row_max and row_sum using online method
+   uint32_t offset = rowIdx * D;
+   for (uint32_t tile = 0; tile < D; tile += tileLen) {
+       uint32_t curLen = min(tileLen, D - tile);
+       // Load tile into local
+       // Compute local max
+       // Update row_max and row_sum with scaling
+   }
+   // Second loop: compute output
+   float inv_sum = 1.0f / row_sum;
+   for (uint32_t tile = 0; tile < D; tile += tileLen) {
+       uint32_t curLen = min(tileLen, D - tile);
+       // Load tile
+       // Compute exp(x - row_max) * inv_sum
+       // Store to output
+   }
+
+We need double buffering for both loops. Since the loops are separate, we can reuse buffers.
+
+We'll use two queues for input (double buffer) and one for output. For the first loop, we don't need output queue; we can just compute local max and sum using vector operations. For the second loop, we need output.
+
+To simplify, we can use a single input queue and process tiles sequentially without double buffering? To overlap copy and compute, we can do double buffering. For the first loop, we can do prefetch of next tile while computing current tile's max/sum. Then for second loop, similar.
+
+We'll implement Pipeline with double buffering for input and output.
+
+Because the kernel is complex, we need to write it carefully.
+
+Given the example leaky_relu used a specific style (grid-stride with double buffering), we can adapt that.
+
+Now, for the host operator and tiling:
+
+TilingData: totalLength, tileLength, blockDim, D (feature dim). Also we might need the number of rows (B) but can compute from totalLength and D.
+
+The tiling function should compute tileLength based on UB budget. For softmax, we need more temporary space: we need to compute exp and sum, so we might need an extra local tensor for exp values? Actually, we can compute exp in place: we can load input, subtract max, compute exp, then add to sum using vector calculations. But we need to keep input for later? In first loop, we need input to compute exp and sum, but we also need to compute local max. We can compute local max first, then compute exp and sum in the same loop after updating row_max? That is possible: for each tile, we first compute local max, then adjust row_max and row_sum, then compute tile contribution to sum using the updated row_max. Since we have the tile data in local, we can compute exp(tile - row_max) and sum it. So in first loop, we only need input tile; we don't need to store it after. Then for second loop, we need to load again. So we don't need a large buffer for exp.
+
+Thus, UB usage: 2 input tiles (double buffer), 2 output tiles (double buffer) for second loop, plus maybe a temporary for intermediate? The exp and sum operations can be done using vector intrinsics that use temporary registers; we don't need a separate local tensor? Actually, we might need a local tensor for the exp calculation because we need to store the result of exp before adding to sum? We can use a local tensor to hold the exp values, but we can also use a scalar accumulation with vector sum. In AscendC, there is a function for vector exp, and we can sum using ReduceAdd. But we need a local tensor to hold the output of exp. So we need a temporary local tensor of size tileLen for the exp values. So total buffers: 2 input, 2 output, 1 temp (for exp). That's 5 * tileLen as before. So tileLen can be similar.
+
+But note: in first loop, we need input and temp for exp (or we can compute exp and sum without storing? We can compute exp and then immediately sum using vreduce? Actually, we can use vector calculation: vexp, then vadd (to accumulate to a local sum tensor?), but sum is a scalar. We can use a vector to accumulate the sum, but it's easier to compute sum using a loop or using AscendC's ReduceAdd. ReduceAdd requires a local tensor with the exp values. So we need a temp tensor. So UB budget still 5 * tileLen.
+
+Thus tileLen calculation remains similar.
+
+Now, let's generate the code.
+
+We need to include necessary headers.
+
+For the kernel, we'll use AscendC::Exp, AscendC::Max, etc. We'll implement the online max/sum.
+
+We also need to handle the case where tileLen is less than D modulo tileLen.
+
+We'll use float.
+
+Now, let's write the six strings.
+
+First, project_json_src: operator named "SoftmaxCustom" with input x (ND, float), output y (ND, float). No attributes? Actually, softmax has dim parameter, but in this case dim is always 1 (last dim). We can make dim an attribute, but for simplicity we can assume dim=1. The original model uses dim=1, so we can hardcode it. But to be general, we can add an optional attribute "dim" with default 1. However, in the user's request, the original model uses dim=1. We'll add an attribute "dim" as optional int with default 1.
+
+But the kernel we implement will process along the last dimension (the feature dimension). So we'll include dim attribute, but we can ignore if dim != last dim? Actually, we can assume the input is 2D and dim=1. To keep it simple, we'll just pass the feature dimension D from the shape. The operator can infer dim from shape? The tiling function can read input shape and set D. No need for dim attribute.
+
+Let's check the example: they had an attribute for negative_slope. For softmax, we don't need extra attributes if we assume dim=1. But the operator definition should match the kernel. We'll define it without attributes.
+
+So project_json_src: input_desc for x (ND, float), output_desc for y (ND, float). No attr.
+
+But wait, the original model has no extra parameters. So that's fine.
+
+Second, host_tiling_src: define SoftmaxCustomTilingData with fields: totalLength, tileLength, blockDim, D (feature dimension). But we also need to compute blockDim. We can also include B (number of rows) for convenience. But we can compute from totalLength and D. We'll include D.
+
+Third, host_operator_src: similar structure to leaky_relu, but with softmax specific tiling computation and infer shape same as input.
+
+Tiling function: compute totalLength = product of shape dims. Then D = shape[1] (last dim). Then tileLen from UB budget. Then blockDim = number of cores (maybe 24) or based on number of rows? We can set blockDim to a fixed number like 8 or direct to aicore count. The example used adaptive blockDim based on number of tiles, but here we need to distribute rows. We can set blockDim to number of available cores (e.g., 24). Or we can compute blockDim = min(24, B) to avoid idle cores. We'll use the same adaptive formula, but with a twist: we want blockDim <= B (rows). Since B is 4096, we can use up to 24.
+
+We'll set blockDim = min(24, B) but also consider that each block will process multiple rows. However, the tiling data should ideally be computed based on the actual hardware. For simplicity, we can set blockDim = 8 if B < 24 else 24. We'll use 24 as max.
+
+Fourth, kernel_src: implement as described.
+
+Fifth, python_bind_src: similar to leaky_relu but for softmax_custom.
+
+Sixth, model_src: new model class using custom_ops_lib.softmax_custom.
+
+Now, let's write the code.
+
+Note: the kernel name is "softmax_custom". In PascalCase for operator: "SoftmaxCustom".
+
+Be careful with naming consistency.
+
+Also ensure that the kernel function in kernel_src is exactly "softmax_custom".
+
+Now, produce the six strings.

@@ -8,7 +8,8 @@ if _project_root not in sys.path:
 
 from generator.utils.utils import get_client, get_default_model_from_config, underscore_to_pascalcase
 from generator.config import temperature, num_completions, max_tokens, top_p, project_root_path
-from generator.dataset import dataset
+from generator.dataset import dataset, category2exampleop
+from generator.test_set_ops import TEST_SET_CATEGORY, select_ops_by_categories
 from generator.prompt_generators.prompt_registry import PROMPT_REGISTRY
 import importlib
 import argparse
@@ -83,7 +84,12 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default=_default_model, help='模型名称')
     parser.add_argument('--language', type=str, default='ascendc', help='目标语言 (ascendc, cuda, triton)')
     parser.add_argument('--strategy', type=str, default='add_shot', help='提示策略')
-    parser.add_argument('--categories', nargs='+', default=['activation'], help='算子类别列表')
+    parser.add_argument(
+        '--categories',
+        nargs='+',
+        default=['activation'],
+        help='算子类别列表；可使用 test_set 表示固定 12 个评测算子（generator/test_set_ops.py）',
+    )
 
     args = parser.parse_args()
 
@@ -99,9 +105,16 @@ if __name__ == '__main__':
     print(f"Strategy: {strategy}")
     print(f"Categories: {categories}")
 
-    op_tested = list(dataset.keys())
-    if categories != ['all']:
-        op_tested = [op for op in op_tested if dataset[op]['category'] in categories]
+    if (
+        categories != ["all"]
+        and TEST_SET_CATEGORY in categories
+        and len(categories) > 1
+    ):
+        print(
+            "[WARN] --categories 含 test_set 且还有其他类别名；仅使用 test_set 固定的算子列表，其它类别名忽略。"
+        )
+
+    op_tested, _preserve_order = select_ops_by_categories(categories, dataset)
 
     if '/' in model:
         model_name = model.split('/')[1]

@@ -1,0 +1,84 @@
+We need to analyze the error. The vector core exception with "CCU instruction address check error" on many cores. This suggests a memory access violation in the kernel. The previous attempt had:
+
+- Kernel: `masked_cumsum_custom` with Init taking (x, mask, y, totalLength, rowLength, tileLength, blockDim). The Process function iterates sequences (rows) with grid stride, for each sequence it does element-wise multiply x and mask (both float), then a scalar prefix sum in a loop using `accum`. The output is written back.
+
+Potential issues:
+1. The `mask` input type in project_json is `float` but the original PyTorch uses bool mask. In python_bind we convert mask to float. That's fine.
+2. In kernel, we treat mask as float, multiply element-wise. That's correct.
+3. The prefix sum is done with a for loop over `len` elements, reading from `xLocal(i)` and writing back to `xLocal(i)`. That's in-place modification of the local tensor after it's fetched from global, then enqueued to outQueue. But note: `xLocal` is a local tensor allocated from `inQueueX_`. After we dequeue it, we use it as input and then also as output? We are modifying it in place. Then we enqueue it to `outQueueY_`. That is allowed because we own that local tensor and can reuse it. But we must ensure we don't use the same tensor for both input and output queue? It's fine as long as we don't enqueue it to input queue again. We enqueue to output queue. But we also free the mask tensor after Mul, that's fine.
+
+However, the critical error: "CCU instruction address check error" often indicates out-of-bounds access or misaligned access. The prefix sum loop accesses `xLocal(i)` for i from 0 to len-1. That should be within allocated size (tileLen_ elements). But we must ensure that `len` does not exceed `tileLen_`. We set `curTileLen = (rowLen_ > tileLen_) ? tileLen_ : rowLen_;` That's safe.
+
+But there is another issue: The kernel uses `AscendC::Mul(xLocal, xLocal, maskLocal, len);` after dequeuing. That's fine.
+
+Then the loop:
+
+```
+for (uint32_t i = 0; i < len; i++) {
+    accum += xLocal(i);
+    xLocal(i) = accum;
+}
+```
+
+This is a sequential scalar loop. That is extremely inefficient but should be correct. However, on AscendC, vector instructions are preferred. But vector prefix sum is complex. The error might be due to using a scalar loop that reads/writes the local tensor at element granularity. That might cause issues if the tensor is not in some specific memory? Actually, LocalTensor supports element access via operator() as float&. That should work. But perhaps the address generation for element access within a loop might cause CCU errors? Unlikely.
+
+Another issue: The tensor sizes: In project_json, we defined mask as float. But in kernel, we treat mask as float. However, the python_bind converts bool to float. So size matches.
+
+But looking at the tiling: The error occurs on many cores, all executing the same kernel. The error "CCU instruction address check error" indicates that the instruction is trying to access an invalid address. This could be due to the global memory accesses: `xGm_[baseOffset + tileStart]` when `tileStart` or `len` is not properly aligned? But we use `DataCopy` which should handle alignment.
+
+Perhaps the issue is that the mask input is boolean in original, but in kernel we read as float, but the actual global memory for mask might be bool (1 byte per element) if we don't convert? But we convert to float in python_bind, so it's float. However, the project_json defines mask as float, so the runtime will expect float. But the original op is called with mask as bool tensor. The python_bind converts to float before calling EXEC_NPU_CMD. That should be fine.
+
+But wait: The python_bind function signature: `at::Tensor masked_cumsum_impl_npu(const at::Tensor& self, const at::Tensor& mask, int64_t dim)`. The `mask` passed is bool. We convert to float. That creates a new tensor. The EXEC_NPU_CMD is called with `self` (float x) and `mask_float`, and `dim`. But dim is passed as int64_t, but the aclnn call expects a scalar? The macro `EXEC_NPU_CMD` probably wraps the op call. The op signature in project_json has attr dim (int). So that should be fine.
+
+Potential root cause: The kernel uses two input queues: `inQueueX_` and `inQueueMask_`. Both are allocated with `tileLen_ * sizeof(float)` each. Then we allocate from each. That's fine. But note: The total number of local tensors: each tile we allocate two input tensors and one output tensor? Actually, in CopyIn we allocate xLocal and maskLocal. Then in Compute we dequeue both, perform Mul, free maskLocal, then enqueue xLocal to outQueueY_. So the output tensor is actually the same as xLocal. That's okay as long as we don't try to reuse xLocal before it's copied out.
+
+But there's a potential double allocation: The outQueueY_ is initialized with buffer size `tileLen_ * sizeof(float)`. That is used to enqueue the result. However, we never allocate a separate tensor for output; we reuse xLocal. That means the outQueueY_ buffer is not used? Actually, the outQueueY_ is initialized with a buffer, but we don't allocate from it; we enqueue an already allocated tensor (xLocal) into it. That is allowed? The TQue::EnQue expects a tensor that belongs to the queue's buffer? Usually, you allocate a tensor from the queue, fill it, and enqueue it. Here we are enqueuing a tensor that was allocated from a different queue (inQueueX_). That might cause a problem because the memory ownership is not tracked correctly. The runtime may not know that the tensor can be used for output. This could lead to memory corruption and CCU error.
+
+In AscendC programming model, each TQue has its own buffer pool. You should allocate a tensor from the output queue, fill it, and enqueue it. You should not reuse input tensor as output. Instead, we need to allocate a separate output tensor from outQueueY_ and copy the modified data into it. Or compute directly into the output tensor.
+
+Thus, the fix: In Compute, after performing Mul and prefix sum, we should copy the result to a separate output tensor. Or, we can compute directly into the output tensor. Let's restructure:
+
+- Allocate xLocal from inQueueX_ and maskLocal from inQueueMask_.
+- Allocate yLocal from outQueueY_.
+- Multiply xLocal and maskLocal into yLocal? Actually, we need prefix sum over the masked values. We can do: first multiply x * mask into yLocal (or use a temp). Then prefix sum in place on yLocal. Then enqueue yLocal. That avoids reusing input tensor.
+
+But we also need to preserve xLocal? No, xLocal can be freed after multiplication. So:
+
+1. Allocate xLocal, maskLocal, yLocal.
+2. Mul(xLocal, xLocal, maskLocal, len) => result in xLocal (since we can modify in place).
+3. Free maskLocal.
+4. Copy xLocal to yLocal? Or we can do prefix sum directly in xLocal and then copy to yLocal? But we need to enqueue yLocal for output. So we can do prefix sum in yLocal after copying. Or we can do prefix sum in xLocal and then copy to yLocal. Simpler: after Mul, we have result in xLocal. Then we can copy xLocal to yLocal using AscendC::DataCopy? But DataCopy between locals is not typical; we can use a loop or use vector copy (but that would require another queue). Better: compute prefix sum directly in yLocal after copying.
+
+But we can't copy directly between locals without using a pipe. The standard way is to allocate yLocal from outQueueY_, fill it, and enqueue. Since we have the intermediate result in xLocal, we could use a loop to assign each element: for i in 0..len: yLocal(i) = xLocal(i); then prefix sum in yLocal. That is fine.
+
+However, the double allocation of three tensors (xLocal, maskLocal, yLocal) will increase UB usage. Our current UB budget: In host_tiling, we only accounted for 2 * tileLen floats for input and output? Actually, the queue buffers are allocated separately. The UB usage should be: inQueueX_ buffer: BUFFER_NUM * tileLen * sizeof(float) = 2 * tileLen * 4 bytes = 8*tileLen bytes. Similarly inQueueMask_: 8*tileLen bytes. outQueueY_: 8*tileLen bytes. Total = 24*tileLen bytes. But our tiling calculation used UB_BUDGET_BYTES / (2 * sizeof(float)) = 192*1024/8 = 24576 elements max. That's 24576 floats per queue? Actually, that calculation was for 2 queues? The previous leaky relu used 5*tileLen floats (2 in, 2 out, 1 tmp). For this kernel, we have 3 buffers (inQueueX, inQueueMask, outQueueY) each with BUFFER_NUM=2 tiles. So total floats = (2+2+2) * tileLen = 6*tileLen. That is 24*tileLen bytes. The tiling should reflect that. But the current tiling uses UB_BUDGET_BYTES / (2 * sizeof(float)) which underestimates the UB usage (assuming only 2 tiles). That might cause UB overflow and CCU errors. Let's recompute: UB budget is 192KB. We need to allocate three queues: each queue has 2 buffers of tileLen floats (since BUFFER_NUM=2). But note: The queue buffer is allocated only once per queue, not per tile. Actually, pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float)) allocates a buffer of size BUFFER_NUM * tileLen_ * sizeof(float) = 2*tileLen_*4 = 8*tileLen_ bytes. So total UB usage = 3 * 8*tileLen = 24*tileLen bytes. So we need to ensure 24*tileLen <= UB_BUDGET_BYTES. That gives tileLen <= 192*1024 / 24 = 8192 elements. But our current maxTile is 24576, which is too high. This will cause UB overflow and memory corruption, leading to CCU errors. That is the likely cause.
+
+Thus, we need to fix the tiling to account for the correct buffer sizes.
+
+Additionally, we should fix the queue usage: allocate separate output tensor from outQueueY_ instead of reusing input.
+
+Also, the kernel currently uses a scalar loop for prefix sum. That is okay for correctness but slow. However, we can keep it for simplicity.
+
+Also, note that the mask input is boolean in original, but we treat as float. That's fine.
+
+Also, the python_bind: the aclnn function name should match the op name. The op name is "MaskedCumsumCustom". The aclnn API generated would be something like "aclnnMaskedCumsumCustom". The EXEC_NPU_CMD macro likely expects that. So that is fine.
+
+But we need to ensure that the aclnn header is included. The build log shows it generated aclnn_masked_cumsum_custom.h, so the name is aclnnMaskedCumsumCustom.
+
+Now, let's produce the corrected code. We'll make minimal changes:
+
+1. Fix tiling: recalc UB budget based on 3 queues * 2 buffers * tileLen floats? Actually, each queue has BUFFER_NUM=2, so total UB for queues = (inQueueX + inQueueMask + outQueueY) * BUFFER_NUM * tileLen * sizeof(float) = 3*2*tileLen*4 = 24*tileLen bytes. Also, we should include any temporary tensors (none). So maxTile = UB_BUDGET_BYTES / (24). Then align down to ALIGN_ELEMS (32). Also cap at a reasonable max.
+
+2. In kernel, change Compute to allocate yLocal from outQueueY_, copy xLocal to yLocal (or compute directly), perform prefix sum on yLocal, then enqueue yLocal. And free xLocal and maskLocal appropriately.
+
+3. Ensure the CopyOut dequeues from outQueueY_ and copies to global.
+
+4. Also adjust host_tiling to not include blockDim? It is not used in kernel? Actually, kernel uses blockDim_ but only for debugging? It is not used in Process. We can remove it from tiling data to avoid confusion.
+
+5. The project_json: mask type should be "bool"? But the original model uses bool mask. The op input_desc should accept bool. But converting to float in python_bind is a workaround. However, it's better to define mask as "bool" in op definition to avoid extra conversion. But the example leaky relu used float only. The error logs didn't show any type mismatch. We can keep mask as float for consistency, but then we need to ensure the python bind converts bool to float. That is done. However, the original model feeds mask as bool, but the op expects float, so the host will convert? Actually, the op input_desc defines type, and the runtime will expect that. If we pass a bool tensor, it might fail. But we convert in python_bind, so the call to EXEC_NPU_CMD will pass a float mask. So it's okay.
+
+But the project_json should match what the aclnn API expects. The aclnn API will be generated based on the op definition. So if we define mask as float, the aclnn function will expect float. Our python_bind supplies float, so it's consistent.
+
+However, there is an issue: the workspace parameter in kernel_src: we have `GM_ADDR workspace` in the kernel function signature. That is fine. But the python_bind does not pass workspace; EXEC_NPU_CMD handles it.
+
+Now, let's write the corrected code.

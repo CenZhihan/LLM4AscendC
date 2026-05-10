@@ -43,6 +43,13 @@ def _write_text(path: pathlib.Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _normalize_ascend_search_version(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    t = str(value).strip()
+    return t or None
+
+
 def _artifact_group_rel_from_txt_path(txt_path: pathlib.Path) -> Optional[pathlib.Path]:
     txt = txt_path.resolve()
     out_root = OUTPUT_ROOT.resolve()
@@ -91,6 +98,35 @@ def _run_eval_for_txt(
 
 def _load_result_payload(path: pathlib.Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _synthetic_result_payload_when_eval_json_missing(
+    *,
+    op: str,
+    eval_mode: str,
+    eval_rc: int,
+    result_path: pathlib.Path,
+) -> Dict[str, Any]:
+    """
+    eval_operator normally writes result_<op>.json even on failure; if the subprocess exits
+    without creating the file (crash, pre-pipeline bug), synthesize the same top-level shape
+    so repair rounds still get correctness_info and a written json for debugging.
+    """
+    msg = (
+        f"eval_operator did not emit result json (subprocess rc={eval_rc}). "
+        f"Expected path: {result_path}"
+    )
+    return {
+        "result": {
+            op: {
+                "compiled": False,
+                "correctness": False,
+                "performance": None,
+                "correctness_info": msg,
+            }
+        },
+        "meta": {"mode": eval_mode, "fingerprint": None, "logs": {}},
+    }
 
 
 def _extract_eval_core(payload: Dict[str, Any], op: str) -> Dict[str, Any]:
@@ -195,6 +231,7 @@ def _generate_one_attempt(
     attempt_id: int,
     repair_error_logs_raw: str = "",
     previous_attempt_code: str = "",
+    ascend_search_version_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     from generator.agent.agent_runner import KernelGenerationTask, generate_kernel_with_agent
 
@@ -211,6 +248,7 @@ def _generate_one_attempt(
         attempt_id=attempt_id,
         repair_error_logs_raw=repair_error_logs_raw,
         previous_attempt_code=previous_attempt_code,
+        ascend_search_version_filter=ascend_search_version_filter,
     )
     paths = _save_generation_outputs(
         out_dir=out_dir,
@@ -246,6 +284,7 @@ def run_multi_attempt_for_op(
     max_attempts: int,
     eval_workers: int,
     eval_npu: int,
+    ascend_search_version_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     if max_attempts < 2:
         raise ValueError("max_attempts must be >= 2")
@@ -295,6 +334,7 @@ def run_multi_attempt_for_op(
                 attempt_id=attempt_id,
                 repair_error_logs_raw=repair_logs_raw,
                 previous_attempt_code=previous_attempt_code,
+                ascend_search_version_filter=ascend_search_version_filter,
             )
             outcome.generated = True
             outcome.txt_path = str(gen["txt_path"])
@@ -310,11 +350,17 @@ def run_multi_attempt_for_op(
             outcome.eval_ran = True
             result_path = _eval_result_json_path(gen["txt_path"], op)
             if not result_path.exists():
-                raise RuntimeError(
-                    f"eval finished (rc={eval_rc}) but result json not found: {result_path}"
+                payload = _synthetic_result_payload_when_eval_json_missing(
+                    op=op,
+                    eval_mode=eval_mode,
+                    eval_rc=eval_rc,
+                    result_path=result_path,
                 )
+                result_path.parent.mkdir(parents=True, exist_ok=True)
+                _write_json(result_path, payload)
+            else:
+                payload = _load_result_payload(result_path)
             outcome.eval_result_path = str(result_path)
-            payload = _load_result_payload(result_path)
             core = _extract_eval_core(payload, op)
             outcome.compiled = core["compiled"]
             outcome.correctness = core["correctness"]
@@ -378,6 +424,7 @@ def _run_single_op_job(
     eval_workers: int,
     eval_npu: int,
     op_slot: int,
+    ascend_search_version_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     device_id = op_slot % eval_npu
     os.environ["ASCEND_VISIBLE_DEVICES"] = str(device_id)
@@ -395,6 +442,7 @@ def _run_single_op_job(
         max_attempts=max_attempts,
         eval_workers=eval_workers,
         eval_npu=eval_npu,
+        ascend_search_version_filter=ascend_search_version_filter,
     )
 
 
@@ -413,12 +461,79 @@ def _all_ops_summary_filename(max_attempts: int) -> str:
     return f"attempts{max_attempts}_summary_all_ops.json"
 
 
+def _resolve_ops_for_multi_round(
+    *,
+    ops_explicit: Optional[List[str]],
+    categories: List[str],
+    kernelbench102: bool,
+    dataset: Dict[str, Any],
+) -> List[str]:
+    """
+    Align with generator/scripts/generation/generate_agent.py:
+    supports virtual category test_set (固定列表见 generator/test_set_ops.py)，否则按 dataset.category 过滤，
+    再可选 intersect KERNELBENCH102_OP_SET。
+    When ops_explicit is given, use that list (order preserved, duplicates dropped); unknown keys raise.
+    """
+    from generator.kernelbench102_ops import KERNELBENCH102_OP_SET
+    from generator.test_set_ops import TEST_SET_CATEGORY, select_ops_by_categories
+
+    if ops_explicit is not None:
+        seen: set[str] = set()
+        ordered: List[str] = []
+        for op in ops_explicit:
+            if op not in dataset:
+                raise ValueError(f"Unknown operator key: {op!r}")
+            if op not in seen:
+                seen.add(op)
+                ordered.append(op)
+        return ordered
+
+    if (
+        categories != ["all"]
+        and TEST_SET_CATEGORY in categories
+        and len(categories) > 1
+    ):
+        print(
+            "[WARN] --categories 含 test_set 且还有其他类别名；仅使用 test_set 固定的算子列表，其它类别名忽略。"
+        )
+
+    all_ops, preserve_order = select_ops_by_categories(categories, dataset)
+    if kernelbench102:
+        if preserve_order:
+            all_ops = [op for op in all_ops if op in KERNELBENCH102_OP_SET]
+        else:
+            all_ops = sorted([op for op in all_ops if op in KERNELBENCH102_OP_SET])
+    if not preserve_order:
+        return sorted(all_ops)
+    return all_ops
+
+
 def main() -> int:
     from vendor.mkb.dataset import dataset
     from generator.agent.agent_config import get_llm_config_compatible, model_slug_for_path
 
     parser = argparse.ArgumentParser(description="Automated multi-attempt agent generation + eval + repair.")
-    parser.add_argument("--ops", nargs="+", required=True, help="Operator keys to run.")
+    parser.add_argument(
+        "--ops",
+        nargs="+",
+        default=None,
+        metavar="OP",
+        help="Explicit operator keys. If omitted, derive from --categories and optional --kernelbench102 "
+        "(same rules as generator/scripts/generation/generate_agent.py).",
+    )
+    parser.add_argument(
+        "--categories",
+        nargs="+",
+        default=["all"],
+        metavar="CATEGORY",
+        help="When --ops is omitted: filter by category (default: all). "
+        "虚拟类别 test_set 表示固定 12 个评测算子，见 generator/test_set_ops.py。",
+    )
+    parser.add_argument(
+        "--kernelbench102",
+        action="store_true",
+        help="When --ops is omitted: keep only operators in the kernelbench102 102-op validated set.",
+    )
     parser.add_argument("--tool-mode", type=str, default="all", help="Tool mode string.")
     parser.add_argument("--strategy", type=str, default="one_shot", help="Prompt strategy.")
     parser.add_argument("--run", type=int, default=0, help="Run index for output path.")
@@ -432,6 +547,15 @@ def main() -> int:
     parser.add_argument("--parallel-ops", type=int, default=1, help="Number of ops to run in parallel.")
     parser.add_argument("--eval-workers", type=int, default=1, help="Pass-through eval workers per attempt.")
     parser.add_argument("--eval-npu", type=int, default=1, help="Pass-through eval npu count per attempt.")
+    parser.add_argument(
+        "--ascend-search-version",
+        default=None,
+        metavar="SUBSTRING",
+        help=(
+            "Ascend 官网文档搜索：按返回条目的 version 字段子串过滤（如 9.0.0）；"
+            "省略则不限制版本。适用于 ascend_search + ascend_fetch 组合。"
+        ),
+    )
     args = parser.parse_args()
     if args.max_attempts < 2:
         raise ValueError("--max-attempts must be >= 2")
@@ -452,6 +576,16 @@ def main() -> int:
     llm_config = get_llm_config_compatible(cli_model=args.model)
     resolved_model = llm_config["model"]
     model_slug = model_slug_for_path(resolved_model)
+    ascend_vf = _normalize_ascend_search_version(args.ascend_search_version)
+    if ascend_vf is not None:
+        from generator.agent.agent_config import has_ascend_fetch, has_ascend_search, parse_tool_mode
+
+        _tm = parse_tool_mode(args.tool_mode)
+        if not (has_ascend_search(_tm) and has_ascend_fetch(_tm)):
+            print(
+                "[WARN] --ascend-search-version 建议在同时启用 ascend_search 与 ascend_fetch 时使用；"
+                f"当前 ascend_search={has_ascend_search(_tm)}, ascend_fetch={has_ascend_fetch(_tm)}。"
+            )
     out_run_dir = pathlib.Path(args.out_dir) if args.out_dir else _default_run_dir(
         model_slug=model_slug,
         tool_mode=args.tool_mode,
@@ -461,9 +595,40 @@ def main() -> int:
     )
     out_run_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.ops is not None and args.kernelbench102:
+        print(
+            "[INFO] Explicit --ops is set; --kernelbench102 does not filter the list "
+            "(only applies when --ops is omitted)."
+        )
+
+    try:
+        resolved_ops = _resolve_ops_for_multi_round(
+            ops_explicit=args.ops,
+            categories=list(args.categories),
+            kernelbench102=args.kernelbench102,
+            dataset=dataset,
+        )
+    except ValueError as e:
+        print(f"[ERROR] {e}")
+        raise SystemExit(2) from e
+    if not resolved_ops:
+        print(
+            "[ERROR] No operators to run after applying --categories / --kernelbench102. "
+            "Relax filters or pass explicit --ops."
+        )
+        raise SystemExit(2)
+
+    print(
+        f"[INFO] Operators to run ({len(resolved_ops)}): "
+        f"selection={'explicit --ops' if args.ops is not None else 'categories/kernelbench102'}"
+    )
+    if len(resolved_ops) <= 30:
+        print(f"[INFO] op list: {resolved_ops}")
+
     all_summaries: Dict[str, Any] = {
         "model": resolved_model,
         "tool_mode": args.tool_mode,
+        "ascend_search_version_filter": ascend_vf,
         "strategy": args.strategy,
         "eval_mode": args.eval_mode,
         "clean_policy": args.clean_policy,
@@ -472,12 +637,16 @@ def main() -> int:
         "eval_workers": args.eval_workers,
         "eval_npu": args.eval_npu,
         "run_dir": str(out_run_dir),
+        "categories": list(args.categories),
+        "kernelbench102": args.kernelbench102,
+        "ops_resolution": "explicit" if args.ops is not None else "from_categories",
+        "operator_keys": resolved_ops,
         "ops": {},
     }
 
     if args.parallel_ops == 1:
         results = []
-        for op_slot, op in enumerate(args.ops):
+        for op_slot, op in enumerate(resolved_ops):
             category = dataset.get(op, {}).get("category", "activation")
             print(f"[RUN] op={op} category={category} strategy={args.strategy} tool_mode={args.tool_mode}")
             summary = _run_single_op_job(
@@ -494,13 +663,14 @@ def main() -> int:
                 eval_workers=args.eval_workers,
                 eval_npu=args.eval_npu,
                 op_slot=op_slot,
+                ascend_search_version_filter=ascend_vf,
             )
             results.append({"op": op, "summary": summary})
     else:
         results = []
         with concurrent.futures.ProcessPoolExecutor(max_workers=args.parallel_ops) as ex:
             fut_to_op = {}
-            for op_slot, op in enumerate(args.ops):
+            for op_slot, op in enumerate(resolved_ops):
                 category = dataset.get(op, {}).get("category", "activation")
                 print(f"[RUN] op={op} category={category} strategy={args.strategy} tool_mode={args.tool_mode}")
                 fut = ex.submit(
@@ -518,6 +688,7 @@ def main() -> int:
                     eval_workers=args.eval_workers,
                     eval_npu=args.eval_npu,
                     op_slot=op_slot,
+                    ascend_search_version_filter=ascend_vf,
                 )
                 fut_to_op[fut] = op
             for fut in concurrent.futures.as_completed(fut_to_op):
@@ -537,7 +708,8 @@ def main() -> int:
                     }
                     results.append({"op": op, "summary": err_summary})
 
-    for item in sorted(results, key=lambda x: args.ops.index(x["op"])):
+    order_index = {op: i for i, op in enumerate(resolved_ops)}
+    for item in sorted(results, key=lambda x: order_index.get(x["op"], 10**9)):
         op = item["op"]
         summary = item["summary"]
         all_summaries["ops"][op] = summary

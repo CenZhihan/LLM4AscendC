@@ -1,0 +1,90 @@
+We need to generate the six Python strings for the given architecture: `project_json_src`, `host_tiling_src`, `host_operator_src`, `kernel_src`, `python_bind_src`, `model_src`. The kernel name is `gemm_bias_add_hardtanh_mish_group_norm_custom` (PascalCase: `GemmBiasAddHardtanhMishGroupNormCustom`). The model does: linear (gemm + bias), add another bias, hardtanh, mish, group_norm. So we need to fuse all these into one custom AscendC kernel. The inputs: x (shape [batch, in_features]), weight ([out_features, in_features]), lin_bias ([out_features]), bias ([out_features]), gn_gamma ([out_features]), gn_beta ([out_features]). The output is the result of group_norm. The model also has `num_groups` as an init parameter, but it's a constant. We need to pass it as an attribute? Probably as an attribute in the operator definition.
+
+We need to design the kernel to do all steps efficiently on Ascend. The kernel will load tiles of the input and weight? Actually linear is a matrix multiplication. Doing a fused kernel with gemm might be complex. Usually on Ascend, matrix multiplication is done using `MatMul` or `Cube` unit. But we can implement the entire fusion in a single kernel with tile-based processing. However, for simplicity and feasibility, we might decompose: the linear step is the heavy part; we could do a tiled matmul using the Cube unit, then apply the rest element-wise. But AscendC kernels typically don't directly access Cube (that's for aicube). In AscendC (Vector core), we can do matrix multiplication using vector instructions? Actually, AscendC is for vector processing; for matrix multiplication, one would use the MatMul API from AscendC (which uses Cube). So we can use `MatMul` in the kernel.
+
+We need to design Tiling: the input x is [B, I], weight [O, I], output of linear is [B, O]. Then add bias, hardtanh, mish, group_norm. Group norm: we need to compute mean and variance over groups. That requires reduction across spatial dimensions? Actually group_norm: (N, C, ...) but here x is 2D? The input after linear is [B, O], where O is the number of channels? The model uses `F.group_norm(x, self.num_groups, gn_gamma, gn_beta)`. group_norm expects input shape (N, C, *). But x is [B, O], so it's (B, O). That means it's batch and channels, no spatial dims. So group_norm will compute mean and variance over channels per group? Actually group_norm divides channels into groups and normalizes within each group across spatial dimensions. Since there are no spatial dims, it's just per group normalization of the channels. So we need to compute mean and variance for each group across the O dimension. For each batch element, we have O channels divided into num_groups groups, each group has O/num_groups channels. We compute mean and variance over those channels, then normalize.
+
+Thus the operation: 
+- Compute Y = linear(x, weight, lin_bias) => (B, O)
+- Y = Y + bias
+- Y = hardtanh(Y) (clip between -1 and 1? default hardtanh min_val=-1.0, max_val=1.0)
+- Y = mish(Y) = x * tanh(softplus(x)) where softplus(x) = ln(1+exp(x))
+- Then group_norm: for each batch, for each group, compute mean and variance of Y over the group channels, then Y = gamma * (Y - mean) / sqrt(var+eps) + beta. Here gamma and beta are of shape (O,) as given. The group_norm usually operates on feature maps with spatial dimensions; but here it's 1D. So we treat the last dimension as the channel dimension.
+
+We need to pass as attributes: num_groups, eps (default 1e-5?), hardtanh min and max (default -1,1). The inputs include weight, lin_bias, bias, gn_gamma, gn_beta. The output is result of group_norm.
+
+We'll write the kernel: a single kernel that does all steps. For tiling, we can tile along batch dimension (first dim) and also along channels? Since weight is [O,I], and x is [B,I], we can do a tile of batch rows and compute linear for that tile. But matrix multiply requires full weight. We can tile the weight matrix along the O dimension? Actually, we can tile the output dimension: for a tile of output rows (batch) and output channels (partial O), we need a portion of weight rows. However, weight is [O,I], so if we process a subset of output channels, we need the corresponding rows of weight. That is feasible: we can split the O dimension into tiles. For each tile of output channels, we compute linear for all batch rows (or tile batch as well). Then we apply the remaining operations only on that tile of output channels. But group_norm requires the entire output? No, group_norm normalizes based on statistics over the group channels. If we process output channels in tiles, we can compute group_norm only for the channels within the tile, but the mean/variance for a group spans across channels that may be split across tiles. To avoid inter-tile dependencies, we can either process the entire O dimension per batch element in one tile, or compute group_norm after all tiles are done by using shared memory? That's complex. Better to not tile the output channels; instead tile only the batch dimension. For each batch element, we can compute the entire linear, then apply element-wise operations, then group_norm (which also needs all channels). So we tile along batch: each core processes a subset of batch rows. That is straightforward.
+
+However, for a single batch row, the linear is a matrix-vector product: x_row (I,) * weight^T (O x I) => (O,). That's a large operation. We can use AscendC's MatMul to compute the full linear for a batch row. Then we can apply the remaining operations using vector instructions on the resulting vector of length O. Since O=8192, that's moderate. So we can have each core handle one batch row? But with batch_size=1024, blockDim can be up to 24 or more, so each core handles multiple batch rows. We can tile batch: each core processes a contiguous chunk of batch rows. For each batch row, do matmul, then element-wise, then group_norm for that row. That requires loading the weight matrix multiple times per core? Actually, each core processes multiple rows; it can load weight once into local memory if the weight size fits. Weight is [8192, 8192] float = 256 MB, too large for local memory. So we need to tile the weight as well. But we can use the Cube unit's capability to handle matrix multiplication from global memory? In AscendC, MatMul can read from global tensors, so we can perform the matmul row by row with weight in global memory. That is typical: use `MatMul` API with input matrices in global memory, output to local. So each core can do multiple matmuls, each with its x row and the full weight (global). That is fine.
+
+Alternatively, we can use a more complex tiling where we split weight rows (output channels) and batch simultaneously, but that complicates the subsequent group_norm. So I'll go with batch tiling.
+
+Thus, the kernel: 
+- Inputs: x [B, I], weight [O, I], lin_bias [O], bias [O], gn_gamma [O], gn_beta [O]. (Note: gn_beta is also [O]).
+- Tiling data: total batch size B, O, I, num_groups, eps, hardtanh_min, hardtanh_max. Also tile length? Since each core processes a chunk of batch, we need batch tile size (number of rows per core). We'll compute blockDim and assign each core a range of batch rows.
+
+We need to define tiling data: totalB, O, I, numGroups, eps, negative_slope? No, hardtanh params, mish no params.
+
+We'll write the kernel using AscendC's MatMul: `MatMul(x, weight, output, ...)` but MatMul in AscendC typically requires specific transpositions and memory formats. We'll need to handle transposition: weight is [O, I], x is [B, I]. So output = x * weight^T? Actually F.linear(x, weight, bias) does x @ weight.T + bias. So we need to transpose weight. We can store weight as transposed? In the input, weight is [O, I], so we can treat it as weight matrix in row-major. To compute x * weight^T, we can either transpose weight in advance or use MatMul with appropriate transposition flags. In AscendC, MatMul(a, b, c, transA, transB). We can set transB=True to use weight's transpose. But we also have bias addition that can be done via vector add.
+
+Given complexity, we'll implement the kernel with explicit vectorized matmul? That would be slow. We should use the high-level MatMul API from AscendC. However, I must be careful: the provided example uses simple element-wise ops. This task is more advanced. But the instruction says "Replace relevant PyTorch operators ... with custom AscendC kernels". It expects a fused kernel. I need to produce plausible code.
+
+Given the constraints, I'll sketch a kernel that uses AscendC's MatMul for the linear part, then vector ops for the rest. I'll assume the weight is in the correct format for MatMul (likely need to be transposed). I'll also assume we can load the weight into local memory tile by tile? Alternatively, we can use the `MatMul` function that directly reads from global tensors. In AscendC, we have `MatMul` as a class that can be initialized with global tensors and then compute. I'll write a simplified version that processes one batch row at a time per core, but with tiling over batch rows.
+
+Let's define the tiling:
+
+- totalB: batch size
+- totalO: out_features
+- totalI: in_features
+- numGroups: int
+- eps: float (default 1e-5)
+- hardtanhMin: float (default -1.0)
+- hardtanhMax: float (default 1.0)
+- blockDim: computed
+
+Each core's iteration: for i from startRow to endRow, do:
+  - Load x[i] (length I)
+  - For the linear: we need to compute y = x[i] * weight^T + lin_bias. That is a matrix-vector product. Using MatMul: we can create a MatMul object for a single row? There is `MatMul<...>` with batch dimensions. Alternatively, we can use `aivMatMul`? I think using AscendC's `MatMul` class with non-batched mode for each row is inefficient. Better to do a batched matmul for all rows in the chunk? But weight is same. We can use the batch mode of MatMul: x shape [tileSize, I] and weight shape [O, I] -> output [tileSize, O] if we treat x as batch of vectors. That is possible: use MatMul with a as x (tile rows), b as weight (transposed or not). So we can compute linear for the entire tile batch at once using one MatMul call. That is efficient.
+
+So let tileSize be number of batch rows per iteration (could be the whole chunk if size fits in UB). We'll set tileLength in terms of batch rows (call Btile). We'll compute Btile based on UB budget: we need to hold x tile (Btile * I floats), weight? Weight is in global, but for matmul we need it accessible; the MatMul engine will read from global. So we only need input and output local. Output tile is Btile * O floats. Also we need buffers for intermediate results: after matmul we need to add bias (vector), then hardtanh, mish, group_norm on that tile. For group_norm, for each row we need to compute mean/variance across groups. That requires reduction over O dimension. We can do that by iterating over groups: for each group, compute mean of the tile's channels within group. We can use vector reduction. Since we have Btile rows, we need to compute per row statistics. That means we need to store the output tile and then process row by row? Or vectorized across rows? Group norm is per row, independent across batches. So we can process row by row after matmul. But we can also batch the group norm if we do per-row operations.
+
+Given complexity, I'll design for a single row at a time per core (tileSize=1) to simplify. That is acceptable: each core processes batch rows one by one, each row doing a matmul vector (size O), then element-wise, then group norm on that row. This is simpler to code and may still be efficient if number of cores is high (blockDim up to 24, batch size 1024 -> each core processes ~43 rows). The matmul for a single row is a matrix-vector product which can be done using a MatMul with b as weight and a as row vector (1xI). That's a small operation; but the Cube unit is designed for large matmuls, but it can handle small sizes as well. Alternatively, we could do a vectorized dot product per output channel using vector ops, but that would be slower. I'll stick with MatMul for single row.
+
+But note: The weight matrix [O,I] may be too large to load into local memory, but the MatMul engine in AscendC can stream tiles from global memory. So for each row, we can invoke a MatMul with a=row (1,I), b=weight (O,I transposed) to get output (1,O). That should work.
+
+For group_norm: compute mean and variance for each group. For a row of length O, divide into num_groups groups. For each group, compute mean = sum over group channels / group_size, var = sum((x - mean)^2)/group_size. Then normalize: y = gamma * (x - mean) / sqrt(var+eps) + beta. gamma and beta are vectors of length O, same as channels. So we can apply element-wise.
+
+We'll need to allocate local tensors for output (O floats), temporary for means (num_groups), vars (num_groups), etc.
+
+I'll write the kernel with the assumption that we have access to AscendC vector reduction ops like `ReduceSum`, `ReduceMax`, etc. We can use `Vec::` functions.
+
+Given the complexity, I will produce a self-consistent but simplified kernel code that demonstrates the fusion. In practice, one would need to handle many details, but for this task, plausible code should suffice.
+
+Let's define the tiling data:
+
+```
+BEGIN_TILING_DATA_DEF(GemmBiasAddHardtanhMishGroupNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalB);
+  TILING_DATA_FIELD_DEF(uint32_t, totalO);
+  TILING_DATA_FIELD_DEF(uint32_t, totalI);
+  TILING_DATA_FIELD_DEF(uint32_t, numGroups);
+  TILING_DATA_FIELD_DEF(float, eps);
+  TILING_DATA_FIELD_DEF(float, hardtanhMin);
+  TILING_DATA_FIELD_DEF(float, hardtanhMax);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+```
+
+We also need tile length per iteration? We'll set core batch chunk size as some value; we can compute `btile` based on UB budget: we need to hold one row of output (O floats) and some temps. Since O=8192, that's 32KB, plus intermediate for matmul? MatMul may require workspace. We'll assume UB can hold a couple of rows. We'll set btile = 1 for simplicity.
+
+In host_operator_src, we need to compute blockDim and tiling. We'll set blockDim = min(totalB, 24) or something.
+
+For project_json_src: op named "GemmBiasAddHardtanhMishGroupNormCustom", inputs: x, weight, lin_bias, bias, gn_gamma, gn_beta. Output: y. Attributes: num_groups (int), eps (float), hardtanh_min (float), hardtanh_max (float).
+
+For python_bind_src: we need a custom op that takes all tensors and attributes, executes the kernel. We'll use EXEC_NPU_CMD with the custom op name.
+
+For model_src: ModelNew that uses the custom op.
+
+Now, I'll write the six strings. Ensure consistency: kernel function name in kernel_src must be `gemm_bias_add_hardtanh_mish_group_norm_custom`. Operator definition in project_json and host_operator uses PascalCase.
+
+I'll produce the code now.

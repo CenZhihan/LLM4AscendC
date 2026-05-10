@@ -1,0 +1,157 @@
+We need to provide the six Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src. The previous attempt had errors: it was missing host_operator_src, kernel_src, python_bind_src. The previous attempt code was incomplete (truncated at "UnknownUnknownUnknown"). So we need to produce a complete and correct set.
+
+The kernel name is instance_norm_custom, PascalCase InstanceNormCustom. The model uses nn.InstanceNorm2d with num_features. The inputs: x (N, C, H, W), optional weight and bias (but InstanceNorm2d uses affine=False by default, but the model uses default, so affine=False, meaning weight and bias are not used? Actually nn.InstanceNorm2d has parameters affine=False by default, so no learnable affine parameters. But the operator definition could have optional weight and bias? The user instruction says "replace relevant PyTorch operators". The original model uses nn.InstanceNorm2d, which computes: y = (x - mean) / sqrt(var + eps) * gamma + beta, but if affine=False, gamma=1, beta=0. So effectively just normalization. So the custom kernel should take x, and optionally eps (attribute). No need for weight and bias inputs. However, the previous project_json included weight and bias as required inputs. That might be incorrect because the original model doesn't have them. But the task says "replace relevant PyTorch operators", so we can design the custom op to match the functionality. To keep consistency with the original, we can have only x as input and eps as attribute. Also, the kernel should compute instance norm per channel per sample.
+
+Let's design a simple instance normalization kernel: For each sample n and channel c, compute mean and variance over H*W elements, then normalize. The kernel can be parallelized across N*C blocks. Each block processes one channel of one sample. The tiling should handle the channel size (H*W). The kernel will need to compute sum and sum of squares, then mean and variance.
+
+We'll write the kernel using AscendC primitives: ReduceSum, Muls, etc. Use a two-pass approach or one pass? Use standard approach: compute mean, then compute variance using mean-subtracted squares. We'll use functional calls: reduce_add, etc.
+
+Given the complexity, we need to produce all six strings. The previous attempt had host_tiling_src correctly defined. We need to fix host_operator_src, kernel_src, python_bind_src. Also ensure the OpDef class is complete.
+
+Let's write the corrected versions.
+
+For host_operator_src: we need to define TilingFunc and the OpDef class. The previous OpDef was incomplete (truncated). We'll write a proper one.
+
+For kernel_src: We'll implement a kernel that processes one channel per block. The kernel will load tile of data (H*W elements), compute mean and variance using reduction operations available in AscendC. However, AscendC's reduction functions like ReduceSum require the input to be in VECCALC memory. We'll need to use pipe and queues. We'll design: For each block, we have the global pointer to the start of the channel (offset = n*C*H*W + c*H*W). Then we process the entire channel as one tile? If channel size is too large, we may need to tile. But with UB budget, we can handle up to ~ H*W elements (within tileLen). We'll set tileLen to channelSize if possible, else tile. We'll compute mean and variance in two steps, using temporary buffers.
+
+We'll use AscendC functions: DataCopy, ReduceAdd, Muls, Add, Sqrt, etc. For reduction, we can use the vec_reduce_add or the AscendC::ReduceSum function. But we need to be careful with the API. The example uses AscendC::Mins, Muls, Add. For instance norm, we can compute mean = sum(x)/N, then variance = sum((x-mean)^2)/N. We'll compute sum and sum_sq in two passes? Actually we can compute sum and sum_sq in one pass by copying data and then computing reductions. We'll use a loop over tiles (if needed), accumulate sum and sum_sq in local scalar buffers. Since we have limited UB, we'll use a tile size and accumulate.
+
+Simplify: Assume channel size fits in one tile (tileLen = channelSize). Then process: copy entire channel into local, compute mean via reduce_add, broadcast mean, compute variance via reduce_add of squared difference, then normalize.
+
+We'll use pipe with inQueueX, outQueueY, and tmpQueue for temporary storage. We'll need a scalar buffer for mean and variance? In AscendC, we can use a scalar variable (float) and update via reduction. Actually reduction functions output a scalar tensor (size 1). We can store in a LocalTensor of length 1. We'll use tmpQueue for the mean and variance scalars and intermediate results.
+
+Let's write kernel_src:
+
+```
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelInstanceNormCustom {
+public:
+    __aicore__ inline KernelInstanceNormCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileLength,
+                                uint32_t N, uint32_t C, uint32_t H, uint32_t W,
+                                float eps)
+    {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+        N_ = N;
+        C_ = C;
+        H_ = H;
+        W_ = W;
+        channelSize_ = H * W;
+        eps_ = eps;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0 || channelSize_ == 0) return;
+
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t numBlocks = AscendC::GetBlockNum();
+
+        // Each block handles one channel of one sample
+        // Map blockIdx to (n, c) pair
+        uint32_t totalChannels = N_ * C_;
+        if (blockIdx >= totalChannels) return;
+        uint32_t n = blockIdx / C_;
+        uint32_t c = blockIdx % C_;
+
+        // Compute global offset for this channel
+        uint32_t offset = (n * C_ + c) * channelSize_;
+        uint32_t len = channelSize_;
+
+        // Copy entire channel into local
+        uint32_t curLen = (len > tileLen_) ? tileLen_ : len;
+        AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm_[offset], curLen);
+        inQueueX_.EnQue(xLocal);
+        AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+        AscendC::LocalTensor<float> tLocal = tmpQueue_.AllocTensor<float>();
+
+        // Compute mean = sum(x) / len
+        AscendC::ReduceAdd(tLocal, xLocal, curLen); // reduce to a scalar in tLocal[0]
+        float mean = tLocal.GetValue(0) / static_cast<float>(curLen);
+        
+        // Compute variance = sum((x - mean)^2) / len
+        // Use another pass: we can reuse xLocal? But it's already consumed. We need to reload.
+        // Better to do one pass: compute sum and sum_sq simultaneously? Not straightforward.
+        // We'll do two passes: first load again to compute variance.
+        // But we have already used xLocal. We'll need to reload.
+        AscendC::LocalTensor<float> xLocal2 = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal2, xGm_[offset], curLen);
+
+        // (x - mean)
+        AscendC::Subs(tLocal, xLocal2, mean, curLen);
+        // square
+        AscendC::Mul(tLocal, tLocal, tLocal, curLen);
+        // reduce sum
+        AscendC::ReduceAdd(yLocal, tLocal, curLen); // use yLocal as temp for variance scalar
+        float var = yLocal.GetValue(0) / static_cast<float>(curLen);
+        float invStd = 1.0f / sqrtf(var + eps_);
+
+        // Now normalize: y = (x - mean) * invStd
+        // We have xLocal2 already, but we used it for variance. We'll need a third copy? 
+        // To avoid multiple copies, we can compute in one pass: store x in a temporary, then compute.
+        // Let's restructure: first copy x into tLocal (tileLen), then compute mean using reduction on tLocal.
+        // Then copy x again into tLocal (overwrite) and compute variance.
+        // For simplicity, we'll do three copies: one for mean, one for variance, one for normalization? 
+        // Actually we can reuse tLocal after mean, but need x for variance and final output.
+        // Better: copy x into xLocal (tileLen), then compute mean, store mean. Then compute variance using same xLocal (still there). Then normalize using same xLocal and output.
+        // But after ReduceAdd, the xLocal tensor might be used? We'll use a separate buffer for reduction result.
+        // Let's redesign: use inQueueX for input, outQueueY for output, tmpQueue for reduction accum.
+        // We'll do:
+        // 1. Load x into xLocal.
+        // 2. Compute mean: reduction of xLocal into mean scalar (store in tLocal scalar) -> Free tensor? We'll use tmpQueue for reduction temp.
+        // 3. Compute variance: (xLocal - mean)^2 -> reduce into var scalar.
+        // 4. Normalize: (xLocal - mean) * invStd -> store into yLocal.
+        // 5. Copy out.
+
+        // Reimplement Process with this logic.
+    }
+};
+```
+
+But the above is incomplete. We'll write a full kernel with proper steps.
+
+Also need to handle cases where channelSize > tileLen? We'll tile with accumulation of sum and sum_sq across tiles. For simplicity, assume tileLen = channelSize (since channelSize is H*W, could be large, but we'll set tileLen to channelSize if it fits UB, else tile. We'll implement tiled reduction.
+
+Given complexity, we can implement a naive kernel that processes the entire channel as one tile (if fits). In tiling, we set tileLen = min(channelSize, max possible from UB). If channelSize > tileLen, we need to tile. We'll implement tiled reduction: for each tile, compute part sum and part sum_sq, accumulate in scalar (float) variables. At the end, compute mean and variance, then normalize in a second pass.
+
+But using AscendC, we can accumulate using scalar variables? Scalar variables are not threadsafe across threads, but each block runs independently. We can use local variables (float) and update them. However, the reduction functions return a scalar tensor (size 1). We can store in a LocalTensor and then read the value. We can also use the scalar value to compute.
+
+We'll implement a tiled version:
+
+- For a channel, divide into tiles of size tileLen.
+- For each tile, compute sum and sum_sq using ReduceAdd and ReduceAdd on squared values (compute square before reduction).
+- Accumulate totalSum and totalSumSq as float.
+- After all tiles, compute mean = totalSum / channelSize, var = totalSumSq/channelSize - mean*mean (or compute directly).
+- Then do second pass: load each tile again, compute (x - mean)*invStd, store output.
+
+This requires two passes over the data. We'll use a loop for first pass (accumulation) and second pass (normalization).
+
+We'll use inQueueX and outQueueY, and tmpQueue for intermediate square calculations.
+
+Let's write kernel_src fully.
+
+Also, python_bind_src: we need to create a custom op binding. Following the example, we define a function that calls the NPU command. Since our op is named InstanceNormCustom, the aclnn function would be aclnnInstanceNormCustom. We'll need to pass both tensors? Actually we only have x input and optionally weight and bias? But we decided not to include weight/bias. The original model doesn't have them. So the op should have only x and y, and eps attribute. We'll adjust project_json accordingly.
+
+Thus, we'll modify project_json to have only x input, y output, eps attr.
+
+Also, host_operator_src should match: only x input.
+
+Let's produce all strings.
+
+We'll avoid redundancy and ensure correctness.
+
+Now write the answer with six strings.

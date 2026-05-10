@@ -1,0 +1,267 @@
+```python
+project_json_src='''
+
+[
+  {
+    "op": "CumprodCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "dim",
+        "param_type": "required",
+        "type": "int"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CumprodCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, rowLength);
+  TILING_DATA_FIELD_DEF(uint32_t, numRows);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CumprodCustom, CumprodCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "cumprod_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // per-core share
+static constexpr uint32_t MAX_BLOCK_NUM = 24;
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (a + b - 1u) / b;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context) {
+    CumprodCustomTilingData tiling;
+    const gert::StorageShape *xShape = context->GetInputShape(0);
+    const auto &originShape = xShape->GetOriginShape();
+    uint32_t totalLength = static_cast<uint32_t>(originShape.GetShapeSize());
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    int32_t dim = attrs->GetAttrPointer<int32_t>(0)[0];
+    int32_t ndim = static_cast<int32_t>(originShape.GetDimNum());
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) dim = ndim - 1;
+
+    // Row length = size of the cumprod dimension
+    uint32_t rowLength = static_cast<uint32_t>(originShape.GetDim(dim));
+    uint32_t numRows = totalLength / rowLength;
+
+    // Each row's buffer: rowLength floats (read + in-place compute)
+    // UB budget per core: at least one row must fit (rowLength * 4 bytes)
+    if (rowLength * sizeof(float) > UB_BUDGET_BYTES) {
+        // Should not happen for typical sizes; fallback: reduce rowLength? but that would break semantics.
+        // Here we assert minimal budget; user must ensure input fits.
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t blockDim = numRows < MAX_BLOCK_NUM ? numRows : MAX_BLOCK_NUM;
+    if (blockDim < 1) blockDim = 1;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_rowLength(rowLength);
+    tiling.set_numRows(numRows);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context) {
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context) {
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class CumprodCustom : public OpDef {
+public:
+    explicit CumprodCustom(const char* name) : OpDef(name) {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("dim").AttrType(REQUIRED).Int();
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CumprodCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+class KernelCumprodCustom {
+public:
+    __aicore__ inline KernelCumprodCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t rowLength,
+                                uint32_t numRows, uint32_t blockDim)
+    {
+        totalLen_ = totalLength;
+        rowLen_ = rowLength;
+        numRows_ = numRows;
+        blockDim_ = blockDim;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        // Single buffer for in-place computation: sufficient UB for one row
+        pipe_.InitBuffer(tmpBuf_, 1, rowLen_ * sizeof(float));  // FIX: added '1' as num buffer argument
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (rowLen_ == 0 || numRows_ == 0) return;
+
+        uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        uint32_t rowsPerBlock = (numRows_ + blockDim_ - 1) / blockDim_;
+        uint32_t startRow = blockIdx * rowsPerBlock;
+        if (startRow >= numRows_) return;
+        uint32_t endRow = startRow + rowsPerBlock;
+        if (endRow > numRows_) endRow = numRows_;
+
+        for (uint32_t r = startRow; r < endRow; ++r) {
+            uint32_t offset = r * rowLen_;
+
+            // Load row into local buffer
+            AscendC::LocalTensor<float> buf = tmpBuf_.AllocTensor<float>();
+            AscendC::DataCopy(buf, xGm_[offset], rowLen_);
+
+            // In-place cumulative product
+            float prod = 1.0f;
+            for (uint32_t i = 0; i < rowLen_; ++i) {
+                prod *= buf(i);
+                buf(i) = prod;
+            }
+
+            // Store result
+            AscendC::DataCopy(yGm_[offset], buf, rowLen_);
+            tmpBuf_.FreeTensor(buf);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpBuf_;  // single buffer, reused per row
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalLen_ {0};
+    uint32_t rowLen_ {0};
+    uint32_t numRows_ {0};
+    uint32_t blockDim_ {1};
+};
+
+extern "C" __global__ __aicore__ void cumprod_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCumprodCustom op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.rowLength, tiling_data.numRows, tiling_data.blockDim);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor cumprod_impl_npu(const at::Tensor& self, int64_t dim) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnCumprodCustom, self, dim, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cumprod_custom", &cumprod_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cumprod_custom", &cumprod_impl_npu, "Cumulative product (CumprodCustom on NPU)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'cumprod_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, self.dim)
+'''
+```

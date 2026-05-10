@@ -1,0 +1,295 @@
+We are given the previous attempt and the error logs. The error shows that the custom kernel outputs zeros instead of the expected values. The kernel is supposed to compute: linear (matmul + bias) -> sum over dim=1 -> max over dim=1 -> mean over dim=1 -> logsumexp -> logsumexp. However, the kernel in the previous attempt only computes a simple dot product between x and a row-sum of w plus bSum, and then sums across batches? Actually reading the kernel: it computes wRowSum as sum of rows of w (so sum over outFeatures per inFeature). Then for each batch, dot product with x, add bSum, and output that as y. That is not the correct sequence of operations. The correct sequence is:
+
+Given x: [B, in_features], w: [out_features, in_features], b: [out_features].
+1. linear: y1 = x @ w.T + b -> shape [B, out_features]
+2. sum over dim=1: y2 = sum(y1, dim=1, keepdim=True) -> [B, 1]
+3. max over dim=1: y3 = max(y1, dim=1, keepdim=True)[0] -> [B, 1]   // but note: sum and max are both over dim=1 of the same y1? Actually the original model does: x = F.linear(x,w,b); x = torch.sum(x, dim=1, keepdim=True); x = torch.max(x, dim=1, keepdim=True)[0]; x = torch.mean(x, dim=1, keepdim=True); x = torch.logsumexp(x, dim=1, keepdim=True); return torch.logsumexp(x, dim=1, keepdim=True). This is weird because after sum and max, the tensor becomes [B,1] and then mean over dim=1 of a [B,1] is just the same values, and logsumexp of a [B,1] is log(exp(x)). So the operations collapse. But the reference output from eval shows numbers like 16836256, which are large. Probably the correct computation should be linear -> sum -> max -> mean -> logsumexp -> logsumexp, but note that sum and max are both applied to the original linear output? The PyTorch code: x = F.linear(x,w,b); then x = torch.sum(x, dim=1, keepdim=True); then x = torch.max(x, dim=1, keepdim=True)[0]; ... Actually careful: after linear, x has shape [B, out_features]. Then sum over dim=1 gives [B,1]. Then max over dim=1 on a [B,1] tensor gives the same as the tensor itself (since only one element per batch). Then mean, etc. So the result is essentially the linear output's sum per batch, but then max, mean, logsumexp are identity. So the final output is just the sum of the linear output across out_features, plus some nonlinearities? Let's compute: For each batch, after linear: y1 = [val1, val2, ..., val_out]. sum = sum of all vals. max = maximum of vals? But after sum, the tensor is [B,1] with the sum value. Then max over dim=1 gives the same sum value. Then mean gives same, logsumexp gives log(exp(sum)) = sum. So the final output is just the sum of the linear output across out_features per batch. That is exactly what the kernel in the previous attempt computes: dot(x, sum_rows(w)) + bSum? Actually Linear: y1 = x @ W.T + b. Sum over out_features: sum(y1, dim=1) = sum_{j=1}^{out} ( (x @ W.T)_j + b_j ) = sum_j ( (sum_i x_i * W_{j,i}) ) + sum_j b_j = sum_i x_i * ( sum_j W_{j,i} ) + sum_j b_j = dot(x, row_sum_of_W) + sum(b). So the kernel computes exactly that: wRowSum = sum over rows of w (i.e., sum over j of W_{j,i}), bSum = sum of b. Then for each batch, compute dot(x, wRowSum) + bSum. That seems correct for the sum of linear outputs. But the reference output shows numbers around 16 million, and the kernel output zeros. Possibly the kernel has a bug: In the process, it uses global tensor SetValue to write to yGm_, but yGm_ is defined with size batchTotal_ (since y is [B,1] flattened). That's fine. However, the tiling data passes totalBatches, inFeatures, outFeatures. The kernel uses these to compute wRowSum and bSum. But note: the kernel assumes that wGm_ is of shape outFeat_ * inFeat_ (row-major), and bGm_ is outFeat_. That matches the inputs: w shape [out_features, in_features], b shape [out_features]. So that is fine.
+
+Why are outputs zero? Possible reasons:
+1. The kernel might be reading garbage tiling data or not receiving correct tiling data. The tiling data in the previous attempt only contains totalBatches, inFeatures, outFeatures, blockDim. But the kernel expects these via GET_TILING_DATA. If the tiling data is not correctly passed, the values could be zero.
+2. The kernel uses AscendC::Duplicate, DataCopy, Add, Mul, etc. But maybe the pointers or dimensions are off.
+
+The error log shows that the kernel compiled and ran, but output zeros. So the kernel executed but produced all zeros. Likely the input data is not being read correctly, or the computation yields zero.
+
+We need to fix the kernel. But note: The user instruction is to replace the original PyTorch operators with a custom AscendC kernel that does the entire fused operation. The previous attempt's kernel does compute the correct final result (sum of linear output + sum(b)), but it seems the sum of linear output does not match the reference? The reference output is tensor([[16836256.], ...]). That is a large number. For random inputs of size [1024,8192] and [8192,8192] weights and bias, the sum of linear outputs can indeed be large. The kernel should produce the same.
+
+Maybe the issue is that the kernel is not correctly handling the tiling data. Let's examine the host operator tiling function. It sets tiling fields: totalBatches, inFeatures, outFeatures, blockDim. But the kernel's Init function takes totalBatches, inFeatures, outFeatures. It does not take blockDim. That's okay, blockDim is used by the system to determine number of blocks. But the kernel uses blockNum from AscendC::GetBlockNum() which should be set by context->SetBlockDim. That is fine.
+
+However, note: In the kernel, it uses pipe_.InitBuffer for local buffers. The buffers: wRowSumBuf_ (inFeat_ * sizeof(float)), wTileBuf_ (1 * inFeat_ * sizeof(float)), bTileBuf_ (1 * sizeof(float)), xBuf_ (inFeat_ * sizeof(float)), dotBuf_ (inFeat_ * sizeof(float)). But wTileBuf_ is declared as 1 * inFeat_ * sizeof(float). That's fine. However, the kernel uses AscendC::DataCopy to load wTile from wGm_[j * inFeat_] with length inFeat_. That should work.
+
+But there is a potential issue: In the loop over outFeat_, it repeatedly uses wTileBuf_.Get<float>() without any synchronization. The TBuf is a fixed buffer, and each iteration overwrites it. That's okay as long as the operations finish before the next iteration's DataCopy. Similarly for bTileBuf_. But note: The loop uses AscendC::Add(wRowSum, wRowSum, wTile, inFeat_). The Add operation is asynchronous? AscendC operations are typically synchronous on the vector unit. Should be fine.
+
+I suspect the issue is that the kernel is not correctly obtaining the tiling data. The TILING_DATA macro generates a struct from the tiling buffer passed as GM_ADDR tiling. The tiling data is passed from the host operator's tiling function, which saves the tiling struct into the buffer. That should work.
+
+Another possibility: The kernel's process uses blockNum and blockIdx to split batches. But note: The linear operation is independent per batch, so that is fine.
+
+Maybe the problem is that the kernel expects xGm_ to have batchTotal_ * inFeat_ elements, but the actual tensor x is of shape [batchTotal_, inFeat_], that's fine.
+
+I see that the kernel's output yGm_ is set with SetValue(batchStart, outVal). But yGm_ is defined with batchTotal_ elements. However, the output tensor is expected to be [batchTotal_, 1] according to the python bind and InferShape. So yGm_ should have batchTotal_ elements (since [batchTotal_, 1] flattened is batchTotal_). That is correct.
+
+But why are the outputs zero? Possibly because outVal is calculated as dot + bSum, but dot is computed as sum of dotTmp elements. However, dotTmp is obtained from Mul(dotTmp, xLocal, wRowSum, inFeat_). Then the kernel does a for loop to accumulate dot = 0; for k in range(inFeat_): dot += dotTmp.GetValue(k). That loop is problematic because GetValue on a LocalTensor might not be efficient, but it should work. However, there is a subtlety: The local tensor dotTmp is allocated from dotBuf_. After the loop, it is not freed? But it's reused. That's okay.
+
+But more importantly, the loop over inFeat_ uses dotTmp.GetValue(k). This is a scalar read from local memory. That should work.
+
+Maybe the bug is in the tiling data: The tiling data structure is defined as:
+BEGIN_TILING_DATA_DEF(MatmulSumMaxAvgPoolLogSumExpLogSumExpCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalBatches);
+  TILING_DATA_FIELD_DEF(uint32_t, inFeatures);
+  TILING_DATA_FIELD_DEF(uint32_t, outFeatures);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+But note: The field names in the tiling data are totalBatches, inFeatures, outFeatures, blockDim. But in the kernel's Init function, the parameters are totalBatches, inFeatures, outFeatures. The tiling data is accessed via GET_TILING_DATA(tiling_data, tiling) and then tiling_data.totalBatches, etc. So the names match.
+
+However, the tiling function in host_operator_src sets:
+    tiling.set_totalBatches(batchSize);
+    tiling.set_inFeatures(inFeat);
+    tiling.set_outFeatures(outFeat);
+    tiling.set_blockDim(blockDim);
+That should be correct.
+
+So why zeros? Perhaps the tiling data is not being passed correctly because the host operator's TilingFunc sets blockDim and then context->SetBlockDim(blockDim). That is fine.
+
+Another possible issue: In the kernel, the yGm_ global tensor is set with size batchTotal_. But the output tensor might have shape [batchTotal_, 1], and when we write using SetValue, we are writing to contiguous elements. That's fine.
+
+I suspect the issue is with the use of DataCopy in the kernel. The DataCopy function expects the length in number of elements (not bytes) for vector copy? In AscendC, DataCopy copies data from global to local, and the length is in number of elements for the type. So DataCopy(wTile, wGm_[j * inFeat_], inFeat_) copies inFeat_ float elements. That's correct.
+
+Maybe the problem is that the kernel's wRowSum initial Duplicate sets to 0.0f for inFeat_ elements. Then Add(wRowSum, wRowSum, wTile, inFeat_) accumulates. But wTile is loaded from global memory row by row. However, note: wRowSum is a buffer of size inFeat_ floats. After the loop, wRowSum contains the sum of all rows of w. That should be correct.
+
+Then for each batch, xLocal is loaded, Mul with wRowSum, then accumulate dot. bSum is added. That yields the sum of linear output.
+
+But the reference output might be expecting something else? Let's double-check the original PyTorch model. It does linear, then sum, then max, then mean, then logsumexp, then logsumexp. As argued, if the tensor after linear is [B, out], then sum over dim=1 gives [B,1]. Then max over dim=1 on that [B,1] gives the same. Then mean gives same. Then logsumexp gives log(exp(x)) = x (since keepdim). Then another logsumexp gives same. So the final output is just the sum over out_features of the linear output. So the kernel's computation is correct.
+
+But maybe the original model's operations are not exactly as described? The code:
+x = F.linear(x, w, b)
+x = torch.sum(x, dim=1, keepdim=True)
+x = torch.max(x, dim=1, keepdim=True)[0]
+x = torch.mean(x, dim=1, keepdim=True)
+x = torch.logsumexp(x, dim=1, keepdim=True)
+return torch.logsumexp(x, dim=1, keepdim=True)
+
+After torch.sum, x is [B,1]. Then torch.max on a [B,1] tensor with dim=1 returns values as the same tensor (max of a single element). So x remains [B,1]. Then mean of a single element is itself. Then logsumexp: logsumexp(x) = log(exp(x)). For a scalar, that's x. So the result is the sum. So yes.
+
+But the reference output shows values like 16836256, which is plausible for sum of many floats.
+
+Why does the kernel produce zeros? Possibly the values are written but then the output tensor is not properly returned? Or maybe the kernel is not executed at all? The log says "New output: tensor([[0.], ...], device='npu:0')". So it produced zero tensors.
+
+Perhaps the issue is that the kernel uses AscendC::DataCopy for wTile and bTile, but these buffers are not properly allocated? The pipe_.InitBuffer(wTileBuf_, 1 * inFeat_ * sizeof(float)); That allocates a buffer of size inFeat_ floats. But note: The argument to InitBuffer is the size in bytes. So 1 * inFeat_ * sizeof(float) is correct. Similarly, bTileBuf_ is 1 * sizeof(float). That's fine.
+
+But there is a subtlety: The wTileBuf_ is declared as AscendC::TBuf<AscendC::TPosition::VECCALC>. This buffer resides in VECCALC memory. It can be used with DataCopy? DataCopy typically copies to VECIN or VECOUT. Actually, DataCopy can copy to any local memory? The AscendC documentation: DataCopy copies from global to local (VECIN or VECCALC?). I'm not 100% sure. In many examples, they use TQue for pipelining. But using TBuf directly is possible. However, there might be restrictions. Possibly the DataCopy is not working because the buffer is not in the correct memory space for vector operations? The typical usage is to use TQue for input and output. But using TBuf might still work.
+
+Another possibility: The for loop in the accumulation of dot uses dotTmp.GetValue(k). This is a scalar read from a local tensor, which might be slow but should work. However, note that dotTmp is of type LocalTensor<float> from dotBuf_. After the Mul, the values are stored. The loop reads them. That should work.
+
+Given the complexity, I think the main error is that the kernel's logic is too simplified and might not actually compute the sum of linear outputs correctly due to missing some operations like the bias addition per out_feature? But we argued it does because sum of bias is added at the end. However, note: The linear operation is x @ W.T + b. The sum over out_features is sum_j ( (x @ W.T)_j + b_j ) = sum_j (x @ W.T)_j + sum_j b_j. The kernel computes dot(x, sum_rows(W)) + sum(b). That is correct.
+
+But wait: sum_j (x @ W.T)_j = sum_j ( sum_i x_i * W_{j,i} ) = sum_i x_i * ( sum_j W_{j,i} ) = dot(x, row_sum). Yes.
+
+So the kernel should match the reference.
+
+Maybe the problem is that the kernel does not handle the case where outFeat_ is large (8192) and the loop over outFeat_ is slow and might cause some timeout? But the eval log shows it ran quickly.
+
+Another idea: The kernel might be writing to yGm_ using SetValue, but yGm_ is a GlobalTensor and SetValue writes to a specific index, but it might not be vectorized. That should work.
+
+Given the previous attempt's kernel seems logically correct, I suspect the issue is in the tiling data or the python bindings. The python bindings call EXEC_NPU_CMD with aclnn function. That should work if the operator is correctly registered.
+
+But the output is zeros. Perhaps the kernel is not receiving the correct pointers because of mismatched memory spaces? The tiling data is passed as GM_ADDR tiling, and the kernel uses GET_TILING_DATA macro which reads from that global memory. That should work.
+
+Maybe the problem is that the kernel uses AscendC::Duplicate to set wRowSum to 0, but then later uses AscendC::Add to accumulate. However, after the first iteration, wRowSum contains the first row. Then the second iteration adds the second row, etc. That is correct.
+
+But note: The Add operation might be in-place. The function signature is Add(LocalTensor<float>& dst, const LocalTensor<float>& src1, const LocalTensor<float>& src2, uint32_t len). In the kernel, it's Add(wRowSum, wRowSum, wTile, inFeat_). That adds wRowSum and wTile and stores in wRowSum. That is correct.
+
+I think the most likely cause is that the kernel's global memory accesses are incorrect because the pointer arithmetic for xGm_[batchStart * inFeat_] might be wrong. The global tensor xGm_ is set with totalSize = batchTotal_ * inFeat_. The operator [] returns a GlobalTensor at that offset. For DataCopy, it expects the starting address. So xGm_[batchStart * inFeat_] should give the start of the batch's row. That is correct.
+
+But there is a potential off-by-one: When blockIdx is 0, batchStart = 0, then it processes batch0, then batchStart += blockNum (which could be 8), so batchStart becomes 8, then processes batch8, etc. That is fine.
+
+However, the loop condition: while (batchStart < batchTotal_) { ... batchStart += blockNum; } But note: batchStart is uint32_t, and blockNum is uint32_t. This loop will process until batchStart exceeds batchTotal_. That's correct.
+
+But there is a subtle bug: In the while loop, for each iteration, it processes the current batchStart. But the loop increments batchStart after the iteration. So it will process batches 0, 8, 16, ... for blockIdx=0. That's fine.
+
+However, the kernel also initializes wRowSum and computes bSum once, which is correct.
+
+But maybe the issue is that the kernel assumes that the global memory for w and b is accessible from all cores? Yes, global memory is shared.
+
+Another thought: The kernel uses AscendC::LocalTensor<float> wTile = wTileBuf_.Get<float>(); This gets a LocalTensor pointing to the buffer. But the buffer is used multiple times. The kernel should ensure that the previous Async operations are completed before reusing the buffer. AscendC operations are typically blocking? In the vector pipeline, operations might be pipelined. There might be a need to synchronize. But the kernel does not have explicit synchronization. However, in simple operations, the compiler might handle dependencies.
+
+Given the difficulty, I think we need to rewrite the kernel properly using pipelining with TQue to ensure correctness and performance. The previous attempt used a simplified approach that might have hidden bugs due to lack of pipelining.
+
+But the instruction says "Fix the previous attempt with minimal and targeted changes." So we should aim to fix the existing kernel rather than rewrite from scratch. However, the kernel might be fundamentally flawed in its approach of using TBuf directly without proper synchronization. Many AscendC examples use TQue for input and output to pipeline data copies and compute. The previous kernel for leaky_relu used TQue and queues. So the proper way is to use queues.
+
+Given the error, I'll propose a corrected kernel that uses proper pipelining with TQue, similar to the leaky_relu example. But this is not minimal; it's a rewrite. However, the error shows the kernel produces zeros, which suggests a serious bug. Perhaps the minimal fix is to ensure that the kernel waits for previous operations to complete before reusing buffers. In AscendC, when using TBuf, you might need to use pipe_.Barrier() or something. Alternatively, the bug could be that DataCopy to a TBuf that is VECCALC is not allowed? It's safer to use VECIN for input.
+
+Given the constraints, I'll produce a corrected kernel using TQue for input and output, and compute the dot product and sum in vectorized manner. Also, note that the output is a scalar per batch, so we can compute the sum using a reduction. But to keep it simple, we can compute the sum by vector multiply and then using a reduction intrinsic (like ReduceAdd). However, to minimize changes, we can keep the scalar accumulation loop but ensure proper buffer usage.
+
+I think the root cause might be that the kernel uses AscendC::DataCopy on TBuf that is allocated with pipe_.InitBuffer, but the InitBuffer for a TBuf does not necessarily allocate local memory? Actually, pipe_.InitBuffer(TBuf, size_bytes) allocates the buffer in the specified memory space (default is VECCALC). Then Get<T>() returns a LocalTensor pointing to that buffer. DataCopy expects the destination to be a LocalTensor in VECIN or VECCALC? In the leaky_relu example, they use TQue for input and output, and DataCopy copies from global to the tensor from the queue, which is VECIN. So maybe DataCopy to VECCALC is not supported. That would cause the copy to fail silently, leaving zeros. That is a plausible explanation.
+
+So the fix should be to use TQue for input data. The kernel needs to load w rows and the x batch using queues. But that would be a significant rewrite.
+
+Given the complexity, I'll instead propose a kernel that uses more standard AscendC patterns with queues, but keep the same overall logic.
+
+But the user instruction is to output the six strings. I need to provide the corrected code. I'll make the following targeted changes:
+
+- Use TQue for loading w rows and x batches, to ensure DataCopy works.
+- Use proper synchronization.
+- Keep the same tiling data structure.
+- Ensure the output is written correctly.
+
+I'll write the kernel_src with pipelining similar to the leaky_relu example but adapted for this operation. Also, the host_operator_src tiling function needs to provide tileLength for the pipelining? Actually, the operation does not require tiling because the input sizes are fixed. But we can still use tiling for batches.
+
+I'll modify the tiling data to include tileBatches for pipelining.
+
+But to minimize changes, I'll keep the tiling as is, but adjust the kernel to use queues for loading x and w rows.
+
+Since the operation involves iterating over outFeatures for weights, we can precompute the row sum of w once and store it in local memory, then process batches.
+
+I'll write the kernel using TQue for loading w rows to accumulate row sum, and TQue for loading x rows.
+
+Given time, I'll produce a corrected kernel. I'll also fix potential issues with the host operator: The InferShape sets output shape to [batchSize, 1], which is fine.
+
+Also, the python_bind_src uses EXEC_NPU_CMD with aclnnMatmulSumMaxAvgPoolLogSumExpLogSumExpCustom. The operator name must match exactly. That seems correct.
+
+Now, I'll generate the corrected code.
+
+I'll focus on the kernel_src and host_tiling_src to add tileBatches for pipelining, and rewrite kernel_src with proper queue usage.
+
+But I need to keep the output as the six strings. I'll produce the corrected version.
+
+Let me write the corrected kernel_src:
+
+```cpp
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelMatmulSumMaxAvgPoolLogSumExpLogSumExpCustom {
+public:
+    __aicore__ inline KernelMatmulSumMaxAvgPoolLogSumExpLogSumExpCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                uint32_t totalBatches, uint32_t inFeatures, uint32_t outFeatures)
+    {
+        batchTotal_ = totalBatches;
+        inFeat_ = inFeatures;
+        outFeat_ = outFeatures;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, batchTotal_ * inFeat_);
+        wGm_.SetGlobalBuffer((__gm__ float*)w, outFeat_ * inFeat_);
+        bGm_.SetGlobalBuffer((__gm__ float*)b, outFeat_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, batchTotal_);
+
+        // Allocate ping-pong buffers for pipelining
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, inFeat_ * sizeof(float));
+        pipe_.InitBuffer(inQueueW_, BUFFER_NUM, inFeat_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, inFeat_ * sizeof(float));
+        pipe_.InitBuffer(wRowSumBuf_, 1, inFeat_ * sizeof(float));
+        pipe_.InitBuffer(bSumBuf_, 1, sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (inFeat_ == 0 || outFeat_ == 0 || batchTotal_ == 0) return;
+
+        uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        // Step 1: Compute row sum of W and sum of b
+        AscendC::LocalTensor<float> wRowSum = wRowSumBuf_.Get<float>();
+        AscendC::Duplicate(wRowSum, 0.0f, inFeat_);
+        AscendC::LocalTensor<float> bSumLocal = bSumBuf_.Get<float>();
+        AscendC::Duplicate(bSumLocal, 0.0f, 1);
+
+        for (uint32_t j = 0; j < outFeat_; ++j) {
+            // Load one row of W
+            AscendC::LocalTensor<float> wTile = inQueueW_.AllocTensor<float>();
+            AscendC::DataCopy(wTile, wGm_[j * inFeat_], inFeat_);
+            inQueueW_.EnQue(wTile);
+            wTile = inQueueW_.DeQue<float>();
+            // Accumulate row sum
+            AscendC::Add(wRowSum, wRowSum, wTile, inFeat_);
+            inQueueW_.FreeTensor(wTile);
+
+            // Load b[j]
+            AscendC::LocalTensor<float> bTile = inQueueW_.AllocTensor<float>(); // reuse queue for simplicity
+            AscendC::DataCopy(bTile, bGm_[j], 1);
+            float bVal = bTile.GetValue(0);
+            bSumLocal.SetValue(0, bSumLocal.GetValue(0) + bVal);
+            inQueueW_.FreeTensor(bTile);
+        }
+
+        // Step 2: Process batches in grid-stride loop
+        uint32_t batchStart = blockIdx;
+        while (batchStart < batchTotal_) {
+            // Load x[batchStart] into local
+            AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            AscendC::DataCopy(xLocal, xGm_[batchStart * inFeat_], inFeat_);
+            inQueueX_.EnQue(xLocal);
+            xLocal = inQueueX_.DeQue<float>();
+
+            // Compute dot product: sum(xLocal * wRowSum)
+            AscendC::LocalTensor<float> tmp = tmpQueue_.AllocTensor<float>();
+            AscendC::Mul(tmp, xLocal, wRowSum, inFeat_);
+            float dot = 0.0f;
+            for (uint32_t k = 0; k < inFeat_; ++k) {
+                dot += tmp.GetValue(k);
+            }
+            tmpQueue_.FreeTensor(tmp);
+            float outVal = dot + bSumLocal.GetValue(0);
+
+            // Write output
+            yGm_.SetValue(batchStart, outVal);
+
+            inQueueX_.FreeTensor(xLocal);
+            batchStart += blockNum;
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueW_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> wRowSumBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bSumBuf_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> wGm_;
+    AscendC::GlobalTensor<float> bGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t batchTotal_ {0};
+    uint32_t inFeat_ {0};
+    uint32_t outFeat_ {0};
+};
+
+extern "C" __global__ __aicore__ void matmul_sum_max_avg_pool_log_sum_exp_log_sum_exp_custom(
+    GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulSumMaxAvgPoolLogSumExpLogSumExpCustom op;
+    op.Init(x, w, b, y, tiling_data.totalBatches, tiling_data.inFeatures, tiling_data.outFeatures);
+    op.Process();
+}
+```
+
+I also need to ensure that the host_tiling_src unchanged except maybe add tileBatches? But I will keep it as is.
+
+Also, the host_operator_src needs to be consistent with the kernel. The tiling function provides totalBatches, inFeatures, outFeatures, blockDim. That's fine.
+
+The python_bind_src and model_src are fine.
+
+The project_json_src should include the attr for negative_slope? No, for this operation we have no attr. But the input_desc is correct.
+
+Now, I'll output the six strings.
+
+But note: The kernel uses inQueueW_ for both w rows and b values. That might cause confusion because b values are 1 element, but we allocate a tensor of inFeat_ floats? Actually, inQueueW_.AllocTensor<float>() allocates a tensor of the size of the queue's buffer, which was initialized with inFeat_ * sizeof(float). But when we load b[j] with DataCopy(bTile, bGm_[j], 1), we are only copying 1 float into a buffer that can hold inFeat_ floats. That is fine, but we then read GetValue(0). However, the allocation was for inFeat_ floats, so it's wasteful but okay. Alternatively, we could use a separate small buffer for b. I'll leave it as is to minimize changes.
+
+Also, the kernel uses the same inQueueW_ for both w rows and b, but it EnQue and DeQue properly. However, note that the queue is used for both operations sequentially. That should be fine.
+
+One issue: In the loop over outFeat_, we call inQueueW_.AllocTensor<float>() to get a tensor for wTile, then DataCopy, then EnQue, then DeQue, then Add, then FreeTensor. Then we reuse inQueueW_.AllocTensor for bTile. This is okay because the queue has 2 buffers (BUFFER_NUM=2). But we are allocating and freeing sequentially, so we only use one buffer at a time. Should be fine.
+
+But we must ensure that after EnQue, the tensor is queued and can be dequeued. That pattern is correct.
+
+After the loop, wRowSum contains the row sum.
+
+Then in the batch loop, we use inQueueX_ for x. That's independent.
+
+Now, I'll produce the final answer.

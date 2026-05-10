@@ -15,9 +15,17 @@ import json
 import os
 import time
 import traceback
+from typing import Optional
 
 from vendor.mkb.dataset import dataset
 from generator.agent.agent_runner import KernelGenerationTask, generate_kernel_with_agent
+
+
+def _normalize_ascend_search_version(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    t = str(value).strip()
+    return t or None
 
 
 CASE_STUDY_OPS = [
@@ -36,11 +44,15 @@ CASE_STUDY_OPS = [
 ]
 
 
-def run_one(op: str, tool_mode: str, strategy: str):
+def run_one(op: str, tool_mode: str, strategy: str, ascend_search_version_filter: Optional[str] = None):
     category = dataset.get(op, {}).get("category", "activation")
     task = KernelGenerationTask(language="ascendc", op=op, strategy_name=strategy, category=category)
     start = time.time()
-    result = generate_kernel_with_agent(task, tool_mode)
+    result = generate_kernel_with_agent(
+        task,
+        tool_mode,
+        ascend_search_version_filter=ascend_search_version_filter,
+    )
     dur = time.time() - start
     return result, dur
 
@@ -56,16 +68,23 @@ def main():
         action="store_true",
         help="Run CASE_STUDY_OPS (default: conv_pointwise_2d, gelu, relu)",
     )
+    p.add_argument(
+        "--ascend-search-version",
+        default=None,
+        metavar="SUBSTRING",
+        help="Ascend 官网文档搜索 version 子串过滤；省略则不限制。",
+    )
     args = p.parse_args()
 
     ops = CASE_STUDY_OPS if args.case_study else args.ops
+    ascend_vf = _normalize_ascend_search_version(args.ascend_search_version)
 
     os.makedirs(args.outdir, exist_ok=True)
 
     for op in ops:
         print(f"[RUN] op={op} tool_mode={args.tool_mode} strategy={args.strategy}")
         try:
-            res, dur = run_one(op, args.tool_mode, args.strategy)
+            res, dur = run_one(op, args.tool_mode, args.strategy, ascend_vf)
             out = {
                 "op": res.op,
                 "duration_s": dur,

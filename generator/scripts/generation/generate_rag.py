@@ -18,7 +18,10 @@ from generator.config import (
 from generator.prompt_generators.prompt_utils import read_relavant_files, ascendc_template
 from generator.scripts.generation.generate_and_write import generate_and_write_single
 from generator.rag import EmbeddingRetriever
-from generator.dataset import dataset
+
+from generator.dataset import dataset, category2exampleop
+from generator.test_set_ops import TEST_SET_CATEGORY, select_ops_by_categories
+
 
 
 def _load_code_rag_retriever():
@@ -199,7 +202,12 @@ def main():
     parser.add_argument("--runs", type=int, default=1, help="运行次数")
     parser.add_argument("--top-k", type=int, default=rag_top_k, help="检索 top_k")
     parser.add_argument("--max-chars", type=int, default=rag_max_chars, help="检索内容最大字符数")
-    parser.add_argument("--categories", nargs='+', default=['all'], help='算子类别')
+    parser.add_argument(
+        "--categories",
+        nargs="+",
+        default=["all"],
+        help="算子类别；可使用 test_set 表示固定 12 个算子（generator/test_set_ops.py）",
+    )
     parser.add_argument("--workers", type=int, default=4, help="并行工作数")
     parser.add_argument("--start-from", type=str, default=None, help="从指定算子开始（断点续传）")
     args = parser.parse_args()
@@ -209,15 +217,18 @@ def main():
     workers = args.workers
     model_name = model.split("/")[-1] if "/" in model else model
 
-    # 获取算子列表
-    all_ops = list(dataset.keys())
+    if (
+        args.categories != ["all"]
+        and TEST_SET_CATEGORY in args.categories
+        and len(args.categories) > 1
+    ):
+        print(
+            "[WARN] --categories 含 test_set 且还有其他类别名；仅使用 test_set 固定的算子列表，其它类别名忽略。"
+        )
 
-    # 按 category 过滤
-    if args.categories != ['all']:
-        all_ops = [op for op in all_ops if dataset[op]['category'] in args.categories]
-
-    # 排序
-    all_ops = sorted(all_ops)
+    all_ops, preserve_order = select_ops_by_categories(args.categories, dataset)
+    if not preserve_order:
+        all_ops = sorted(all_ops)
 
     print(f"[INFO] Total ops to generate: {len(all_ops)}")
     print(f"[INFO] Categories: {args.categories}")

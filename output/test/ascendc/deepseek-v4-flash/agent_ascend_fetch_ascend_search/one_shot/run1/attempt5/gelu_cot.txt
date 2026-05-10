@@ -1,0 +1,381 @@
+We need to fix the vector core exception: "VEC instruction error: the ub address out of bounds". The error indicates that the kernel is accessing Unified Buffer (UB) memory beyond allocated bounds. In the previous attempt, the kernel uses 5 temporary queues (tmpQueue1 to tmpQueue5) each of size tileLen_ * sizeof(float). The tiling calculation for UB budget was based on 28 bytes per element? Actually, UB_BUDGET_BYTES = 192*1024, and they divided by 28. Let's compute the actual UB usage per tile: we have input queue (tileLen floats), output queue (tileLen floats), and 5 temp queues (each tileLen floats). That's 1+1+5 = 7 tileLen floats = 7 * tileLen * 4 bytes = 28 * tileLen bytes. So the tiling calculation: maxTile = UB_BUDGET_BYTES / 28 is correct. However, the error suggests that the UB address is out of bounds, which could be because the tiling data's tileLength is not properly aligned or the kernel is trying to use more UB than allocated. Also note that the kernel uses AscendC::DataCopy which may require alignment (32-byte alignment?). But the error says "ub address out of bounds", meaning the local tensor address exceeds the allocated buffer size.
+
+Possible issue: The kernel uses tmpQueue1_ to tmpQueue5_ each of size tileLen_ * sizeof(float). But in Compute, it allocates all five temp tensors. If tileLen_ is not a multiple of something, or if the buffer sizes are not exactly tileLen_ floats, there could be overflow. Also, the tiling calculation uses UB_BUDGET_BYTES = 192*1024, but the actual UB available per core might be less. However, the error is "ub address out of bounds", which typically means the program tried to access beyond the allocated LocalTensor.
+
+Looking at the kernel's Compute: it uses Muls, Mul, Add, Sub operations on tensors of length len (which is either tileLen_ or less for last tile). These operations expect the tensors to have exactly len elements. If len is not a multiple of the vectorization width, AscendC handles it. But if the allocated buffer size is exactly tileLen_, but the operations are called with len < tileLen_, it should be fine because they only access up to len elements.
+
+However, the error might be due to using the same temporary queues multiple times without proper synchronization. But the kernel uses a single buffer for each temp queue, and they are freed after use. That should be fine.
+
+Another common issue: The tiling data's totalLength may be larger than the actual shape size? But that seems unlikely.
+
+Let's examine the error more: "VEC instruction error: the ub address out of bounds." The error occurs on many cores, with pc start and current addresses indicating same instruction. This suggests a systematic issue, possibly in the tiling calculation where tileLength is too large, causing the buffers to exceed UB capacity.
+
+The UB budget is 192KB = 196608 bytes. Divided by 28 gives ~7021 elements. But the tiling also divides by ALIGN_ELEMS (2048) and aligns down: maxTile = AlignDown(maxTile, 2048). If maxTile < ALIGN_ELEMS, set to ALIGN_ELEMS. So if maxTile is ~7021, AlignDown(7021, 2048) = 6144. So tileLen=6144. Then totalLength for the test case is batch_size*dim = 256*65536 = 16,777,216. With tileLen=6144, number of tiles = CeilDiv(16,777,216, 6144) ≈ 2732. Then blockDim = numTiles, clamped to 8-24, so blockDim=24. That's fine.
+
+But the UB usage: 7 queues each of 6144 floats = 7*6144*4 = 172,032 bytes. That's less than 192KB, so okay.
+
+The error says "ub address out of bounds", but it could be that the actual buffer address calculations are off due to alignment requirements. AscendC DataCopy and vector operations often require addresses to be 32-byte aligned. However, the tiling alignment uses ALIGN_ELEMS=2048, which is aligned to 32 bytes because 2048*4=8192 bytes, which is 32-byte aligned. So that's fine.
+
+Maybe the issue is that the kernel's Init function sets xGm_ and yGm_ with global buffer pointers using totalLen_, but the kernel uses grid stride with strideElems = blockNum * tileLen_. If blockNum * tileLen_ exceeds totalLen_, the base could overflow? For blockIdx=0, base=0, curLen=min(tileLen_, totalLen_). For nextBase = base + strideElems, which could be > totalLen_, then we stop. That seems correct.
+
+Wait: The error occurs on many cores (12-49), indicating all cores are failing. This suggests the kernel has a bug that affects all cores. Possibly the temporary queues are not properly allocated or the buffer sizes are miscalculated due to alignment in pipe_.InitBuffer. The InitBuffer takes a size in bytes, which should be tileLen_ * sizeof(float). But if tileLen_ is not divisible by something, it may round up? Not sure.
+
+Another possibility: In the Compute function, we use AscendC::Mins and other functions from the previous leaky_relu kernel, but this is GELU and we use Mul, Muls, Add, Sub, Adds. None of those should cause UB out of bounds.
+
+However, looking at the previous leaky_relu example, they used a different approach: they had a single temporary queue for one tmp buffer. Here we have 5 temp queues. Could it be that having many VECCALC queues causes issues? But the error is not about queue count.
+
+Maybe the issue is that we are not properly handling the last tile when it's smaller than tileLen_. In CopyIn, we allocate a local tensor of size tileLen_ (the buffer size) but only copy len elements. That should be fine because the buffer is larger. In Compute, we use len as the operation length, which is <= tileLen_. So the temp buffers are also used only for len elements, which is within their allocation.
+
+But wait: In Compute, we do:
+```
+AscendC::LocalTensor<float> t1 = tmpQueue1_.AllocTensor<float>();
+// ...
+AscendC::Mul(t1, xLocal, xLocal, len);
+// ...
+AscendC::Mul(t2, t1, xLocal, len);
+```
+t1 is used as source for Mul, but we previously wrote to t1 with t1 = x^2, then we use t1 as source for t2 = t1 * x. That's fine.
+
+However, after we compute t5 = tanh(y), we do:
+```
+AscendC::Sub(t5, yLocal, t5, len);
+```
+Here t5 is used as both source and destination? The signature of Sub: Sub(dst, src1, src2, len). It's dst = src1 - src2. So we are using t5 as dst and as src2? Actually we want t5 = yLocal - t5. But the code is:
+```
+AscendC::Sub(t5, yLocal, t5, len);
+```
+That means dst=t5, src1=yLocal, src2=t5. That's valid because dst is different from src2? AscendC allows in-place operations? Not sure. But that might cause issues if the implementation doesn't support overlapping tensors. In many SIMD vector libraries, "in-place" sub is allowed if the tensor is the same object, but if t5 is different from yLocal, it should be fine. However, t5 is also used as dst and src2, which is the same tensor. That is likely allowed because the operation is element-wise and the read and write addresses are the same. But it's still risky.
+
+But the error says "ub address out of bounds", not an arithmetic error.
+
+Maybe the real issue is that the tiling algorithm allocates too many temporary buffers and exceeds the UB capacity on certain cores due to fragmentation. The UB_BUDGET_BYTES=192KB might be a generous estimate, but the actual available UB per thread might be less. However, 192KB is typically the total UB per core, but the kernel might share with other operations? Not sure.
+
+Given the error, a simpler fix is to reduce the number of temporary buffers by reusing them. The GELU approximation can be computed with fewer temps. For example, we can compute step by step and reuse the same buffer multiple times. This would reduce UB usage and avoid potential out-of-bounds.
+
+Let's rewrite the Compute function to use only 2 or 3 temp buffers. Also, we should ensure that the tiling calculation accounts for the actual number of buffers. Currently we used 7 buffers (1 input, 1 output, 5 temp) => 7*4 = 28 bytes per element. If we reduce temps to 2, then total = 4 * 4 = 16 bytes per element, giving maxTile = 192*1024/16 = 12288, which is larger.
+
+We also need to fix the potential in-place Sub issue.
+
+Additionally, the kernel function signature includes GM_ADDR workspace, GM_ADDR tiling. That's fine.
+
+Let's modify the kernel to use only 2 temp queues: tmpA_ and tmpB_. We'll compute GELU as:
+
+// y = x
+// y = 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+
+We can compute:
+tA = x
+tB = x * x   // x^2
+tB = tB * x   // x^3
+tB = c2 * tB   // 0.044715 * x^3
+tA = tA + tB   // x + 0.044715*x^3
+tA = c1 * tA   // sqrt(2/pi)*(x+...)
+Now compute tanh(tA) using approximation:
+We need tB for tanh series. Let's use tB for intermediate.
+tB = tA * tA   // y^2
+tB = tB * tA   // y^3
+tB = - (1/3) * tB   // -y^3/3
+tB = tA + tB   // y - y^3/3
+Now we need y^5 and y^7. We can compute tA2 = y^2 again, then tA3 = y^3, tA5 = y^5, tA7 = y^7 using tA and tB maybe. But this requires more buffers.
+
+Alternatively, use a polynomial approximation that requires fewer intermediates. The standard GELU approximation uses tanh of a cubic. Another approach is to compute the entire tanh approximation in a single expression using a series of Muls and Adds with reuse. However, to be safe, we can still use two temps plus the output buffer for final result.
+
+Simplify: Use the formula: GELU(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ) ).
+
+We can compute:
+1. t1 = x
+2. t2 = x * x   // x^2
+3. t2 = t2 * x   // x^3
+4. t2 = 0.044715f * t2   // 0.044715*x^3
+5. t1 = t1 + t2   // x + 0.044715*x^3
+6. t1 = 0.7978845608028654f * t1   // sqrt(2/pi)*(x+...)
+
+Now compute tanh(t1) using approximation: tanh(z) ≈ z - z^3/3 + 2z^5/15 - 17z^7/315.
+
+We can compute:
+t2 = t1 * t1   // z^2
+t2 = t2 * t1   // z^3
+t2 = (1.0f/3.0f) * t2   // z^3/3
+t2 = t1 - t2   // z - z^3/3
+Now need z^5 and z^7. Compute:
+// need t3 for z^5 = z^2 * z^3, but we don't have z^2 anymore. We can recompute.
+
+Better: Use 3 temps: tA, tB, tC. We'll compute:
+tA = x
+tB = x * x   // x^2
+tC = tB * x   // x^3
+tC = 0.044715f * tC   // 0.044715*x^3
+tA = tA + tC   // x + 0.044715*x^3
+tA = 0.79788456f * tA   // z
+// Now tanh:
+tB = tA * tA   // z^2
+tC = tB * tA   // z^3
+tC = (1.0f/3.0f) * tC   // z^3/3
+tC = tA - tC   // z - z^3/3
+// Compute z^5 = z^2 * z^3, but we have z^2 in tB, z^3? We lost z^3? We have tC modified to z - z^3/3. So we need to recompute z^3.
+tB = tA * tA   // z^2 again
+// Now we need z^3 = tB * tA
+// But we can compute z^5 = z^2 * z^3 = tB * (tB * tA) = tB*tB*tA. That's too many operations.
+
+Given the complexity, a simpler approach is to use a different GELU approximation that uses only one nonlinear function. For example, the exact GELU uses the error function, but we can implement it using AscendC's built-in functions? AscendC provides a tanh function? Actually AscendC kernel operator library includes tanh? I think AscendC provides `AscendC::Tanh` for local tensors. We can use that! That would drastically simplify the kernel and avoid manual tanh approximation. However, the documentation search returned no matches, and the environment may not support Tanh. But the leaky_relu example used only basic arithmetic. The AscendC operator library likely includes Tanh. If we use Tanh, the kernel becomes much simpler and less prone to UB errors.
+
+Let's check: In AscendC, there is `AscendC::Tanh` (maybe in math.h). The kernel_operator.h includes various math functions. We can try using `AscendC::Tanh`. The user instruction didn't restrict using built-in functions. So we should use `AscendC::Tanh` to compute the hyperbolic tangent. This eliminates the need for multiple temp buffers.
+
+Thus, we can reduce temp buffers to one or two. We'll use:
+- xLocal (input)
+- yLocal (output)
+- tmp1 for intermediate
+
+Compute:
+1. tmp1 = x * x  (x^2)
+2. tmp1 = tmp1 * x (x^3)
+3. tmp1 = 0.044715f * tmp1
+4. tmp1 = x + tmp1
+5. tmp1 = 0.79788456f * tmp1   // z = sqrt(2/pi)*(x+0.044715*x^3)
+6. AscendC::Tanh(tmp1, tmp1, len)  // tanh(z) in-place
+7. tmp1 = 1.0f + tmp1
+8. yLocal = 0.5f * x
+9. yLocal = yLocal * tmp1
+
+That's only 1 temp buffer. Actually we need one more for the multiplication in step 2? We can reuse tmp1. Let's check step 1: tmp1 = x * x (requires source x and destination tmp1). Step 2: tmp1 = tmp1 * x (tmp1 and x). That works if tmp1 is overwritten. So we only need one temp buffer besides x and y. But we also need to keep x for later (step 8). x is still in queue. So we can use tmp1 for all intermediates. So total buffers: input queue (1), output queue (1), temp queue (1). That's 3 * tileLen * 4 = 12 * tileLen bytes. UB_BUDGET_BYTES/12 = 16384 elements for 192KB. That is safe.
+
+So we need to modify tiling to use 12 bytes per element instead of 28. Also modify kernel to use only one temp queue and use AscendC::Tanh.
+
+But is AscendC::Tanh available? The ascends docs show that math operations like Tanh are available in `kernel_operator.h`? I believe so. In the leaky_relu example they used Mins, Muls, Add which are basic. Tanh might be in `math.h`. However, to be safe, we can include `"math.h"` or use the AscendC namespace. Since the environment compiled successfully the previous kernel, adding Tanh should work if it's available.
+
+Alternatively, we can keep the manual tanh approximation but reduce temps. Using Tanh simplifies.
+
+Given the error logs show "VEC instruction error: the ub address out of bounds", it's likely that the manual approximation's many temps caused the buffer allocation to exceed UB. So using Tanh will reduce temp usage and likely fix the issue.
+
+We also need to ensure that the tiling calculation aligns properly. Since we now have 3 queues (in, out, temp) each of tileLen floats, total bytes = 3*tileLen*4 = 12*tileLen. So we set UB_BUDGET_BYTES / 12.
+
+Also, we should keep the tiling's ALIGN_ELEMS to 2048 or maybe 256? But 2048 is fine.
+
+Now, the kernel function's Init signature must match the tiling data. The previous kernel had only totalLength and tileLength. Since we still have no negative slope, the tiling data remains the same (totalLength, tileLength, blockDim). So no change there.
+
+Also, the host_operator_src tiling calculation must be updated to reflect the new UB budget (dividing by 12). We'll change that.
+
+Now, the kernel_src: we need to modify the class to have only one temp queue, and use Tanh. Also, we need to include the appropriate header for Tanh? The standard AscendC kernel includes "kernel_operator.h", which typically includes math functions. We can try using `AscendC::Tanh`. If not, we can use a built-in function `AscendC::Tanh` from `math.h`. Let's include `"math.h"` for safety.
+
+We also need to adjust the kernel entry point to call Init with tiling data. The previous attempt had Init with totalLength and tileLength. We'll keep that.
+
+Now, we need to produce the corrected code snippets: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+We'll modify:
+
+- project_json_src: unchanged (no attrs).
+- host_tiling_src: unchanged (no negativeSlope field).
+- host_operator_src: change UB_BUDGET_BYTES calculation from /28 to /12. Also ensure the tiling algorithm aligns properly.
+- kernel_src: rewrite to use one temp queue, use AscendC::Tanh.
+- python_bind_src: unchanged (calls aclnnGeluCustom).
+- model_src: unchanged.
+
+We need to be careful about the kernel's Process loop: the grid-strided loop works fine.
+
+Let's write the corrected kernel_src:
+
+```cpp
+#include "kernel_operator.h"
+#include "math.h"   // for Tanh if needed
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelGeluCustom {
+public:
+    __aicore__ inline KernelGeluCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileLength)
+    {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0 || tileLen_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        const uint32_t strideElems = blockNum * tileLen_;
+        uint32_t base = blockIdx * tileLen_;
+        if (base >= totalLen_) return;
+
+        uint32_t curLen = totalLen_ - base;
+        if (curLen > tileLen_) curLen = tileLen_;
+        CopyIn(base, curLen);
+
+        while (true) {
+            const uint32_t nextBase = base + strideElems;
+            uint32_t nextLen = 0;
+            if (nextBase < totalLen_) {
+                nextLen = totalLen_ - nextBase;
+                if (nextLen > tileLen_) nextLen = tileLen_;
+                CopyIn(nextBase, nextLen);
+            }
+
+            Compute(curLen);
+            CopyOut(base, curLen);
+
+            if (nextLen == 0) break;
+            base = nextBase;
+            curLen = nextLen;
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm_[gmOffset], len);
+        inQueueX_.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+        AscendC::LocalTensor<float> tmp = tmpQueue_.AllocTensor<float>();
+
+        // GELU: 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+        constexpr float c1 = 0.7978845608028654f;  // sqrt(2/pi)
+        constexpr float c2 = 0.044715f;
+
+        // tmp = x^2
+        AscendC::Mul(tmp, xLocal, xLocal, len);
+        // tmp = x^3
+        AscendC::Mul(tmp, tmp, xLocal, len);
+        // tmp = c2 * x^3
+        AscendC::Muls(tmp, tmp, c2, len);
+        // tmp = x + c2*x^3
+        AscendC::Add(tmp, xLocal, tmp, len);
+        // tmp = c1 * tmp   (z)
+        AscendC::Muls(tmp, tmp, c1, len);
+
+        // tanh(z) in-place
+        AscendC::Tanh(tmp, tmp, len);
+
+        // tmp = 1 + tanh(z)
+        AscendC::Adds(tmp, tmp, 1.0f, len);
+        // yLocal = 0.5 * x
+        AscendC::Muls(yLocal, xLocal, 0.5f, len);
+        // yLocal = yLocal * tmp
+        AscendC::Mul(yLocal, yLocal, tmp, len);
+
+        tmpQueue_.FreeTensor(tmp);
+        outQueueY_.EnQue<float>(yLocal);
+        inQueueX_.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueueY_.DeQue<float>();
+        AscendC::DataCopy(yGm_[gmOffset], yLocal, len);
+        outQueueY_.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalLen_ {0};
+    uint32_t tileLen_ {0};
+};
+
+extern "C" __global__ __aicore__ void gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGeluCustom op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength);
+    op.Process();
+}
+```
+
+Now, update host_operator_src tiling calculation: change UB_BUDGET_BYTES / 28 to / 12. Also, we might want to keep ALIGN_ELEMS maybe smaller to avoid unnecessary padding? But 2048 is fine.
+
+Also, note that the kernel no longer uses tmpQueue multiple times, so UB usage is 3 * tileLen * 4 = 12*tileLen. So we change the divisor to 12.
+
+Let's write the corrected host_operator_src:
+
+```cpp
+#include "gelu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
+static constexpr uint32_t ALIGN_ELEMS = 2048;
+static constexpr uint32_t HARD_CAP_ELEMS = 32768;
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a)
+{
+    return (x / a) * a;
+}
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b)
+{
+    return (a + b - 1u) / b;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    GeluCustomTilingData tiling;
+    const uint32_t totalLength =
+        static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+
+    // UB: inQueueX + outQueueY + tmpQueue = 3 floats per element => 12 bytes per element
+    uint32_t maxTile = UB_BUDGET_BYTES / 12;  // elements
+    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
+    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
+
+    uint32_t tileLen = maxTile;
+    if (totalLength < tileLen) {
+        uint32_t aligned = AlignDown(totalLength, ALIGN_ELEMS);
+        tileLen = (aligned > 0) ? aligned : totalLength;
+    }
+
+    const uint32_t numTiles = (tileLen == 0) ? 1u : CeilDiv(totalLength, tileLen);
+    uint32_t blockDim = numTiles;
+    if (blockDim < 8u) blockDim = 8u;
+    if (blockDim > 24u) blockDim = 24u;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileLength(tileLen);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+// rest unchanged (InferShape, InferDataType, OpDef class)
+```
+
+We also need to ensure that the host_operator_src includes the header `"kernel_operator.h"`? No, it's for tiling. It includes `"gelu_custom_tiling.h"` which is generated from tiling header.
+
+Now, the other files remain unchanged.
+
+We should also consider if we need to include "math.h" in kernel_src. To be safe, we can include it after kernel_operator.h.
+
+Now, produce the final answer with the six strings.

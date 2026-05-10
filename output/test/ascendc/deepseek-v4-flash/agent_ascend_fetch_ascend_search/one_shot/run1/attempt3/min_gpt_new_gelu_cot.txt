@@ -1,0 +1,65 @@
+We need to fix the kernel error: "VEC instruction error: the ub address out of bounds". The error indicates that the kernel is accessing UB (Unified Buffer) out of bounds. This is likely due to incorrect tile size or buffer allocation. In the previous attempt, the kernel uses 4 temporary queues (tmpQueue1..4) each of size tileLen_ floats. However, the tiling calculation assumed 8 * tile floats (32 bytes per element? Actually 32 * tileLen_ bytes) but the actual usage is: inQueueX: 2*tile, outQueueY: 2*tile, tmpQueue1..4: 4*tile => total 8*tile floats = 32*tileLen_ bytes. So the tiling budget seems consistent. But the error "ub address out of bounds" might be due to misalignment or the TileLen being too large relative to UB size. Also note that the Tanh operation may require additional temporary space internally? But the error occurs at pc offset 0xd24, which is in the kernel. Could be that the tileLen is not properly aligned to 64-byte or 32-byte boundaries? AscendC typically requires alignment to 32 or 64 bytes for vector operations. In tiling, we AlignDown to 2048 elements (which is 8192 bytes), that should be fine. However, the error might be because the totalLength is not a multiple of tileLen? But we handle last tile with curLen.
+
+Another possibility: The kernel uses 4 tmp queues, but each queue is a single buffer of tileLen_ floats. However, the intermediate operations like Tanh might use the same queue and possibly overlap? The error "vec instruction error: the ub address out of bounds" suggests that a vector instruction (like Mul, Tanh) is accessing memory outside the allocated buffer. Could be that the tileLen is too large such that the combined usage of all queues exceeds UB size. UB size on ascend910b is 192KB per core? But we already budget 192KB. However, each queue is allocated separately, so total UB usage = (2+2+4)*tileLen_*4 bytes = 8*tileLen_*4 = 32*tileLen_ bytes. With UB_BUDGET_BYTES=192*1024, maxTile = 192*1024/32 = 6144 elements. But we AlignDown to 2048, so maxTile = 2048? Actually AlignDown(6144, 2048) = 4096? Wait: 6144/2048=3, so AlignDown is 3*2048=6144? Actually AlignDown(x, a) = (x/a)*a, so 6144/2048=3, 3*2048=6144. So maxTile could be 6144, but then we cap at HARD_CAP_ELEMS=32768, so maxTile=6144. Then tileLen = min(maxTile, totalLength). For totalLength = 8192*8192 = 67108864? Actually batch_size=8192, dim=8192 => total elements = 8192*8192=67108864. So tileLen = 6144. That's fine. But then the UB usage would be 32*6144=196608 bytes, which is slightly over 192KB? 196608 > 196608? Actually 192KB = 196608 bytes, exactly. So it's exactly at the limit. That might be okay but could be borderline. Also we need to consider that the Tanh operation might require extra workspace. In AscendC, Tanh may use internal temporary buffers. That could cause out-of-bounds.
+
+We should reduce the UB budget or make the tile size smaller. A common practice is to use a conservative UB budget like 128KB or less to leave room for system overhead. In the original leaky_relu example, they used 192KB and 5*tile floats (bytes=20*tile). So they had more slack. For this kernel with 8*tile floats, we need to reduce the budget. Let's set UB_BUDGET_BYTES = 160 * 1024 (160KB) to allow some headroom. Also ensure alignment to 64 bytes? VEC instructions require 32-byte alignment? Actually 32-byte alignment for float? Let's align to 64 elements (256 bytes) to be safe.
+
+Also, there is a potential issue: the tmpQueue1..4 are allocated as single buffers, but they are used in sequence and freed. However, in AscendC, temporaries allocated from VECCALC queue are not overlapping with VECIN/VECOUT? They are separate. But we must ensure that the total UB used by all live tensors does not exceed UB size. The pattern: we allocate xLocal from inQueueX, then allocate x2, x3, inner, tanhVal from tmp queues. At that point, we have xLocal, x2, x3, inner, tanhVal all live. That's 5*tileLen_ floats (xLocal is from VECIN, not VECCALC). So VECCALC usage is 4*tileLen_, VECIN uses 2*tileLen_ (double buffer), VECOUT uses 2*tileLen_. But the double buffer for VECIN means two buffers of tileLen? Actually BUFFER_NUM=2, so inQueueX has two buffers. But we only allocate one at a time. So max live tensors: one from inQueueX (tileLen), one from outQueueY (tileLen), and four from tmp queues (4*tileLen) = total 6*tileLen floats = 24*tileLen bytes. With tileLen=6144, that's 147456 bytes, well within 192KB. But wait, the double buffering may cause the other buffer to be allocated but not live? Actually when we alloc from inQueueX, we get one buffer; the other buffer might be still occupied if not freed? But we free xLocal after compute. So it's fine.
+
+But the error still occurs. Perhaps the issue is that the Tanh instruction causes internal memory allocation and overwrites. A safer approach is to combine the temporary queues into fewer to reduce fragmentation. Or use a single large temporary buffer and partition it manually. But that may be complex.
+
+Another possibility: The tiling calculation for blockDim might be too high, causing many cores to access overlapping regions? No, grid stride ensures no overlap.
+
+Let's look at the error: "vec instruction error: the ub address out of bounds" and "CCU instruction address check error". This might be due to misaligned access. The DataCopy and vector operations require addresses to be 32-byte aligned. Our tileLen is aligned to 2048 elements (8192 bytes), which is 32-byte aligned. So that's fine.
+
+Maybe the issue is that the totalLength is not a multiple of tileLen, and the last tile has len less than tileLen. But the queues are allocated with tileLen_ size. When we do Compute with len < tileLen_, the operations are only on the first len elements, but the buffer is larger. That should be fine. However, the Tanh instruction may require the input to be a full tile? It should work with any length. But the AscendC Tanh might have alignment requirements on the length? Possibly need to be multiple of 32 or 64. We should ensure that len is aligned to 64 bytes (16 floats). In the tiling, we already align tileLen to ALIGN_ELEMS=2048, which is a multiple of 64. But the last tile may have any length. To avoid issues, we can pad the last tile to be a multiple of 32 bytes. But that would require extra logic. Alternatively, we can enforce that tileLen is also a multiple of 32 (which it is) and that the totalLength is padded? No.
+
+Another common cause: The GM_ADDR pointers might be misaligned? But they are from PyTorch tensors which are aligned.
+
+Let's look at the previous attempt's kernel: It uses a grid-stride loop with double buffering. The copy-in for next tile is done while computing current. That should be fine.
+
+But the error might be due to the use of multiple tmp queues. In AscendC, VECCALC queues are used for intermediate computations, but they might interfere. There's a known issue: using multiple VECCALC queues can cause out-of-bounds if not properly managed. Maybe we should use a single VECCALC queue and reuse it for each temp. For example, use one temporary buffer and do operations sequentially, freeing and reallocating. That would reduce total UB usage.
+
+Let's modify the kernel to use only one temporary queue (tmpQueue) and reuse it for each step. Since the operations are sequential, we can reuse the same buffer. We'll allocate x2, then free, then allocate x3, free, etc. But we need to be careful: the AddMul sequence requires keeping xLocal alive. We can do:
+
+- Allocate tmp = tmpQueue_.AllocTensor<float>() for x2 = x*x
+- Then reuse for x3 = x2 * x (but x2 is still needed? Actually after computing x3, we no longer need x2, so we can reuse the same buffer for x3 by freeing and reallocating? But we need to ensure that after freeing, the buffer is returned to the queue. However, we cannot allocate again in the same function if we free and then alloc again? In AscendC, you can free and then alloc again; it should give you the same buffer. But the order might be tricky. Simpler: use a single temp buffer and manually compute in steps, overwriting. For example:
+
+tmp = x^2
+tmp = tmp * x  (now tmp is x^3)
+tmp = coeff * tmp
+tmp = x + tmp (inner)
+tmp = sqrt2pi * tmp
+tanhVal = tanh(tmp)  // need another buffer? We can reuse a second temp? Or we can use the same? Tanh returns to a separate buffer, so we need an output buffer. We can have two temp queues: tmp1 for intermediate, tmp2 for tanh result. That would reduce from 4 to 2 temp queues.
+
+Actually, we can do with 2 temps: one for intermediate, one for tanh result. Then total UB usage: inQueueX (1*?), outQueueY (1*?), tmp1, tmp2: total 4*tile floats = 16*tile bytes. That's less than before. Also we can set BUFFER_NUM=1 for input? But double buffering is needed for overlap. However, we can keep double buffering for in/out but use single buffer for temps? That's fine.
+
+But the error might be due to large tile size. Let's also reduce UB budget to 128KB to be safe.
+
+Let's compute: with 4*tile floats (16 bytes per float? No, float=4 bytes). Actually 4*tile*4 = 16*tile bytes. With UB_BUDGET=128KB=131072 bytes, max tile = 131072/16 = 8192 elements. Align down to 2048 gives 8192? Actually 8192 is multiple of 2048. So tileLen could be up to 8192. For totalLength=67M, tileLen=8192 is fine.
+
+But we also need to account for double buffering: inQueueX has 2 buffers, but they are not all live simultaneously? Actually during Compute, we have one from inQueueX, one from outQueueY, and two temps. So live floats: 1+1+2 = 4*tile, bytes=16*tile. For tile=8192, that's 131072 bytes, exactly 128KB. That's okay. But the double buffering means the other buffer is already allocated but not in use? Actually when we alloc from inQueueX, we get one buffer; the other buffer may be still allocated from previous iteration if not freed? But we free after compute. So at any point, only one buffer per queue is allocated. So total live is 4*tile.
+
+Given the error, we should also ensure that the tile length is not too large for the Tanh instruction. Tanh may have internal workspace that we are not accounting for. The AscendC Tanh might require a temporary buffer internally. So we should leave more headroom. Let's set UB_BUDGET_BYTES = 96 * 1024 (96KB). Then max tile = 96KB / 16 = 6144? Actually 96*1024/16=6144. That gives tileLen=6144. That leaves 96KB used. That should be safe.
+
+But we need to adjust the tiling code accordingly.
+
+Also, note that the previous attempt's tiling did not include a negativeSlope field, but that's fine.
+
+Now, fix the kernel to use only two temp queues (tmpQueue1_ and tmpQueue2_). We'll compute step by step, reusing tmpQueue1_ for intermediate results, and tmpQueue2_ for tanh output.
+
+Also, ensure that the last tile length is handled correctly. The CopyIn and Compute use len which may be less than tileLen_. That should be fine as long as operations support variable length. The vector instructions (Mul, Muls, Add, Adds, Tanh) all take a length parameter, so they work with any positive length.
+
+One more potential issue: The DataCopy for the next tile might overwrite the current xLocal if the buffer is reused? But we are using double buffering, so next tile goes into a different buffer. That's fine.
+
+Let's rewrite the kernel.
+
+Also, check the host_operator_src: the UB model in comments should be updated. We'll change to 4*tile floats.
+
+We need to keep the Python model_src, python_bind_src, project_json_src unchanged (except maybe the UB model comment). The error is in kernel execution, so likely kernel or tiling.
+
+We'll also modify the kernel_src to use only two temp queues and reduce UB budget in tiling.
+
+Let's produce the corrected code.
+
+We'll output the six strings as in the example.

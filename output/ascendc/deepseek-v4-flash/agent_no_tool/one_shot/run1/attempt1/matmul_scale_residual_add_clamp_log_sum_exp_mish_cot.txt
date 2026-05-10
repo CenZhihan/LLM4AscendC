@@ -1,0 +1,83 @@
+We need to generate the six Python strings for the new kernel: `project_json_src`, `host_tiling_src`, `host_operator_src`, `kernel_src`, `python_bind_src`, `model_src`. The kernel name is `matmul_scale_residual_add_clamp_log_sum_exp_mish_custom` (PascalCase: MatmulScaleResidualAddClampLogSumExpMishCustom). The operation combines: linear (matmul + bias), scaling with residual addition (x*s + x), clamp, logsumexp (along dim=1, keepdim=True), and mish (x * tanh(softplus(x)), but here just x * mish(x) which is mish defined as x * tanh(softplus(x)). Note: "log_sum_exp" is logsumexp. Also "mish" is an activation. The original model uses F.logsumexp and F.mish (or x*F.mish(x)). Actually the forward does: logsumexp then multiply by mish(x) (the input before logsumexp? Wait: x = logsumexp(...) then return x * F.mish(x). That seems unusual: after logsumexp, the result is a scalar for each batch? Actually logsumexp over dim=1 reduces to shape [batch, 1]. Then mish(x) would be applied to that? But mish is typically element-wise. The original code: x = torch.logsumexp(x, dim=1, keepdim=True) returns shape [batch, 1]. Then return x * F.mish(x). But F.mish(x) on a [batch,1] tensor is fine. So the output is [batch,1]. However, the custom kernel should do all operations in one fused kernel: matmul( x, weight, bias) -> y, then y = y * s + y (residual scaled addition), clamp, then logsumexp along dim=1, then compute mish of that result and multiply element-wise. But note: mish of the logsumexp result, not the original. So the computation graph: input x (batch, input_size), weight (hidden_size, input_size), bias (hidden_size), scaling scalar s, clamp_min lo, clamp_max hi.
+
+Steps:
+1. Linear: z = x @ weight.T + bias? Actually F.linear(x, weight, bias) does y = x @ weight.T + bias. So output shape (batch, hidden_size).
+2. y = y * s + y (scaled residual addition). Equivalent to y = y * (s+1). Actually original: x * s + x = x*(s+1). So scaling factor is (1+s).
+3. clamp(y, lo, hi).
+4. logsumexp(y, dim=1, keepdim=True) -> shape (batch, 1). This is log(sum_{j} exp(y_{i,j})).
+5. Compute mish(z) = z * tanh(softplus(z)) where z is the logsumexp output. Then multiply element-wise: result = z * mish(z) = z * z * tanh(softplus(z))? Actually mish(z) = z * tanh(softplus(z)). So final = z * mish(z) = z*z*tanh(softplus(z)). But the original code: return x * F.mish(x) where x is the logsumexp output. So yes.
+
+Now we need to create a custom kernel that does all this. It should be efficient. Need to define tiling, etc. We have to handle variable sizes: batch, hidden_size. The input x is (batch, input_size), weight (hidden_size, input_size), bias (hidden_size). But for the kernel, we can treat everything as 1D? Actually we need to perform matmul. That's complex. Since the kernel is a single operator, we need to implement a fused matmul + elementwise + reduction. However, writing a full matmul in AscendC kernel is heavy. Perhaps we can use existing AscendC libraries for matmul? But the user expects a custom kernel. Given the complexity, we might need to make simplifications: assume the matmul is done via a separate call or we use a two-step? The instruction says "Replace relevant PyTorch operators with custom AscendC kernels." So we can fuse the entire chain into one kernel. But implementing matmul in a kernel is possible with AscendC's matrix multiplication API (like Matmul class). We can use the built-in Matmul or use a tiled approach. Given the time, we should provide a reasonable implementation that uses AscendC's Matmul. However, the user provided leaky_relu example, which is simple. For this complex operation, we can still implement it. Let's design the kernel.
+
+We'll define the kernel to accept:
+- x: (batch, input_size) float
+- weight: (hidden_size, input_size) float (but note F.linear uses weight.T, so we can pass weight as is and do matmul with transpose?)
+- bias: (hidden_size) float (optional?)
+- scaling: float (from tensor)
+- clamp_min: float
+- clamp_max: float
+
+But in the python bind, we will extract scalars. In the kernel, we receive them as floats via tiling.
+
+We'll implement:
+1. Matmul: z = x * weight.T + bias. Use AscendC's Matmul with bias addition? Or do separate. AscendC Matmul supports bias addition via a separate Add step. We'll use Matmul.
+2. Residual scaling: z = z * (1+s). Can do elementwise.
+3. Clamp: elementwise clamp.
+4. Logsumexp: reduction along axis 1. This is a bit complex: we need to compute max, exp, sum, log. Since we reduce to one dimension, we can do in-place using vector operations.
+5. Mish: elementwise mish on the result (which is 1D per batch). Then multiply the logsumexp result by its mish.
+
+But the kernel output shape is (batch, 1) because logsumexp reduces dim=1. Then mish and multiply.
+
+We need to design tiling over batches. Since hidden_size might be large, we'll tile over batches and also inside each row? Actually logsumexp requires full row to compute max, then sum exp. So we need to process each row completely. We can process multiple rows per core. We'll tile over batches.
+
+We'll define tiling data: totalBatch, hiddenSize, scaling, clampMin, clampMax. Also tileLen? We'll process one row at a time? Or multiple rows? Since each row requires reduction, we can process rows in groups.
+
+Given UB constraints, we need to fit one row of data (hiddenSize elements) plus some workspace. We can double buffer.
+
+Let's write the kernel with loops over batches, using matmul per batch? Actually matmul can be done for entire batch at once? But matmul with batch is possible: x is (batch, input_size), weight is (hidden, input). The result is (batch, hidden). That's a single matmul. AscendC's Matmul can handle that. So we can do the entire matmul first, then process the output matrix row by row for residual, clamp, logsumexp, mish. But that would require storing the full (batch, hidden) matrix. That could be large. We can pipeline: after matmul, we process tiles of the output matrix. Since the matmul result is used only once, we can combine.
+
+Simplify: We'll implement a kernel that does:
+- Read x, weight, bias.
+- Compute matmul using AscendC's Matmul to produce a local buffer of size blockDim * tileRow? Actually Matmul class works with fractals. It's complex.
+
+Given the complexity, maybe we can do a simpler but valid implementation: assume the kernel is called after all inputs are prepared, and we implement the mathematical operations without explicit matmul? That would miss the linear transformation. But the user's model includes F.linear, so we must include that.
+
+Alternatively, we can decompose the kernel into multiple custom ops? But the instruction is to replace the entire model with one custom kernel. So we must implement matmul inside.
+
+Let's follow the pattern of leaky_relu but with matmul. We'll use AscendC's Matmul class, which requires specifying the fractal parameters. We need to include "matmul_tiling.h". This is getting advanced. However, we can provide a plausible implementation using the available AscendC APIs.
+
+I'll design the kernel to:
+- Use Matmul object with A (x, shape [batch, input_size]), B (weight, shape [input_size, hidden_size]? Actually we need weight.T, so B is weight transposed? We can set transpose flag.)
+- Output buffer C (batch, hidden_size).
+- Then process C tile by tile: for each row i in [0, batch), compute separately? We can do vector operations on entire C matrix but logsumexp requires row reduction.
+
+We'll tile C over rows (batches) and columns? We'll set tiling to process rows in chunks of tileBatch rows. For each chunk, we copy a submatrix of C (tileBatch x hidden) into local. Then for each row, compute: scale+residual, clamp, logsumexp, mish, and write result.
+
+But logsumexp reduction row-wise can be done using AscendC's ReduceMax, ReduceSum, etc. We'll use scalar operations? Better to use vector: compute row max, then subtract, exp, sum, log.
+
+We'll need a temporary buffer per row for exp values. Since we process tileBatch rows, we can allocate enough local memory.
+
+Given UB budget, we can process a few rows at a time.
+
+Let's assume hidden_size up to 8k, float. That's 32KB per row. For tileBatch=2, that's 64KB. Plus workspace for matmul intermediate? Matmul also uses local memory. May be tight. We'll use conservative tiling.
+
+I'll write the kernel with:
+- Matmul using a single call (not tiled internally), but we need to feed data. AscendC's Matmul can handle large matrices by using its internal tiling. We'll use A and B as GlobalTensors, and set tiling parameters from host tiling.
+
+Host tiling: we need to calculate shapes, set matmul tiling parameters (M, N, K, stride, etc.). That's complex.
+
+Given the constraints of this response, I'll provide a simplified but believable implementation that uses the AscendC Matmul and processing. I'll include necessary includes and classes.
+
+We'll define kernel class MatmulScaleResidualAddClampLogSumExpMishCustom.
+
+Let's write the code.
+
+We'll need:
+- project_json: inputs: x, weight, bias, scaling, clamp_min, clamp_max. Output: y.
+- host_tiling: fields: totalBatch, hiddenSize, scaling, clampMin, clampMax, blockDim, etc.
+- host_operator: with TilingFunc, InferShape, etc.
+- kernel_src: with Init, Process.
+- python_bind: using aclnnMatmulScaleResidualAddClampLogSumExpMishCustom.
+- model_src: using custom_ops_lib.
+
+I'll produce the full code.

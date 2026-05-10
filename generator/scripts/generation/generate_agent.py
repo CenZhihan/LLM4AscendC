@@ -3,6 +3,7 @@ from __future__ import annotations
 # 使用智能体生成算子 Kernel（支持 KB、Web、Code RAG 多源检索）
 import os
 import sys
+from typing import Optional
 
 # 添加项目根目录到 sys.path
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -28,7 +29,15 @@ from generator.agent.agent_config import (
 
 from generator.agent.retrievers.code_retriever import CodeRetriever
 from generator.dataset import dataset
+from generator.test_set_ops import TEST_SET_CATEGORY, select_ops_by_categories
 from generator.config import rag_index_path, rag_embedding_model
+
+
+def _normalize_ascend_search_version(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    t = str(value).strip()
+    return t or None
 
 
 def _load_code_retriever():
@@ -50,6 +59,7 @@ def _generate_one_op(
     code_retriever: CodeRetriever,
     strategy: str,
     llm_config: dict,
+    ascend_search_version_filter: Optional[str] = None,
 ):
     """Single operator generation task."""
     out_path = os.path.join(out_dir, f"{op}.txt")
@@ -72,6 +82,7 @@ def _generate_one_op(
             tool_mode=tool_mode,
             retriever=code_retriever,
             llm_config=llm_config,
+            ascend_search_version_filter=ascend_search_version_filter,
         )
 
         # Write output
@@ -128,7 +139,7 @@ def main():
         "--categories",
         nargs='+',
         default=['all'],
-        help="算子类别列表 (默认: all)"
+        help="算子类别列表 (默认: all)。可使用虚拟类别 test_set 表示固定的 12 个评测算子（见 generator/test_set_ops.py）"
     )
     parser.add_argument(
         "--runs",
@@ -164,6 +175,15 @@ def main():
         action="store_true",
         help="测试模式：默认输出根目录改为 output/test/ascendc（仅在未传 --output-dir 时生效）",
     )
+    parser.add_argument(
+        "--ascend-search-version",
+        default=None,
+        metavar="SUBSTRING",
+        help=(
+            "Ascend 官网文档搜索：按返回条目的 version 字段子串过滤（如 9.0.0）；"
+            "省略则不限制版本。适用于 ascend_search + ascend_fetch 等组合。"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -182,6 +202,16 @@ def main():
     except ValueError as e:
         print(f"[ERROR] Invalid --tool-mode: {e}")
         raise SystemExit(2) from e
+    ascend_vf = _normalize_ascend_search_version(args.ascend_search_version)
+    if ascend_vf is not None:
+        from generator.agent.agent_config import has_ascend_fetch, has_ascend_search
+
+        if not (has_ascend_search(tool_mode) and has_ascend_fetch(tool_mode)):
+            print(
+                "[WARN] --ascend-search-version 通常在同时启用 ascend_search 与 ascend_fetch 时使用；"
+                f"当前 ascend_search={has_ascend_search(tool_mode)}, "
+                f"ascend_fetch={has_ascend_fetch(tool_mode)}。"
+            )
     strategy = args.strategy
     workers = args.workers
 
@@ -190,18 +220,30 @@ def main():
     print(f"[INFO] Strategy: {strategy}")
     print(f"[INFO] Workers: {workers}")
     print(f"[INFO] Categories: {args.categories}")
+    print(f"[INFO] ascend_search_version_filter={ascend_vf!r}")
 
-    # Get operator list
-    all_ops = list(dataset.keys())
-    if args.categories != ['all']:
-        all_ops = [op for op in all_ops if dataset[op]['category'] in args.categories]
+    if (
+        args.categories != ["all"]
+        and TEST_SET_CATEGORY in args.categories
+        and len(args.categories) > 1
+    ):
+        print(
+            "[WARN] --categories 含 test_set 且还有其他类别名；仅使用 test_set 固定的算子列表，其它类别名忽略。"
+        )
+
+    # Get operator list（test_set 保持定义顺序，其余按字母序）
+    all_ops, preserve_order = select_ops_by_categories(args.categories, dataset)
 
     if args.kernelbench102:
         from generator.kernelbench102_ops import KERNELBENCH102_OP_SET
-        all_ops = [op for op in all_ops if op in KERNELBENCH102_OP_SET]
+        if preserve_order:
+            all_ops = [op for op in all_ops if op in KERNELBENCH102_OP_SET]
+        else:
+            all_ops = sorted([op for op in all_ops if op in KERNELBENCH102_OP_SET])
         print(f"[INFO] KernelBench102 filter: {len(all_ops)} ops")
 
-    all_ops = sorted(all_ops)
+    if not preserve_order:
+        all_ops = sorted(all_ops)
     print(f"[INFO] Total ops to generate: {len(all_ops)}")
 
     # Pre-load Code RAG retriever if needed
@@ -241,8 +283,15 @@ def main():
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(
-                    _generate_one_op, op, dataset[op]['category'],
-                    out_dir, tool_mode, code_retriever, strategy, llm_config
+                    _generate_one_op,
+                    op,
+                    dataset[op]["category"],
+                    out_dir,
+                    tool_mode,
+                    code_retriever,
+                    strategy,
+                    llm_config,
+                    ascend_vf,
                 ): op
                 for op in ops_to_process
             }

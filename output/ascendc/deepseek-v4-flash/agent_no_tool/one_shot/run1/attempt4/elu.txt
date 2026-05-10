@@ -1,0 +1,301 @@
+```python
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelEluCustom {
+public:
+    __aicore__ inline KernelEluCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileLength,
+                                float alpha)
+    {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+        alpha_ = alpha;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(expTmp_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(onesTmp_, 1, tileLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0 || tileLen_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        // Tile-granularity grid-stride for load balance and occupancy.
+        const uint32_t strideElems = blockNum * tileLen_;
+        uint32_t base = blockIdx * tileLen_;
+        if (base >= totalLen_) return;
+
+        // Prefetch first tile
+        uint32_t curLen = totalLen_ - base;
+        if (curLen > tileLen_) curLen = tileLen_;
+        CopyIn(base, curLen);
+
+        while (true) {
+            // Prefetch next tile early for overlap
+            const uint32_t nextBase = base + strideElems;
+            uint32_t nextLen = 0;
+            if (nextBase < totalLen_) {
+                nextLen = totalLen_ - nextBase;
+                if (nextLen > tileLen_) nextLen = tileLen_;
+                CopyIn(nextBase, nextLen);
+            }
+
+            Compute(curLen);
+            CopyOut(base, curLen);
+
+            if (nextLen == 0) break;
+            base = nextBase;
+            curLen = nextLen;
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm_[gmOffset], len);
+        inQueueX_.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+        AscendC::LocalTensor<float> expLocal = expTmp_.AllocTensor<float>();
+        AscendC::LocalTensor<float> onesLocal = onesTmp_.AllocTensor<float>();
+        AscendC::LocalTensor<float> negMask = onesTmp_.AllocTensor<float>(); // reuse onesTmp_ after filling? Need separate.
+        // Actually we need two tensors: expLocal and mask. Let's allocate mask from another queue.
+        // We'll create a separate queue for mask.
+        // But we already have onesTmp_. Let's use it for ones and then reuse for mask after filling? No, because we need ones for subtraction.
+        // Better: use expTmp_ for exp, and use onesTmp_ for mask. But we also need ones. So we need two temps: expTmp_ and maskTmp_.
+        // Let's restructure: we have expTmp_ (size tileLen) for exp, and we'll allocate a separate onesTmp_ for the ones constant.
+        // For mask, we can reuse the same buffer after filling? But we need both ones and mask simultaneously? 
+        // We'll compute mask after exp subtraction. So we can allocate mask from onesTmp_ buffer after we are done with ones.
+        // Let's fill onesLocal with 1.0f.
+        AscendC::Fill(onesLocal, len, 1.0f);
+        
+        // Compute alpha * (exp(x) - 1)
+        AscendC::Exp(expLocal, xLocal, len);
+        AscendC::Sub(expLocal, expLocal, onesLocal, len);
+        AscendC::Muls(expLocal, expLocal, alpha_, len);
+        
+        // Now compute mask = x > 0 ? 1.0 : 0.0
+        // We can use Compare and Select, but we want to avoid Sel. Instead, use Max/Min trick:
+        // Let pos = max(x, 0.0f); then mask = (pos == x) ? 1.0 : 0.0? Hard.
+        // Alternative: use AscendC::Select if available. The error said 'Sel' not 'Select'. Try 'Select'.
+        // We'll attempt to use Select with a comparison tensor.
+        // Generate comparison: x > 0.0f gives a bool tensor (int8). Use VCmp? 
+        // Actually AscendC has VCmp for elementwise comparison returning int8 mask.
+        // Then we can use Select option.
+        // Let's use VCmp and Select. VCmp returns a tensor of int8 with 1 for true.
+        AscendC::LocalTensor<int8_t> maskLocal = onesTmp_.ReinterpretCast<int8_t>(); // use same buffer but as int8
+        // But onesTmp_ is float. Reinterpret to int8. Ensure size: float*len = 4*len bytes, int8*len = len bytes, safe.
+        // We'll fill mask with 0 first? Actually we can use VCmp which may produce values.
+        AscendC::VCmp(maskLocal, xLocal, 0.0f, AscendC::CMPMODE::GT, len);
+        
+        // Now select using mask. AscendC::Select expects condition as int8 tensor.
+        // Use Select: y = mask ? x : expLocal
+        AscendC::Select(yLocal, xLocal, expLocal, maskLocal, len);
+        
+        // Free tensors
+        expTmp_.FreeTensor(expLocal);
+        onesTmp_.FreeTensor(onesLocal); // actually we reused onesTmp_ for mask, so free after use? We'll free both.
+        // But we allocated onesLocal and then reused the buffer for maskLocal. Need to be careful with queue management.
+        // Better to separate: allocate maskLocal from a different queue or use the same queue but only one tensor per queue.
+        // Simpler: use separate queues: expTmp_ for exp, onesTmp_ for ones, maskTmp_ for mask.
+        // Let's add maskTmp_ queue in Init. Then we don't have to reinterpret.
+        // For now, to match the original attempt's structure, let's keep it simple and use Select with VCmp.
+        // We'll fix by adding a third queue for mask.
+        
+        outQueueY_.EnQue<float>(yLocal);
+        inQueueX_.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueueY_.DeQue<float>();
+        AscendC::DataCopy(yGm_[gmOffset], yLocal, len);
+        outQueueY_.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> expTmp_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> onesTmp_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> maskTmp_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalLen_ {0};
+    uint32_t tileLen_ {0};
+    float alpha_ {1.0f};
+};
+
+extern "C" __global__ __aicore__ void elu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelEluCustom op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength, tiling_data.alpha);
+    op.Process();
+}
+"""
+
+# Fix: The above kernel_src still uses VCmp and Select which are not verified; also queue management issues.
+# We need a cleaner version. Let's produce a corrected kernel_src that avoids both Subs and Sel by using only known safe ops: Exp, Sub (tensor-tensor), Muls, Fill, VCmp, Select (if available) or arithmetic alternative.
+# Since we cannot be certain of Select, we can compute mask using arithmetic:
+# mask = (x > 0) can be computed as: let zero = 0.0f; then t1 = Sub(x, zero); but that's not.
+# Another approach: compute y = max(x, 0) + min(0, expLocal) ... no.
+# Given time constraints, the most reliable is to use the same pattern as leaky_relu but for ELU we need condition. 
+# Let's check AscendC documentation: VCmp and Select are standard. The error was for 'Sel' not 'Select'. So we use 'Select'.
+# Also, we must ensure Fill is available. It is.
+# Let's finalize a clean kernel_src with proper queue usage.
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelEluCustom {
+public:
+    __aicore__ inline KernelEluCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileLength,
+                                float alpha)
+    {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+        alpha_ = alpha;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(expTmp_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(onesTmp_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(maskTmp_, 1, tileLen_ * sizeof(int8_t)); // for VCmp output
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0 || tileLen_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        const uint32_t strideElems = blockNum * tileLen_;
+        uint32_t base = blockIdx * tileLen_;
+        if (base >= totalLen_) return;
+
+        uint32_t curLen = totalLen_ - base;
+        if (curLen > tileLen_) curLen = tileLen_;
+        CopyIn(base, curLen);
+
+        while (true) {
+            const uint32_t nextBase = base + strideElems;
+            uint32_t nextLen = 0;
+            if (nextBase < totalLen_) {
+                nextLen = totalLen_ - nextBase;
+                if (nextLen > tileLen_) nextLen = tileLen_;
+                CopyIn(nextBase, nextLen);
+            }
+
+            Compute(curLen);
+            CopyOut(base, curLen);
+
+            if (nextLen == 0) break;
+            base = nextBase;
+            curLen = nextLen;
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm_[gmOffset], len);
+        inQueueX_.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+        AscendC::LocalTensor<float> expLocal = expTmp_.AllocTensor<float>();
+        AscendC::LocalTensor<float> onesLocal = onesTmp_.AllocTensor<float>();
+        AscendC::LocalTensor<int8_t> maskLocal = maskTmp_.AllocTensor<int8_t>();
+
+        // Fill ones with 1.0f
+        AscendC::Fill(onesLocal, len, 1.0f);
+
+        // exp(x)
+        AscendC::Exp(expLocal, xLocal, len);
+        // exp(x) - 1
+        AscendC::Sub(expLocal, expLocal, onesLocal, len);
+        // alpha * (exp(x)-1)
+        AscendC::Muls(expLocal, expLocal, alpha_, len);
+
+        // Compare x > 0 -> maskLocal (int8, 1 for true)
+        AscendC::VCmp(maskLocal, xLocal, 0.0f, AscendC::CMPMODE::GT, len);
+        // Select: y = mask ? x : expLocal
+        AscendC::Select(yLocal, xLocal, expLocal, maskLocal, len);
+
+        // Free all allocated tensors
+        expTmp_.FreeTensor(expLocal);
+        onesTmp_.FreeTensor(onesLocal);
+        maskTmp_.FreeTensor(maskLocal);
+
+        outQueueY_.EnQue<float>(yLocal);
+        inQueueX_.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueueY_.DeQue<float>();
+        AscendC::DataCopy(yGm_[gmOffset], yLocal, len);
+        outQueueY_.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> expTmp_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> onesTmp_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> maskTmp_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalLen_ {0};
+    uint32_t tileLen_ {0};
+    float alpha_ {1.0f};
+};
+
+extern "C" __global__ __aicore__ void elu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelEluCustom op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength, tiling_data.alpha);
+    op.Process();
+}
+"""
+```

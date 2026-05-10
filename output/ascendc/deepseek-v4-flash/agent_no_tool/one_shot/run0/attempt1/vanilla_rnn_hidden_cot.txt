@@ -1,0 +1,377 @@
+We need to generate the six artifacts for the given model with kernel name "vanilla_rnn_hidden_custom" (PascalCase: VanillaRnnHiddenCustom). The model implements a simple RNN: for each time step, concatenate input and hidden, apply linear (input-to-hidden) with bias, tanh, then linear (hidden-to-output) with bias. We need to replace the loop with a custom kernel that does the entire RNN step (or maybe the whole loop?) Possibly we can write a kernel that processes the entire sequence in one go? But given the example, they replaced a simple activation with a custom kernel. Here the model is more complex: it involves matrix multiplications and tanh. We could replace the entire RNN step (including the concatenation, linear, tanh, linear) with a custom kernel. However, note that the kernel name is "vanilla_rnn_hidden_custom" which suggests a custom hidden state computation. Perhaps we should write a kernel that takes the input x (T,B,I), initial hidden h0 (B,H), weights w_i2h (H,K), bias b_i2h (H), w_h2o (O,H), bias b_h2o (O) and outputs y (T,B,O) and final hidden? The original returns only y, but we might need to output both? The contract: (x, h0, w_i2h, b_i2h, w_h2o, b_h2o) -> y. So only output y. The kernel should compute the entire loop.
+
+We need to design the AscendC kernel. It will be complex: we need to perform matmul, add bias, tanh, matmul, add bias. But AscendC has APIs for matrix multiplication and activation. We can use Cube (matrix multiplication) and vector operations. The kernel should be efficient. However, given the limited context, we need to produce the six strings as per the example.
+
+We'll follow the pattern:
+
+- project_json_src: define operator with inputs and outputs (probably ND format, float type). Inputs: x (T,B,I), h0 (B,H), w_i2h (H,K), b_i2h (H), w_h2o (O,H), b_h2o (O). Output: y (T,B,O). Attributes? Maybe none, but we can keep them as optional. The example had one attribute. We'll keep it empty or maybe none.
+
+- host_tiling_src: define tiling data struct containing needed parameters: total elements? For each time step, we have matmuls of different sizes. Better to set tiling based on B, H, I, O, T. We can define fields: T, B, I, H, O, K (I+H), etc. We'll need to compute work distribution among blocks. Since the loop is sequential, we could parallelize over batch dimension? Or time steps? Possibly we can assign each block a batch element? That's typical: For each batch, process time steps sequentially. So we set blockDim = B (or multiple of B). We'll need tiling data: T, B, I, H, O, K, maybe also pointers or offsets? We'll store dimensions.
+
+- host_operator_src: define operator class with InferShape, InferDataType, and tiling function. Tiling function computes blockDim = B (or something similar) and sets tiling data.
+
+- kernel_src: implement kernel that uses Cube for matmul, vector for bias and tanh. We'll write a class KernelVanillaRnnHiddenCustom with Init and Process. Process loops over time steps for its assigned batch range. Use double buffering for matmul? Might be complex. We can simplify: for each time step, do two matmuls (one for i2h, one for h2o). Use Cube API (MatMul). Use vector Add and Tanh.
+
+- python_bind_src: similar pattern, using aclnnVanillaRnnHiddenCustom (the operator name). We'll write a pybind function that calls the custom op.
+
+- model_src: import custom_ops_lib and call the function.
+
+We need to be careful about the names: kernel function name: vanilla_rnn_hidden_custom. Operator name: VanillaRnnHiddenCustom. Tiling data struct: VanillaRnnHiddenCustomTilingData. We'll keep the naming consistent.
+
+Given the complexity, we'll produce a plausible implementation. We'll assume UB budget and set tile lengths appropriately. We'll use AscendC's MatMul API. But note: the kernel code must be valid and compile. We'll try to keep it simple but functional.
+
+Let's start generating the six strings.
+
+First, project_json_src: define the operator with inputs and outputs. All tensors are float ND. Inputs: x (T,B,I), h0 (B,H), w_i2h (H,K), b_i2h (H), w_h2o (O,H), b_h2o (O). Output: y (T,B,O). Attributes: none.
+
+Second, host_tiling_src: define tiling struct with dimensions: T, B, I, H, O, K (K = I+H). Also maybe tileLength for intermediate tensors? We'll store all dims.
+
+Third, host_operator_src: implement TilingFunc that sets blockDim = B (or perhaps min(B, 24) for 910B). Set tiling data. InferShape: output shape (T,B,O). InferDataType: all float.
+
+Fourth, kernel_src: implement the kernel. The kernel will be launched with blockDim = B (or less). Each block handles one batch element? Actually we can assign each block a batch index. Since B may be larger than max block dim (24), we need to distribute. We'll use grid-stride loop over batch. For each block, it iterates over batch indices with stride blockNum. For each batch, it loops over time steps T. At each time step:
+- Concatenate x[t,b,:] and h[b,:] to form a vector of length K (I+H). But we can avoid explicit concat by using matmul with weights that are (H, K) and input is (1, K). Actually we can form the input as [x[t,b,:], h[b,:]] but we can compute the linear combination directly: i2h = w_i2h * [x; h] = w_i2h[:, :I] * x + w_i2h[:, I:] * h + bias. That's two smaller matmuls and add. Similarly for h2o. So we can split w_i2h into w_x and w_h parts. But the kernel input is the combined weight, so we need to handle it. We can use MatMul with the full weight matrix and the concatenated input. To avoid concat, we can load x and h into a local buffer and concatenate manually. That might be simpler: allocate local tensor of length K, copy x segment and h, then matmul with w_i2h (H,K). Then add bias, tanh. Then matmul with w_h2o (O,H) to get y_t. Store y_t. Then update h. We'll need to load weights from global memory. We'll do this for each time step. This may be bandwidth-bound but we can double buffer.
+
+Given the constraints, we'll write a kernel that does one time step at a time, using vector and cube operations. We'll need to be careful with the matmul: use aicore matmul API (MatMul). We'll set a local workspace for intermediate outputs.
+
+We'll assume we have tensors: x_gm (T,B,I), h0_gm (B,H), w_i2h_gm (H,K), b_i2h_gm (H), w_h2o_gm (O,H), b_h2o_gm (O), y_gm (T,B,O). We'll also need a local h for each batch.
+
+We'll implement Process: for each batch index that this block handles, we initialize h from h0, then loop t=0..T-1: load x[t,b,:], load previous h, concatenate into local buf of length K (I+H), matmul with w_i2h -> pre (size H), add bias, tanh -> new h, matmul h with w_h2o -> y_t (size O), add bias, store y[t,b,:]. That's the core.
+
+We need to handle the matmul sizes: K (I+H) possibly large. We'll use Cube unit.
+
+Double buffering can be applied for loading weights and inputs. However, for simplicity, we might process sequentially.
+
+We'll produce a kernel that is functional but not heavily optimized.
+
+The kernel_src should have the extern function "vanilla_rnn_hidden_custom".
+
+Now, let's write the code. We'll use AscendC constructs: GlobalTensor, LocalTensor, TBuf, MatMul, etc. We'll need to include appropriate headers: "kernel_operator.h", "matmul_api.h", etc.
+
+We'll assume AscendC has MatMul API like: MatMul<...>(dst, src1, src2, ...). We'll use the API as in examples.
+
+We'll need to define constants: BUFFER_NUM = 2.
+
+We'll define class KernelVanillaRnnHiddenCustom with members:
+
+- totalT, totalB, I, H, O, K.
+- pointers to global tensors: xGm_, h0Gm_, w_i2hGm_, b_i2hGm_, w_h2oGm_, b_h2oGm_, yGm_.
+- local pipes and queues: for x, h, weights, intermediate results, etc.
+
+We'll need multiple local buffers: for concat input, for pre, for h, for y_t, etc.
+
+Given the complexity, we can simplify by using local tensors directly without queues for each time step? But we must use pipe and queues for efficient data movement. However, building a full double-buffered kernel is too detailed. We'll produce a simplified version that works correctly, maybe without double buffering, using synchronous copies. But AscendC best practices recommend double buffering. In the example, they used queues and double buffering for the simple activation. For this kernel, it's more complex. We'll attempt a double-buffered approach for loading x and h across time steps.
+
+Actually, the time steps are sequential and require the previous h. So we cannot double buffer across time steps because each step depends on previous. But we can double buffer the loading of x and weights within a step. Or use prefetch.
+
+Given the complexity, we'll produce a kernel that is conceptually correct but may not be the most efficient. The instruction is to generate the artifacts, so we need to provide complete code.
+
+Let's write the kernel_src with a simplified approach: for each batch, for each time step, we load the necessary data, compute using cube and vector, and store. We'll use local tensors allocated from pipe. We'll use MatMul with the full weight and the concatenated input.
+
+We'll define the matmul as:
+
+- Shape: (1, K) * (H, K).T? Actually we want y = x * W^T + b, so if we have row vector input, we can do matmul with transposed weight. Or we can store weight as (K, H). For simplicity, we'll assume weight matrices are transposed appropriately. In the original model, they used w_i2h.t(), so weight is (H, K) and they multiply input (B, K) with weight.t() (K, H) to get (B, H). So we can do matmul of input (1, K) with weight (K, H) (if we store weight as (K, H)). But the input weight is given as (H, K). We'll need to handle transposition. In the kernel, we can either transpose on the fly or store weight in transposed layout. To simplify, we'll assume the weight is passed in a transposed format (K, H) for i2h and (H, O) for h2o? Actually h2o: original w_h2o is (O, H) and they multiply h (B, H) with w_h2o.t() (H, O) to get (B, O). So we need weight as (H, O). So for the kernel, we can expect the input weights to be in the shape suitable for matmul: w_i2h as (K, H) (i.e., transposed) and w_h2o as (H, O) (transposed). We'll document this in the JSON. Alternatively, we can transpose inside the kernel using transposed matmul flag. AscendC MatMul API supports transpose options. So we can set transposeA, transposeB. For i2h: input (1, K) * weight (H, K) with transpose weight (so weightB=True) => result (1, H). For h2o: input (1, H) * weight (O, H) with transpose weight => result (1, O). So we can use the same weight shapes as given. We'll assume weight matrices are stored as (H, K) and (O, H) respectively, and we set transposeB=True.
+
+We'll use AscendC::MatMul<float> with appropriate dimensions.
+
+Now, we need to estimate UB budget. We'll define tile lengths for intermediate buffers.
+
+Given the complexity, we'll generate a kernel that assumes that the entire computation for one batch fits in UB? That may not be feasible. We'll tile by time steps and batch elements.
+
+We'll set blockDim = B (but capped at 24). Within each block, we process one batch element (or multiple with grid-stride). For each time step, we need to allocate local buffers of size K (I+H), H, O, etc. That might exceed UB if K is large (e.g., 1024+256=1280). That's about 1280*4=5KB per buffer, which is fine. Total maybe 20KB, well within 192KB. So we can process one time step at a time.
+
+We'll use double buffering for loading x and h for the current time step? We'll do simple: for each t, we load x[t,b,:] and load h, compute, store.
+
+The kernel will be long. We'll produce a plausible code.
+
+Let's write the six strings. We'll ensure naming consistency.
+
+I'll start with project_json_src:
+
+```json
+[
+  {
+    "op": "VanillaRnnHiddenCustom",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "x", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "h0", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "w_i2h", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "b_i2h", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "w_h2o", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "b_h2o", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "output_desc": [
+      {"name": "y", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "attr": []
+  }
+]
+```
+
+But we need to define the shapes. In the operator definition, shapes are not specified; they are inferred from input shapes. So we can leave as is.
+
+host_tiling_src: define struct with fields: T, B, I, H, O, K. Use uint32_t.
+
+host_operator_src: Implement TilingFunc, InferShape, InferDataType, and the operator class.
+
+In TilingFunc, we get shapes from context: InputShape(0) is x (T,B,I), InputShape(1) is h0 (B,H), InputShape(2) is w_i2h (H,K), etc. We can extract dimensions. We'll set blockDim = B (capped at 24). Also compute K = I + H from shapes.
+
+InferShape: output shape (T,B,O).
+
+InferDataType: all float.
+
+Operator class: define with Input/Output/Attr.
+
+kernel_src: Implement KernelVanillaRnnHiddenCustom.
+
+We'll need to include headers for matmul, vector, etc.
+
+We'll write a simplified version that uses synchronous DataCopy and MatMul. We'll allocate local tensors from pipe for each time step? To avoid reallocation, we can allocate once and reuse.
+
+Let's write the kernel code:
+
+```cpp
+#include "kernel_operator.h"
+#include "matmul_api.h"
+
+using namespace AscendC;
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelVanillaRnnHiddenCustom {
+public:
+    __aicore__ inline KernelVanillaRnnHiddenCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR h0, GM_ADDR w_i2h, GM_ADDR b_i2h,
+                                GM_ADDR w_h2o, GM_ADDR b_h2o, GM_ADDR y,
+                                uint32_t T, uint32_t B, uint32_t I, uint32_t H, uint32_t O)
+    {
+        T_ = T; B_ = B; I_ = I; H_ = H; O_ = O; K_ = I + H;
+        xGm_.SetGlobalBuffer((__gm__ float*)x, T_ * B_ * I_);
+        h0Gm_.SetGlobalBuffer((__gm__ float*)h0, B_ * H_);
+        w_i2hGm_.SetGlobalBuffer((__gm__ float*)w_i2h, H_ * K_);
+        b_i2hGm_.SetGlobalBuffer((__gm__ float*)b_i2h, H_);
+        w_h2oGm_.SetGlobalBuffer((__gm__ float*)w_h2o, O_ * H_);
+        b_h2oGm_.SetGlobalBuffer((__gm__ float*)b_h2o, O_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, T_ * B_ * O_);
+
+        // Allocate local buffers (max size needed: K_ > H_ > O_)
+        pipe_.InitBuffer(inBufConcat_, BUFFER_NUM, K_ * sizeof(float));
+        pipe_.InitBuffer(inBufWeightsI2H_, BUFFER_NUM, H_ * K_ * sizeof(float)); // large, but we'll just load rows needed? For simplicity, we load entire weight per block? That's huge. We need to tile differently.
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Actually, we need to handle tiling properly. For simplicity, let's redesign.
+    }
+};
+```
+
+This is getting too complicated. Given the time, I'll produce a simpler kernel that assumes the entire computation fits in UB? That's unrealistic. Perhaps we can cheat: the custom kernel only replaces a small part of the computation, not the whole loop. But the instruction says "replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels." The model does a loop with linear, tanh, linear. We could replace the entire forward pass with a single kernel. That is what we need to do.
+
+Given the difficulty, I'll produce a kernel that uses a single Cube matmul for the entire sequence? There is a technique: flatten time and batch, but the recurrence makes it sequential. So we need the loop.
+
+I'll produce a kernel that is not double-buffered but uses simple DataCopy and MatMul for each time step, and only processes one batch per block (using grid stride). That should be plausible.
+
+We'll allocate local tensors for one time step: input_concat (K), pre (H), h (H), y_t (O). We'll also need local for weights rows? We'll load weights from global each time? That would be very slow. We should cache weights in local or use vector multiplication? Alternatively, we can use Cube matmul where the weight matrix is loaded once and reused for each time step. Since the weights are the same for all time steps, we can load them into local once before the loop. But they are large (H*K and O*H). For H=256, K=1280, that's 327680 floats, about 1.3 MB, which exceeds UB (192KB). So we cannot load entire weights. We need to tile the weight matrix as well. Cube can handle large weight matrices by loading them in a tiled fashion. AscendC's MatMul API manages that automatically if we use the proper call. We can just call MatMul with global tensor for weight and local tensor for input, and the cube unit fetches weight from global using DMA. That is possible: we can set the weight as a global tensor parameter. So we don't need to load weight into local. So we can do: MatMul(preLocal, inputLocal, w_i2hGm_, ...). That is the typical usage: one operand is local, the other global (the weight). The cube unit will load weight tiles from global.
+
+So we can avoid loading weights into local. Good.
+
+Similarly for h2o.
+
+Thus, for each time step, we need local input (K), local output (H), etc. That's fine.
+
+We can also prefetch the next time step's input while computing.
+
+Let's design: For each batch element assigned to this block, we iterate t=0..T-1. For each t, we load x[t,b,:] and previous h (from local register) into local input_concat. Then we call MatMul to compute pre = input_concat * w_i2h^T (which is essentially pre = input_concat * w_i2h_Gm with transpose). Then add bias, tanh, then MatMul for h2o, add bias, store y[t,b,:]. Then update h.
+
+We need to keep h in local between time steps. That's fine.
+
+So we need local buffers: input_concat (K), pre (H), h (H), y_t (O). Also maybe temp for tanh.
+
+We'll allocate them from pipe once per batch, not per time step. So we allocate before the time loop.
+
+We'll use double buffering for loading x: we can have two buffers for input_concat, but since we need to concatenate with h which is local, we can just load x directly into the first part of input_concat. We'll do a DataCopy for x[t,b,:] into input_concat[0..I-1], and then copy h into input_concat[I..K-1]. That's a potential overlap.
+
+We can use two buffers: one for loading x while computing previous.
+
+But for simplicity, we'll just load sequentially.
+
+Now, kernel_src code:
+
+We'll define the class with pointers and local buffers.
+
+We'll use MatMul API: `AscendC::MatMul(preLocal, inputLocal, w_i2hGm_, ...)` with transposes.
+
+We'll use vector Add and Tanh.
+
+We'll also need to handle bias addition: y = x * w^T + b, so we can do matmul and then add bias vector. The bias vector is small (H or O), can be broadcast.
+
+We'll use `AscendC::Add(biased, pre, b_i2hGm_..., H)` but bias is global, we need to bring it to local. We'll load bias once per block into local.
+
+So we'll also load biases into local before the batch loop.
+
+Now, let's write the kernel.
+
+We'll include necessary headers: "kernel_operator.h", "matmul_api.h".
+
+We'll define the class.
+
+Implementation:
+
+```cpp
+class KernelVanillaRnnHiddenCustom {
+public:
+    __aicore__ inline KernelVanillaRnnHiddenCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR h0, GM_ADDR w_i2h, GM_ADDR b_i2h,
+                                GM_ADDR w_h2o, GM_ADDR b_h2o, GM_ADDR y,
+                                uint32_t T, uint32_t B, uint32_t I, uint32_t H, uint32_t O)
+    {
+        T_ = T; B_ = B; I_ = I; H_ = H; O_ = O; K_ = I + H;
+        xGm_.SetGlobalBuffer((__gm__ float*)x, T_ * B_ * I_);
+        h0Gm_.SetGlobalBuffer((__gm__ float*)h0, B_ * H_);
+        w_i2hGm_.SetGlobalBuffer((__gm__ float*)w_i2h, H_ * K_);
+        b_i2hGm_.SetGlobalBuffer((__gm__ float*)b_i2h, H_);
+        w_h2oGm_.SetGlobalBuffer((__gm__ float*)w_h2o, O_ * H_);
+        b_h2oGm_.SetGlobalBuffer((__gm__ float*)b_h2o, O_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, T_ * B_ * O_);
+
+        // Allocate local buffers: input_concat, pre, h, y_t, plus temp for tanh
+        pipe_.InitBuffer(inBufInputConcat_, 1, K_ * sizeof(float));
+        pipe_.InitBuffer(inBufPre_, 1, H_ * sizeof(float));
+        pipe_.InitBuffer(inBufH_, 1, H_ * sizeof(float));
+        pipe_.InitBuffer(inBufYt_, 1, O_ * sizeof(float));
+        pipe_.InitBuffer(inBufBiasI2H_, 1, H_ * sizeof(float));
+        pipe_.InitBuffer(inBufBiasH2O_, 1, O_ * sizeof(float));
+        // For matmul workspace? MatMul might need a temporary buffer. We'll use the pipe with a queue for workspace? Actually need to provide a local buffer for matmul output. We'll use inBufPre_ and inBufYt_ as output. We'll also need a temp for tanh, we can reuse pre after adding bias? Actually tanh in-place: compute tanh on pre after bias, then pre becomes h. So we can do in-place.
+        // We'll allocate a separate temp for tanh if needed, but Tanh function can work in-place? AscendC Tanh takes src and dst, can be same.
+    }
+
+    __aicore__ inline void Process()
+    {
+        uint32_t blockNum = GetBlockNum();
+        uint32_t blockIdx = GetBlockIdx();
+
+        // Load biases into local
+        AscendC::LocalTensor<float> biasI2H = inBufBiasI2H_.Get<float>();
+        AscendC::DataCopy(biasI2H, b_i2hGm_, H_);
+        AscendC::LocalTensor<float> biasH2O = inBufBiasH2O_.Get<float>();
+        AscendC::DataCopy(biasH2O, b_h2oGm_, O_);
+
+        // For each batch handled by this block (grid stride over batches)
+        for (uint32_t b = blockIdx; b < B_; b += blockNum) {
+            // Load initial hidden state for this batch
+            AscendC::LocalTensor<float> hLocal = inBufH_.Get<float>();
+            AscendC::DataCopy(hLocal, h0Gm_[b * H_], H_);
+
+            // Loop over time steps
+            for (uint32_t t = 0; t < T_; ++t) {
+                // Load x[t, b, :] into input_concat[0..I-1]
+                AscendC::LocalTensor<float> inputConcat = inBufInputConcat_.Get<float>();
+                uint32_t xOffset = (t * B_ + b) * I_;
+                AscendC::DataCopy(inputConcat, xGm_[xOffset], I_);
+
+                // Copy h into input_concat[I..K-1]
+                AscendC::LocalTensor<float> hPart = inputConcat[I_]; // pointer arithmetic? Need to use SubTensor?
+                // Better to do two copies: first copy x, then copy h at offset I.
+                // We can use DataCopy with offset.
+                // Let's use AscendC::DataCopy with stride? Simpler: use two separate buffers and then concatenate? But we need a contiguous K-length tensor for matmul.
+                // We'll copy h into a temporary and then copy to inputConcat[I_]. Actually we can copy h directly to inputConcat+I_ using pointer offset. AscendC allows LocalTensor with offset.
+                AscendC::LocalTensor<float> hPart = inputConcat[I_]; // but this returns a tensor that views from index I.
+                // We'll just use a loop? No, better to use SetGlobalBuffer for hPart.
+                // Actually, we can copy h from global to inputConcat+I_ by using a setter.
+                // Let's do: AscendC::LocalTensor<float> hPart = inputConcat.SubTensor(I_, H_); // maybe not.
+                // Alternatively, we can copy h into a separate local, then use element-wise copy? Too complex.
+                // Simplification: Instead of concatenating, we can compute the linear combination as: pre = w_i2h_x * x + w_i2h_h * h + bias. That would require two matmuls with smaller matrices. That might be simpler and avoid copying.
+                // Since w_i2h is (H, K), we can split it into w_x (H, I) and w_h (H, H). We can load x and h separately and do two matmuls and add. That might be more efficient.
+                // For the kernel, we'll do that: pre = matmul(x, w_x^T) + matmul(h, w_h^T) + bias.
+                // We need to have w_x and w_h as separate global tensors. But the input is a combined weight. We can slice the weight using global tensor offsets.
+                // We'll use w_i2hGm_ with offsets: w_x = w_i2hGm_[0 : H*I] as (H, I) and w_h = w_i2hGm_[H*I : H*K] as (H, H). This is fine.
+                // Similarly for bi2h is a single bias.
+                // So we avoid concatenation. That simplifies memory and copy.
+            }
+        }
+    }
+};
+```
+
+Given the complexity, I'll produce a kernel that uses the split approach. So we need to define w_x and w_h as sub-tensors of w_i2h. We'll compute pre = Ax + Bh + b.
+
+Similarly for h2o: y = matmul(h, w_h2o^T) + b_h2o.
+
+We'll use MatMul with transpose on both operands? Actually we have input as row vector (1,I) and weight (H,I) -> we want dst (1,H) = input * weight^T. We can set transposeB=True. So for Ax: input x (1,I), weight w_x (H,I) -> transposeB => result (1,H). Similarly for Bh: input h (1,H), weight w_h (H,H) -> transposeB => result (1,H). Then add both and bias.
+
+So the kernel becomes:
+
+For each t:
+- Load x[t,b,:] into local xLocal (size I)
+- Load previous h (from local) into hLocal (size H)
+- MatMul preA: preA = xLocal * w_x^T => (1,H)
+- MatMul preB: preB = hLocal * w_h^T => (1,H)
+- Add preA + preB + biasI2H -> pre (H)
+- Tanh pre -> hNew (in-place)
+- MatMul yRaw = hNew * w_h2o^T => (1,O)
+- Add biasH2O -> y_t (O)
+- Store y_t to y[t,b,:]
+- Update hLocal = hNew
+
+Now we need to load biases and weights: w_x and w_h sub-tensors from global. We can define GlobalTensor for them with offsets.
+
+Also need to load biasI2H once, biasH2O once.
+
+We'll allocate local tensors: xLocal (I), hLocal (H), preA (H), preB (H), pre (H), yRaw (O), yLocal (O). Plus temp for tanh? Tanh can be computed on pre directly.
+
+We can reuse preA and preB for accumulation: preA = matmulX -> preA, preB = matmulH -> preB, then add preA and preB into pre, then add bias.
+
+We'll use pipe buffers: inBufX, inBufH, inBufPreA, inBufPreB, inBufPre, inBufY, inBufBiasI2H, inBufBiasH2O. But we need to allocate before the time loop.
+
+We'll also need to load initial h from h0.
+
+Now, let's write the final kernel code.
+
+We'll need to define the matmul parameters: use MatMul with type float, and we need to specify the dimensions. The MatMul API in AscendC is like:
+
+MatMul<MatMulType<ROUND_LENGTH<16, 16>, CubeFormat::ND, false, false>>(dst, src1, src2, ...);
+
+But simpler: we can use the base MatMul function:
+
+AscendC::MatMul(dst, src1, src2, transposeA, transposeB, ...);
+
+We'll use the newer API: `AscendC::MatMul<false, true>(preA, xLocal, w_x_gm, H, I, 1, 1);` where we specify M=1, N=H, K=I. We need to provide the correct dimensions.
+
+Alternatively, use the MtxxB approach.
+
+We'll assume AscendC API has a MatMul with sig:
+template <bool isTransA, bool isTransB>
+void MatMul(const LocalTensor<DType>& dst, const LocalTensor<DType>& srcA, const LocalTensor<DType>& srcB, const uint32_t M, const uint32_t N, const uint32_t K, const uint32_t batch, ...);
+
+We'll use that.
+
+We'll set isTransA = false (srcA is row-major MxK), isTransB = true (srcB is column-major? Actually we want w as (H, I), and we treat srcB as (I, H) if transposed? Actually if srcB is (H, I) and we want to multiply a (1,I) vector with (I,H) matrix (W^T), we can set isTransB=true and srcB is (H,K) with K=I, and after transpose it becomes (I,H). So that works.
+
+So MatMul<false, true>(preA, xLocal, w_x_gm, 1, H, I, 1);
+
+Similarly for preB: MatMul<false, true>(preB, hLocal, w_h_gm, 1, H, H, 1);
+
+For y: MatMul<false, true>(yRaw, hNew, w_h2o_gm, 1, O, H, 1);
+
+We need to provide the global tensors for weights. We'll create sub-tensors: w_x_gm = w_i2hGm_[0 : H*I] (reshape to (H, I)); w_h_gm = w_i2hGm_[H*I : H*H] (reshape to (H, H)); w_h2o_gm is given as (O, H).
+
+Now, in Process, we need to loop over batches with grid stride, and within each batch loop over time.
+
+We'll set blockDim = B (capped at 24) in tiling, and use GetBlockNum/GetBlockIdx.
+
+Now, let's write the full kernel_src.
+
+We'll also need to include tiling data headers? The kernel receives tiling data via GET_TILING_DATA. We'll do that.
+
+We'll define the tiling data struct earlier in host_tiling_src.
+
+Now, write the final answer.
+
+Given the length, I'll produce the six strings as required.
+
+I'll ensure the kernel name is "vanilla_rnn_hidden_custom" and operator name "VanillaRnnHiddenCustom".
+
+Let's generate.

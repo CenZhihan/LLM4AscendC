@@ -1,16 +1,16 @@
 """
 Ascend online docs search node for generator agent.
 
-Fixed policy for now:
+Fixed policy:
 - lang: zh
 - doc_type: DOC
-- version_filter: 8.5.0
+- version_filter: optional (default: no restriction); set via build_agent / CLI
 - query must contain Chinese text
 """
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage
 
@@ -50,12 +50,19 @@ def _summarize_results(items: List[Dict[str, Any]], *, top_n: int = 6) -> List[s
 def ascend_search_node(
     state: GeneratorAgentState,
     retriever: AscendDocsSearchRetriever | None = None,
+    *,
+    version_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Run Ascend docs search with fixed policy.
+    Run Ascend docs search with fixed lang/doc_type.
+
+    ``version_filter``: substring matched against each hit's ``version`` field;
+    ``None`` or empty string means no version filtering (retriever default).
     """
     if retriever is None:
         retriever = AscendDocsSearchRetriever()
+
+    vf = (version_filter or "").strip() or None
 
     query = (state.get("current_query") or "").strip()
     if not query:
@@ -78,7 +85,7 @@ def ascend_search_node(
         doc_type="DOC",
         page_num=1,
         page_size=5,
-        version_filter="8.5.0",
+        version_filter=vf,
     )
     items = list(result.get("data") or [])
     allowed_urls = [str(x.get("url") or "").strip() for x in items]
@@ -97,7 +104,10 @@ def ascend_search_node(
         "response": response,
     }
 
-    print(f"[Round {round_num}] tool=ascend_search query={query!r} matched={len(items)}")
+    print(
+        f"[Round {round_num}] tool=ascend_search query={query!r} "
+        f"version_filter={vf!r} matched={len(items)}"
+    )
     return {
         "ascend_search_results": summary_lines if summary_lines else [response],
         "ascend_search_allowed_urls": allowed_urls,

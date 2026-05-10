@@ -1,0 +1,46 @@
+We need to fix the kernel. The error shows output mismatch with many zeros and nans. The kernel's loop logic seems flawed: it uses blockIdx to iterate over preSize, but then for each preIndex it loops over postSize in tiles. However the tiling data computes tileOutput but the kernel's Process uses blockIdx to step over preSize, not over totalOutputLen. Also the DataCopy and Add operations might have alignment issues. The output shows zeros and nans, indicating possible out-of-bounds or incorrect GM addressing.
+
+Key issues:
+1. The kernel's Process iterates over preSize with blockIdx step, but blockDim is computed from numTiles = ceil(totalOutputLen/tileOutput), which is not related to preSize. This can cause either all blocks doing the same work or missing rows. Better to use grid-stride over totalOutputLen (i.e., treat output as flat array of preSize*postSize elements). Each block handles a contiguous segment of output elements (postSize tiles). Since reduction is along the middle dimension, the input access pattern is strided: for output index flat_idx = p*postSize + q, the input slice is at p*reduceSize*postSize + r*postSize + q for r in [0,reduceSize). So we can treat the output as flat and each block handles a (flat) range.
+
+2. The tiling sets tileOutput, but the tileOutput may be too large relative to UB budget? The budget calculation uses 4*tileOutput, but we also have inQueueX, outQueueY, tmpQueue, sumQueue. However the code uses inQueueX and sumQueue and tmpQueue, but not outQueueY? Actually outQueueY is allocated but never used in ComputeAndStore; it's just sitting. That's fine but wasteful. The sumQueue is used as accumulator. In the current code, it uses DataCopy directly to sumLocal for first slice, then Add with xLocal for remaining. That's okay.
+
+3. The major flaw: Process uses blockIdx to stride over preSize, but blockDim may be much smaller than preSize. For example, if preSize=128, blockDim=24, then blockIdx steps 0,24,48,72,96,120, then loop ends, missing rows 1-23 etc. That's wrong. Should process all output elements in a flat grid-stride over totalOutputLen. Each block processes a contiguous segment of flat output indices.
+
+4. Also the kernel's Init receives tileOutput, but the DataCopy operations assume tileOutput length. However the ComputeAndStore function uses len which is the actual length for the tile (could be less than tileOutput at the boundary). The DataCopy and vector ops must handle len correctly. They do: they pass len. But the DataCopy for the first slice uses `len` but the xGm offset calculation: firstOffset = p * (reduceSize * postSize) + 0 * postSize + q_start. That seems correct.
+
+5. The output shows zeros and nans: likely due to wrong GM addressing because not all output elements are written (only those from preSize stride), and some writes may be out-of-bounds.
+
+Fix: Change Process to iterate over flatOutputIdx from blockIdx * tileOutput, stride by blockNum * tileOutput. For each flatOutputIdx, compute p = flatOutputIdx / postSize, q = flatOutputIdx % postSize. Then compute reduction over reduceSize. Need to handle boundary where flatOutputIdx+len may exceed totalOutputLen.
+
+Also adjust tiling: tileOutput should be multiple of ALIGN_ELEMS, and we align down. For compute, we need to ensure len is properly aligned for DataCopy? DataCopy requires 32-byte alignment on GM addr and length in elements must be multiple of (32/sizeof(float))=8. We already align tileOutput to 8. At boundaries, the actual len may be less than tileOutput, and may not be aligned. That can cause runtime errors. We must ensure that we only process aligned lengths. Or we can process the remainder separately, but simpler: ensure that totalOutputLen is at least tileOutput, and for the last tile we still use the aligned tileOutput length but only copy valid elements. However DataCopy with len not multiple of 8 might fail. Actually DataCopy for ND format requires length in bytes multiple of 32. So len in floats must be a multiple of 8. So we must adjust last tile length to be multiple of 8. Easiest: make totalOutputLen multiple of 8? But not guaranteed. Alternatively, we can pad the output tensor? Not allowed. Or we can use the last tile with length = totalOutputLen % tileOutput, and if that remainder is not multiple of 8, we can process less? But then we lose elements. Better: in tiling, ensure tileOutput is such that at the last tile, len is also multiple of 8. We can set tileOutput to be a divisor of totalOutputLen? That's restrictive. Common approach: set tileOutput to be the largest multiple of ALIGN_ELEMS that fits in UB budget, and for the last tile, we adjust len to remain multiple of ALIGN_ELEMS; if the remainder is less than ALIGN_ELEMS, we can process the previous tile with extra elements? That's complex.
+
+Given the error shows zeros and nans, likely the addressing is wrong. Let's redesign kernel with simpler flat grid-stride.
+
+Also note: the kernel currently allocates sumQueue but never frees it. It uses sumQueue.AllocTensor in ComputeAndStore and doesn't FreeTensor before next iteration? Actually it does free sumLocal at the end. That's okay.
+
+But the main issue is the loop over preSize with blockIdx step. Change to loop over flat output indices.
+
+Also, the Use of outQueueY is unnecessary; just direct DataCopy from tmpQueue to yGm. However, DataCopy from Local to Global requires the local tensor to be in VECOUT? Actually DataCopy can be used with any local tensor position? Typically for output we need to move from VECCALC to VECOUT? But in the example leaky_relu they used outQueueY for output. To avoid complications, we can directly use DataCopy from tmpQueue (which is VECCALC) to yGm. Is that allowed? The DataCopy function expects source and destination pointers; local tensors can be from any TQue, but the position must be compatible. Usually AscendC's DataCopy for output expects source in VECOUT? Let's check the leaky_relu example: they had outQueueY (VECOUT) and did data copy from outQueueY to GM. So they moved data from VECOUT to GM. To conform, we should have an outQueueY and copy from it. So we will keep that pattern: accumulate in sumQueue (VECCALC), then move to outQueueY (VECOUT) and then DataCopy to GM.
+
+But the current kernel didn't use outQueueY at all in ComputeAndStore. It directly copied tmpQueue to yGm. That might be illegal. Let's fix that.
+
+Also need to handle buffer deallocation properly.
+
+Given limited time, produce minimal changes:
+
+- Rewrite kernel's Process to iterate over flat output indices.
+- Use outQueueY for output.
+- Ensure proper alignment handling: in ComputeAndStore, we will only process lengths that are multiples of 8. If the last tile length is not multiple of 8, we reduce it to the nearest multiple of 8 (i.e., len = AlignDown(len, 8)). But then we would miss the last few elements. To handle that, we can process the remainder separately with a single element loop? Or we can ensure that totalOutputLen is a multiple of 8 by padding? Not possible. In practice, the shapes from pytorch may not be multiples of 8. However, the kernel must handle arbitrary lengths. We can process the bulk with aligned lengths and then the remainder with a scalar loop? But that's inefficient. Another way: use DataCopy with byte-accurate length? Actually AscendC's DataCopy for VecIn/VecOut with length in number of elements, and it requires length to be multiple of 8. So we must ensure lengths are multiples of 8. Given that the error shows zeros and nans, alignment might be causing issues.
+
+Look at the reference: shape (128, 4096, 4095). Reduce dim=1. Then totalOutputLen = 128*4095 = 524160. Not a multiple of 8? 524160 % 8 = 0 (since 524160/8=65520). So it is multiple of 8. Good. So alignment is fine for that particular test. But the code must be general.
+
+Given the error output has zeros and nans, alignment is not the main cause; it's the addressing.
+
+Let's produce a corrected kernel with flat grid-stride. Also adjust tiling to compute blockDim based on totalOutputLen/tileOutput, but then each block will handle a contiguous chunk of output. Should be straightforward.
+
+Also note: The kernel's Init receives many parameters; we keep them.
+
+We'll write corrected kernel_src. Also adjust host_operator_src if needed: the blockDim calculation is already based on numTiles. But we need to ensure that the number of blocks times tileOutput covers totalOutputLen. That's fine.
+
+Now, produce final answer with all six strings.

@@ -1,0 +1,291 @@
+project_json_src='''
+
+[
+  {
+    "op": "Conv2dScalingMinCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "bias",
+        "param_type": "optional",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "scale_factor",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": "1.0"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv2dScalingMinCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batchSize);
+  TILING_DATA_FIELD_DEF(uint32_t, outChannels);
+  TILING_DATA_FIELD_DEF(uint32_t, outH);
+  TILING_DATA_FIELD_DEF(uint32_t, outW);
+  TILING_DATA_FIELD_DEF(uint32_t, kernelH);
+  TILING_DATA_FIELD_DEF(uint32_t, kernelW);
+  TILING_DATA_FIELD_DEF(uint32_t, inChannels);
+  TILING_DATA_FIELD_DEF(float, scaleFactor);
+  TILING_DATA_FIELD_DEF(uint32_t, tileSize);   // number of output elements per tile (spatial slice)
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv2dScalingMinCustom, Conv2dScalingMinCustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src="""
+
+#include "conv2d_scaling_min_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "graph/operator.h"
+#include "graph/operator_attr.h"
+
+namespace optiling {
+
+// UB budget conservative estimate
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;   // per core
+static constexpr uint32_t ALIGN_ELEMS = 16;               // byte alignment of float
+static constexpr uint32_t MAX_TILE_ELEMS = 8192;          // safety limit
+
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) {
+    return (x / a) * a;
+}
+
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (a + b - 1u) / b;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context) {
+    Conv2dScalingMinCustomTilingData tiling;
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+    const gert::Shape *bias_shape = context->GetOptionalInputShape(2);
+
+    auto x_dims = x_shape->GetOriginShape().GetDims();
+    auto w_dims = w_shape->GetOriginShape().GetDims();
+
+    uint32_t N = x_dims[0];
+    uint32_t C_in = x_dims[1];
+    uint32_t H = x_dims[2];
+    uint32_t W = x_dims[3];
+    uint32_t C_out = w_dims[0];
+    uint32_t K_h = w_dims[2];
+    uint32_t K_w = w_dims[3];
+    uint32_t H_out = H - K_h + 1;
+    uint32_t W_out = W - K_w + 1;
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const float *scalePtr = attrs->GetAttrPointer<float>(0);
+    float scaleFactor = (scalePtr != nullptr) ? *scalePtr : 1.0f;
+
+    // Estimate tile size: each output pixel requires loading tile of input and weights.
+    // We'll tile over spatial output pixels (H_out * W_out).
+    // For each output pixel, we need K_h*K_w*C_in input elements and C_out*K_h*K_w weight elements.
+    // UB needed for input slice, weight slice, intermediate accumulation, bias, scale.
+    // Simplify: tile over a contiguous block of output pixels.
+    uint32_t totalOutElems = N * C_out * H_out * W_out;
+    uint32_t bytesPerOutElem = sizeof(float);   // one float per output element after min across channels
+    // Actually the final output is N * 1 * H_out * W_out, but intermediate conv output is N*C_out*H_out*W_out.
+    // To compute min we need all C_out values per spatial location.
+    // We can process one spatial location at a time (1x1 patch) to reduce UB usage.
+    uint32_t tileSpatial = 1; // process one output pixel per iteration
+    // But we can group multiple spatial pixels if UB allows.
+    // For simplicity, we process one output pixel (H=1,W=1) at a time.
+    // That requires loading all C_out weights and one input patch.
+    uint32_t inputPatch = K_h * K_w * C_in;
+    uint32_t weightSlice = C_out * K_h * K_w;
+    uint32_t biasSize = (bias_shape != nullptr) ? bias_shape->GetOriginShape().GetShapeSize() : 0;
+    uint32_t elementsNeeded = inputPatch + weightSlice + C_out + (biasSize > 0 ? C_out : 0) + 1;
+    uint32_t bytesNeeded = elementsNeeded * sizeof(float);
+    // If too high, reduce tile further (but already 1 spatial pixel)
+    // Adjust block dim based on total out elements
+    uint32_t totalSpatialLocs = N * H_out * W_out;
+    uint32_t blockDim = CeilDiv(totalSpatialLocs, 256); // heuristic
+    if (blockDim < 8) blockDim = 8;
+    if (blockDim > 24) blockDim = 24;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_batchSize(N);
+    tiling.set_outChannels(C_out);
+    tiling.set_outH(H_out);
+    tiling.set_outW(W_out);
+    tiling.set_kernelH(K_h);
+    tiling.set_kernelW(K_w);
+    tiling.set_inChannels(C_in);
+    tiling.set_scaleFactor(scaleFactor);
+    tiling.set_tileSize(1); // one spatial pixel per tile
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context) {
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *w_shape = context->GetInputShape(1);
+    auto x_dims = x_shape->GetOriginShape().GetDims();
+    auto w_dims = w_shape->GetOriginShape().GetDims();
+    uint32_t N = x_dims[0];
+    uint32_t C_in = x_dims[1];
+    uint32_t H = x_dims[2];
+    uint32_t W = x_dims[3];
+    uint32_t C_out = w_dims[0];
+    uint32_t K_h = w_dims[2];
+    uint32_t K_w = w_dims[3];
+    uint32_t H_out = H - K_h + 1;
+    uint32_t W_out = W - K_w + 1;
+    gert::Shape y_shape({N, (int64_t)1, (int64_t)H_out, (int64_t)W_out});
+    context->SetOutputShape(0, y_shape);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context) {
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class Conv2dScalingMinCustom : public OpDef {
+public:
+    explicit Conv2dScalingMinCustom(const char* name) : OpDef(name) {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Attr("scale_factor").AttrType(OPTIONAL).Float(1.0f);
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(Conv2dScalingMinCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelConv2dScalingMinCustom {
+public:
+    __aicore__ inline KernelConv2dScalingMinCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR bias,
+                                GM_ADDR y, 
+                                uint32_t batchSize, uint32_t outChannels,
+                                uint32_t outH, uint32_t outW,
+                                uint32_t kernelH, uint32_t kernelW,
+                                uint32_t inChannels,
+                                float scaleFactor,
+                                uint32_t tileSize) 
+    {
+        batchSize_ = batchSize;
+        outChannels_ = outChannels;
+        outH_ = outH;
+        outW_ = outW;
+        kernelH_ = kernelH;
+        kernelW_ = kernelW;
+        inChannels_ = inChannels;
+        scaleFactor_ = scaleFactor;
+        tileSize_ = tileSize;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x);
+        wGm_.SetGlobalBuffer((__gm__ float*)weight);
+        bGm_.SetGlobalBuffer((__gm__ float*)bias);  // bias may be null, handle in kernel
+        yGm_.SetGlobalBuffer((__gm__ float*)y);
+
+        // Allocate local buffers for one spatial pixel
+        uint32_t inputPatchBytes = kernelH * kernelW * inChannels * sizeof(float);
+        uint32_t weightBytes = outChannels * kernelH * kernelW * sizeof(float);
+        uint32_t biasBytes = outChannels * sizeof(float);
+        uint32_t outBytes = outChannels * sizeof(float);  // conv output per pixel
+        // Also allocate temp for scaled and min
+        // Use UB as: inputPatch + weight + bias + outTemp
+        // Double buffer input and weight to overlap transfer and compute?
+        // For simplicity single buffering, but still use queues for structure.
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, inputPatchBytes);
+        pipe_.InitBuffer(inQueueW_, BUFFER_NUM, weightBytes);
+        pipe_.InitBuffer(inQueueB_, 1, biasBytes);
+        pipe_.InitBuffer(outQueueY_, 1, outBytes);
+        // Temporary buffer for intermediate sum
+        pipe_.InitBuffer(tmpQueue_, 1, outBytes);
+    }
+
+    __aicore__ inline void Process() {
+        if (batchSize_ == 0 || outH_ == 0 || outW_ == 0) return;
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t totalSpatialLocs = batchSize_ * outH_ * outW_;
+        // Distribute spatial locations across blocks
+        for (uint32_t idx = blockIdx; idx < totalSpatialLocs; idx += blockNum) {
+            uint32_t b = idx / (outH_ * outW_);
+            uint32_t hw = idx % (outH_ * outW_);
+            uint32_t h = hw / outW_;
+            uint32_t w = hw % outW_;
+            ProcessOnePixel(b, h, w);
+        }
+    }
+
+private:
+    __aicore__ inline void ProcessOnePixel(uint32_t_t_t

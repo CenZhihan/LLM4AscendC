@@ -1,0 +1,61 @@
+We need to fix the previous attempt. The error log shows "txt bundle missing blocks: ['host_operator_src', 'kernel_src', 'python_bind_src']". That means the previous generated code only had project_json_src and host_tiling_src, but missing the other three. The full code should include all six strings. Also note that the previous attempt's host_operator_src had a truncated/incomplete code (ends with "static ge::graphStatus InferShapeShapeShape"). So we need to generate full correct code for all six parts.
+
+We have the example for leaky_relu_custom, but we need to adapt for softmax_custom. The kernel name is softmax_custom, PascalCase SoftmaxCustom. The operation is softmax along dim=1 (which for 2D is the last dimension). The input shape is (batch_size, dim) with batch_size=4096, dim=393216. So we need to implement an AscendC kernel for softmax.
+
+We need to provide six Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src. Each must be syntactically correct and complete.
+
+Let's design:
+
+- project_json_src: define op SoftmaxCustom with input x (float, ND), output y (float, ND). No attrs needed for standard softmax.
+- host_tiling_src: define tiling data with fields: totalLength, innerDim, tileLength, blockDim. Also maybe negativeSlope? No, softmax doesn't need it. But we need to handle reduction along last dimension. Tiling should break rows across blocks and tiles within row for UB.
+- host_operator_src: implement TilingFunc, InferShape, InferDataType, and OpDef registration. Use UB budget. For softmax, we need to compute max and sum of exponentials along row. The kernel will need to process rows: each block handles some rows. The tile length refers to how many elements of the row are processed at once.
+- kernel_src: implement kernel with Init and Process. Use grid-stride loops over rows, and for each row, compute softmax in tiles. Need stable softmax: subtract max, exponentiate, accumulate sum, then divide. Use three buffers (in, out, tmp). We'll use two buffers for double buffering? The example used double buffering for input and output. For softmax, we need to read input, compute max (two passes or one pass with reduction), then compute exp and sum, then normalize. Since we need to read again, we can store input in local memory or read twice. Given UB size constraints, we can tile within row: first pass compute max per tile and reduce across tiles (using pipe reduction?). Alternatively, we can do a single pass: load tile, compute local max, reduce across tiles of the same row (using pipe with sync?). But easier: we can process entire row in one block if tile length >= innerDim? But innerDim is 393216, too large for UB (192KB ~ 49152 floats). So we must tile. For softmax, typical approach: first pass compute max, second pass compute sum and output. But that would require two reads of input from global memory. We can store entire tile in local, but need to hold multiple tiles? We could interleave: for each row, load all tiles in a loop, compute max, then loop again to compute exp/sum and output. Need to read input twice from GM. That's acceptable. Alternatively, we can use a two-buffer approach: load tile, compute local max, keep max in register/pipe, then after all tiles, we have row max, then reload and compute. We'll need to store the row max somewhere. We can use a scalar register or a small buffer. Given the complexity, let's adopt a simple approach: each block handles a set of rows. For each row, iterate over tiles twice: first to compute max, second to compute exp/sum and output. Use double buffering? But we need to reload input; we can reuse the same buffer. Since we have two buffers (inQueueX), we can double buffer the reads. For simplicity, we could use a single buffer and sequential loads. However, the example used double buffering for overlap. For softmax, we can also double buffer: while computing max for next tile, load current? But max requires all tiles before finalization. Better to do two separate loops: first loop over tiles to get max, second loop to compute output. Use two buffers to overlap load and compute? The max computation is cheap; merging might not save much. We'll keep it simple: one buffer, sequential.
+
+Given the evaluation context, we need to ensure correctness. The previous error was missing blocks, so we must output all six strings properly.
+
+Let's craft the code.
+
+For kernel_src, we'll implement a Softmax kernel with Init and Process. Use tile length to process parts of a row. The outer loop iterates over rows assigned to this block. For each row, compute max, then compute output.
+
+We'll need to handle the reduction across tiles for max. Use a local variable maxVal. For each tile, compute max of that tile, then update maxVal = max(maxVal, tileMax). After all tiles, use maxVal for exponentiation.
+
+Then second pass: for each tile, compute exp(x - maxVal), accumulate sum, then store normalized values.
+
+We need a temporary buffer for exp values? We can compute exp and then divide per element: for each element, compute exp, add to sum via atomic? But we need sum before dividing. So we need two passes: compute exp and sum, then divide. But that requires storing exp values or recomputing. Since we need to write output, we can compute exp and accumulate sum in a scalar, then divide and write. That can be done in one pass: for each element, compute exp, add to sum, maybe store temporarily (we have out buffer). Then after the tile, we need the total sum for the row. But we haven't computed sum for the entire row yet (only tile). So we need to accumulate sum across tiles. We can use a scalar rowSum. After computing all tiles, we have rowSum. Then we need to normalize each element, which requires reading input again (or from stored exp values). Storing exp values is possible using the output buffer (write exp values there, then later normalize). That would be three passes: compute max, compute exp and sum (store exp), then normalize. Or we can store input in local memory and compute exp on the fly. Given UB size, we can hold one tile of input, one tile of exp, and one tile of output? That's 3 * tileLen floats. With tileLen maybe 4096, that's 12K floats ~ 48KB, within UB. So we can load input tile, compute exp, store exp in a temporary tile buffer, then after all tiles, compute normalization using exp values (read from temp buffer) and write output. That requires two passes: first compute max, then for each tile: load input, compute exp, store exp, and accumulate sum into rowSum. After all tiles, we have rowSum. Then second pass: for each tile, load exp from temporary buffer (or recompute from input? but input would be overwritten if we double buffer? We can keep input in separate buffer). Simpler: we can compute exp and sum in one pass, storing exp in the output buffer (since we will overwrite later with normalized values). Then after all tiles, we have rowSum. Then we need to normalize: another pass over tiles, load exp from output buffer (which currently holds exp), divide by rowSum, and write back. That is three passes over the data. However, we can combine the last two: after computing exp and sum, we can immediately normalize if we had the total sum, but we don't until end of row. So three passes: max, exp+sum, normalize.
+
+Alternatively, we can use a two-pass approach: compute max and sum of exp in one pass (by computing exp and accumulating sum, and also tracking max with reduction across tiles). But sum of exp needs exp, which needs max. So we need max first. So at least two passes: max, then exp+sum+output. But for output we need sum; we cannot output until after the tile is processed? Actually, we can compute exp and sum, then after the tile, we can't output because sum not final. So we need to store exp values (or input) for later per-element division. So three passes.
+
+Given the complexity, maybe we can implement a simpler approach: process each row entirely in UB if innerDim <= UB capacity. But innerDim=393216 > UB (192KB / 4 bytes = 49152 floats). So not possible.
+
+Given that Ascend C provides built-in softmax? But we are to write custom kernel. However, the example shows a simple element-wise kernel. Softmax is more complex but doable. We'll implement the three-pass approach with tiling.
+
+We need to ensure buffer sizes: inQueueX for input (double buffered), outQueueY for output (double buffered), tmpQueue for temporary (maybe exp values or intermediate). We'll use two buffer queues: inQueueX (for input), expQueue (for exp values), outQueueY (for output). We'll reuse outQueueY for storing exp values temporarily, then later overwrite with normalized output. But that mixes semantics; better to have a dedicated temporary queue. Use tmpQueue for exp values. So we have three buffers: input, exp, output. For double buffering, we need two buffers per queue. But we only have one tmpQueue with size 1? We can increase BUFFER_NUM for tmpQueue to 2 as well. We'll define BUFFER_NUM=2 and initialize all queues with 2 buffers of tileLen floats.
+
+Kernel steps per row:
+1. Load all tiles of the row into input buffer (double buffered). While loading, compute max across the row. We'll need to compute max per tile and reduce across tiles. Since we load tile by tile, we can compute tile max and keep rowMax. However, we need to reload input for later passes. So we can store input in global? Or we can keep input in local memory across passes? But we only have two input buffers; we can reuse them by loading again. So first pass: for each tile: load input, compute tile max, update rowMax. (No need to keep input after this pass.)
+2. Second pass: for each tile: load input again, compute exp(x - rowMax), store exp in tmpQueue, accumulate rowSum += sum(exp).
+3. Third pass: for each tile: load exp from tmpQueue, divide by rowSum, store in outQueueY, then copy to GM.
+
+We can combine steps 2 and 3 if we can compute exp and accumulate sum, then immediately output by dividing with the running sum? But sum is not final. So cannot.
+
+Alternatively, we can compute normalized values in one pass after obtaining rowMax and rowSum: load input, compute exp(x - rowMax) / rowSum. That requires both scalars known. So we need rowMax and rowSum before doing the output. So we need two passes: pass1 to get rowMax, pass2 to get rowSum and output. But pass2 can compute exp and sum, but we need sum before outputting. However, we can compute exp, accumulate sum in a scalar, and also store exp values in a temporary buffer. Then after the tile, we can't output because sum not final. So we need another pass to normalize using stored exp. So three passes.
+
+To optimize, we could store exp values in the output buffer (since we will overwrite), and then after rowSum is known, we do a final pass reading from output buffer (exp values) and dividing. That's still three passes.
+
+Given the kernel is for evaluation, performance may not be critical. We'll implement three passes with double buffering for overlapping load/compute where possible.
+
+We'll also need to handle the fact that innerDim may not be multiple of tileLen. We'll handle partial tiles.
+
+Now let's write the code.
+
+We'll also need to ensure that the tiling sets tileLength appropriately. For softmax, the tile should be aligned to 1024 or something, and not exceed a reasonable size for UB (3 * tileLen floats). With 3 buffers, the UB budget must accommodate 3 * tileLen floats. So max tile = UB_BUDGET_BYTES / (3*4) = 192KB / 12 = 16384 elements. But we also need some overhead, so we can set a safe limit like 4096 or 8192.
+
+We'll define ALIGN_ELEMS = 1024, MAX_TILE_ELEMS = 8192 (or 4096). Let's use 4096 to be safe.
+
+Now we produce the six strings.
+
+Make sure to follow the same structure as leaky_relu example: include proper headers, namespaces, etc.
+
+Also note that the kernel function name in kernel_src must be "softmax_custom". The op class name in host_operator_src should be "SoftmaxCustom" and registered with OP_ADD.
+
+Now generate.
