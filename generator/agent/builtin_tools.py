@@ -26,7 +26,9 @@ from .nodes import (
     ascend_fetch_node,
     npu_arch_node,
     security_check_node,
+    shape_stride_layout_validator_node,
     tiling_calc_node,
+    tiling_budget_codegen_node,
     tiling_validate_node,
     web_search_node,
 )
@@ -193,6 +195,30 @@ def _meta() -> Dict[str, Dict[str, Any]]:
                 "Use this only after you already have a numeric tiling candidate, typically `status=numeric_ok`. If tiling_calc returned `planner_ok` or explicitly refused, do not invent zeros to validate; pass through the structured status or move on to operator-specific tools."
             ),
         },
+        "tiling_budget_codegen": {
+            "display_name": "Tiling budget/codegen",
+            "description": "Plan UB budget, search alignment-safe tile/block settings, and emit TPipe/TQue init code from structured pipeline stages.",
+            "parameter_docs": 'Prefer structured args such as {"op_name":"fused_add_relu","op_type":"elementwise","total_shape":[8388608],"dtype":"float16","input_tensor_count":2,"output_tensor_count":1,"ub_total_bytes":196608,"ub_reserved_bytes":4096,"enable_double_buffer":true,"pipeline_stages":[{"stage_name":"in_x","position":"VECIN","buffer_role":"input","per_tile_elements":1,"depth":2},{"stage_name":"in_y","position":"VECIN","buffer_role":"input","per_tile_elements":1,"depth":2},{"stage_name":"out_z","position":"VECOUT","buffer_role":"output","per_tile_elements":1,"depth":2},{"stage_name":"tmp_relu_mask","position":"VECCALC","buffer_role":"temp","per_tile_elements":1,"depth":1}]}. `total_shape` or `total_elements` is required. If `pipeline_stages` is omitted, the tool can synthesize default input/output queues from `input_tensor_count` and `output_tensor_count`.',
+            "examples": [
+                '{"tool":"tiling_budget_codegen","query":"plan UB budget for fused add relu","args":{"op_name":"fused_add_relu","op_type":"elementwise","total_shape":[8388608],"dtype":"float16","input_tensor_count":2,"output_tensor_count":1,"ub_total_bytes":196608,"ub_reserved_bytes":4096,"enable_double_buffer":true,"pipeline_stages":[{"stage_name":"in_x","position":"VECIN","buffer_role":"input","per_tile_elements":1,"depth":2},{"stage_name":"in_y","position":"VECIN","buffer_role":"input","per_tile_elements":1,"depth":2},{"stage_name":"out_z","position":"VECOUT","buffer_role":"output","per_tile_elements":1,"depth":2},{"stage_name":"tmp_relu_mask","position":"VECCALC","buffer_role":"temp","per_tile_elements":1,"depth":1}]}}',
+                '{"tool":"tiling_budget_codegen","query":"plan budget for relu","args":{"op_name":"relu","op_type":"elementwise","total_shape":[1000],"dtype":"float16","input_tensor_count":1,"output_tensor_count":1,"enable_double_buffer":true}}'
+            ],
+            "usage_guidance": (
+                "Use this after you already know the operator family and want a concrete queue budget plus `InitBuffer` template lines. Pass a structured stage list when temp/workspace buffers matter. This tool reuses baseline tiling and hardware validation internally, then adds reserved-UB accounting, stage-by-stage budget tables, and tail/double-buffer suggestions."
+            ),
+        },
+        "shape_stride_layout_validator": {
+            "display_name": "Shape/stride/layout validator",
+            "description": "Validate tensor shape, layout contiguity, stride legality, and GM/UB copy-parameter compatibility, then suggest the smallest legal repair.",
+            "parameter_docs": 'Prefer structured args such as {"tensor_shape":[2,16],"tensor_stride":[32,1],"movement_direction":"UB_TO_GM","element_dtype":"float16","src_stride":32,"requested_copy_kind":"ROW_WISE"}. Required core fields are tensor_shape, tensor_stride, movement_direction, and either element_dtype or element_bytes. Optional copy fields include src_stride, dst_stride, row_count, row_bytes, requested_copy_kind, gm_alignment_bytes, and ub_alignment_bytes.',
+            "examples": [
+                '{"tool":"shape_stride_layout_validator","query":"validate UB to GM row copy for padded local tensor","args":{"tensor_shape":[2,16],"tensor_stride":[32,1],"movement_direction":"UB_TO_GM","element_dtype":"float16","src_stride":32,"requested_copy_kind":"ROW_WISE"}}',
+                '{"tool":"shape_stride_layout_validator","query":"check GM to UB row copy for non aligned payload","args":{"tensor_shape":[2,13],"tensor_stride":[13,1],"movement_direction":"GM_TO_UB","element_dtype":"float16","row_count":2,"row_bytes":26,"requested_copy_kind":"ROW_WISE"}}'
+            ],
+            "usage_guidance": (
+                "Use this before choosing DataCopy, DataCopyPad, or a layout rebuild. Provide the tensor view in `tensor_shape`/`tensor_stride`, the movement direction, and any explicit copy strides from the planned move. The tool distinguishes dense contiguous, row-regular noncontiguous, transposed regular, and irregular layouts, and then reports whether the current copy parameters are legal or need a minimal repair."
+            ),
+        },
         "npu_arch": {
             "display_name": "NPU architecture",
             "description": "Return UB size, compile macros, and feature flags for a chip name.",
@@ -287,6 +313,10 @@ def _handler_for(
             return tiling_calc_node(state, tiling_retriever)
         if name == "tiling_validate":
             return tiling_validate_node(state, tiling_retriever)
+        if name == "tiling_budget_codegen":
+            return tiling_budget_codegen_node(state, tiling_retriever)
+        if name == "shape_stride_layout_validator":
+            return shape_stride_layout_validator_node(state, tiling_retriever)
         if name == "api_lookup":
             return api_lookup_node(state, api_retriever)
         if name == "api_constraint":

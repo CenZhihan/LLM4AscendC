@@ -4,7 +4,7 @@ Tiling Retriever for Ascend C kernel development agent.
 Provides conservative tiling parameter computation and validation based on
 hardware constraints (repeatTimes <= 255, 256B alignment, UB capacity).
 """
-from typing import Any, Dict
+from typing import Any, Dict, TYPE_CHECKING
 
 from .tiling_classification import classify_operator_for_tiling, find_blacklist_entry
 from .tiling_broadcast import compute_broadcast_tiling
@@ -15,6 +15,10 @@ from .tiling_reduction import compute_reduction_tiling
 from .tiling_types import PLANNER_OK_STATUS, TilingParamsResult, TilingValidationResult, VALIDATABLE_TILING_STATUSES
 from .tiling_unsupported import build_category_unsupported_result, build_unsupported_tiling_result
 from .tiling_validation import build_skipped_validation_result, validate_tiling_params
+
+if TYPE_CHECKING:
+    from .shape_stride_layout_validator import ShapeStrideLayoutValidatorResult
+    from .tiling_budget_codegen import TilingBudgetCodegenResult
 
 
 class TilingRetriever:
@@ -164,6 +168,16 @@ class TilingRetriever:
                 f"upstream tiling_calc returned status={status}, no numeric tiling parameters to validate"
             )
         return validate_tiling_params(tiling_params, effective_chip)
+
+    def plan_tiling_budget_codegen(self, request: Dict[str, Any]) -> "TilingBudgetCodegenResult":
+        from .tiling_budget_codegen import plan_tiling_budget_codegen
+
+        return plan_tiling_budget_codegen(request, tiling_retriever=self)
+
+    def plan_shape_stride_layout_validator(self, request: Dict[str, Any]) -> "ShapeStrideLayoutValidatorResult":
+        from .shape_stride_layout_validator import plan_shape_stride_layout_validation
+
+        return plan_shape_stride_layout_validation(request)
 
 
 __all__ = [

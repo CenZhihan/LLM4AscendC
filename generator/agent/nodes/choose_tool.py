@@ -150,6 +150,8 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
     api_alternative_results = state.get("api_alternative_results", [])
     tiling_calc_results = state.get("tiling_calc_results", [])
     tiling_validate_results = state.get("tiling_validate_results", [])
+    tiling_budget_codegen_results = state.get("tiling_budget_codegen_results", [])
+    shape_stride_layout_validator_results = state.get("shape_stride_layout_validator_results", [])
     npu_arch_results = state.get("npu_arch_results", [])
     code_style_results = state.get("code_style_results", [])
     security_check_results = state.get("security_check_results", [])
@@ -185,6 +187,18 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
         existing += "Tiling calc (excerpt):\n" + "\n".join(tiling_calc_results[:1]) + "\n\n"
     if tiling_validate_results:
         existing += "Tiling validate (excerpt):\n" + "\n".join(tiling_validate_results[:1]) + "\n\n"
+    if tiling_budget_codegen_results:
+        existing += (
+            "Tiling budget/codegen (excerpt):\n"
+            + "\n".join(tiling_budget_codegen_results[:1])
+            + "\n\n"
+        )
+    if shape_stride_layout_validator_results:
+        existing += (
+            "Shape/stride/layout validator (excerpt):\n"
+            + "\n".join(shape_stride_layout_validator_results[:1])
+            + "\n\n"
+        )
     if npu_arch_results:
         existing += "NPU arch (excerpt):\n" + "\n".join(npu_arch_results[:1]) + "\n\n"
     if code_style_results:
@@ -274,6 +288,8 @@ _RESULT_LIST_KEYS = {
     "api_alternative": "api_alternative_results",
     "tiling_calc": "tiling_calc_results",
     "tiling_validate": "tiling_validate_results",
+    "tiling_budget_codegen": "tiling_budget_codegen_results",
+    "shape_stride_layout_validator": "shape_stride_layout_validator_results",
     "npu_arch": "npu_arch_results",
     "code_style": "code_style_results",
     "security_check": "security_check_results",

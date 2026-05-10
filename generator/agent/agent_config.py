@@ -25,6 +25,8 @@ BUILTIN_TOOL_NAMES: FrozenSet[str] = frozenset(
         "api_alternative",
         "tiling_calc",
         "tiling_validate",
+        "tiling_budget_codegen",
+        "shape_stride_layout_validator",
         "npu_arch",
         "code_style",
         "security_check",
@@ -125,6 +127,14 @@ def has_tiling_calc(mode: AgentToolMode) -> bool:
 
 def has_tiling_validate(mode: AgentToolMode) -> bool:
     return "tiling_validate" in mode
+
+
+def has_tiling_budget_codegen(mode: AgentToolMode) -> bool:
+    return "tiling_budget_codegen" in mode
+
+
+def has_shape_stride_layout_validator(mode: AgentToolMode) -> bool:
+    return "shape_stride_layout_validator" in mode
 
 
 def has_npu_arch(mode: AgentToolMode) -> bool:
@@ -274,6 +284,8 @@ def normalize_tool_choice_name(raw: str) -> Optional[str]:
         "api_alternative": "api_alternative",
         "tiling_calc": "tiling_calc",
         "tiling_validate": "tiling_validate",
+        "tiling_budget_codegen": "tiling_budget_codegen",
+        "shape_stride_layout_validator": "shape_stride_layout_validator",
         "npu_arch": "npu_arch",
         "code_style": "code_style",
         "security_check": "security_check",
@@ -296,6 +308,8 @@ def normalize_tool_choice_name(raw: str) -> Optional[str]:
         "API_ALTERNATIVE": "api_alternative",
         "TILING_CALC": "tiling_calc",
         "TILING_VALIDATE": "tiling_validate",
+        "TILING_BUDGET_CODEGEN": "tiling_budget_codegen",
+        "SHAPE_STRIDE_LAYOUT_VALIDATOR": "shape_stride_layout_validator",
         "NPU_ARCH": "npu_arch",
         "CODE_STYLE": "code_style",
         "SECURITY_CHECK": "security_check",

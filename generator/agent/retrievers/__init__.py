@@ -25,6 +25,17 @@ from .tiling_retriever import (
     compute_tiling_params,
     validate_tiling_params,
 )
+from .tiling_budget_codegen import (
+    TilingBudgetCodegenResult,
+    UBBudgetItem,
+    plan_tiling_budget_codegen,
+)
+from .shape_stride_layout_validator import (
+    RuleViolation,
+    RepairSuggestion,
+    ShapeStrideLayoutValidatorResult,
+    plan_shape_stride_layout_validation,
+)
 from .api_doc_retriever import (
     ApiDocRetriever,
     ApiSignatureResult,
@@ -62,6 +73,8 @@ __all__ = [
     'NpuArchRetriever', 'ChipSpecResult',
     'TilingRetriever', 'TilingParamsResult', 'TilingValidationResult',
     'compute_tiling_params', 'validate_tiling_params',
+    'TilingBudgetCodegenResult', 'UBBudgetItem', 'plan_tiling_budget_codegen',
+    'RuleViolation', 'RepairSuggestion', 'ShapeStrideLayoutValidatorResult', 'plan_shape_stride_layout_validation',
     'ApiDocRetriever', 'ApiSignatureResult', 'ApiConstraintResult', 'ApiAlternativeResult',
     'CodeQualityRetriever', 'CodingStyleResult', 'SecurityCheckResult',
     'check_coding_style', 'check_security_patterns',

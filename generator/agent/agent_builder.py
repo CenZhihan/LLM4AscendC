@@ -25,6 +25,8 @@ from .agent_config import (
     has_api_alternative,
     has_tiling_calc,
     has_tiling_validate,
+    has_tiling_budget_codegen,
+    has_shape_stride_layout_validator,
     has_npu_arch,
     has_code_style,
     has_security_check,
@@ -131,7 +133,12 @@ def build_agent_app(
     _npu_arch_retriever = NpuArchRetriever() if has_npu_arch(tool_mode) else None
     _tiling_retriever = (
         TilingRetriever()
-        if (has_tiling_calc(tool_mode) or has_tiling_validate(tool_mode))
+        if (
+            has_tiling_calc(tool_mode)
+            or has_tiling_validate(tool_mode)
+            or has_tiling_budget_codegen(tool_mode)
+            or has_shape_stride_layout_validator(tool_mode)
+        )
         else None
     )
     _api_retriever = (

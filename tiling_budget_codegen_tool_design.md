@@ -154,6 +154,10 @@
 - `generator/agent/agent_state.py`
 - `generator/agent/builtin_tools.py`
 - `generator/agent/agent_config.py`
+- `generator/agent/agent_builder.py`
+- `generator/agent/nodes/__init__.py`
+- `generator/agent/nodes/choose_tool.py`
+- `generator/agent/nodes/answer.py`
 
 不要把这套能力直接塞进 `tiling_calc.py`。原因很直接：
 
@@ -176,6 +180,13 @@
 
 1. `TilingRetriever.compute_tiling()`
 2. `validate_tiling_params()`
+
+但这里要明确分工：
+
+- `validate_tiling_params()` 只负责底层硬件约束校验，例如 repeatTimes、tile 对齐、芯片默认 UB 上限、block 上限。
+- 新工具自己的 budget planner 负责业务预算校验，例如 `ub_total_bytes`、`ub_reserved_bytes`、分 stage 占用、双缓冲深度。
+
+不要把 `validate_tiling_params()` 当成完整预算校验器。当前实现里的 validator 不认识 `ub_reserved_bytes`，也不会按请求里的 `ub_total_bytes` 重算可用 UB。
 
 ---
 
@@ -223,6 +234,7 @@
       "stage_name": "tmp_relu_mask",
       "position": "VECCALC",
       "buffer_role": "temp",
+      "allocation_kind": "TQue",
       "per_tile_elements": 1,
       "depth": 1
     }
@@ -253,6 +265,7 @@
 | `stage_name` | 是 | 阶段名 |
 | `position` | 是 | `VECIN` / `VECOUT` / `VECCALC` |
 | `buffer_role` | 是 | `input` / `output` / `temp` / `workspace` |
+| `allocation_kind` | 否 | 默认 `TQue`；后续可支持 `TBuf`，但两者代码生成模板不同 |
 | `per_tile_elements` | 是 | 每个 tile 需要的元素倍数，通常输入输出是 1，融合中间量可能 > 1 |
 | `depth` | 是 | 期望队列深度 |
 | `fixed_bytes` | 否 | 固定字节数，用于与 tile 无关的控制 buffer |
@@ -279,14 +292,22 @@
   "tile_length": 4096,
   "loop_count": 64,
   "tail_length": 2048,
+  "num_per_core": 262144,
+  "last_core_num": 262144,
+  "last_core_loop_count": 64,
+  "last_core_tail_length": 2048,
   "tail_num_last_core": 6144,
   "repeat_times": 32,
+  "stage_total_bytes": 94208,
+  "ub_reserved_bytes": 4096,
+  "ub_total_bytes": 196608,
   "ub_usage_bytes": 98304,
   "ub_usage_pct": 50.0,
   "ub_budget_table": [
     {
       "stage_name": "in_x",
       "position": "VECIN",
+      "allocation_kind": "TQue",
       "bytes_per_buffer": 8192,
       "depth": 2,
       "total_bytes": 16384,
@@ -298,7 +319,12 @@
     "tail_length is not alignment-safe; use split tail path with DataCopyPad",
     "double buffer is beneficial because loop_count >= 2 and UB headroom is sufficient"
   ],
-  "validation": {
+  "hardware_validation": {
+    "is_valid": true,
+    "errors": [],
+    "warnings": []
+  },
+  "planning_validation": {
     "is_valid": true,
     "errors": [],
     "warnings": []
@@ -312,13 +338,21 @@
 |-------------|-------------|
 | `block_dim` | `block_num` |
 | `tile_length` | `tile_length` |
-| `loop_count` | 新增计算 |
-| `tail_length` | 新增计算 |
+| `loop_count` | 基于 `num_per_core` 和 `tile_length` 新增计算 |
+| `tail_length` | 基于 `num_per_core` 和 `tile_length` 新增计算 |
+| `num_per_core` | `num_per_core` |
+| `last_core_num` | `tail_num_last_core` 修正后得到 |
+| `last_core_loop_count` | 新增计算 |
+| `last_core_tail_length` | 新增计算 |
 | `tail_num_last_core` | `tail_num_last_core` |
 | `repeat_times` | `repeat_times` |
-| `ub_usage_bytes` | `ub_usage_bytes` |
-| `ub_usage_pct` | `ub_usage_pct` |
-| `validation` | `validate_tiling_params()` |
+| `stage_total_bytes` | 新工具预算表汇总 |
+| `ub_reserved_bytes` | 新工具输入 |
+| `ub_total_bytes` | 新工具输入或芯片默认值 |
+| `ub_usage_bytes` | `stage_total_bytes + ub_reserved_bytes` |
+| `ub_usage_pct` | `ub_usage_bytes / ub_total_bytes` |
+| `hardware_validation` | `validate_tiling_params()` |
+| `planning_validation` | 新工具预算和代码生成一致性校验 |
 
 ---
 
@@ -423,23 +457,46 @@ while candidate >= elements_per_alignment:
         continue
 
     budget = estimate_ub_budget(candidate, ...)
-    if budget.total_bytes > usable_ub_bytes:
+    if budget.stage_total_bytes > usable_stage_ub_bytes:
         candidate -= elements_per_alignment
         continue
 
-    validation = validate_tiling_params(...)
-    if validation.is_valid:
+    hardware_validation = validate_tiling_params(...)
+    planning_validation = validate_budget_plan(...)
+    if hardware_validation.is_valid and planning_validation.is_valid:
         accept candidate
         break
 
     candidate -= elements_per_alignment
 ```
 
-`usable_ub_bytes` 建议定义为：
+这里的 UB 口径必须统一。建议定义三类字段：
 
 ```python
-usable_ub_bytes = ub_total_bytes - ub_reserved_bytes
+ub_capacity_bytes = request.ub_total_bytes
+reserved_bytes = request.ub_reserved_bytes
+usable_stage_ub_bytes = ub_capacity_bytes - reserved_bytes
+
+stage_total_bytes = sum(item.total_bytes for item in budget_items)
+ub_usage_bytes = stage_total_bytes + reserved_bytes
+ub_usage_pct = ub_usage_bytes / ub_capacity_bytes * 100.0
 ```
+
+判断预算是否可行时用：
+
+```python
+stage_total_bytes <= usable_stage_ub_bytes
+```
+
+或者等价地用：
+
+```python
+ub_usage_bytes <= ub_capacity_bytes
+```
+
+不要把已经包含 reserved 的 `ub_usage_bytes` 再拿去和 `usable_stage_ub_bytes` 比，否则会重复扣减 reserved。
+
+调用 `validate_tiling_params()` 时传入的 `ub_usage_bytes` 应该是包含 reserved 后的总占用，用来做芯片硬件上限兜底校验；是否满足用户请求的 reserved 预算，由新工具自己的 planning validation 判断。
 
 ## 7.4 第四步：`block_dim` 搜索
 
@@ -478,32 +535,45 @@ score =
 
 ## 7.5 第五步：计算 `loop_count` 和 `tail_length`
 
-在 block 维度和 tile 确定后，统一用下面公式输出：
+在 block 维度和 tile 确定后，需要同时输出一个“主核视角”的简洁字段，以及与现有 `tiling_calc` 一致的末核字段。
+
+不要只用 `ceil_div(total_elements, block_dim)` 覆盖全部语义。当前 generic tiling 的 `num_per_core` 是 `total_elements // block_num`，`tail_num_last_core` 是余数修正后的末核工作量；如果新工具直接改成全核上取整，生成出来的 loop 可能和现有切分不一致。
+
+建议第一版这样计算：
 
 ```python
-num_per_core = ceil_div(total_elements, block_dim)
-loop_count = ceil_div(num_per_core, tile_length)
-tail_length = num_per_core - (loop_count - 1) * tile_length if loop_count > 0 else 0
+main_core_num_per_core = seed.num_per_core or (total_elements // block_dim)
+last_core_num = seed.tail_num_last_core
+if last_core_num in (None, 0):
+    last_core_num = main_core_num_per_core
+
+loop_count = ceil_div(main_core_num_per_core, tile_length)
+tail_length = main_core_num_per_core - (loop_count - 1) * tile_length if loop_count > 0 else 0
+
+last_core_loop_count = ceil_div(last_core_num, tile_length)
+last_core_tail_length = (
+    last_core_num - (last_core_loop_count - 1) * tile_length
+    if last_core_loop_count > 0
+    else 0
+)
 ```
 
-如果你想与当前 `tiling_calc` 的切分完全一致，也可以保留：
-
-- `num_per_core`
-- `tail_num_last_core`
-
-并额外输出：
-
-- `last_core_loop_count`
-- `last_core_tail_length`
-
-但为了符合你的目标输出，建议统一主输出为：
+目标主输出仍然保留：
 
 - `block_dim`
 - `tile_length`
 - `loop_count`
 - `tail_length`
 
-再把更细的末核信息作为补充字段。
+但补充字段建议固定输出：
+
+- `num_per_core`
+- `tail_num_last_core`
+- `last_core_num`
+- `last_core_loop_count`
+- `last_core_tail_length`
+
+这样既满足高层工具的简洁输出，也不会破坏现有 tiling 结果的核心切分语义。
 
 ## 7.6 第六步：UB 预算估算与预算表生成
 
@@ -525,8 +595,26 @@ stage_total_bytes = aligned_bytes * effective_depth
 总 UB：
 
 ```python
-ub_total = sum(stage_total_bytes for stage in stages) + ub_reserved_bytes
+stage_total_bytes = sum(stage.total_bytes for stage in stages)
+ub_usage_bytes = stage_total_bytes + ub_reserved_bytes
+ub_usage_pct = ub_usage_bytes / ub_total_bytes * 100.0
 ```
+
+预算合法性：
+
+```python
+stage_total_bytes <= ub_total_bytes - ub_reserved_bytes
+# 等价于
+ub_usage_bytes <= ub_total_bytes
+```
+
+预算表中的普通 stage 只记录自身占用；`reserved` 可以作为一行特殊 item 输出，但它不能再被重复计入 `stage_total_bytes`。建议结果里同时保留：
+
+- `stage_total_bytes`
+- `ub_reserved_bytes`
+- `ub_usage_bytes`
+- `ub_total_bytes`
+- `ub_usage_pct`
 
 ### 建议输出表字段
 
@@ -599,21 +687,40 @@ ub_total = sum(stage_total_bytes for stage in stages) + ub_reserved_bytes
 
 ## 8. `TPipe` / `TQue` 代码生成设计
 
-## 8.1 为什么建议默认只生成 `TQue`
+## 8.1 为什么建议第一版默认生成 `TQue`
 
 你要求的是“可直接放入 `Init()` 的 `TPipe/TQue` 申请代码”。
 
-建议第一版代码生成只输出 `TQue` 风格的 staged allocation，原因有两个：
+建议第一版默认输出 `TQue` 风格的 staged allocation，但不要把它描述成仓库里的唯一惯例。当前仓库中确实有不少 `TQue<VECCALC, 1>` 的生成产物，也有模板使用 `TBuf<VECCALC>` 申请临时 buffer。
 
-1. 仓库里现成 kernel 模板就是这种风格。
-2. 当前仓库的修复规则里明确提醒过，不要在生成代码里误用 `TBuf` 的 `InitBuffer` 形态。
+第一版默认 `TQue` 的原因是：
 
-因此，目标工具默认生成：
+1. 它和已有动态生成产物更容易统一成 “position + depth + bytes” 的表格模型。
+2. `VECIN` / `VECOUT` 队列天然适合 `TQue`。
+3. `VECCALC` 临时 buffer 使用 `TQue` 时也能用 `depth=1` 表达单缓冲，便于预算表和代码模板保持一致。
+
+因此，目标工具第一版默认生成：
 
 - `VECIN` / `VECOUT` / `VECCALC` 都用 `TQue`
 - 临时单缓冲也用 `depth=1` 的 `TQue`
 
-等后续验证稳定后，再考虑增加 `TBuf` 作为可选输出模式。
+但输入 schema 建议预留字段：
+
+```json
+{
+  "allocation_kind": "TQue"
+}
+```
+
+后续可支持：
+
+```json
+{
+  "allocation_kind": "TBuf"
+}
+```
+
+`TBuf` 的 `InitBuffer` 形态和 `TQue` 不同，不能直接套用 `pipe_.InitBuffer(queue, depth, bytes)`。因此 Phase 1 可以先只实现 `TQue`，但设计上要承认 `TBuf` 是合法的 temp/workspace 表达。
 
 ## 8.2 成员声明模板
 
@@ -646,7 +753,7 @@ pipe_.InitBuffer(tmpQueue_, 1, tileLength_ * sizeof(T));
 对每个 stage：
 
 1. `position` 映射到 `AscendC::TPosition::*`
-2. `depth` 直接进入模板参数和 `InitBuffer` 第二个参数
+2. `allocation_kind == "TQue"` 时，`depth` 进入模板参数和 `InitBuffer` 第二个参数
 3. buffer size 取预算表中的 `bytes_per_buffer`
 
 即：
@@ -654,6 +761,13 @@ pipe_.InitBuffer(tmpQueue_, 1, tileLength_ * sizeof(T));
 ```python
 declaration = f"AscendC::TQue<AscendC::TPosition::{pos}, {depth}> {name}_;"
 init_line = f"pipe_.InitBuffer({name}_, {depth}, {bytes_per_buffer});"
+```
+
+后续支持 `TBuf` 时应使用独立模板：
+
+```python
+declaration = f"AscendC::TBuf<AscendC::TPosition::{pos}> {name}_;"
+init_line = f"pipe_.InitBuffer({name}_, {bytes_per_buffer});"
 ```
 
 ## 8.3 融合算子场景建议
@@ -712,6 +826,7 @@ tail_length is aligned and large enough; reuse the main loop body with a final s
 class UBBudgetItem:
     stage_name: str
     position: str
+    allocation_kind: str
     bytes_per_buffer: int
     depth: int
     total_bytes: int
@@ -734,16 +849,26 @@ class TilingBudgetCodegenResult:
     tile_length: int | None
     loop_count: int | None
     tail_length: int | None
+    num_per_core: int | None
+    last_core_num: int | None
+    last_core_loop_count: int | None
+    last_core_tail_length: int | None
     tail_num_last_core: int | None
     repeat_times: int | None
+    stage_total_bytes: int | None
+    ub_reserved_bytes: int | None
+    ub_total_bytes: int | None
     ub_usage_bytes: int | None
     ub_usage_pct: float | None
     ub_budget_table: list[UBBudgetItem]
     init_code: str
     strategy_suggestions: list[str]
-    validation_status: str
-    validation_errors: list[str]
-    validation_warnings: list[str]
+    hardware_validation_status: str
+    hardware_validation_errors: list[str]
+    hardware_validation_warnings: list[str]
+    planning_validation_status: str
+    planning_validation_errors: list[str]
+    planning_validation_warnings: list[str]
     seed_strategy_kind: str = ""
     seed_status: str = ""
 ```
@@ -793,6 +918,64 @@ init_code=...
 - `tiling_budget_codegen_result`
 - `tiling_budget_codegen_results`
 
+### 11.1 必须补齐的 agent 接入点
+
+当前 agent 使用统一 `tool_dispatch_node` 和 registry 分发，所以不需要为新工具单独新增 graph node。但是要让工具真正可选、可执行、可进入最终回答，需要补齐下面这些位置：
+
+1. `generator/agent/agent_config.py`
+   - 在 `BUILTIN_TOOL_NAMES` 加入 `tiling_budget_codegen`。
+   - 新增 `has_tiling_budget_codegen(mode)`。
+   - 如果希望 `"all"` 模式包含该工具，也要把它加入 `ALL`。
+
+2. `generator/agent/agent_builder.py`
+   - import `has_tiling_budget_codegen`。
+   - 初始化 `_tiling_retriever` 的条件改为：
+
+```python
+has_tiling_calc(tool_mode)
+or has_tiling_validate(tool_mode)
+or has_tiling_budget_codegen(tool_mode)
+```
+
+3. `generator/agent/builtin_tools.py`
+   - 从 `generator.agent.nodes` import `tiling_budget_codegen_node`。
+   - 在 `_meta()` 添加 `tiling_budget_codegen` 的 display name、description、parameter docs、examples、usage guidance。
+   - 在 `_handler_for()` 添加：
+
+```python
+if name == "tiling_budget_codegen":
+    return tiling_budget_codegen_node(state, tiling_retriever)
+```
+
+4. `generator/agent/nodes/__init__.py`
+   - import 并导出 `tiling_budget_codegen_node`。
+
+5. `generator/agent/agent_state.py`
+   - 增加：
+
+```python
+tiling_budget_codegen_results: Annotated[List[str], _add_list]
+tiling_budget_codegen_result: NotRequired[Dict[str, Any]]
+```
+
+   - `create_initial_state()` 里初始化 `tiling_budget_codegen_results: []`。
+
+6. `generator/agent/nodes/choose_tool.py`
+   - `_summarize_existing_results()` 加入 `tiling_budget_codegen_results` 摘要。
+   - `_RESULT_LIST_KEYS` 加入：
+
+```python
+"tiling_budget_codegen": "tiling_budget_codegen_results"
+```
+
+   这样重复调用防护和下一轮工具选择上下文才完整。
+
+7. `generator/agent/nodes/answer.py`
+   - `_format_retrieved_content()` 加入 `[Tiling budget/codegen]` 段落。
+
+8. 测试
+   - 除 planner 单测外，还要覆盖 registry / choice / answer prompt 链路，避免“工具实现了但 agent 看不见”。
+
 ---
 
 ## 12. 校验闭环设计
@@ -801,10 +984,10 @@ init_code=...
 
 ### 12.1 数值校验
 
-直接复用：
+数值校验直接复用现有 validator，但它只表示硬件底线校验：
 
 ```python
-validate_tiling_params(
+hardware_validation = validate_tiling_params(
     {
         "operator_class": operator_class,
         "tile_length": tile_length,
@@ -817,20 +1000,25 @@ validate_tiling_params(
 )
 ```
 
+这里传入的 `ub_usage_bytes` 应为 `stage_total_bytes + ub_reserved_bytes`。由于现有 validator 内部只按 `chip` 选择默认 UB 容量，它不会校验“用户要求 reserved 后是否仍能放下 stage”。这个检查必须由规划校验完成。
+
 ### 12.2 规划校验
 
 这是新增的逻辑，建议补以下检查：
 
-1. `sum(stage.total_bytes) + ub_reserved_bytes == ub_usage_bytes`
-2. `depth == 2` 只在允许双缓冲的 stage 上启用
-3. `loop_count == 1` 时给出关闭双缓冲建议
-4. `tail_length` 不对齐时给出 split-tail 建议
-5. `init_code` 中生成的 depth 与预算表一致
+1. `stage_total_bytes == sum(stage.total_bytes for stage in stages)`
+2. `ub_usage_bytes == stage_total_bytes + ub_reserved_bytes`
+3. `stage_total_bytes <= ub_total_bytes - ub_reserved_bytes`
+4. `ub_usage_bytes <= ub_total_bytes`
+5. `depth == 2` 只在允许双缓冲的 stage 上启用
+6. `loop_count == 1` 时给出关闭双缓冲建议
+7. `tail_length` 不对齐时给出 split-tail 建议
+8. `init_code` 中生成的 depth / allocation kind 与预算表一致
 
 也就是说，目标工具最终的结果中应同时带：
 
-- 底层硬件校验结果
-- 上层规划一致性校验结果
+- `hardware_validation_*`：来自 `validate_tiling_params()`。
+- `planning_validation_*`：来自新工具自己的预算和代码生成一致性检查。
 
 ---
 
@@ -879,6 +1067,23 @@ validate_tiling_params(
 1. 对齐粒度走 32B
 2. planner 能正确继承 `tiling_calc` 的 reduction 结果
 
+### 13.6 预算口径一致性
+
+验证：
+
+1. `stage_total_bytes + ub_reserved_bytes == ub_usage_bytes`
+2. `stage_total_bytes <= ub_total_bytes - ub_reserved_bytes`
+3. 当 stage 可放入默认芯片 UB、但放不进用户设置的 reserved 后可用 UB 时，`hardware_validation` 可以通过，但 `planning_validation` 必须失败
+
+### 13.7 agent 注册与上下文链路
+
+验证：
+
+1. `parse_tool_mode("tiling_budget_codegen")` 能识别新工具
+2. registry 里能注册并 dispatch 到 `tiling_budget_codegen_node`
+3. `choose_tool` 的重复调用防护能识别 `tiling_budget_codegen_results`
+4. `answer` prompt 中包含 `[Tiling budget/codegen]` 摘要
+
 ---
 
 ## 14. 推荐落地顺序
@@ -892,8 +1097,9 @@ validate_tiling_params(
 1. elementwise only
 2. 单 dtype
 3. `pipeline_stages` 仅支持 `per_tile_elements + depth`
-4. 只生成 `TQue`
+4. 默认只生成 `TQue`，但 schema 保留 `allocation_kind`
 5. 只做 `block_dim` / `tile_length` / `loop_count` / `tail_length` + UB 表 + `InitBuffer` 代码
+6. 完整接入 builtin registry、state、choose_tool、answer prompt
 
 ### Phase 2
 
@@ -904,15 +1110,15 @@ validate_tiling_params(
 3. conversion
 4. 分 stage 独立 dtype
 5. planner_ok 到 numeric candidate 的桥接搜索
+6. `TBuf` temp/workspace 代码生成
 
 ### Phase 3
 
 再增加：
 
 1. 更复杂的 tail 拆分方案
-2. `TBuf` 可选输出模式
-3. 更细的 pipeline overlap 建模
-4. 更复杂的 fused operator budget 模型
+2. 更细的 pipeline overlap 建模
+3. 更复杂的 fused operator budget 模型
 
 ---
 
@@ -936,7 +1142,7 @@ def plan_budget_and_codegen(request: NormalizedPlanRequest) -> TilingBudgetCodeg
 
     alignment_bytes = 32 if seed.operator_class == "reduction" else 256
     elem_size = dtype_bytes(request.dtype)
-    usable_ub_bytes = request.ub_total_bytes - request.ub_reserved_bytes
+    usable_stage_ub_bytes = request.ub_total_bytes - request.ub_reserved_bytes
     candidate_tile = align_down(seed.tile_length or request.total_elements, alignment_bytes // elem_size)
 
     best = None
@@ -948,32 +1154,50 @@ def plan_budget_and_codegen(request: NormalizedPlanRequest) -> TilingBudgetCodeg
             global_dtype=request.dtype,
             reserved_bytes=request.ub_reserved_bytes,
         )
+        stage_total_bytes = budget.stage_total_bytes
+        ub_usage_bytes = stage_total_bytes + request.ub_reserved_bytes
         repeat_times = compute_repeat_times(candidate_tile, elem_size)
-        validation = validate_tiling_params(
+        hardware_validation = validate_tiling_params(
             {
                 "status": "numeric_ok",
                 "operator_class": seed.operator_class,
                 "tile_length": candidate_tile,
                 "repeat_times": repeat_times,
-                "ub_usage_bytes": budget.total_bytes,
+                "ub_usage_bytes": ub_usage_bytes,
                 "block_num": seed.block_num,
                 "dtype": request.dtype,
             },
             chip=request.chip,
         )
-        if budget.total_bytes <= usable_ub_bytes and validation.is_valid:
-            best = (candidate_tile, budget, validation)
+        planning_validation = validate_budget_plan(
+            stage_total_bytes=stage_total_bytes,
+            usable_stage_ub_bytes=usable_stage_ub_bytes,
+            ub_reserved_bytes=request.ub_reserved_bytes,
+            ub_usage_bytes=ub_usage_bytes,
+            ub_total_bytes=request.ub_total_bytes,
+            budget_items=budget.items,
+            init_code=None,
+        )
+        if hardware_validation.is_valid and planning_validation.is_valid:
+            best = (candidate_tile, budget, hardware_validation, planning_validation)
             break
         candidate_tile -= alignment_bytes // elem_size
 
     if best is None:
         return no_feasible_budget_result(...)
 
-    tile_length, budget, validation = best
+    tile_length, budget, hardware_validation, planning_validation = best
     block_dim = seed.block_num or 1
-    num_per_core = ceil_div(request.total_elements, block_dim)
+    num_per_core = seed.num_per_core or (request.total_elements // block_dim)
+    last_core_num = seed.tail_num_last_core or num_per_core
     loop_count = ceil_div(num_per_core, tile_length)
-    tail_length = num_per_core - (loop_count - 1) * tile_length
+    tail_length = num_per_core - (loop_count - 1) * tile_length if loop_count > 0 else 0
+    last_core_loop_count = ceil_div(last_core_num, tile_length)
+    last_core_tail_length = (
+        last_core_num - (last_core_loop_count - 1) * tile_length
+        if last_core_loop_count > 0
+        else 0
+    )
     init_code = render_tque_init_code(budget.stages)
     suggestions = build_strategy_suggestions(...)
 

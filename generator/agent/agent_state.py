@@ -73,6 +73,8 @@ class GeneratorAgentState(MessagesState):
     api_alternative_results: Annotated[List[str], _add_list]
     tiling_calc_results: Annotated[List[str], _add_list]
     tiling_validate_results: Annotated[List[str], _add_list]
+    tiling_budget_codegen_results: Annotated[List[str], _add_list]
+    shape_stride_layout_validator_results: Annotated[List[str], _add_list]
     npu_arch_results: Annotated[List[str], _add_list]
     code_style_results: Annotated[List[str], _add_list]
     security_check_results: Annotated[List[str], _add_list]
@@ -93,6 +95,8 @@ class GeneratorAgentState(MessagesState):
     api_alternative_result: NotRequired[Dict[str, Any]]  # API alternative finder
     tiling_calc_result: NotRequired[Dict[str, Any]]      # Tiling calculation
     tiling_validate_result: NotRequired[Dict[str, Any]]  # Tiling validation
+    tiling_budget_codegen_result: NotRequired[Dict[str, Any]]  # Tiling budget/codegen
+    shape_stride_layout_validator_result: NotRequired[Dict[str, Any]]  # Shape/stride/layout validation
     npu_arch_result: NotRequired[Dict[str, Any]]         # NPU architecture query
     code_style_result: NotRequired[Dict[str, Any]]       # Code style check
     security_check_result: NotRequired[Dict[str, Any]]   # Security pattern check
@@ -170,6 +174,8 @@ def create_initial_state(
         "api_alternative_results": [],
         "tiling_calc_results": [],
         "tiling_validate_results": [],
+        "tiling_budget_codegen_results": [],
+        "shape_stride_layout_validator_results": [],
         "npu_arch_results": [],
         "code_style_results": [],
         "security_check_results": [],

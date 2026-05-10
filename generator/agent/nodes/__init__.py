@@ -13,6 +13,8 @@ Each node handles a specific action in the agent workflow:
 - npu_arch: NPU architecture query
 - tiling_calc: Tiling calculation
 - tiling_validate: Tiling validation
+- tiling_budget_codegen: UB budget planning and queue init code generation
+- shape_stride_layout_validator: Shape/layout/stride legality validation for GM/UB movement
 - api_lookup: API signature lookup
 - api_constraint: API constraint check
 - api_alternative: API alternative finder
@@ -29,7 +31,9 @@ from .code_search_snippet import code_search_snippet_node
 from .env_check import env_check_env_node, env_check_npu_node, env_check_api_node
 from .npu_arch import npu_arch_node
 from .tiling_calc import tiling_calc_node
+from .tiling_budget_codegen import tiling_budget_codegen_node
 from .tiling_validate import tiling_validate_node
+from .shape_stride_layout_validator import shape_stride_layout_validator_node
 from .api_lookup import api_lookup_node
 from .api_constraint import api_constraint_node
 from .api_alternative import api_alternative_node
@@ -52,7 +56,9 @@ __all__ = [
     'env_check_api_node',
     'npu_arch_node',
     'tiling_calc_node',
+    'tiling_budget_codegen_node',
     'tiling_validate_node',
+    'shape_stride_layout_validator_node',
     'api_lookup_node',
     'api_constraint_node',
     'api_alternative_node',

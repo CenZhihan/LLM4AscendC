@@ -56,6 +56,10 @@ def _extract_tiling_params(query: str) -> dict:
 
 def resolve_validation_request(state: GeneratorAgentState) -> dict:
     """Resolve structured validation input before parsing the query."""
+    budget_upstream = state.get("tiling_budget_codegen_result")
+    if isinstance(budget_upstream, dict) and budget_upstream:
+        return dict(budget_upstream)
+
     upstream = state.get("tiling_calc_result")
     if isinstance(upstream, dict) and upstream:
         return dict(upstream)

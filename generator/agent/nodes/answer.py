@@ -89,6 +89,8 @@ def _format_retrieved_content(state: GeneratorAgentState) -> str:
     api_alternative_results = state.get("api_alternative_results", [])
     tiling_calc_results = state.get("tiling_calc_results", [])
     tiling_validate_results = state.get("tiling_validate_results", [])
+    tiling_budget_codegen_results = state.get("tiling_budget_codegen_results", [])
+    shape_stride_layout_validator_results = state.get("shape_stride_layout_validator_results", [])
     npu_arch_results = state.get("npu_arch_results", [])
     code_style_results = state.get("code_style_results", [])
     security_check_results = state.get("security_check_results", [])
@@ -135,6 +137,12 @@ def _format_retrieved_content(state: GeneratorAgentState) -> str:
 
     if tiling_validate_results:
         parts.append("[Tiling validation]\n" + "\n\n".join(tiling_validate_results[:4]))
+
+    if tiling_budget_codegen_results:
+        parts.append("[Tiling budget/codegen]\n" + "\n\n".join(tiling_budget_codegen_results[:4]))
+
+    if shape_stride_layout_validator_results:
+        parts.append("[Shape/stride/layout validator]\n" + "\n\n".join(shape_stride_layout_validator_results[:4]))
 
     if npu_arch_results:
         parts.append("[NPU architecture]\n" + "\n\n".join(npu_arch_results[:4]))
