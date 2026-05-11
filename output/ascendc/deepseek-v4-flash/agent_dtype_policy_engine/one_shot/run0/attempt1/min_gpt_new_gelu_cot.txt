@@ -1,0 +1,76 @@
+We need to provide six Python strings for the min_gpt_new_gelu_custom kernel. The kernel implements GELU activation: 0.5 * x * (1.0 + tanh(sqrt(2/π) * (x + 0.044715 * x^3))) . This is elementwise, float32, using pow and tanh. According to dtype policy, use float32 for compute/accum.
+
+We need:
+- project_json_src: operator definition "MinGptNewGeluCustom" with input x (float), output y (float), no attrs? The forward has no extra params; it's a pure function of x. So no attrs.
+- host_tiling_src: tiling data struct MinGptNewGeluCustomTilingData with totalLength, tileLength, blockDim. No extra params.
+- host_operator_src: TilingFunc, InferShape, InferDataType, OpDef class for MinGptNewGeluCustom.
+- kernel_src: KernelMinGptNewGeluCustom class with Init, Process. Use grid-stride pattern like leaky_relu but compute GELU. Need to compute pow(x,3), multiply constant, add, multiply constants, tanh, then multiply by 0.5*x. Use vector instructions: Mul, Add, Tanh? AscendC has Tanh for float32 (since it's a built-in activation?). Actually, need to check: In AscendC API, there's Tanh, Exp, etc. So we can use AscendC::Tanh on local tensor. Compute pow(x,3) = Mul(x, x) then Mul by x again. So two multiplies. Then Muls to multiply by constant 0.044715, then Adds with x, then Muls by sqrt(2/pi), Tanh, then adds 1.0, then Muls by 0.5 and by x. Need to chain with temporary tensors. Use two tmp tensors maybe. Buffer: inQueueX (2), outQueueY (2), tmpQueue (2) or (1). LeakyRelu used three queues: in, out, tmp. Here we need more tmp space. We can allocate more temporary tensors. Since UB budget is tight, but we can reuse. We'll use two temporary queues: tmpQueue1 for intermediate results, tmpQueue2 maybe. But we can also compute in-place within a single tmp buffer if careful. Simpler: have multiple local tensors allocated from a single tmpQueue (BUFFER_NUM=1) but then we can't interleave. Since we only do one tile at a time, we can allocate all required temps at once using multiple tensors from tmpQueue? We can use a single tmp queue but allocate multiple tensors from it sequentially. The leaky_relu used one tmpQueue with BUFFER_NUM=1 and allocated one tensor. For GELU, we need maybe two temporaries: one for x^3, another for intermediate sum before tanh. We can compute x^3 in t1, then compute (x + 0.044715*t1) in t2, then multiply by sqrt(2/pi) in t2, then tanh(t2) into t1, then add 1.0 into t1, then multiply by 0.5*x into yLocal. But we need to keep xLocal. So we need one extra temporary beyond yLocal. Actually, we can compute:
+1. t1 = x (copy) or reuse xLocal? xLocal is from inQueue, we can modify it? Better not corrupt input. So we keep xLocal untouched.
+2. Compute xcopy = t1 (if we need x later). But we can compute y = 0.5*x, then later multiply by something? Let's do:
+- t1 = x cube: t1 = Mul(x, x) then Mul(t1, x) -> t1 = x^3
+- t2 = 0.044715 * t1 -> Muls(t2, t1, 0.044715)
+- Add(t2, t2, x) -> t2 = x + 0.044715*x^3
+- Muls(t2, t2, sqrt(2/pi)) -> t2 = sqrt(2/pi)*(x + 0.044715*x^3)
+- Tanh(t1, t2) -> t1 = tanh(...) 
+- Adds(t1, t1, 1.0) -> t1 = 1 + tanh(...)
+- Muls(t1, t1, 0.5) -> t1 = 0.5*(1+tanh(...))
+- Mul(y, x, t1) -> y = 0.5*x*(1+tanh(...))
+
+So we need two temporaries: t1 and t2. We can allocate them from a tmpQueue with BUFFER_NUM=1 but allocate two tensors sequentially. But careful with enque/deque: we need to manage pipe. Simpler: use two separate tmp queues: tmpQueue1 and tmpQueue2, each with BUFFER_NUM=1. Or we can use one queue and allocate two tensors at once with total size 2*tileLen. Since we only process one tile at a time, we can allocate both from a single queue with a single allocation of size 2*tileLen and then cast to two tensors? But that's messy. We'll follow the pattern: in leaky_relu, they had one tmpQueue with BUFFER_NUM=1 for the min. So we can add another tmpQueue. Or we can reuse the same tmpQueue for both t1 and t2 sequentially: compute t1, then use t2 from same queue after freeing t1? But we need both t1 and t2 simultaneously for the final Mul? Actually, after computing t1 as tanh result, we can reuse t2 for later steps. But we need t1 and t2 at same time only during the final multiplication? Wait, final step: y = x * (0.5 * (1+tanh(...))). At that point we have xLocal, and we need to compute the scalar factor into some temp and then Mul. We can compute factor into t1, then Mul(y, x, t1). So at final, we have x and t1. So we only need one temp for factor. So we can compute:
+- t1 = x^3 (use Mul twice)
+- t2 = 0.044715 * t1
+- Add(t2, t2, x)
+- Muls(t2, t2, sqrt(2/pi))
+- Tanh(t1, t2)   // overwrite t1 with tanh result
+- Adds(t1, t1, 1.0)
+- Muls(t1, t1, 0.5)   // factor
+- Mul(y, x, t1)
+
+We need t1 and t2 simultaneously only until Tanh. After Tanh, t1 holds result, t2 is no longer needed. So we can use two temporaries t1 and t2, both from the same tmpQueue if we allocate them sequentially: allocate t1, then allocate t2, use them, then free t2 after it's no longer needed, then keep t1. But the pipe expects explicit dequeue and free. Or we can just have two separate tmpQueues with one buffer each. Simpler and follows pattern. So we'll add tmpQueue2 with BUFFER_NUM=1.
+
+But need to be mindful of UB budget. Each tile: x (tileLen floats), y (tileLen floats), t1 (tileLen), t2 (tileLen). Total 4 * tileLen floats. Each float 4 bytes, so 16 bytes per element. For UB budget 192KB, max tileLen = 192*1024 / 16 = 12288 floats. Then align to 2048 -> 12288 is already multiple of 2048? 12288/2048=6, so okay. But we also have in and out queues double buffered? In leaky_relu, inQueueX and outQueueY have BUFFER_NUM=2, so they hold 2*tileLen each, but only one from each at a time? Actually double buffering means they have two slots, but each slot holds one tile. So the total UB consumption is: inQueueX: 2*tileLen floats, outQueueY: 2*tileLen floats, tmpQueue1: 1*tileLen, tmpQueue2: 1*tileLen. Total 6*tileLen floats = 24*tileLen bytes. So max tileLen = 192*1024 / 24 = 8192 bytes? 192KB = 196608 bytes, /24 = 8192 bytes? Actually 24*tileLen bytes, so tileLen max = 196608/24 = 8192 (since 8192*24=196608). So tileLen=8192. That's fine. So we can use 8192 as hard cap.
+
+We'll set UB_BUDGET_BYTES = 192*1024, ALIGN_ELEMS = 2048, HARD_CAP_ELEMS = 8192 (since 8192*24=196608). Or we can compute dynamically.
+
+Now the kernel: we'll adopt similar grid-stride pattern from leaky_relu. Process function iterates with stride blockNum*tileLen.
+
+Compute function: implement the GELU steps.
+
+Constants: sqrt(2/pi) = 0.7978845608028654, 0.044715.
+
+Now produce the six strings.
+
+Let's craft each:
+
+1. project_json_src: 
+   - op: "MinGptNewGeluCustom"
+   - input_desc: [{"name": "x", "param_type": "required", "format": ["ND"], "type": ["float"]}]
+   - output_desc: [{"name": "y", "param_type": "required", "format": ["ND"], "type": ["float"]}]
+   - attr: none
+
+2. host_tiling_src: 
+   - TILING_DATA_DEF: MinGptNewGeluCustomTilingData with uint32_t totalLength, tileLength, blockDim.
+
+3. host_operator_src: 
+   - TilingFunc as described, compute tileLen from UB budget (24 bytes per element = total bytes = 4*sizeof(float)*? Wait compute: 6 * tileLen floats -> 6 * 4 * tileLen = 24 * tileLen bytes. Use that).
+   - InferShape/InferDataType.
+   - OpDef class with Input/Output/Attr (none). Use AICore().AddConfig("ascend910b").
+
+4. kernel_src: 
+   - KernelMinGptNewGeluCustom class.
+   - Init: set xGm_, yGm_, totalLen_, tileLen_, precompute constants.
+   - Process: grid-stride loop.
+   - CopyIn: from xGm_ to inQueueX.
+   - Compute: use two tmp queues (tmpQueue1_, tmpQueue2_, each BUFFER_NUM=1). Allocate xLocal, yLocal, t1, t2. Compute as described.
+   - CopyOut: from outQueueY to yGm_.
+
+5. python_bind_src: 
+   - Similar to leaky_relu but call aclnnMinGptNewGeluCustom. Use torch::Tensor result = at::empty_like(self); EXEC_NPU_CMD(...). For TORCH_LIBRARY_IMPL, use "min_gpt_new_gelu_custom".
+
+6. model_src: 
+   - import torch, import torch_npu, import custom_ops_lib.
+   - ModelNew class uses getattr(custom_ops_lib, 'min_gpt_new_gelu_custom') and calls it.
+
+Make sure kernel function name is min_gpt_new_gelu_custom.
+
+Now write all six strings.

@@ -1,0 +1,100 @@
+We are asked to generate the six Python strings for a custom Ascend C kernel for the Swish activation function. The kernel name is `swish_custom` (PascalCase: `SwishCustom`). The model uses `x * torch.sigmoid(x)`. We need to produce `project_json_src`, `host_tiling_src`, `host_operator_src`, `kernel_src`, `python_bind_src`, and `model_src` similar to the leaky_relu example.
+
+We have retrieved context about dtype policy: elementwise float32, accumulation float32. So we'll use float32 for everything.
+
+We need to design the kernel: Swish(x) = x * sigmoid(x). Since Ascend C has no direct sigmoid, we can implement using exp: sigmoid(x) = 1/(1+exp(-x)). But perhaps we can use the built-in activation functions? Let's check typical Ascend C kernels: there is `Sigmoid` operation? Actually, Ascend C math library includes `Exp` and reciprocal. We can compute using local tensors.
+
+We'll follow the same pattern: tiling, double buffering, grid-stride.
+
+We need to define tiling data: totalLength, tileLength, blockDim (maybe we don't need an attr for Swish since no parameter). So tiling data will have totalLength and tileLength, blockDim.
+
+In host operator, we set the op definition with no attributes. The InferShape/DataType similar.
+
+In kernel, we implement Swish: compute sigmoid via exp.
+
+We'll write kernel with three queues: inQueueX, outQueueY, tmpQueue for intermediate? We can use two queues: we need temp for exp and add. Typically we need two temps: one for negative x, one for exp, etc. But we can reuse the same queue. Let's design:
+
+- DataCopy x -> xLocal.
+- Compute: Compute sigmoid: 
+  - t1 = -xLocal (Muls by -1)
+  - t2 = exp(t1) (using AscendC::Exp)
+  - t3 = 1.0 + t2 (Adds scalar)
+  - t4 = reciprocal(t3) (using AscendC::Reciprocal) -> sigmoid
+  - yLocal = xLocal * t4 (Mul)
+- But we need multiple local tensors. We can allocate two temp tensors from tmpQueue.
+
+We'll use a single tmpQueue with enough buffer for two tiles? Actually we only need temporary during compute. Since we have double buffering, we can allocate two temps each tile length.
+
+Alternatively, we can allocate a single tmp tensor and reuse steps, but careful about dependencies. Let's do: allocate xLocal, yLocal, tLocal1, tLocal2 from separate buffers. But we have only two queues: inQueueX, outQueueY, and tmpQueue. We can allocate multiple tensors from tmpQueue: we can do `pipe_.InitBuffer(tmpQueue_, 2, tileLen_ * sizeof(float));` then allocate two tensors. But the example only used 1 buffer in tmpQueue. Actually we can use multiple buffers in the same queue with different indices. Better: we can use separate queues for temporaries, but to simplify, we can use VECIN, VECOUT, and VECCALC for temporaries? Typically we have one VECCALC queue. We can allocate two tensors from it by using different indices? The TQue class supports multiple buffers? Actually, the buffer number is the number of buffers in the queue, not the number of tensors. We can call AllocTensor multiple times as long as there are free buffers. So if we InitBuffer with 2, we can allocate two tensors sequentially. But we need to free them after use. Example:
+
+pipe_.InitBuffer(tmpQueue_, 2, tileLen_ * sizeof(float));
+...
+auto t1 = tmpQueue_.AllocTensor<float>();
+auto t2 = tmpQueue_.AllocTensor<float>();
+... compute
+tmpQueue_.FreeTensor(t1);
+tmpQueue_.FreeTensor(t2);
+
+But careful: `FreeTensor` puts the buffer back into the queue. We need to ensure we don't exceed the buffer count. Since we allocate two, we can free them after use.
+
+But in the leaky_relu example, they used a single tmp buffer and freed it. That's fine for one temp. For Swish we need multiple temps. Let's use two temps.
+
+Alternatively, we can combine operations to use fewer temps: e.g., compute sigmoid using a series of operations on the same tensor? For example: we can compute negative x, then exp in-place? But exp needs its own input. We can do:
+
+t = xLocal; Muls(t, -1.0f, len); Exp(t, t, len); // t = exp(-x)
+Adds(t, 1.0f, len); // t = 1+exp(-x)
+Reciprocal(t, t, len); // t = sigmoid
+Mul(yLocal, xLocal, t, len); // y = x * sigmoid
+
+That uses only one temp (t) in addition to xLocal and yLocal. But we need to be careful: after first Muls, xLocal is still needed for final multiplication. So we cannot overwrite xLocal. So we need a separate temp for the intermediate. So we'll allocate one temp.
+
+Actually the sequence:
+1. Copy x to xLocal.
+2. Compute sigmoid into temp t:
+   - t = xLocal (copy? we can just use the same xLocal? No, we need x for final multiplication. So we can copy xLocal to t first? But we already have xLocal. Better: we can compute sigmoid into yLocal? That overwrites. So we need a separate temp.
+3. Then compute yLocal = xLocal * t.
+
+Thus we need one temp tensor. So we can use a single tmp buffer. The example also used one. So we can do:
+
+In compute:
+- DeQue xLocal from inQueueX.
+- Alloc tLocal from tmpQueue.
+- Alloc yLocal from outQueueY.
+- Compute:
+  // t = exp(-x)
+  AscendC::Muls(tLocal, xLocal, -1.0f, len);
+  AscendC::Exp(tLocal, tLocal, len); // t = exp(-x)
+  // t = 1 + exp(-x)
+  AscendC::Adds(tLocal, tLocal, 1.0f, len); // t = 1 + exp(-x)
+  // t = 1/(1+exp(-x)) = sigmoid
+  AscendC::Reciprocal(tLocal, tLocal, len); // t = sigmoid
+  // y = x * sigmoid
+  AscendC::Mul(yLocal, xLocal, tLocal, len);
+- Then Free tLocal.
+- EnQue yLocal, Free xLocal.
+
+That's concise.
+
+But note: Ascend C API: `Exp` is `AscendC::Exp(localDst, localSrc, len)`. `Reciprocal` is `AscendC::Reciprocal(localDst, localSrc, len)`. `Adds` is `AscendC::Adds(localDst, localSrc, scalar, len)`. `Muls` is `AscendC::Muls(localDst, localSrc, scalar, len)`. `Mul` is `AscendC::Mul(localDst, localSrc1, localSrc2, len)`.
+
+All good.
+
+Now for the tiling: We need to allocate temporary buffer for one tile (tLocal). So total buffers: inQueueX: 2 tiles, outQueueY: 2 tiles, tmpQueue: 1 tile. So UB budget = (2+2+1)*tileLen*sizeof(float) = 5*tileLen*4 = 20*tileLen bytes. That matches the leaky_relu example exactly. So we can reuse the same UB budget calculation.
+
+Now for the host operator: no attrs. So we don't need to get attrs. But we still need to set blockDim and tiling. We'll set totalLength from input shape. tileLength from UB budget. blockDim similarly adaptive.
+
+For host_operator_src, we need to include the tiling data header and define the tiling function. Since no attr, we can skip getting attrs.
+
+For the host operator class, we define op with input "x" and output "y", both float ND. No attrs.
+
+For project_json_src, we define op "SwishCustom" with input and output, no attrs.
+
+For python_bind_src, we define a function `swish_impl_npu` that calls `aclnnSwishCustom`. The name must match. Since it's custom, we need to include the aclnn header? In the example they used `EXEC_NPU_CMD(aclnnLeakyReluCustom, self, negative_slope, result);`. So we'll use `aclnnSwishCustom`. Note that aclnn API expects the op name as part of the function. Typically aclnn generates a function based on the op name. We'll follow that. Also we need to export the custom op library? The example used `TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) { m.impl("swish_custom", &swish_impl_npu); }` and PYBIND11_MODULE.
+
+For model_src, same as example but with `_FN = 'swish_custom'`.
+
+Now generate the six strings.
+
+Make sure kernel function name is `swish_custom` (lowercase as per the kernel name). PascalCase op type is `SwishCustom`.
+
+Let's write the code.

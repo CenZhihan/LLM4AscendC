@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from generator.agent.rules.cann83_constants import ALIGN_BYTES_COMPARE_BLOCK, dtype_elem_bytes
+
 
 # ============================================================
 # Structured result types
@@ -630,11 +632,9 @@ class ApiDocRetriever:
         count = call_context.get("count", 0)
         dtype = call_context.get("dtype", "float")
         if name == "Compare" and count > 0:
-            dtype_bytes_map = {"float": 4, "float32": 4, "half": 2, "float16": 2,
-                               "int32": 4, "int16": 2, "int8": 1, "uint8": 1}
-            elem_size = dtype_bytes_map.get(dtype, 4)
+            elem_size = dtype_elem_bytes(str(dtype))
             total_bytes = count * elem_size
-            if total_bytes % 256 != 0:
+            if total_bytes % ALIGN_BYTES_COMPARE_BLOCK != 0:
                 constraints.append({
                     "type": "alignment",
                     "desc": "Compare API 的 count 个元素所占空间必须 256 字节对齐",
@@ -642,9 +642,10 @@ class ApiDocRetriever:
                 })
                 violations.append(
                     f"count={count} * sizeof({dtype})={elem_size} = {total_bytes}B，"
-                    f"不是 256B 的倍数。"
+                    f"不是 {ALIGN_BYTES_COMPARE_BLOCK}B 的倍数。"
                 )
-                aligned_count = ((count + (256 // elem_size - 1)) // (256 // elem_size)) * (256 // elem_size)
+                step = ALIGN_BYTES_COMPARE_BLOCK // elem_size
+                aligned_count = ((count + (step - 1)) // step) * step
                 suggestions.append(
                     f"使用 padding 策略: 将 count 从 {count} 对齐到 {aligned_count}，"
                     f"多余的元素填充极值。"

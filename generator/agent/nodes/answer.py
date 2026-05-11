@@ -95,6 +95,8 @@ def _format_retrieved_content(state: GeneratorAgentState) -> str:
     ascend_search_results = state.get("ascend_search_results", [])
     ascend_fetch_results = state.get("ascend_fetch_results", [])
     registered_tool_results = state.get("registered_tool_results", [])
+    dtype_policy_engine_results = state.get("dtype_policy_engine_results", [])
+    dma_alignment_engine_results = state.get("dma_alignment_engine_results", [])
 
     parts: list = []
 
@@ -153,6 +155,12 @@ def _format_retrieved_content(state: GeneratorAgentState) -> str:
 
     if registered_tool_results:
         parts.append("[Registered tools]\n" + "\n\n".join(registered_tool_results[:6]))
+
+    if dtype_policy_engine_results:
+        parts.append("[Dtype policy engine]\n" + "\n\n".join(dtype_policy_engine_results[:4]))
+
+    if dma_alignment_engine_results:
+        parts.append("[DMA alignment engine]\n" + "\n\n".join(dma_alignment_engine_results[:4]))
 
     return "\n\n".join(parts) if parts else ""
 

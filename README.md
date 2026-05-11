@@ -287,6 +287,8 @@ result = generate_kernel_with_agent(task, parse_tool_mode("kb,code_rag,env_check
 | `security_check` | 不安全模式扫描 |
 | `ascend_search` | 在线 Ascend 文档搜索（固定：`lang=zh`、`doc_type=DOC`、`version=8.5.0`） |
 | `ascend_fetch` | 在线 Ascend 文档单 URL 抓取（仅允许抓取本会话 `ascend_search` 返回过的 URL） |
+| `dtype_policy_engine` | 算子级 **dtype / 累加 / cast 阶段** 策略建议（CANN 8.3.rc 基线，**顾问**，不查文档签名） |
+| `dma_alignment_engine` | **DMA 几何与对齐** 建议：搬运字节对齐、`DataCopy` vs `DataCopyPad`、`Compare` 256B 等（**顾问**） |
 
 ### 3.3 提示策略（`generator/prompt_generators/`）
 
@@ -331,6 +333,8 @@ Agent 基于 LangGraph `StateGraph`：在 `build_agent_app` 入口会 **`get_too
 | 安全检查 | `security_check` | 规则集 | 危险模式 |
 | 在线文档搜索 | `ascend_search` | hiascend 在线文档 | 固定参数检索，`query` 必须中文 |
 | 在线文档抓取 | `ascend_fetch` | hiascend 在线文档详情页 | 每次仅 1 个 URL，且必须来自历史 `ascend_search` 结果；沉淀 `main_content/code_examples` |
+| Dtype 策略顾问 | `dtype_policy_engine` | 内置规则（`generator/agent/rules/`） | **不**访问文档库；根据 `args` 与 CANN 8.3.rc 启发式给出累加/cast 阶段建议 |
+| DMA 对齐顾问 | `dma_alignment_engine` | 同上 | **不**访问文档库；根据 `args.transfers` 检查对齐并建议 `DataCopy` / `DataCopyPad` 等 |
 
 底层仍以各 **Retriever** 实现为主；**`tool_dispatch`** 节点根据 `state["next_action"]`（小写键或 `ANSWER`）在 **同一 Registry** 上查找并调用 `handler`。
 
@@ -459,6 +463,50 @@ python3 tools/test_ascend_docs_tools.py \
 ```
 
 依赖：`requirements-generation.txt` 中已列出 `requests` 与 `beautifulsoup4`。
+
+#### 3.5.7 顾问工具：`dtype_policy_engine` / `dma_alignment_engine`
+
+二者均为 **纯规则顾问**：不参与编译或 NPU 评测，也不替代 `api_lookup` / `api_constraint`；需在 **`--tool-mode`**（或 `parse_tool_mode` 的逗号列表 / `frozenset`）中 **显式启用**（预置 `all` **不包含**这两项）。
+
+**1. 工具做什么**
+
+| 工具 | 作用 |
+|------|------|
+| `dtype_policy_engine` | 在 **算子级** 建议：目标精度模式（如 `match_pytorch`、`fp32_accum_fp16_io`）、`op_family` 下的 **累加 dtype**、load/compute/accumulate/store 各阶段的 **cast 取向**，与 MKB / PyTorch 参考习惯对齐（启发式）。 |
+| `dma_alignment_engine` | 在 **搬运级** 建议：每条 transfer 的 **字节总长与偏移** 是否满足常用对齐启发式、GM↔UB 场景下 **`AscendC::DataCopy` vs `DataCopyPad`**，若声明 `involves_api: Compare` 则检查 **extent 是否 256B 对齐** 等。 |
+
+**2. 输入 / 输出（对接 Agent 的 JSON 协议）**
+
+编排模型每轮输出 **一个** `ToolChoice` JSON（全局规则见 §3.5.3.1）。对上述工具：
+
+- **输入（模型 → 解析器）**
+  - **`query`**：短自然语言意图（算子场景、搬运场景）。
+  - **`args`**（对象，可选字段见 `generator/agent/builtin_tools.py` 中各工具的 `parameter_docs`）  
+    - `dtype_policy_engine`：`target_precision_mode`、`op_family`、`io_dtypes`、`stages` 等。  
+    - `dma_alignment_engine`：`transfers`（数组，每项含 `direction`、`dtype`、`elem_count` 或 `byte_length` 等）、可选 `chip`。
+
+- **输出（工具节点 → Agent 状态）**
+  - **列表字段（供下游 prompt 拼接）**：`dtype_policy_engine_results`、`dma_alignment_engine_results`，每项为 **一段字符串**：前半段为 **单行 JSON**（可 `json.loads`），分隔符 **`#######`**，后半段为简短中文摘要（见 `generator/agent/reporting/advisory_report.py`）。
+  - **结构化字段（便于脚本消费）**：`dtype_policy_engine_result`、`dma_alignment_engine_result`，为 **dict**，含 `schema_version`、`cann_version`、`summary`、`issues`、`recommendations`、`alignment_confidence` 等。
+
+**3. 为什么能帮助 Agent**
+
+- 与 **`api_lookup` / `api_constraint`** 分工：后两者偏向 **单个 API 符号** 与 **单次调用点** 的签名与约束；顾问工具覆盖 **整条 dtype 管线** 与 **多段 DMA 几何**，减少「只知道 API 名字却不知道何处 FP32 累加、何处应用 Pad」的断层。
+- 输出同时含 **机器可读 JSON** 与自然语言摘要，便于编排模型与最终写码模型消化；仍为 **建议**，最终以 **CANN 编译与 `eval_operator` 数值结果** 为准。
+
+**4. 工具调用如何记录（审计 / 误判分析）**
+
+以下字段可用于复盘「工具是否答错、是否误导下游」：
+
+| 来源 | 路径 / 字段 | 内容 |
+|------|----------------|------|
+| LangGraph 状态 | `tool_calls_log` | 每次工具执行追加一条：`round`、`tool`、`query`、**`response`（完整顾问输出字符串）**。 |
+| LangGraph 状态 | `tool_choice_json` | 最近一次解析成功的 **`tool` / `query` / `args`**（及可选 `thinking`），可与 `tool_calls_log` 对照「模型到底传了什么」。 |
+| LangGraph 状态 | `tool_choice_reasoning_log` | `choose_tool` 每轮一条：`prompt_excerpt`、`raw_model_output`、`selected_tool`、`thinking`、`parsed_ok` 等（见 `generator/agent/nodes/choose_tool.py`）。 |
+| LangGraph 状态 | `tool_choice_error_log` | JSON 解析失败或 tool 不在 `tool_mode` 时的错误与 **`raw_model_output` 截断**。 |
+| `generate_kernel_with_agent` 返回值 | `result.report` | `tool_calls`：`round`、`tool`、`query`、`response`（**默认最多保留约 500 字符**，过长加 `...`，完整内容请以图中的 `tool_calls_log` 为准）、`tool_choice`（与同 `round` 的 `tool_choice_reasoning_log` 合并）；`tool_selection_trace`；`tool_choice_parse_errors`。 |
+
+**提示**：若需事后完整比对顾问 JSON，请以 **`app.invoke` 结束时的 `final_state["tool_calls_log"]`** 或自行序列化完整状态为准；落盘的 `{op}_report.json` 可能对 `response` 做长度截断以防日志过大。
 
 ### 3.7 多轮自动修复脚本（按轮次命名汇总）
 

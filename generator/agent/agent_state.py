@@ -80,6 +80,8 @@ class GeneratorAgentState(MessagesState):
     ascend_fetch_results: Annotated[List[str], _add_list]
     ascend_search_allowed_urls: Annotated[List[str], _add_list]
     registered_tool_results: Annotated[List[str], _add_list]
+    dtype_policy_engine_results: Annotated[List[str], _add_list]
+    dma_alignment_engine_results: Annotated[List[str], _add_list]
 
     # Structured env check results (for programmatic access)
     env_check_env_result: NotRequired[Dict[str, Any]]    # Environment overview
@@ -98,6 +100,8 @@ class GeneratorAgentState(MessagesState):
     security_check_result: NotRequired[Dict[str, Any]]   # Security pattern check
     ascend_search_result: NotRequired[Dict[str, Any]]    # Ascend online docs search
     ascend_fetch_result: NotRequired[Dict[str, Any]]     # Ascend online docs fetch
+    dtype_policy_engine_result: NotRequired[Dict[str, Any]]  # dtype / accumulation advisory
+    dma_alignment_engine_result: NotRequired[Dict[str, Any]]  # DMA alignment advisory
 
     # Tool call logging
     tool_calls_log: Annotated[List[Dict[str, Any]], _add_tool_calls]
@@ -177,6 +181,8 @@ def create_initial_state(
         "ascend_fetch_results": [],
         "ascend_search_allowed_urls": [],
         "registered_tool_results": [],
+        "dtype_policy_engine_results": [],
+        "dma_alignment_engine_results": [],
         "tool_calls_log": [],
         "tool_choice_reasoning_log": [],
         "query_round_count": 0,

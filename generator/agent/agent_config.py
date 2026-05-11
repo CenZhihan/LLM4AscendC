@@ -30,6 +30,8 @@ BUILTIN_TOOL_NAMES: FrozenSet[str] = frozenset(
         "security_check",
         "ascend_search",
         "ascend_fetch",
+        "dtype_policy_engine",
+        "dma_alignment_engine",
     }
 )
 
@@ -145,6 +147,14 @@ def has_ascend_search(mode: AgentToolMode) -> bool:
 
 def has_ascend_fetch(mode: AgentToolMode) -> bool:
     return "ascend_fetch" in mode
+
+
+def has_dtype_policy_engine(mode: AgentToolMode) -> bool:
+    return "dtype_policy_engine" in mode
+
+
+def has_dma_alignment_engine(mode: AgentToolMode) -> bool:
+    return "dma_alignment_engine" in mode
 
 
 def iter_tools(mode: AgentToolMode) -> Iterable[str]:
@@ -279,6 +289,8 @@ def normalize_tool_choice_name(raw: str) -> Optional[str]:
         "security_check": "security_check",
         "ascend_search": "ascend_search",
         "ascend_fetch": "ascend_fetch",
+        "dtype_policy_engine": "dtype_policy_engine",
+        "dma_alignment_engine": "dma_alignment_engine",
     }
     u = s.upper()
     legacy_upper = {
@@ -301,6 +313,8 @@ def normalize_tool_choice_name(raw: str) -> Optional[str]:
         "SECURITY_CHECK": "security_check",
         "ASCEND_SEARCH": "ascend_search",
         "ASCEND_FETCH": "ascend_fetch",
+        "DTYPE_POLICY_ENGINE": "dtype_policy_engine",
+        "DMA_ALIGNMENT_ENGINE": "dma_alignment_engine",
     }
     if u in legacy_upper:
         return legacy_upper[u]
