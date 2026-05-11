@@ -718,9 +718,7 @@ def plan_tiling_budget_codegen(
         main_core_num = total_elements // block_dim
         if main_core_num <= 0:
             continue
-        last_core_num = total_elements % block_dim
-        if last_core_num == 0:
-            last_core_num = main_core_num
+        last_core_num = total_elements - main_core_num * (block_dim - 1)
 
         max_tile_by_repeat = max(elements_per_alignment, MAX_REPEAT_TIMES * elements_per_repeat)
         start_tile_hint = max(int(seed.tile_length or 0), min(main_core_num, max_tile_by_repeat))

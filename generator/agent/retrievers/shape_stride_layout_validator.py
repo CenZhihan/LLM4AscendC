@@ -502,19 +502,19 @@ def plan_shape_stride_layout_validation(request: Dict[str, Any]) -> ShapeStrideL
         )
     elif stride_status in {"STRIDE_UNIT_MISMATCH", "STRIDE_VALUE_INVALID", "STRIDE_NOT_AFFINE"}:
         hardware_status = "HARDWARE_STRIDE_ENCODING_INVALID"
-    elif use_row_view and derived_row_count > 1 and derived_row_bytes % ub_alignment_bytes != 0:
+    elif derived_row_bytes % ub_alignment_bytes != 0:
         if requested_copy_kind == "PAD_COPY":
             movement_status = "MOVEMENT_LEGAL"
             hardware_status = "HARDWARE_ALIGNMENT_WARNING"
-            warnings.append("row payload is not naturally aligned; legality depends on pad-capable copy semantics")
+            warnings.append("copy payload is not naturally aligned; legality depends on pad-capable copy semantics")
         else:
             movement_status = "MOVEMENT_REQUIRES_PAD_COPY"
             hardware_status = "HARDWARE_ALIGNMENT_WARNING"
             suggestions.append(
                 RepairSuggestion(
                     type="USE_PAD_COPY",
-                    summary="Switch the move to a pad-capable row copy",
-                    rationale="The row payload is not aligned to the required movement granularity, but the row structure is regular.",
+                    summary="Switch the move to a pad-capable copy",
+                    rationale="The payload is not aligned to the required movement granularity, but the layout is regular.",
                     expected_status_after_fix="VALID_WITH_WARNING",
                     patch_fields={"requested_copy_kind": "PAD_COPY"},
                 )
@@ -523,7 +523,7 @@ def plan_shape_stride_layout_validation(request: Dict[str, Any]) -> ShapeStrideL
                 RuleViolation(
                     rule_id="COPY_004",
                     severity="warning",
-                    message="row payload is not alignment-safe for plain row copy and needs pad semantics",
+                    message="copy payload is not alignment-safe for plain copy and needs pad semantics",
                 )
             )
 

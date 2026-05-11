@@ -106,6 +106,27 @@ class TestTilingBudgetCodegenPlanner(unittest.TestCase):
         )
 
 
+    def test_plan_budget_codegen_last_core_covers_non_divisible_workload(self):
+        total_elements = 1000
+        result = plan_tiling_budget_codegen(
+            {
+                "op_name": "relu",
+                "op_type": "elementwise",
+                "dtype": "float16",
+                "total_elements": total_elements,
+                "input_tensor_count": 1,
+                "output_tensor_count": 1,
+                "enable_double_buffer": True,
+            }
+        )
+
+        self.assertEqual(result.status, "ok")
+        covered = (result.block_dim - 1) * result.num_per_core + result.last_core_num
+        self.assertEqual(covered, total_elements)
+        self.assertEqual(result.last_core_num, result.num_per_core + total_elements % result.block_dim)
+        self.assertEqual(result.tail_num_last_core, result.last_core_num)
+
+
 class TestTilingBudgetCodegenNode(unittest.TestCase):
     def test_node_emits_stable_summary_and_structured_result(self):
         result = tiling_budget_codegen_node(

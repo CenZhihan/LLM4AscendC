@@ -61,6 +61,22 @@ class TestShapeStrideLayoutValidatorPlanner(unittest.TestCase):
         self.assertEqual(result.movement_status, "MOVEMENT_LEGAL")
         self.assertEqual(result.hardware_status, "HARDWARE_COMPATIBLE")
 
+    def test_non_aligned_dense_copy_recommends_pad_copy(self):
+        result = plan_shape_stride_layout_validation(
+            {
+                "tensor_shape": [13],
+                "tensor_stride": [1],
+                "movement_direction": "GM_TO_UB",
+                "element_dtype": "float16",
+            }
+        )
+
+        self.assertEqual(result.status, "REPAIRABLE")
+        self.assertEqual(result.layout_class, "DENSE_CONTIGUOUS")
+        self.assertEqual(result.movement_status, "MOVEMENT_REQUIRES_PAD_COPY")
+        self.assertEqual(result.hardware_status, "HARDWARE_ALIGNMENT_WARNING")
+        self.assertTrue(any(item.type == "USE_PAD_COPY" for item in result.suggestions))
+
     def test_row_regular_noncontiguous_stays_repairable_not_rebuild(self):
         result = plan_shape_stride_layout_validation(
             {
