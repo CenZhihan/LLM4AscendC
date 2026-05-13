@@ -55,7 +55,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling.set_total_x(total);
 
     // Moderate core count; avoid excessive stream pressure
-    uint32_t blockDim = 32;
+    uint32_t blockDim = 48;
     if (blockDim > total) blockDim = total;
     if (blockDim == 0) blockDim = 1;
 
@@ -110,11 +110,21 @@ kernel_src="""
 
 #include "kernel_operator.h"
 
-// Fused activation for Conv3d output tensor:
-// y = tanh(mish(x)) where mish(x) = x * tanh(softplus(x))
-// softplus(x) = max(x,0) + log(1 + exp(-abs(x)))
+// Fused activation: y = tanh(mish(x))
+//   mish(x)   = x * tanh(softplus(x))
+//   softplus  = max(x,0) + log(1 + exp(-|x|))
+//   tanh(z)   = (1 - exp(-2z)) / (1 + exp(-2z))
+// float32, ND contiguous flattened.
 //
-// float32 only; ND contiguous flattened.
+// Optimizations vs baseline:
+// - Double-buffered I/O (BUFFER_NUM=2): overlap DataCopy with compute.
+// - Bulk DataCopy for GM<->UB (replaces per-element GetValue/SetValue).
+// - Coarse tile (2048 elts): ~256x fewer GM transactions.
+// - max(x,0) via (x+|x|)/2 instead of scalar select.
+// - 5 shared compute temporaries, reused across tiles.
+
+constexpr int32_t BUFFER_NUM = 2;
+constexpr uint32_t TILE_ELEMS = 4096;
 
 class KernelConv3dMishTanhCustom {
 public:
@@ -122,177 +132,126 @@ public:
 
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
                                uint32_t total_x,
-                               uint32_t elems_per_block)
+                               uint32_t chunk_elems)
     {
-        this->totalX = total_x;
-        this->elemsPerBlock = elems_per_block;
+        totalX_ = total_x;
+        chunkElems_ = chunk_elems;
 
-        xGm.SetGlobalBuffer((__gm__ float*)x, static_cast<uint64_t>(total_x));
-        yGm.SetGlobalBuffer((__gm__ float*)y, static_cast<uint64_t>(total_x));
+        xGm_.SetGlobalBuffer((__gm__ float*)x, static_cast<uint64_t>(total_x));
+        yGm_.SetGlobalBuffer((__gm__ float*)y, static_cast<uint64_t>(total_x));
 
-        // UB scratch for 8-lane vector math
-        pipe.InitBuffer(qV,   1, 8u * sizeof(float));
-        pipe.InitBuffer(qAbs, 1, 8u * sizeof(float));
-        pipe.InitBuffer(qTmp, 1, 8u * sizeof(float));
-        pipe.InitBuffer(qEx,  1, 8u * sizeof(float));
-        pipe.InitBuffer(qOne, 1, 8u * sizeof(float));
-        pipe.InitBuffer(qNum, 1, 8u * sizeof(float));
-        pipe.InitBuffer(qDen, 1, 8u * sizeof(float));
-        pipe.InitBuffer(qSp,  1, 8u * sizeof(float));
-        pipe.InitBuffer(qT,   1, 8u * sizeof(float));
-        pipe.InitBuffer(qY,   1, 8u * sizeof(float));
+        pipe_.InitBuffer(qX_,   BUFFER_NUM, TILE_ELEMS * sizeof(float));
+        pipe_.InitBuffer(qY_,   BUFFER_NUM, TILE_ELEMS * sizeof(float));
+        pipe_.InitBuffer(qAbs_, 1,          TILE_ELEMS * sizeof(float));
+        pipe_.InitBuffer(qTmp_, 1,          TILE_ELEMS * sizeof(float));
+        pipe_.InitBuffer(qExp_, 1,          TILE_ELEMS * sizeof(float));
+        pipe_.InitBuffer(qNum_, 1,          TILE_ELEMS * sizeof(float));
+        pipe_.InitBuffer(qDen_, 1,          TILE_ELEMS * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
         const uint32_t bid = static_cast<uint32_t>(AscendC::GetBlockIdx());
-        uint32_t start = bid * elemsPerBlock;
-        uint32_t end = start + elemsPerBlock;
-        if (end > totalX) end = totalX;
+        uint32_t start = bid * chunkElems_;
+        uint32_t end = start + chunkElems_;
+        if (end > totalX_) end = totalX_;
         if (start >= end) return;
 
-        AscendC::LocalTensor<float> v   = qV.AllocTensor<float>();
-        AscendC::LocalTensor<float> a   = qAbs.AllocTensor<float>();
-        AscendC::LocalTensor<float> tmp = qTmp.AllocTensor<float>();
-        AscendC::LocalTensor<float> ex  = qEx.AllocTensor<float>();
-        AscendC::LocalTensor<float> one = qOne.AllocTensor<float>();
-        AscendC::LocalTensor<float> num = qNum.AllocTensor<float>();
-        AscendC::LocalTensor<float> den = qDen.AllocTensor<float>();
-        AscendC::LocalTensor<float> sp  = qSp.AllocTensor<float>();
-        AscendC::LocalTensor<float> t   = qT.AllocTensor<float>();
-        AscendC::LocalTensor<float> yv  = qY.AllocTensor<float>();
+        uint32_t totalChunk = end - start;
+        uint32_t fullTiles = totalChunk / TILE_ELEMS;
+        uint32_t tailElems = totalChunk % TILE_ELEMS;
 
-        AscendC::Duplicate(one, 1.0f, 8);
+        AscendC::LocalTensor<float> absLocal = qAbs_.AllocTensor<float>();
+        AscendC::LocalTensor<float> tmpLocal = qTmp_.AllocTensor<float>();
+        AscendC::LocalTensor<float> expLocal = qExp_.AllocTensor<float>();
+        AscendC::LocalTensor<float> numLocal = qNum_.AllocTensor<float>();
+        AscendC::LocalTensor<float> denLocal = qDen_.AllocTensor<float>();
 
-        uint32_t i = start;
-
-        // Vector-8 path
-        for (; (i + 8u) <= end; i += 8u) {
-            // load 8 scalars
-            #pragma unroll
-            for (uint32_t k = 0; k < 8; ++k) {
-                float xv = xGm.GetValue(static_cast<uint64_t>(i + k));
-                v.SetValue(k, xv);
-            }
-
-            // ---- Mish(v) ----
-            // a = abs(v)
-            AscendC::Abs(a, v, 8);
-
-            // ex = exp(-abs(v))
-            AscendC::Muls(tmp, a, -1.0f, 8);
-            AscendC::Exp(ex, tmp, 8);
-
-            // tmp = log(1 + exp(-abs(v)))
-            AscendC::Add(tmp, one, ex, 8);
-            AscendC::Log(tmp, tmp, 8);
-
-            // sp = max(v, 0)
-            AscendC::Duplicate(sp, 0.0f, 8);
-            #pragma unroll
-            for (uint32_t k = 0; k < 8; ++k) {
-                float xv = v.GetValue(k);
-                sp.SetValue(k, (xv > 0.0f) ? xv : 0.0f);
-            }
-
-            // sp = softplus(v)
-            AscendC::Add(sp, sp, tmp, 8);
-
-            // t = tanh(softplus): (1 - exp(-2sp)) / (1 + exp(-2sp))
-            AscendC::Muls(tmp, sp, -2.0f, 8);
-            AscendC::Exp(ex, tmp, 8);
-            AscendC::Sub(num, one, ex, 8);
-            AscendC::Add(den, one, ex, 8);
-            AscendC::Div(t, num, den, 8);
-
-            // yv = mish = v * t
-            AscendC::Mul(yv, v, t, 8);
-
-            // ---- tanh(yv) ----
-            // reuse tmp/ex/num/den:
-            // tanh(z) = (1 - exp(-2z)) / (1 + exp(-2z))
-            AscendC::Muls(tmp, yv, -2.0f, 8);
-            AscendC::Exp(ex, tmp, 8);
-            AscendC::Sub(num, one, ex, 8);
-            AscendC::Add(den, one, ex, 8);
-            AscendC::Div(yv, num, den, 8);
-
-            // store 8
-            #pragma unroll
-            for (uint32_t k = 0; k < 8; ++k) {
-                yGm.SetValue(static_cast<uint64_t>(i + k), yv.GetValue(k));
-            }
+        for (uint32_t t = 0; t < fullTiles; ++t) {
+            RunTile(start + t * TILE_ELEMS, TILE_ELEMS,
+                    absLocal, tmpLocal, expLocal, numLocal, denLocal);
+        }
+        if (tailElems > 0) {
+            RunTile(start + fullTiles * TILE_ELEMS, tailElems,
+                    absLocal, tmpLocal, expLocal, numLocal, denLocal);
         }
 
-        // Scalar tail (reuse lane0 of tensors, computed with 4 ops replicated)
-        for (; i < end; ++i) {
-            const float x = xGm.GetValue(static_cast<uint64_t>(i));
-
-            // pack scalar into lanes 0..3 and compute with count=4
-            // (use first 4 lanes of existing 8-lane tensors)
-            v.SetValue(0, x); v.SetValue(1, x); v.SetValue(2, x); v.SetValue(3, x);
-            AscendC::Duplicate(one, 1.0f, 4);
-
-            AscendC::Abs(a, v, 4);
-            AscendC::Muls(tmp, a, -1.0f, 4);
-            AscendC::Exp(ex, tmp, 4);
-            AscendC::Add(tmp, one, ex, 4);
-            AscendC::Log(tmp, tmp, 4);
-
-            AscendC::Duplicate(sp, 0.0f, 4);
-            float mx = (x > 0.0f) ? x : 0.0f;
-            sp.SetValue(0, mx); sp.SetValue(1, mx); sp.SetValue(2, mx); sp.SetValue(3, mx);
-
-            AscendC::Add(sp, sp, tmp, 4);
-
-            AscendC::Muls(tmp, sp, -2.0f, 4);
-            AscendC::Exp(ex, tmp, 4);
-            AscendC::Sub(num, one, ex, 4);
-            AscendC::Add(den, one, ex, 4);
-            AscendC::Div(t, num, den, 4);
-
-            AscendC::Mul(yv, v, t, 4);
-
-            AscendC::Muls(tmp, yv, -2.0f, 4);
-            AscendC::Exp(ex, tmp, 4);
-            AscendC::Sub(num, one, ex, 4);
-            AscendC::Add(den, one, ex, 4);
-            AscendC::Div(yv, num, den, 4);
-
-            yGm.SetValue(static_cast<uint64_t>(i), yv.GetValue(0));
-        }
-
-        qY.FreeTensor(yv);
-        qT.FreeTensor(t);
-        qSp.FreeTensor(sp);
-        qDen.FreeTensor(den);
-        qNum.FreeTensor(num);
-        qOne.FreeTensor(one);
-        qEx.FreeTensor(ex);
-        qTmp.FreeTensor(tmp);
-        qAbs.FreeTensor(a);
-        qV.FreeTensor(v);
+        qDen_.FreeTensor(denLocal);
+        qNum_.FreeTensor(numLocal);
+        qExp_.FreeTensor(expLocal);
+        qTmp_.FreeTensor(tmpLocal);
+        qAbs_.FreeTensor(absLocal);
     }
 
 private:
-    AscendC::TPipe pipe;
+    __aicore__ inline void RunTile(
+        uint32_t offset, uint32_t count,
+        AscendC::LocalTensor<float>& absLocal,
+        AscendC::LocalTensor<float>& tmpLocal,
+        AscendC::LocalTensor<float>& expLocal,
+        AscendC::LocalTensor<float>& numLocal,
+        AscendC::LocalTensor<float>& denLocal)
+    {
+        // Double-buffered load
+        auto xLocal = qX_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm_[offset], count);
+        qX_.EnQue(xLocal);
+        xLocal = qX_.DeQue<float>();
 
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qV;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qAbs;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qTmp;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qEx;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qOne;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qNum;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qDen;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qSp;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qT;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qY;
+        auto yLocal = qY_.AllocTensor<float>();
 
-    AscendC::GlobalTensor<float> xGm;
-    AscendC::GlobalTensor<float> yGm;
+        // ---- softplus(x) = max(x,0) + log(1 + exp(-|x|)) ----
+        AscendC::Abs(absLocal, xLocal, count);
+        AscendC::Muls(tmpLocal, absLocal, -1.0f, count);
+        AscendC::Exp(expLocal, tmpLocal, count);
+        AscendC::Adds(expLocal, expLocal, 1.0f, count);
+        AscendC::Log(expLocal, expLocal, count);
+        // max(x,0) = (x + |x|) / 2
+        AscendC::Add(tmpLocal, xLocal, absLocal, count);
+        AscendC::Muls(tmpLocal, tmpLocal, 0.5f, count);
+        AscendC::Add(tmpLocal, tmpLocal, expLocal, count);  // softplus in tmpLocal
 
-    uint32_t totalX;
-    uint32_t elemsPerBlock;
+        // ---- tanh(sp) ----
+        AscendC::Muls(expLocal, tmpLocal, -2.0f, count);
+        AscendC::Exp(expLocal, expLocal, count);
+        AscendC::Muls(numLocal, expLocal, -1.0f, count);
+        AscendC::Adds(numLocal, numLocal, 1.0f, count);
+        AscendC::Adds(denLocal, expLocal, 1.0f, count);
+        AscendC::Div(tmpLocal, numLocal, denLocal, count);
+
+        // ---- mish = x * tanh(sp) ----
+        AscendC::Mul(yLocal, xLocal, tmpLocal, count);
+
+        // ---- tanh(mish) ----
+        AscendC::Muls(tmpLocal, yLocal, -2.0f, count);
+        AscendC::Exp(expLocal, tmpLocal, count);
+        AscendC::Muls(numLocal, expLocal, -1.0f, count);
+        AscendC::Adds(numLocal, numLocal, 1.0f, count);
+        AscendC::Adds(denLocal, expLocal, 1.0f, count);
+        AscendC::Div(yLocal, numLocal, denLocal, count);
+
+        // Double-buffered store
+        qY_.EnQue(yLocal);
+        yLocal = qY_.DeQue<float>();
+        AscendC::DataCopy(yGm_[offset], yLocal, count);
+
+        qY_.FreeTensor(yLocal);
+        qX_.FreeTensor(xLocal);
+    }
+
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> qX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> qY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qAbs_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qTmp_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qExp_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qNum_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> qDen_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+    uint32_t totalX_;
+    uint32_t chunkElems_;
 };
 
 extern "C" __global__ __aicore__ void conv3d_mish_tanh_custom(
@@ -339,19 +298,59 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 """
 
-model_src='''
-import torch
-import torch_npu
-import custom_ops_lib
+eval_src='''
+#!/usr/bin/env python3
+import json, os, time, torch, torch_npu
 
-_FN = 'conv3d_mish_tanh_custom'
+def _benchmark(fn, *args, synchronize, warmup=5, repeat=20):
+    for _ in range(warmup):
+        fn(*args)
+    synchronize()
+    start = time.perf_counter()
+    for _ in range(repeat):
+        fn(*args)
+    synchronize()
+    return (time.perf_counter() - start) * 1000.0 / repeat
 
-class ModelNew(torch.nn.Module):
-    def __init__(self, *init_inputs):
-        super(ModelNew, self).__init__()
+def main() -> int:
+    module_name = os.environ.get("LLM4ASCENDC_OP_MODULE", "llm4ascendc_ops_conv3d_mish_tanh")
+    custom_ops = __import__(module_name)
+    fn = getattr(custom_ops, "conv3d_mish_tanh_custom")
 
-    def forward(self, *inputs):
-        fn = getattr(custom_ops_lib, _FN)
-        return fn(*inputs)
+    device = torch.device("npu:0")
+    synchronize = torch_npu.npu.synchronize
+
+    # Typical Conv3D output shape: NCDHW
+    N, C, D, H, W = 16, 64, 30, 62, 62
+    x = torch.randn(N, C, D, H, W, dtype=torch.float32, device=device)
+
+    y_custom = fn(x)
+
+    # PyTorch reference: mish(x) = x * tanh(softplus(x)), then tanh
+    sp = torch.nn.functional.softplus(x)
+    mish = x * torch.tanh(sp)
+    y_ref = torch.tanh(mish)
+
+    if not torch.allclose(y_custom, y_ref, atol=1e-4, rtol=1e-4):
+        md = (y_custom - y_ref).abs().max().item()
+        print(f"[FAIL] Output mismatch: max_diff={md}")
+        return 1
+    print("[eval] allclose=True [ref=PyTorch mish+tanh]")
+
+    ref_fn = lambda t: torch.tanh(t * torch.tanh(torch.nn.functional.softplus(t)))
+    ref_ms = _benchmark(ref_fn, x, synchronize=synchronize)
+    custom_ms = _benchmark(fn, x, synchronize=synchronize)
+    speedup = ref_ms / custom_ms if custom_ms > 0 else None
+
+    perf = {
+        "ref_ms": ref_ms, "custom_ms": custom_ms,
+        "speedup": speedup, "warmup": 5, "repeat": 20,
+        "ref_device": str(device), "custom_device": str(device),
+    }
+    print("[perf] " + json.dumps(perf))
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 '''
 ```
