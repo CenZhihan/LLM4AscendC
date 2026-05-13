@@ -7,11 +7,11 @@ from typing import Any, Dict, List
 from .llm_util import openai_client_from_llm_config
 
 
-SYSTEM = """You pick past repair memories that help the current AscendC kernel fix task.
-You receive a numbered manifest (one memory per line) and a current query.
+SYSTEM = """You pick past repair memories that help the current AscendC kernel repair task.
+Each manifest line is one memory (tab-separated fields: id, op, category, tool_mode, tier, anchor, summary).
 Return a JSON object ONLY of the form: {"memory_ids": ["..."]} with at most N ids from the manifest.
-If none are clearly useful, return {"memory_ids": []}.
-Prefer uncertain -> do not select."""
+If none are clearly useful for this task, return {"memory_ids": []}.
+When uncertain, return an empty list (prefer precision over recall)."""
 
 
 def select_memory_ids(

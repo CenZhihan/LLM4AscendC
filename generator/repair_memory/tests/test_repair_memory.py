@@ -29,7 +29,7 @@ class TestMemoryReportEntries(TestCase):
                 "failure_stage_after": "correctness",
                 "error_anchors_before": "e0",
                 "error_anchors_after": "e1",
-                "natural_language": "当编译失败时不要乱改，应检查 OPP。",
+                "natural_language": "When compile fails with OPP install errors, do not randomize tiling; instead verify custom OPP path and reinstall.",
             }
         ]
         rows = memory_entries_for_report(recs)
@@ -98,7 +98,7 @@ class TestMergeInbox(TestCase):
                 "error_anchors_after": "e2",
                 "code_digest_before": "1",
                 "code_digest_after": "2",
-                "natural_language": "当编译失败时不要乱改，应检查 CMake 与 OPP 路径。",
+                "natural_language": "When CPack fails on missing binary config, do not rerun package blindly; instead regenerate CMake outputs and fix paths.",
                 "evidence_refs": [],
             }
             self.assertTrue(validate_record(rec))
@@ -113,7 +113,6 @@ class TestMergeInbox(TestCase):
             self.assertFalse(fp.exists())
 
 
-class TestFailureStage(TestCase):
     def test_infer_correctness_stage(self) -> None:
         s = infer_failure_stage(
             compiled=True,

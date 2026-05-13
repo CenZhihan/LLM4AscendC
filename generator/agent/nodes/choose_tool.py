@@ -79,7 +79,7 @@ def _extract_user_question(state: GeneratorAgentState) -> str:
     if attempt_id <= 1:
         mem = (state.get("retrieved_repair_memories") or "").strip()
         if mem:
-            return f"{base}\n\nRetrieved repair memories (verified past fixes):\n{mem}"
+            return f"{base}\n\nRetrieved repair memories (verified cross-run fixes):\n{mem}"
         return base
 
     repair_logs = (state.get("repair_error_logs_raw") or "").strip()
@@ -100,7 +100,7 @@ def _extract_user_question(state: GeneratorAgentState) -> str:
         )
     mem = (state.get("retrieved_repair_memories") or "").strip()
     if mem:
-        sections.append("Retrieved repair memories (verified past fixes):\n" + mem)
+        sections.append("Retrieved repair memories (verified cross-run fixes):\n" + mem)
     return "\n\n".join(sections)
 
 

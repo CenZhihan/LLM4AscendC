@@ -15,7 +15,7 @@ def get_memory_root() -> Path:
     override = (os.environ.get("LLM4ASCENDC_REPAIR_MEMORY_ROOT") or "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    return (REPO_ROOT / "artifacts" / "repair_memory").resolve()
+    return (REPO_ROOT / "repair_memory").resolve()
 
 
 def run_slug_from_run_dir(run_dir: Path) -> str:

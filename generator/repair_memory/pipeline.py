@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .anchors import extract_anchor
+from .code_diff import format_attempt_code_diff
 from .failure_stage import infer_failure_stage
 from .inbox import write_memory_inbox_line
 from .merge import merge_run_inbox
@@ -99,11 +100,20 @@ def maybe_write_repair_memory_after_eval(
         f"info_tail:\n{str(cc.get('correctness_info') or '')[-4000:]}"
     )
 
+    code_diff_text = format_attempt_code_diff(
+        prev_code or "",
+        curr_code or "",
+        prev_label=f"attempt{attempt_id - 1}_txt",
+        curr_label=f"attempt{attempt_id}_txt",
+        max_chars=12000,
+    )
+
     nl = generate_repair_natural_language(
         llm_config=llm_config,
         tier=tier,
         prev_summary=prev_summary,
         curr_summary=curr_summary,
+        code_diff_text=code_diff_text,
     )
     if not nl.strip():
         return

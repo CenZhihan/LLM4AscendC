@@ -695,9 +695,8 @@ def main() -> int:
         "--use-repair-memory",
         action="store_true",
         help=(
-            "启用跨轮修复记忆：检索注入、评测后写入记忆、默认输出到 output/memory_on/cuda_agent_ops_6k/... "
-            "（与 --test 组合时为 output/test/memory_on/cuda_agent_ops_6k/...）。"
-            "省略本参数时行为与未接入记忆机制前一致。"
+            "Enable cross-attempt repair memory; default output under output/memory_on/cuda_agent_ops_6k/... "
+            "(with --test: output/test/memory_on/cuda_agent_ops_6k/...). Omit for legacy behavior without memory."
         ),
     )
     args = parser.parse_args()
@@ -779,8 +778,9 @@ def main() -> int:
         p = str(out_run_dir.resolve()).replace("\\", "/")
         if "memory_on" not in p:
             print(
-                "[WARN] --use-repair-memory 建议将产物放在包含 memory_on 的路径下（未设置 --out-dir 时默认如此）；"
-                f"当前 run_dir={out_run_dir}"
+                "[WARN] With --use-repair-memory, prefer run_dir under a path containing memory_on "
+                "(default when --out-dir is unset); "
+                f"current run_dir={out_run_dir}"
             )
 
     print(f"[INFO] Rows to run ({len(resolved_indices)}); dataset={dataset_path}")

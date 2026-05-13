@@ -543,6 +543,16 @@ python3 generator/scripts/run_agent_multi_rounds.py \
 - `softmax_attempts3_summary.json`
 - `attempts3_summary_all_ops.json`
 
+#### 3.7.1 跨轮修复记忆（repair memory）
+
+多轮脚本支持 **`--use-repair-memory`**（`run_agent_multi_rounds.py` / `run_agent_cuda_agent_multi_rounds.py`）：开启后会在 **`attempt ≥ 2`** 时从全局记忆库 **检索**若干条经验注入 Agent，并在评测通过后按规则 **写入**新记忆；默认产物根路径在 **`output/memory_on/...`**（与 `--test` 组合时为 `output/test/memory_on/...`），关闭该开关则与接入记忆前行为一致。
+
+- **存储根目录**：默认 **`<REPO_ROOT>/repair_memory/`**（`canonical/repair_memories.jsonl`、`inbox/<run_slug>/` 等）；可用 **`LLM4ASCENDC_REPAIR_MEMORY_ROOT`** 覆盖；**`LLM4ASCENDC_REPAIR_MEMORY=0`** 关闭写入与检索。
+- **自然语言**：新写入记忆的 `natural_language` 由 Review LLM 生成，**固定为英文**一句（`When ... do not ...; instead ...` 模板）；**已存在于 canonical 的历史行不会自动改写**。
+- **Manifest 选条**：选条模型所见的 manifest **不按**当前 run 的 `tool_mode` / `eval_mode` 预筛（仅 `schema_version` + 尾部窗口），便于跨工具配置复用；`query_text` 仍会带上当前 `tool_mode` / `eval_mode` 与 repair 日志供模型判断相关性。
+- **总结输入**：除评测信号外，Review 侧会附带相邻两轮 **txt 的 unified diff（有长度上限）**，便于针对具体 API/符号改动写记忆。
+- **设计说明与示例 prompt 快照**：[`docs/repair_memory_design.md`](docs/repair_memory_design.md)、[`generator/agent/_example_prompts_memory/`](generator/agent/_example_prompts_memory/)（给展示用的英文 message 实录）。
+
 ### 3.6 配置与依赖
 
 | 文件 | 作用 |
@@ -571,7 +581,10 @@ python3 generator/scripts/run_agent_multi_rounds.py \
 | `generator/agent/retrievers/ascend_docs_search_retriever.py` | 在线 Ascend 文档搜索 retriever（hiascend） |
 | `generator/agent/retrievers/ascend_docs_fetch_retriever.py` | 在线 Ascend 文档详情抓取与结构化解析 retriever |
 | `generator/agent/agent_config.py` | 工具键常量、`parse_tool_mode`、`tool_mode_to_string`、Agent LLM 本地文件加载 |
-| `generator/agent/_example_prompts_relu_kb/` | `choose_tool` / `answer` 侧提示样例快照（与线上一致时宜同步更新） |
+| `generator/repair_memory/` | 跨轮修复记忆：schema、tier、写入 pipeline、manifest 选条、merge 等 |
+| `repair_memory/`（仓库根下） | 默认记忆库存储目录（`canonical/`、`inbox/`）；见 `.gitignore` |
+| `generator/agent/_example_prompts_memory/` | Repair-memory 相关 LLM prompt 英文快照（展示用） |
+| `docs/repair_memory_design.md` | 修复记忆机制设计说明（与实现对齐） |
 | `tools/test_ascend_docs_tools.py` | 在线文档工具本地试跑脚本（search/fetch/chain） |
 | `generator/rag/` | RAG 代码索引与嵌入检索（ChromaDB + BGE-M3） |
 | `generator/prompt_generators/` | 提示策略实现（rag、add_shot、selected_shot 等） |

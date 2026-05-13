@@ -73,16 +73,11 @@ def build_retrieval_block_for_attempt(
     if not is_repair_memory_enabled():
         return "", []
     root = memory_root if memory_root is not None else get_memory_root()
-    cache_key = (manifest_cache_key(root), tool_mode, eval_mode)
+    cache_key = manifest_cache_key(root)
     global _MANIFEST_CACHE
     if _MANIFEST_CACHE.get("key") != cache_key:
         _MANIFEST_CACHE["key"] = cache_key
-        _MANIFEST_CACHE["text"] = build_manifest_text(
-            memory_root=root,
-            max_records=500,
-            tool_mode_filter=tool_mode,
-            eval_mode_filter=eval_mode,
-        )
+        _MANIFEST_CACHE["text"] = build_manifest_text(memory_root=root, max_records=500)
     manifest_text = str(_MANIFEST_CACHE.get("text") or "")
     query_parts = [
         f"op={op}",

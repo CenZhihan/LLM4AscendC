@@ -33,20 +33,11 @@ def load_canonical_tail(*, memory_root: Path | None = None, max_records: int = 5
     return out
 
 
-def build_manifest_lines(
-    records: List[Dict[str, Any]],
-    *,
-    tool_mode_filter: str = "",
-    eval_mode_filter: str = "",
-) -> List[str]:
-    """One line per record for the selection model."""
+def build_manifest_lines(records: List[Dict[str, Any]]) -> List[str]:
+    """One line per record for the selection model (no tool_mode / eval_mode filter — cross-config reuse)."""
     lines: List[str] = []
     for r in records:
         if (r.get("schema_version") or "") != SCHEMA_VERSION:
-            continue
-        if tool_mode_filter and (r.get("tool_mode") or "") != tool_mode_filter:
-            continue
-        if eval_mode_filter and (r.get("eval_mode") or "") != eval_mode_filter:
             continue
         mid = r.get("memory_id", "")
         op = r.get("op_key", "")
@@ -64,12 +55,8 @@ def build_manifest_lines(
 def build_manifest_text(**kwargs: Any) -> str:
     mem_root = kwargs.get("memory_root")
     max_records = int(kwargs.get("max_records", 500))
-    tool_mode_filter = str(kwargs.get("tool_mode_filter", "") or "")
-    eval_mode_filter = str(kwargs.get("eval_mode_filter", "") or "")
     recs = load_canonical_tail(memory_root=mem_root, max_records=max_records)
-    lines = build_manifest_lines(
-        recs, tool_mode_filter=tool_mode_filter, eval_mode_filter=eval_mode_filter
-    )
+    lines = build_manifest_lines(recs)
     return "\n".join(lines)
 
 
