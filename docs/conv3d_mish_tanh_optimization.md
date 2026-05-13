@@ -248,7 +248,152 @@ Kernel 加速:  4.49x
       └─ 5.23x speedup, 0.98ms  ← 最终结果
 ```
 
-## 7. 进一步优化方向
+## 7. Profiling 工具对比
+
+本次优化使用了三种 profiling 工具，各有不同的粒度和适用场景。
+
+### 7.1 工具总览
+
+| 工具 | 命令/入口 | 粒度 | 数据内容 | 适用场景 |
+|------|-----------|------|----------|----------|
+| **msprof** | `msprof --application ...` | 进程级 | 全应用的 timeline、kernel 列表、内存拷贝 | 模型级端到端分析 |
+| **msprof op** | `msprof op --output=... bash run.sh` | 单算子 | PipeUtilization、Memory、L2Cache 等硬件指标 CSV | 单算子瓶颈定位 |
+| **PyTorch Profiler** | `torch_npu.profiler.profile(...)` | kernel 级 | kernel_details.csv + tensorboard trace | PyTorch 执行图 + kernel 时序 |
+
+### 7.2 msprof（进程级 Profiler）
+
+```
+msprof --application="python3 train.py" --output=./prof_out
+```
+
+**原理**：拦截整个进程的所有 Ascend runtime 调用，记录每条 kernel 的启动时间、执行时长、
+内存拷贝等事件，生成完整的执行 timeline。
+
+**输出**：
+- `device/<N>/sample.json` — 每个 device 的 kernel 采样数据
+- `host/sample.json` — host 侧 API 调用时间线  
+- `ASCEND_PROFILER_OUTPUT/trace_view.json` — Chrome trace 格式，可用 `chrome://tracing` 查看
+
+**优点**：能看到完整应用执行图，包括 CPU/GPU 间的同步、内存拷贝、多 stream 并发。
+**局限**：粒度较粗，不提供单 kernel 内部的 vec/scalar/mte 分解。
+
+**项目中的使用**：`scripts/pj-lab/profile_gelu_simulator.sh` 用 simulator 模式离线仿真，
+输出在 `output/msprof_gelu_simulator/`。
+
+### 7.3 msprof op（算子级 Profiler）
+
+```
+msprof op \
+  --output=./prof_out \
+  --aic-metrics=PipeUtilization,Memory,L2Cache \
+  --launch-count=3 \
+  bash run_op.sh
+```
+
+**原理**：重复启动同一个算子 N 次（`--launch-count`），每次采集硬件性能计数器。
+适合独立算子的微观分析。
+
+**输出 CSV**（在 `OPPROF_*/<op_name>/0/` 下）：
+- `PipeUtilization.csv` — 每个 block 的 vec/scalar/mte 时间占比和带宽
+- `OpBasicInfo.csv` — Task Duration、Block Dim、频率
+- `Memory.csv` — 内存带宽详情（如启用）
+- `L2Cache.csv` — L2 cache 命中率（如启用）
+
+**PipeUtilization 关键列**：
+
+| 列名 | 含义 |
+|------|------|
+| `aiv_time(us)` | 该 block 的总执行时间 |
+| `aiv_vec_time(us)` | 向量单元活跃时间 |
+| `aiv_vec_ratio` | 向量利用率（**越大越好，理想 >90%**） |
+| `aiv_scalar_ratio` | 标量单元利用率 |
+| `aiv_mte2_time(us)` | 读内存活跃时间 |
+| `aiv_mte2_ratio` | 读带宽利用率 |
+| `aiv_mte3_active_bw` | 写带宽 (GB/s) |
+
+**阅读方法**：
+- `vec_ratio` 低 (<60%) + `mte2_ratio` 高 (>80%) → **memory-bound**，优化内存合并
+- `vec_ratio` 高 (>85%) + `mte_ratio` 低 (<30%) → **compute-bound**，减少计算或降精度
+- 各 block 间 `aiv_time` 差异大 → **负载不均衡**，检查 tiling 分布
+
+**优点**：直接给硬件瓶颈方向，数值精确。
+**局限**：只看一个算子，看不到它在完整图中的位置和 launch overhead。
+
+**项目中的使用**：`eval_operator.py --with-profiler` 内部调用 msprof op。
+本项目该算子测得 `PipeUtilization_*.csv` 各 block 的 vec_ratio ~94.6%。
+
+### 7.4 PyTorch Profiler（kernel 级 Profiler）
+
+```python
+from torch_npu.profiler import (
+    profile, tensorboard_trace_handler, _ExperimentalConfig,
+    AiCMetrics, ProfilerLevel, ProfilerActivity, schedule,
+)
+
+exp = _ExperimentalConfig(
+    profiler_level=ProfilerLevel.Level2,
+    aic_metrics=AiCMetrics.PipeUtilization,
+)
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
+    schedule=schedule(wait=1, warmup=1, active=5, repeat=1),
+    on_trace_ready=tensorboard_trace_handler("./prof_out", analyse_flag=True),
+    experimental_config=exp,
+) as prof:
+    for _ in range(7):
+        model(x)
+        torch_npu.npu.synchronize()
+        prof.step()
+```
+
+**原理**：在 PyTorch 执行图中插入 profiling 标记，采集每个 PyTorch op 对应的
+NPU kernel 列表及其硬件指标。
+
+**输出**：
+- `kernel_details.csv` — 每条 kernel 的 Name、Duration、Block Dim、vec/scalar/mte 占比
+- `trace_view.json` — Chrome trace（算子级，含 PyTorch op 名称）
+- TensorBoard 目录 — 可用 `tensorboard --logdir=./prof_out` 查看
+
+**kernel_details.csv 关键列**：
+
+| 列名 | 含义 |
+|------|------|
+| `Name` | kernel 名称（如 `Conv3dMishTanhCustom` / `aclnnSoftplus_SoftplusV2`） |
+| `Duration(us)` | kernel 执行时长 |
+| `Block Dim` | 启动 block 数 |
+| `aiv_vec_ratio` | 向量利用率 |
+
+**优点**：
+- 能看到 **Ref vs Custom 的完整 kernel 链**，不是单算子
+- 自动解析 PyTorch op → NPU kernel 映射
+- 暴露框架开销（如中间结果的 `Mul`、`MemSet`、`TransData` kernel）
+- 提供 TensorBoard 可视化
+
+**局限**：比 msprof op 多一层 PyTorch 调度开销，kernel 内指标精度略低于裸 msprof op。
+
+**项目中的使用**：
+- `tools/profile_gelu_current.py` — GELU 算子专用
+- `tools/profile_conv3d_mish_tanh.py` — 本算子专用（新增）
+
+### 7.5 选型指南
+
+```
+需要分析什么？                     用什么工具？
+
+"整个训练/推理慢在哪里？"        → msprof (进程级 timeline)
+"这个算子的瓶颈是计算还是访存？"  → msprof op (硬件计数器)
+"Ref 和 Custom 的 kernel 链差异？" → PyTorch Profiler (kernel_details)
+"单 kernel 内部哪个 block 最慢？"  → msprof op (per-block 数据)
+"中间结果产生了多少隐藏 kernel？"  → PyTorch Profiler (只有它能看到全图)
+```
+
+本项目的推荐组合：
+1. **PyTorch Profiler** 先扫一遍，看清 Ref vs Custom 的 kernel 链差异（发现隐藏 Mul）
+2. **msprof op** 深入分析 Custom 单 kernel 的 vec/scalar/mte 占比（定位 compute-bound）
+3. **tiling sweep** 搜最优参数，每次用 msprof op 验证
+4. **PyTorch Profiler** 最终确认端到端加速并输出报告
+
+## 8. 进一步优化方向
 
 | 方向 | 预期收益 | 风险 |
 |------|----------|------|
@@ -257,7 +402,7 @@ Kernel 加速:  4.49x
 | 自适应 tiling (动态选 block_dim) | 小 tensor 场景收益 | 增加 host 逻辑复杂度 |
 | 消除 tail tile 独立路径 | 代码简化 | 收益可忽略 |
 
-## 8. 文件变更
+## 9. 文件变更
 
 | 文件 | 变更内容 |
 |------|----------|
