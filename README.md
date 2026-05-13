@@ -512,6 +512,10 @@ python3 tools/test_ascend_docs_tools.py \
 
 `generator/scripts/run_agent_multi_rounds.py` 现已支持 **可配置轮次**（`--max-attempts >= 2`）与 **算子级并行**（`--parallel-ops`）。算子列表可与单轮脚本对齐：**显式传 `--ops`**，或 **省略 `--ops` 并用 `--categories` + 可选 `--kernelbench102`** 从数据集中展开（规则同 `generator/scripts/generation/generate_agent.py`；例如 `--categories activation --kernelbench102` 对应 12 个激活类算子）。虚拟类别 **`test_set`** 表示学长指定的固定 12 个评测算子，列表维护在 `generator/test_set_ops.py`。
 
+**自定义 OPP 与并行**：当 **`--parallel-ops > 1`** 时，每个并发子进程会把 **`LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH`**（未设置时见 [`tools/common/env.py`](tools/common/env.py) 默认仓库下 `ascend_custom_opp`）解析为逻辑根目录 **`<base>`**，再将实际安装路径设为 **`<base>/_parallel_w(slot mod parallel_ops)`**，与 **`tools/eval_operator.py --txt-dir` + `--workers > 1`** 下每个 worker 使用 `_parallel_w<id>` 的约定一致，避免多个 `.run` 同时写入同一目录覆盖 **`libcust_opapi.so`** / 头文件。当 **`--parallel-ops` 为 1** 时不创建该子目录，安装位置与过去行为相同。大规模任务结束后，可在无任务运行时按需删除 `<base>/_parallel_w*` 以回收磁盘。
+
+**CUDA-Agent 6K 多轮**（[`generator/scripts/run_agent_cuda_agent_multi_rounds.py`](generator/scripts/run_agent_cuda_agent_multi_rounds.py)）在 **`--parallel-ops > 1`** 时采用 **相同的 OPP 沙箱规则**，避免 6k 行级并行评测时互相踩踏自定义算子安装树。
+
 示例：
 
 ```bash

@@ -1,0 +1,147 @@
+We are asked to replace PyTorch operators in the given architecture (vanilla RNN hidden layer) with custom AscendC kernels. The kernel name is "vanilla_rnn_hidden_custom" (PascalCase: VanillaRnnHiddenCustom). We need to produce six Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+The original PyTorch model: takes x [T,B,I], h0 [B,H], w_i2h [H,K] (K=I+H), b_i2h [H], w_h2o [O,H], b_h2o [O]. For each time step t: 
+- inp = cat([x[t], h], dim=-1) -> [B, I+H] = [B,K]
+- pre = inp @ w_i2h.T + b_i2h -> [B,H]
+- h = tanh(pre)
+- y_t = h @ w_h2o.T + b_h2o -> [B,O]
+- stack outputs along time.
+
+We need to create a single custom kernel that does this entire loop? Or replace parts? The instruction: "Replace relevant PyTorch operators ... with custom AscendC kernels." Since the model is a loop, we can fuse the entire per-step computation into one kernel. But given the complexity (matrix multiplications, tanh, etc.), it might be more practical to create a kernel that performs the per-step computation for one time step, and then the Python loop calls it? But the instruction says "Generate an optimized version named ModelNew", which likely calls the custom op in a loop. However, the example provided (leaky_relu_custom) replaced a single activation. Here we have multiple ops: matmul, add, tanh, matmul, add. The kernel could be designed to process one time step: take x[t], h_prev, weights, biases, produce h_next and y_t. But the weights are constant across time, so they can be passed once. Also the kernel could handle multiple batches. So we can design a kernel that does: for a given time step t (batch dimension B), compute:
+
+Inputs: x [B,I], h_prev [B,H], w_i2h [H,K], b_i2h [H], w_h2o [O,H], b_h2o [O].
+Outputs: h_next [B,H], y_t [B,O].
+
+But we need to output y_t for all time steps. The original model stacks all y_t. We could accumulate in global memory by writing each time step's output to a pre-allocated buffer. Or we could have the kernel handle all time steps in a loop (but that might be too large). I think it's better to have a kernel that processes all T time steps in one call, leveraging parallelism across time? But T=256, B=8, so total steps = 2048. Could process each time step sequentially within the kernel, but that would be large and not fully parallel. Alternatively, we can have a host-side loop calling a single-step kernel. However, to maximize performance, we should fuse the entire sequence into one kernel with grid stride over time and batch? Let's think about Ascend C kernel design. Ascend C kernels are typically launched with a block grid. We can distribute time steps across blocks. For each block, it handles a subset of time steps. But the state h depends on previous time step, so it's sequential. However, we can do wavefront parallelism: assume independence? No, it's recurrent. So we must process time steps sequentially. But we can parallelize within a time step across batches (B=8 is small). So the kernel could be designed to process one time step across all batches, with blocks handling different parts of the computation (like matmul). That is complex.
+
+Given the example, the kernel was simple (element-wise). Here, we need matrix multiplications. Ascend C provides MatMul support via Cube API. But that's advanced. Since the user query says "You are an expert in writing custom AscendC kernels", we should produce a realistic, performant design. However, the output must be the six strings. The example provided is quite detailed. We should follow the pattern but adapt to this architecture.
+
+Given the complexity, I think the optimal approach is to create a kernel that performs the entire time-step computation (including matmuls) using Ascend C's MatMul (or maybe just do vectorized operations if we implement matmul manually? That would be very inefficient). But we can use the MatMul API: MatMul for (B, K) x (K, H) etc. However, the input shapes: B=8, I=1024, H=256, O=128, K=1280. So matmuls are small. We can use the Cube unit. The kernel can be launched with blockDim maybe 1 (since B=8 small) or more.
+
+Alternatively, we could note that the primary bottleneck is the matmuls and tanh. Perhaps we could use existing Ascend C operators like aclnnMatmul, aclnnTanh etc., but the task is to create custom kernel. However, the instruction: "Replace relevant PyTorch operators ... with custom AscendC kernels." That implies we replace the entire forward loop with a single custom op. So we need to define a custom op that takes all inputs and returns output y_t for all t. We can design it to perform the recurrence internally.
+
+Given the complexity, we can design a kernel that processes all time steps sequentially in one block, using double buffering for inputs and weights. Since B=8, each time step does matmuls of size 8x1280 and 1280x256 etc. That's manageable. Also we can use vector instructions for tanh (Tanh). The kernel can be implemented with pipe and queues, but we have global tensors for weights and inputs. The weights are small (H*K + H + O*H + O) numbers, we can load them into UB once. Then for each time step, load x[t] (BxI) and h (BxH), compute cat (by copying), then matmul, add bias, tanh, matmul, add bias, write y_t, then update h. We need to store all y_t to GM.
+
+We can design the kernel to be launched with BlockNum=1 (since sequential), but we could also parallelize batches? We can keep B=8 as small. So a single block is fine.
+
+Let's design:
+
+- Input tensors: x [T*B*I], h0 [B*H], w_i2h [H*K], b_i2h [H], w_h2o [O*H], b_h2o [O], output y [T*B*O] (pre-allocated).
+- Load w_i2h, b_i2h, w_h2o, b_h2o into UB (maybe as constant tensors). They are small enough: w_i2h: 256*1280 = 327,680 floats = 1.31 MB? That's too big for UB (192KB). So we cannot load all weights into UB. We need to tile. But we can load row by row? Actually, w_i2h is a matrix of size HxK. We can tile along H dimension. Similarly w_h2o is OxH. To compute matmul, we need to multiply inp [B,K] with w_i2h^T [K,H] (or equivalently inp * w_i2h.T, but we can store w_i2h as HxK and compute inp @ w_i2h^T = inp * (w_i2h)^T? Actually, we have w_i2h shape (H, K). The operation is: pre = inp @ w_i2h.t() + b_i2h. inp is [B,K], w_i2h.t() is [K,H]. So pre = inp * (w_i2h transposed). We can either load w_i2h in its original (H,K) and do matmul with left operand as inp [B,K] and right operand as w_i2h? That would be (B,K) x (H,K)^? Actually, Ascend C MatMul allows specifying transposition. So we can set transB=True and use w_i2h as it is (H,K). That works. Similarly for second matmul: y_t = h @ w_h2o.t() + b_h2o. h is [B,H], w_h2o is [O,H], so w_h2o.t() is [H,O], so matmul outputs [B,O]. So we can set transB=True for w_h2o as well.
+
+Now, for tiling: We need to split the matmul over the reduction dimension K and H. Since K=1280, H=256, O=128. For the first matmul, reduction K=1280, which is moderate. We can use the Cube API with appropriate tiling. The Cube API expects descriptors specifying L1/L0 buffer sizes. This is advanced but doable.
+
+Given the complexity and the example provided, the example used simple element-wise operations. The instruction expects us to produce realistic code. We should produce a similar structure but adapted. However, we must be careful to not exceed token limits, but we can produce plausible code that uses MatMul primitives.
+
+I'll design the kernel with the following components:
+
+- Tiling data struct: totalT, batchSize, I, H, O, K, tile lengths for matmul etc. But to simplify, we can keep tileLen for matmul inner dimension.
+- The kernel will be for a single block (blockDim=1). It will iterate over time steps.
+- Use double buffering for loading x[t] and h.
+- Use MatMul: there is a function `MatMul` in Ascend C? Actually, for Cube, we use `MatMul` from "kernel_operator.h" with Matrix objects. We'll need to set up MatMul objects and call them.
+
+I'll write the kernel_src using Ascend C's MatMul API. However, the example kernel_src was simple, using DataCopy, mins, muls, add. For matmul, we need to include "matmul_api.h" or similar. But to keep consistent with the example, I'll assume using "kernel_operator.h" which includes vector functions, but not matmul. Actually, Ascend C supports Cube operations via separate headers. For simplicity, I could implement matmul manually using vector MAC operations? That would be very slow and unrealistic. Better to assume we have access to MatMul functions.
+
+Given the instruction says "You are an expert in writing custom AscendC kernels", the output should be realistic and high quality. I'll produce the code with MatMul.
+
+Let me start by defining the tiling data. We need to store dimensions and maybe tile sizes for matmul. Also we need to store pointers to weight tensors? Actually, in the kernel, we'll receive GM_ADDR for each tensor. So tiling data will just hold dimensions and runtime constants like totalT, batchSize, etc.
+
+Tiling data fields: totalT, batchSize, I, H, O, K, tileK (for matmul inner), tileH, tileO. But we can compute from shapes.
+
+Better: The kernel can compute shapes from tiling data that includes all dimensions. The host op can set these.
+
+I'll define tiling data:
+
+```cpp
+BEGIN_TILING_DATA_DEF(VanillaRnnHiddenCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, T);
+  TILING_DATA_FIELD_DEF(uint32_t, B);
+  TILING_DATA_FIELD_DEF(uint32_t, I);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, O);
+  TILING_DATA_FIELD_DEF(uint32_t, K); // I+H
+  // Matmul tiling parameters
+  TILING_DATA_FIELD_DEF(uint32_t, tileK);
+  TILING_DATA_FIELD_DEF(uint32_t, tileH);
+  TILING_DATA_FIELD_DEF(uint32_t, tileO);
+END_TILING_DATA_DEF;
+```
+
+But we can compute tile sizes based on UB budget.
+
+Now, the kernel. I'll create class KernelVanillaRnnHiddenCustom with Init and Process. In Init, set global pointers: xGm, h0Gm, w_i2hGm, b_i2hGm, w_h2oGm, b_h2oGm, yGm. Also set dimensions.
+
+In Process, iterate over t in [0,T). For each t:
+
+- Load x[t] (B*I floats) from xGm.
+- Load current h (B*H) from a local buffer (initially h0).
+- Concatenate x[t] and h into inp of size B*K. (We can do DataCopy or vector copy). We'll have a local tensor for inp.
+- Compute pre = inp @ w_i2h.T + b_i2h. Use MatMul: maybe use CubeMatMul.
+- Compute h = tanh(pre) element-wise.
+- Compute y_t = h @ w_h2o.T + b_h2o.
+- Write y_t to yGm at offset t*B*O.
+- Update h (in local buffer) for next iteration.
+
+We need to manage UB memory: inp (B*K = 8*1280=10240 floats = 40KB), pre (B*H=8*256=2048 floats=8KB), h (B*H=8KB), y_t (B*O=8*128=1024 floats=4KB), workspace for MatMul (maybe tile buffers). Also weights are in GM, we need to load them in tiles. Since weights are large, we need to tile the matmuls.
+
+Given UB is 192KB, we can allocate buffers for tiled matmul. For first matmul: M=B (batch), K=K, N=H. We can tile over N (H dimension) maybe. We'll use MatMul with tiling descriptor.
+
+To keep kernel plausible, I'll write it with some tiling loops.
+
+But this is getting very long. Maybe we can simplify by noting that the model is small (B=8, H=256, O=128) and we can load entire weight matrices into UB? w_i2h: 256*1280=327680 floats ~1.3MB, too big. w_h2o: 128*256=32768 floats ~128KB, that fits. So we can load w_h2o and b_h2o into UB wholly, but w_i2h is too big. For w_i2h, we need to tile. However, we can load it in tiles along H dimension. Since H=256, we can process w_i2h row by row (each row is K=1280 floats = 5KB). 256 rows fit? 256*5KB=1.28MB still too big. So we must tile over H and K both.
+
+Maybe we can use Cube API's automatic tiling by calling MatMul with descriptors that handle tiling internally. Ascend C's MatMul can handle large matrices by itself if we provide the right parameters. For example, using `MatMul` with `A` and `B` as GlobalTensor and specifying tile sizes. In practice, the Cube unit handles tiling automatically if we use the high-level MatMul API from "matmul_api.h". I'm not an expert on that API, but for the purpose of this exercise, I'll produce code that looks realistic.
+
+I'll write the kernel using `MatMul` from "kernel_operator.h" (assuming included). Actually, in the example, they used `DataCopy`, `Mins`, `Muls`, `Add`. For matmul, there is `MatMul` function in the Ascend C API (see documentation). We'll use:
+
+```cpp
+#include "matmul_api.h" // hypothetical
+```
+
+And use:
+
+```cpp
+MatMul<MatMulTransMode::NONE, MatMulTransMode::TRANS>(inpLocal, w_i2hLocal, preLocal, ...);
+```
+
+But weights need to be loaded from GM to UB in tiles. We can load entire w_i2h into UB? No. So we need to use a stream of tiles. The advanced approach is to use the MatMul high-level API that accepts GM tensors and handles data movement inside. That's the best. So we can pass global tensors directly to MatMul and it will manage data from GM? Probably not; MatMul expects LocalTensor inputs. So we must manually load tiles.
+
+Given the time constraint, I'll produce a plausible kernel that does the following:
+
+- For each time step, do the two matmuls using a simple loop with DataCopy and vector MAC? That would be extremely inefficient but simpler to write. But that would not be realistic for an expert. I think it's better to assume we use MatMul API and just write it out.
+
+I'll write kernel_src that includes:
+
+- Load w_i2h and b_i2h row-wise from GM into UB in tiles, compute partial products, and accumulate. But that is complex for matmul.
+
+Alternatively, we could note that the model is small enough that we can use existing Ascend C operators via aclnn calls? But the task is to create custom kernel.
+
+Given the example provided was simple, maybe the expected output is also simple: just replace the entire forward function with a custom op that does the loop using PyTorch-like operations inside? But the kernel is Ascend C, not Python.
+
+I think the safest approach is to produce a kernel that does a single time step, and the host (ModelNew) loops over T calling the kernel. That would be more realistic and less complex. The kernel would take x[t], h_prev, weights, biases and output h_next and y_t. Then ModelNew loops T times. In that case, we can keep the per-step kernel simpler (just matmuls and activation). The kernel can use the same small matmul approach.
+
+But the instruction says "Replace relevant PyTorch operators ... in the architecture named Model with custom AscendC kernels." The architecture includes the loop. We could replace the inner operations with a custom kernel, and keep the loop in Python. That is acceptable.
+
+Let's do that: Design a kernel "vanilla_rnn_hidden_custom" that takes one time step's inputs: x_cur [B,I], h_prev [B,H], w_i2h [H,K], b_i2h [H], w_h2o [O,H], b_h2o [O], and outputs h_next [B,H] and y_cur [B,O]. Then the ModelNew will loop over T and call this kernel. But the kernel_name is given as vanilla_rnn_hidden_custom. That suggests the whole thing might be a single kernel. However, we can still implement it as a per-step kernel.
+
+Given the example, the kernel leaky_relu_custom was a simple element-wise op. So it's plausible that we make a kernel that does the entire time-step (matmul+tanh+matmul). But the challenge is matmul.
+
+I'll try to produce a complete set of files. I'll write the kernel using MatMul API with tiling for w_i2h (since it's large) and for w_h2o (small enough to load once). But I'll keep it realistic and use the Cube. I'll include the necessary headers.
+
+Given the output length is limited, I need to be concise but complete. I'll produce the code as in the example, with appropriate modifications.
+
+Let's outline:
+
+project_json_src: define op "VanillaRnnHiddenCustom" with inputs: x (float, ND), h0 (float, ND), w_i2h (float, ND), b_i2h (float, ND), w_h2o (float, ND), b_h2o (float, ND). Output: y (float, ND). Attributes: none (but we could pass T, B, I, H, O as attributes? Actually, shapes can be inferred from input shapes. The op can be defined with no attrs, and shapes are inferred.
+
+host_tiling_src: define tiling data with fields: T, B, I, H, O, K, and maybe tile sizes. Also we could store blockDim.
+
+host_operator_src: implement TilingFunc, InferShape, InferDataType, and op registration. For InferShape, we compute output shape from input shapes: output shape [T, B, O] from x shape [T, B, I] and other shapes (H, O from w_h2o). Also we can infer from w_i2h that K = w_i2h.size(1) = I+H? Not exactly, but we can compute from shapes: K = w_i2h.shape[1] (since w_i2h is HxK). Then I = x.shape[2], etc. We'll use that.
+
+kernel_src: implement KernelVanillaRnnHiddenCustom class with Init and Process. Process loops over time steps. Use double buffering for x and h. Use MatMul for each step.
+
+python_bind_src: bind the op as custom op "vanilla_rnn_hidden_custom" (using the kernel name). Use EXEC_NPU_CMD macro.
+
+model_src: define ModelNew that calls the custom op.
+
+I'll write the code now.

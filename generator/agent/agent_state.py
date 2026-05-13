@@ -3,7 +3,7 @@ Agent state definition for LangGraph-based kernel generation agent.
 
 Defines GeneratorAgentState that integrates KB, WEB, and Code RAG retrieval results.
 """
-from typing import Annotated, List, Dict, Any
+from typing import Annotated, Any, Dict, List, Optional
 
 try:
     from typing import NotRequired
@@ -126,6 +126,9 @@ class GeneratorAgentState(MessagesState):
     attempt_id: NotRequired[int]             # Attempt index, e.g., 1 or 2
     repair_error_logs_raw: NotRequired[str]  # Raw error context for repair attempt
     previous_attempt_code: NotRequired[str]  # Full previous attempt code for repair attempt
+    retrieved_repair_memories: NotRequired[str]  # Injected cross-run repair memory (natural language)
+    retrieved_repair_memories_applied: NotRequired[List[Dict[str, Any]]]  # Structured rows for report
+    eval_mode: NotRequired[str]  # e.g. full — used for memory filtering only
 
 
 def create_initial_state(
@@ -137,6 +140,9 @@ def create_initial_state(
     attempt_id: int = 1,
     repair_error_logs_raw: str = "",
     previous_attempt_code: str = "",
+    retrieved_repair_memories: str = "",
+    retrieved_repair_memories_applied: Optional[List[Dict[str, Any]]] = None,
+    eval_mode: str = "full",
 ) -> Dict[str, Any]:
     """
     Create initial state for agent invocation.
@@ -163,6 +169,9 @@ def create_initial_state(
         "attempt_id": attempt_id,
         "repair_error_logs_raw": repair_error_logs_raw,
         "previous_attempt_code": previous_attempt_code,
+        "retrieved_repair_memories": retrieved_repair_memories or "",
+        "retrieved_repair_memories_applied": list(retrieved_repair_memories_applied or []),
+        "eval_mode": eval_mode or "full",
         "kb_results": [],
         "web_results": [],
         "code_rag_results": [],

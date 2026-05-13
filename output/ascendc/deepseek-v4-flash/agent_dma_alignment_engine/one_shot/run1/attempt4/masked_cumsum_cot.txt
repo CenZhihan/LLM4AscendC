@@ -1,0 +1,99 @@
+We need to fix the kernel for masked cumulative sum. The error log shows vector core exception with MPU address access invalid, likely due to misaligned data copies with scalar element-wise operations. The previous attempt used a for-loop over individual elements in ComputeTile, which is inefficient and may cause alignment issues. Instead, we should use vectorized operations.
+
+Given the DMA alignment engine recommendations, we need to ensure 32B alignment for DataCopy. The kernel currently uses DataCopy for all transfers. The alignment engine suggests for tail tiles we might need DataCopyPad. But the main issue is the vector core exception. 
+
+The kernel uses a manual for-loop to do cumulative sum element by element. That's not vectorized and probably causes the MPU error. We need to implement a proper vectorized scan. However, cumulative sum is inherently sequential. We can use AscendC's vector instructions for scan? AscendC does not have a built-in cumsum. We need to implement a parallel prefix sum algorithm, but that's complex. Alternatively, we can keep the sequential approach but use vectorized operations on tiles: load tile, do cumsum with state, store tile. The issue might be that we are using a for-loop with scalar indexing x(i) and mask(i) which are not allowed in vector core? Actually AscendC allows scalar indexing but it's very slow and may cause issues. Better to use vector operations: we can use a combination of Add and Mul etc. But cumulative sum requires carry.
+
+Given the complexity, a simpler approach: Since we only have one dimension and the data is 1D (32768 elements) and 32768 batches? Actually input shape is (32768, 32768) -> 1e9? Wait batch_size=32768, input_shape=(32768,) so each sample is 32768 elements. So total elements = 32768 * 32768 = 1,073,741,824 elements (float). That's huge. The kernel is expected to compute masked cumulative sum along dim=1 (the last dim). So each row is 32768 elements. The previous kernel assigned each row to a block (grid-stride). That seems fine.
+
+The error shows vector core exception on multiple cores, likely due to misaligned local tensor accesses or invalid memory. Possibly because we are using bool type for mask in LocalTensor with DataCopy. bool is 1 byte, but DataCopy might require alignment to 32 bytes? The engine says it's 32B-aligned for first tile but for tail tiles it might not be. But the error happens on all cores, not just tail.
+
+The previous kernel used a for-loop with scalar indexing which is not vectorized. The vector core is designed for vector operations, not scalar loops. We should rewrite the compute tile using vectorized operations. But we need to maintain state across tiles.
+
+Alternate approach: Use a two-pass algorithm: first produce partial sums per tile with prefix sums internally, then combine across tiles. That's more complex.
+
+Maybe the simplest fix is to ensure that the kernel uses proper vectorized operations for the cumsum. We can use a vectorized prefix sum within a tile: For a tile of length L, we can do log2 steps but that's overkill. However, we can still use a loop but with vector load and store? Actually the issue might be that the loop as written uses raw pointers? No, we are using LocalTensor indexing which is fine.
+
+Let's examine the error: "MPU address access is invalid" suggests that a local memory access went out of bounds or misaligned. The tile length might be misaligned for bool type. Since bool is 1 byte, we need to ensure tile length is multiple of 32 for DataCopy? The DMA alignment engine says for bool, total_bytes=128 (32 elements? Actually 128 bytes = 128 bools). That's aligned. But later tail tile might be not.
+
+The error shows cores 30-46 etc, all with similar errors. The PC is consistent, meaning the same instruction is causing the fault. That could be the DataCopy or the scalar loop.
+
+Given the time, a minimal fix: replace the element-wise loop with a vectorized loop using AscendC's vector operations. We can still do sequential cumsum but using a vector add and a carry. For each tile:
+- Load x and mask into local tensors.
+- Multiply x by mask (element-wise) to get masked_x.
+- Then compute prefix sum: we can use a series of vector adds with shifting? Not easy.
+
+Alternatively, since the kernel is for a specific input size (32768 per row), we can set tile length to row length and process each row in one tile. Then we can do a simple loop but using __aicore__ loops should be fine? The vector core can execute scalar loops but each iteration is serial. The MPU error might be due to misaligned address in the local tensor when using the [] operator. Actually [] operator on LocalTensor is allowed.
+
+Wait, the error shows "vec error info: 0x2000000c2" and "mte error info: 0x100000075" etc. These indicate memory protection unit errors. Possibly due to accessing out-of-bounds because tile length calculation is wrong.
+
+In ProcessRow, we compute curLen as remaining = rowLen_ - tile * tileLen_, but if tileLen_ is not multiple of 4? For float, tileLen_ should be multiple of 8? Actually DataCopy requires 32-byte alignment, so tileLen_ in elements should be multiple of 8 for float (32 bytes) and multiple of 32 for bool? The alignment engine says 32B for bool? Actually bool is 1 byte so 32 bytes = 32 elements. So tileLen_ should be a multiple of 32 for bool. The tiling function sets tileLength based on UB budget but doesn't align for bool specifically. It aligns to ALIGN_ELEMS=2048, which is large enough. So tileLen_ is multiple of 2048, which is fine.
+
+But the issue might be that when curLen < tileLen_ for the last tile, it might not be 32B-aligned. For example, rowLen_=32768, tileLen_ could be 4096 (since max_inner might be less than 32768, but we set tileLength = min(rowLength, max_inner). If max_inner is 32768, then tileLength = 32768, so only one tile per row. But if max_inner is smaller, then tail tile could be smaller. The last tile's curLen may not be a multiple of 32 (for float) or 32 (for bool). DataCopy requires alignment to 32 bytes for both source and destination. The engine says for tail tiles we need DataCopyPad.
+
+Thus the vector core exception might be due to DataCopy on unaligned sizes. We should use DataCopyPad for all transfers. Or ensure that tileLen_ is always a multiple of 32 for float and multiple of 32 for bool. Since we align to 2048, it's fine for the full tiles, but the last tile might be smaller. We need to pad the last tile.
+
+Simplest fix: set tileLen_ = rowLen_ (i.e., process each row as one tile) for simplicity. Since rowLen_ is 32768, which is a multiple of 32 (32768/8=4096 floats, yes 32768*4=131072 bytes, 131072/32=4096, aligned). So one tile per row. Then we don't have tail alignment issues. Also we can avoid the inner tile loop. And the data copies will be aligned. The kernel then becomes: each block processes one row: load entire row of x and mask, compute cumsum, store entire row. That's fine for memory? 32768 floats * 4 = 128KB, plus 32768 bools = 32KB, total 160KB per row. UB budget is 192KB, so fits. So we can set tileLen_ = rowLen_ in tiling.
+
+But what if rowLen_ is larger than UB budget? In this case it's 32768 * 4 = 128KB, which is under 192KB. So it's fine. For generality, we should still allow tiling. But for the immediate fix, we can set tileLen_ = rowLen_ (if rowLen_ <= maxTile). The tiling code already ensures tileLength = min(rowLength, max_inner). If max_inner is less than rowLength, then we need tiling. In this case, rowLength=32768, max_inner from UB_BUDGET_BYTES=192*1024 / 9? They used bytes_per_elem=9 (float4+bool1?) Actually they set bytes_per_elem=9, but that's wrong: x is float (4 bytes), mask is bool (1 byte), total 5 bytes per element? But we need to account for both input and output? Actually we need space for x, mask, y. So bytes per element = 4+1+4=9. So max_inner = 192*1024/9 ≈ 21845. That's less than 32768, so tileLen_ will be around 21845, which is not a multiple of 32 for float (must be multiple of 8). Actually ALIGN_ELEMS=2048 ensures alignment to 2048 elements, which is fine. So tileLen_ will be 21504? (21845 aligned down to 2048 is 21504). Then tail tile length might be 32768 - 21504 = 11264, which is 11264 floats, 11264*4=45056 bytes, not 32B aligned? 45056/32=1408, it is aligned. So no problem. Wait 11264*4=45056, 45056 mod 32 = 0? 45056/32=1408 exactly. So aligned. So the last tile size is also aligned. So why the error?
+
+Maybe the issue is with bool: 11264 bools = 11264 bytes, 11264 mod 32 = 0? 11264/32=352, aligned. So seems fine.
+
+Then the error must be from the scalar loop in ComputeTile. The for-loop uses x(i) and mask(i) which are scalar accesses. In AscendC, scalar indexing of LocalTensor is allowed but it's not vectorized and might cause issues if the tensor is not in a proper state? Or maybe the problem is that we are using LocalTensor<bool> and then accessing via bool()? Actually we use mask(i) which returns a bool. That should be fine.
+
+But the error occurs across many cores. The PC is the same, so it's likely the same instruction. That instruction might be in DataCopy or in the scalar loop. Given the MPU error, it could be a misaligned access to local memory. The local tensor allocation might be aligned but the loop index i might be accessing an address that is misaligned for bool? bool is 1 byte, no alignment requirement.
+
+I suspect the issue is that the kernel is not using vectorized operations, and the vector core is not designed for element-wise scalar operations in a loop. Although it can execute scalar instructions, the performance is poor and may hit hardware limitations. The error "vector core execution abnormal" suggests the vector unit encountered an invalid instruction or memory access. The scalar loop might be compiled into scalar instructions that are not properly handled.
+
+To fix, we should rewrite the ComputeTile to use vector operations. We can do the cumsum using a combination of Add, Mul, and a running sum. But we cannot vectorize a carry-dependent scan easily. However, we can do it tile by tile with a scalar loop but using vector load/store? No.
+
+Alternative: Use AscendC's built-in cumulative sum? There is no such API.
+
+Maybe we can use a two-step approach: for each tile, compute prefix sums, then add the previous state to all elements. But the prefix sum within a tile can be vectorized using a parallel prefix algorithm (e.g., Hillis-Steele). That requires log2(tileLen) steps. For tileLen up to 32768, that's 15 steps, each step a vector operation. This is more complex but possible.
+
+Given the time, I think the simplest working fix is to avoid tiling and process each row as a whole. That eliminates alignment issues and allows using a simple loop that might be better vectorized by the compiler? Actually the compiler will still generate scalar code.
+
+But the error might be because we are using GlobalTensor<bool> with DataCopy. In the kernel, we do DataCopy(maskLocal, maskGm_[tileOffset], curLen). But maskGm_ is bool*, and it's in global memory. DataCopy expects the size in number of elements? Actually AscendC::DataCopy copies bytes? I think it copies elements. For bool, each element is 1 byte. So curLen elements = curLen bytes. That should be fine.
+
+After looking at the previous attempt's kernel, I see that in ProcessRow, we allocate and enqueue tensors but never use the queues! We directly use DataCopy on the local tensors and then later free them. That's incorrect because we are not using the queues for synchronization. The pipe's queues are used for double buffering. But we are not using them; we directly allocate and use them. That might cause the local memory to be corrupted because the pipe expects proper enqueue/dequeue for synchronization. In the example kernel for leaky_relu, they properly use queues. Here we are not; we just allocate and use directly. That could lead to memory access violations. Indeed, the error "MPU address access invalid" could be due to accessing local memory that is not properly allocated or out of bounds because the pipe's queue management is not used.
+
+Therefore, the fix is to use the queuing mechanism properly. We should follow the pattern from the leaky_relu kernel: for each tile, allocate tensor, enqueue, then dequeue for computation, and enqueue output, then dequeue for copyout. But we need to maintain state across tiles within a row. That's tricky.
+
+Simpler: We can still use the direct allocation, but we need to ensure that we are using the pipe correctly. Actually the pipe.InitBuffer just allocates memory for the queue, but the queue itself is not used. If we never enqueue/dequeue, the tensors we allocate via AllocTensor will still point to valid memory, but the pipe's internal management might not be synchronized. However, many kernels do use simple allocation without queues. It should be safe as long as we free them. But the error suggests something else.
+
+Given the complexity, I will rewrite the kernel to use a single tile per row (since rowLen <= UB budget) and use simple direct allocation without queues, but following a pattern that works. Alternatively, we can use the queue pattern like leaky_relu.
+
+I'll go with the queue pattern to be safe. For each row, we process it as one tile. Use double buffering? Not necessary for single tile. We can just allocate, compute, copy out, free.
+
+Let's rewrite the kernel:
+
+- Init: set xGm_, maskGm_, yGm_ based on total length. Set rowLen_ as row length. No tileLen_ needed.
+- Process: each block iterates over rows with stride. For each row:
+   - Load x and mask from global to local.
+   - Compute cumulative sum with state (initialize 0).
+   - Store to y local.
+   - Write y to global.
+
+For compute, we can use a scalar loop but it's okay if it's a single tile. We'll use direct access to local tensors via [].
+
+But we need to ensure data copy alignment: rowLen_ is multiple of 32? In this case, 32768 floats * 4 = 131072 bytes, aligned. mask 32768 bytes, aligned. So DataCopy is fine.
+
+We also need to ensure that the local tensors are allocated with proper size. pipe.InitBuffer with BUFFER_NUM=1, size = rowLen_ * sizeof(float) for x, y and rowLen_ * sizeof(bool) for mask. That should fit in UB.
+
+Now the tiling data can be simplified: just totalLength, rowLength, blockDim. No tileLength needed.
+
+But the tiling function must ensure rowLength <= maxTile. We can set tileLength = rowLength inside kernel.
+
+Let's implement.
+
+Also fix the python bind: the function signature should match the contract: masked_cumsum_custom(Tensor x, Tensor mask, int dim). But the PyTorch model's forward expects x, mask, dim. In python_bind, we should have (const at::Tensor& self, const at::Tensor& mask, int64_t dim). Currently it's correct.
+
+Now, the error also might be from the host_operator: they used bytes_per_elem=9 which is wrong because mask is bool (1 byte), x is float (4), y is float (4) total 9. That's fine. But they also set tileLength = min(rowLength, max_inner) but if rowLength > max_inner, tileLength will be less, then they use multiple tiles per row. However, in the kernel they use innerTileCount_ based on tileLen_, which is fine.
+
+Given the time, I'll produce a minimal fix: change the kernel to process each row as a single tile by ensuring tileLen_ = rowLen_ in tiling (by setting max_inner to rowLen_ if it fits, else keep tiling but ensure alignment). Also fix the kernel to use proper queue management.
+
+But since we see the error with the current tiling (which likely sets tileLen_ to 21504), and the kernel uses multiple tiles per row, the queue management issue exists. So I'll rewrite the kernel to use a queued approach.
+
+I'll generate the six source strings with the fix.
+
+Let's produce the corrected code.

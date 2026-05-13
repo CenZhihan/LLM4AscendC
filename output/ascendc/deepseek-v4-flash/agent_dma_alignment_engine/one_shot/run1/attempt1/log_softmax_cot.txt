@@ -1,0 +1,171 @@
+We are given a task to replace the PyTorch LogSoftmax operator with a custom AscendC kernel. The kernel name is `log_softmax_custom` (PascalCase: `LogSoftmaxCustom`). We need to produce six code strings: `project_json_src`, `host_tiling_src`, `host_operator_src`, `kernel_src`, `python_bind_src`, and `model_src`.
+
+From the retrieved context, we have information about DMA alignment, but that's more for reference. The user instruction includes an example for leaky_relu_custom. We need to adapt that pattern for log_softmax_custom.
+
+LogSoftmax(x, dim) = log(softmax(x, dim)) = log(exp(x_i) / sum(exp(x_j))) = x_i - log(sum(exp(x_j))). For numerical stability, we usually subtract max before exp: log_softmax(x) = x - max(x) - log(sum(exp(x - max(x)))). But we can also do directly: max along dim, then compute sumexp = sum(exp(x - max)), then output = x - max - log(sumexp). This requires two reductions: max and sumexp. In Ascend C, we need to handle the dimension. The given model has shape (batch_size, dim) and dim=1 (default). So we need to reduce along the last dimension (dim=393216). This is a large dimension; we need to tile along that dimension. Each block can handle a portion of the batch? Actually, the input is (4096, 393216). That's huge. Typically we would split across blocks for each batch element? But the kernel needs to compute log_softmax per batch independently. So we can parallelize across batches: each block processes one or more rows? But 4096 rows, each of length 393216. The UB size is limited (192KB). We need to compute max and sum over 393216 floats (1.5 MB). So we can't fit the whole row in UB. We need to tile along the row dimension: process a chunk of the row, compute local max, then after first pass get global max via reduction across chunks (using atomic operations or multiple passes). However, Ascend C doesn't have direct atomic operations across blocks? Typically, for reduction across tiles, we can use a two-pass approach: first pass compute per-chunk max and store in a temporary buffer in GM, then sync (AscendC::MemSync) or use a second kernel? Or we can use a single kernel with synchronization barriers if blocks collaborate. But for simplicity, we might process each row independently within a single block if we can tile across the row and use local reductions. Since UB per block is 192KB, we can only hold a fraction of the row. So we need to load multiple tiles, compute running max and sumexp. After processing all tiles, we have the global max and sumexp, then we need to compute the final output (x - max - log(sumexp)) for each element. That requires a second pass over the data. So we need two passes: first pass to compute max and sumexp, then second pass to compute output. This can be done in a single kernel by using a double buffer or storing intermediate results in GM. Alternatively, we can design the kernel to process each row completely within one block by looping over tiles, storing max and sumexp in local variables (accumulators), and after the loop, compute the final values and then loop again to write output. That is feasible: we need two copies of the input or we can reload from GM. Since we have to load from GM anyway, we can do the first pass (load tiles, update max and sumexp), store the results per row in a small GM buffer (e.g., an array of size batch_size for max and sumexp), then a second pass (load tiles again and compute output). But we need to synchronize? No, if each block processes one or more rows fully, the two passes are sequential within the same block. So we can have a loop over tiles for first pass, then a second loop over tiles for output. That works if we have enough UB for the tile data and accumulators. The max and sumexp are scalars per row. So we need to store the final log-sum-exp (LSE) which is max + log(sumexp) computed after first pass. Then second pass: output = x - LSE. So the algorithm is:
+
+For each row row_batch:
+  max_val = -inf
+  sumexp = 0
+  For each tile in row:
+    load tile from GM
+    compute tile_max = max(tile)
+    max_val = max(max_val, tile_max)
+    (we need to recompute exp after getting global max? Actually, we can update sumexp incrementally: after we have max_val, we need to recompute exp with max_val. But we don't know max_val until end of first pass. So we need a two-pass approach: first pass compute global max, then second pass compute sumexp with that max, then output. Alternatively, we can do one pass with running max and running sumexp by using the technique of online softmax: we maintain max and sum, and when we see a larger max, we adjust sum by multiplying by exp(old_max - new_max). Then final sumexp = sum * exp(old_max - final_max)? That is the "softmax trick". Yes, we can do online softmax: 
+    m = max(m, tile_max)
+    d = exp(prev_m - m)
+    sum = sum * d + sum_tile_adj
+ where sum_tile_adj = sum(exp(tile_val - tile_max)) * exp(tile_max - m)?? Actually, standard online softmax: 
+    m_new = max(m_old, local_max)
+    d = exp(m_old - m_new)
+    s_new = s_old * d + sum(exp(local - local_max)) * exp(local_max - m_new)
+But that's complicated. For simplicity, we can do two passes within the same block: first pass compute global max, store it; second pass compute sumexp using that global max, then output. That requires storing the input values in UB or reloading from GM. Reloading from GM is okay. So we have two loops over tiles for each row.
+
+We need to decide how to distribute rows across blocks. With batch_size=4096 and blocks maybe up to 24 (from example), we can assign multiple rows per block. The tiling data should specify tile length along the row dimension (dim=393216), and also how many rows per block? We can have blockDim = number of rows? But each block processes one row. Actually, we have 4096 rows, so we could use 4096 blocks? That's too many; Ascend C typically limits blocks to 24 or 40. So we must assign multiple rows per block. We can make each block process a contiguous chunk of rows. So the tiling data should include totalRows, totalCols, tileCols, and blockDim = number of rows per block? Wait, blockDim is the number of AICore blocks used. We can set blockDim to say 24 and distribute rows among them. So tiling: totalLength = batch_size * dim? But we process rows independently. Better to define totalRows = batch_size, totalCols = dim. Then each block processes a set of rows. The kernel grid-stride over rows. So we can have blockDim = number of blocks allocated. Then each block calculates rowStart = blockIdx * rowsPerBlock, rows processed = min(rowsPerBlock, remaining). rowsPerBlock = ceil(totalRows / blockDim). For each row, we loop over tiles of size tileLen along cols.
+
+The UB budget: we need buffers for input tile, output tile, and maybe temporary for the reduction. For each row, we process tiles sequentially. So we need a double buffer for input and output to overlap DMA and compute. But for the first pass, we only need to compute max and sumexp. We can use a single buffer for input and compute locally. Then second pass: need to load input again and compute output. We can use double buffer for output only? Actually, we can use the same input queue for both passes. Since we reload from GM, we can use the same pipeline but with different compute. Simpler: Use a single loop for the two passes? We can do first pass, then second pass. We need to store the input tile? Not necessary; we reload.
+
+Given the complexity, we should design a kernel that works with a single block per row? Actually, we can process each row within a block by iterating over tiles. That is fine. But we need to allocate a workspace for per-row results? The max and sumexp are per row. We can store them in a temporary GM buffer of size totalRows * 2 floats (max and lse). Or we can store them in local variables during the loop? They are scalar per row, so we can keep them in registers. After first pass we compute LSE, keep them, and then second pass writes output. Since each block processes multiple rows sequentially, we can reuse the same local variables for each row.
+
+Important: Need to handle padding if tileLen doesn't divide totalCols. Also alignment: DMA requires 32B alignment. totalCols = 393216, which is divisible by 32? 393216 * 4 bytes = 1,572,864 bytes (1.5 MB). 393216 mod 8 = 0? Actually, float is 4 bytes, so 393216 * 4 = 1,572,864 bytes. 1,572,864 / 32 = 49,152, integer. So it's 32B aligned. But tile length should be multiple of 32B (8 floats) to ensure alignment.
+
+Now, construct the code.
+
+Project json: op name "LogSoftmaxCustom", inputs: "x" (float, ND), output: "y" (float, ND), attr: "dim" (int, optional, default 1). But the model has dim parameter. The kernel might not need dim as it's always 1? But better to pass it for generality. However, the given model uses dim=1. We can set default 1.
+
+Tiling data: We need fields: totalRows, totalCols, tileCols, blockDim. Also maybe dim? But dim is constant per op. We can ignore dim in tiling and assume dim=1 (last dimension). Or pass it. The example for LeakyRelu had totalLength and tileLength. Here we need two dimensions. So we can define: totalRows, totalCols, tileCols, blockDim. And also float for nothing else? We don't need slope. So simpler: uint32 totalRows, uint32 totalCols, uint32 tileCols, uint32 blockDim.
+
+Host operator: similar to LeakyRelu but with LogSoftmax tiling. Tiling function: get input shape (ND shape). Input has at least 2 dimensions. We need dim attribute. For simplicity, assume dim=-1 (last dim). So we can treat the last dimension as cols = tensor shape[-1], rows = product of all other dims (total elements / cols). That works for 2D. For higher dims, it would need more work, but we'll assume 2D for now. Then compute blockDim and tileCols based on UB budget: We need to load one tile of floats for input, and possibly output. In first pass, we only need input tile; we can reuse buffer. In second pass, we need input tile and output tile. So we need at most 2 tiles of floats (double buffer) for each. That's 2 * tileCols * sizeof(float) for input and 2 * tileCols * sizeof(float) for output = 4 * tileCols * 4 bytes = 16 * tileCols bytes. Also temporary for reduction? We can use local tensors for max and sumexp, but they are scalars. So UB budget = 192KB. So max tileCols = 192*1024 / 16 = 12,288 floats. But we also need space for other stuff, so maybe set max to 8192 (32KB per tile, total 64KB for input+output with double buffer). We'll set a cap of 8192 elements (which is 32KB for a single tile). So tileCols <= 8192, also must be multiple of 8 (32B alignment). Also upper bound by totalCols. So tileLen = min(maxTile, totalCols) aligned down. Block dim: number of blocks = min(totalRows, 24) maybe? We can set blockDim = min(totalRows, 24) to have each block process at least one row. If totalRows > blockDim, then each block processes multiple rows. We'll compute rowsPerBlock = ceil(totalRows, blockDim).
+
+Kernel function name: "log_softmax_custom". Kernel class name: "KernelLogSoftmaxCustom".
+
+The kernel algorithm:
+
+- Parameters: GM_ADDR x, y, workspace (maybe for per-block temp?), tiling data.
+
+- Process:
+  - Get tiling data (totalRows, totalCols, tileCols, blockDim).
+  - Compute rowsPerBlock = (totalRows + blockDim - 1) / blockDim.
+  - rowStart = blockIdx * rowsPerBlock.
+  - rowEnd = min(rowStart + rowsPerBlock, totalRows).
+  - For each row in [rowStart, rowEnd):
+      // First pass: compute global max
+      float rowMax = -FLT_MAX;
+      col=0;
+      while col < totalCols:
+          curTileLen = min(tileCols, totalCols - col);
+          // Load tile from x[row*totalCols + col]
+          Load tile from GM to UB;
+          // Compute local max
+          float localMax = max(tile);
+          if localMax > rowMax:
+              rowMax = localMax;
+          col += tileCols;
+      // Compute sumexp with rowMax
+      double sumexp = 0.0; // use double for accuracy? but Ascend C supports float. Use float.
+      col=0;
+      while col < totalCols:
+          curTileLen = min(tileCols, totalCols - col);
+          Load tile from GM again;
+          // compute sumexp += sum(exp(tile - rowMax))
+          for each element in tile: sumexp += expf(tile[i] - rowMax);
+          // Alternatively use vector exp and reduce.
+          // We can use local variables and vector operations: 
+          //   AscendC::Sub(tLocal, xLocal, rowMax, curTileLen);
+          //   AscendC::Exp(tLocal, tLocal, curTileLen);
+          //   AscendC::ReduceSum(sum, tLocal, curTileLen);
+          // But we need to accumulate sum across tiles.
+          // Since we cannot reduce across tiles easily, we can accumulate in a local variable using scalar loop or use a vector accumulator? Actually, we can do:
+          //   AscendC::Sub(tmp, xLocal, rowMax, curTileLen);
+          //   AscendC::Exp(tmp, tmp, curTileLen);
+          //   AscendC::ReduceSum(sumLocal, tmp, curTileLen); // sumLocal is scalar
+          //   sumexp += sumLocal;
+          // Then final LSE = rowMax + log(sumexp).
+          // Then second pass: compute output = x - LSE.
+          col += tileCols;
+      // Compute LSE
+      float LSE = rowMax + logf(sumexp);
+      // Third pass: write output
+      col=0;
+      while col < totalCols:
+          curTileLen = min(tileCols, totalCols - col);
+          Load tile from GM;
+          // output = tile - LSE
+          // Write to output GM.
+          col += tileCols;
+
+  This is three passes over the data, which is inefficient. We can combine second and third passes: after computing LSE, we can immediately compute output for that tile and write it out, avoiding a third reload. So after the first pass we have rowMax, then second pass we compute sumexp and also produce output? No, we need sumexp to compute LSE. But we can compute sumexp and store it per tile? Not easily. Better: First pass compute rowMax. Second pass compute sumexp (accumulate) and store output? Actually, we need LSE to compute output. So we must compute sumexp completely first. So we need a second pass to compute sumexp, then after that we have LSE, then third pass to produce output. However, we can reduce to two passes by using the online softmax approach that avoids computing sumexp separately. For simplicity and correctness, we'll stick with three passes but note that on Ascend C, reloading from GM is relatively fast with double buffering, and we can overlap loads. We can also reduce passes by storing the input in UB if the entire row fits, but it doesn't. So we need three loops. Alternatively, we can use a two-pass approach: first pass compute rowMax, second pass compute output using rowMax and online sumexp? Actually, if we know rowMax, we can compute the correct sumexp only after seeing all data. So we need a separate pass to compute sumexp. So three passes is the straightforward way.
+
+To improve, we can combine the first and second passes: maintain both max and sumexp using the online softmax algorithm. That would allow a single pass to compute both max and sumexp, then a second pass to compute output. Let's implement online softmax to be more efficient.
+
+Online softmax algorithm (stable version):
+Initialize m0 = -inf, s0 = 0
+For each tile:
+  m_i = max(m_{i-1}, local_max)
+  d = exp(m_{i-1} - m_i)
+  s_i = s_{i-1} * d + sum(exp(local - local_max)) * exp(local_max - m_i)
+At end, LSE = m_last + log(s_last)
+
+We can compute this with vector operations. For each tile:
+1. Compute local_max: vector max (single value).
+2. Compare with current global max (stored in scalar). Need to broadcast.
+3. If global_max changes, we need to scale previous sumexp by d = exp(old_max - new_max). That's a scalar multiplication on the scalar sumexp.
+4. Compute local sumexp: for each element in tile, compute sub(local, local_max) -> exp -> reduce sum (scalar).
+5. Then scale that local sumexp by exp(local_max - new_max) and add to scaled sumexp.
+
+We can implement this with scalar operations (regular C++ floats) for the global max and sumexp, and vector operations for the tile. Since the global max and sumexp are per-row, we can keep them as local variables.
+
+Implementation details:
+- In the loop over tiles:
+   - Load tile (float vector) into local tensor.
+   - Compute local_max using AscendC::ReduceMax (returns scalar).
+   - Compare with global_max: if local_max > global_max:
+         float factor = expf(global_max - local_max);
+         global_sum *= factor;
+         global_max = local_max;
+   - Compute local_sumexp: subtract local_max from tile (vector), exp, reduce sum (scalar).
+   - Scale local_sumexp by expf(local_max - global_max) and add to global_sum.
+   - (No need to compute factor again if global_max unchanged? Actually, after possible update, we need to scale local_sumexp correctly. So after updating global_max if needed, compute scale = expf(local_max - global_max). That works because if local_max > global_max, after update global_max = local_max, so scale = 1.0. If local_max <= global_max, scale = expf(local_max - global_max).
+- After loop, LSE = global_max + log(global_sum).
+
+Then second pass: for each tile, load again, compute output = tile - LSE, write.
+
+So we have two passes (online reduction then output). That's better.
+
+We need to ensure numerical stability: use double for accumulation? In Ascend C, local variables can be float; we can use double (64-bit) for the sumexp scalar to reduce rounding error. In kernel code, we can declare `double sumexp;` and use `expf` for float, then cast. But Ascend C may have limited double support? It supports double for scalar but vector operations are float only. We'll use float for sumexp but it might be okay for 393k elements. We can use double for safety: double global_sum = 0.0; and use expf for float. The scalars are in scalar register, so double is fine.
+
+Now, the kernel structure with double buffering to overlap DMA and compute. In the first pass, we load tile, compute local max and local sumexp, then accumulate global. We can use double buffering: while one tile is being computed, next tile is being loaded. In the second pass, we also use double buffering for output.
+
+Given complexity, we'll design the kernel with a simple single-buffer approach for simplicity and correctness, since the tiles are small (max 8192 floats) and DMAs are relatively fast. We'll omit double buffering to keep code shorter, but the example used double buffering. To match the style, we should include double buffering. However, for the online reduction pass, we need to process tiles sequentially with overlap. We can do:
+
+- Init pipe with inQueueX (2), inQueueY (2) for output, and maybe a temp queue (1) for local.
+- Process rows one by one.
+- For each row:
+   - First pass (reduction):
+        - For each tile:
+            - Use double buffer to prefetch next tile.
+            - Compute on current tile.
+   - Second pass (output):
+        - For each tile:
+            - Use double buffer to prefetch input tile and compute output to output queue.
+            - Write output to GM.
+
+We can share the same input queue for both passes, but the first pass doesn't write output. We'll have separate loops.
+
+Given the length, I'll produce a kernel that is similar to the leaky_relu_custom example but adapted for log_softmax. I'll use double buffering with BUFFER_NUM = 2.
+
+Now, produce the six strings.
+
+Important notes:
+- The kernel function name is "log_softmax_custom".
+- PascalCase for op: "LogSoftmaxCustom".
+- Tiling data: I'll define totalRows, totalCols, tileCols, blockDim. Also maybe dim attr? Not needed for tiling but we can ignore dim and assume last dimension.
+- Attr: dim (int, optional, default 1) is defined in project json and used in host operator to compute rows and cols? Actually, we can infer from shape: totalCols = shape[dim]; but if dim is -1 or last, we can just use last dimension. Since dim=1 means the second dimension is reduced. For 2D input (batch, dim), correct. For higher dim, we would need to flatten. For simplicity, we assume 2D. We'll include dim attr but not use it in host tiling (just use last dimension). In host operator, we can compute totalRows = totalElements / shape[dim] etc.
+
+Let's write the code.
+
+We'll need to include <math.h> for expf, logf, fmaxf, etc. In kernel, we use vector versions.
+
+We'll also need to handle row loop.
+
+Let me produce the strings.

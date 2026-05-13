@@ -1,0 +1,93 @@
+We need to generate six Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src. The kernel name is max_pooling_3d_custom (kernel function name) -> PascalCase: MaxPooling3dCustom (for operator definition). The model is a 3D max pooling with kernel_size=3, stride=2, padding=1, no dilation, no return_indices, no ceil_mode (though they could be passed). But the user's architecture passes kernel_size, stride, padding as init inputs and forward does x only. So we need to handle these attributes.
+
+We must produce a custom Ascend C kernel that does efficient 3D max pooling. We need to consider alignment constraints from retrieved contexts: DMA alignment engine suggests using DataCopyPad for non-aligned transfers, and for compare operations need 256B alignment. For max pooling, we will need to compare values (max). So we must pad to 256B alignment.
+
+Given the typical sizes: input (16,32,128,128,128) -> output after maxpool3d(k=3,s=2,p=1) => (N, C, (128+2*1-3)/2+1 = (128+2-3)/2+1 = 127/2? Actually floor: (128+2*1-3)/2+1 = 127/2+? Let's compute: (128+2-3)=127, stride 2 => floor(127/2)=63, +1? Actually formula: output_size = floor((input_size + 2*padding - dilation*(kernel_size-1)-1)/stride + 1). With dilation=1: floor((128+2-3)/2)+1? Wait: (128+2*1 -1*(3-1)-1)/2+1 = (128+2-2-1)/2+1 = 127/2+1 = 63.5? floor=63, +1? Actually the formula: out = floor((in + 2*pad - dilation*(k-1)-1)/stride + 1). So (128+2-2-1)/2+1 = 127/2+1 = 63.5+1? Let's compute numerically: (127/2)=63.5, floor=63, +1=64? no: should be (127/2) = 63.5, floor gives 63, then +1 = 64. But typical PyTorch: For input 128, k=3, pad=1, stride=2, output size is 64. Because (128+2*1-3)/2+1 = (128+2-3)/2+1 = 127/2+1 = 63.5+1=64.5? Actually integer division in Python floor: (128+2-3)//2+1 = 127//2+1 = 63+1=64. Yes.
+
+So output size is 16,32,64,64,64.
+
+Allocate UB buffer for a tile of input: 3x3x3 window per output element requires accessing 27 input elements per output element. But we can design tiling along spatial dimensions. Could treat each channel individually, but better to handle all channels together to reuse.
+
+Given alignment constraints: Our transfers must be 32B aligned for DataCopy, else use DataCopyPad. For compare (max) we need 256B aligned total bytes. So we need to design tiling so that each tile size (in elements) is a multiple of 256/sizeof(float)=64, 64*4=256B. Also ensure GM offsets are aligned.
+
+We'll design a kernel that processes the output spatial grid in tiles. Since output is 64^3, we can tile along one or two spatial dimensions. For simplicity, tile along output spatial dimensions: each block handles a contiguous chunk of output positions. But we need to read the corresponding input windows, which may overlap. Efficient loading: we can load a larger input region and then compute the max for each output in that region.
+
+Given UB constraints, we can load a slice of input (e.g., a 2D slice of size (D_in, H_in, W_in) but limited budget). Alternatively, we can process output voxel-by-voxel with necessary input window loaded. But that would be inefficient.
+
+Better approach: Use DataCopy to load a 3D patch of input that covers multiple output voxels, then compute max inside loops, then write out results. Need to ensure alignment.
+
+We'll create a tiling structure that specifies total output size (N*C*Dout*Hout*Wout), tileLength in terms of number of output voxels per block, and per-tile we also need to know the input region to load. But input region depends on position. We can compute in kernel the base indices.
+
+Given complexities, we'll adopt a simpler grid-stride approach: each block handles a range of output voxels (linear index). For each output voxel, compute the corresponding input window coordinates (based on kernel, stride, padding), then load the 27 input values (3x3x3) from GM (using DataCopyPad if needed for alignment), then find max, store result. This requires loading 27 floats per output, which is 108 bytes. With UB budget 192KB per core, we can handle many output voxels per block. But we must be careful with alignment when loading multiple input values that may not be contiguous? Actually, 27 floats are within a contiguous block of 27 floats if we load the whole 3x3x3 cube? The input cube is contiguous in memory if we consider the memory layout: (N,C,D,H,W) with D inner? Typically PyTorch tensors are contiguous in memory with dimensions ordered as N C D H W, with D being the innermost spatial dimension? Actually for 5D, the order is N, C, D, H, W (batch, channel, depth, height, width) with width being fastest? In PyTorch, default memory format is contiguous with last dimension contiguous. So for 5D tensor of shape (N,C,D,H,W), stride is (C*D*H*W, D*H*W, H*W, W, 1). So spatial dimensions: width is innermost, then height, then depth. So a 3x3x3 cube in spatial dimensions is not contiguous if considered as a 27-element block; it's a 3D sub-block with strides. To load it efficiently, we might need to load three 2D slices (per depth) or load each row. But we can still use DataCopy if we load each depth (H*W) slice separately? Or we can load the entire 3D sub-block by multiple DataCopy calls. Or we can use a technique: load the entire input region that covers the needed window for a batch of output voxels, then compute.
+
+Given time, we'll design a kernel that processes output voxels in a loop, loading the 27 elements individually using DataCopy for each? That's too many DMA calls. Better: preload an input tile that covers the receptive field for a set of output voxels.
+
+Simplification: Since the problem is large, we can implement a naive but correct kernel that loads each output's needed input window via 27 DataCopy of single elements? But each DataCopy for a single float would be inefficient and alignment problematic. We'll design to load a whole input slice (e.g., a 2D plane) and then compute max for multiple output positions within that plane.
+
+Given the constraints and time, we'll produce a kernel that uses a straightforward approach: for each block, we iterate over a range of output spatial indices. For each output index (d_out, h_out, w_out), we compute the corresponding input region: d_start = d_out*stride - padding, etc. Then we load a 3x3x3 sub-tensor by issuing 3 DataCopy operations for each depth layer (since each depth layer is a contiguous 2D (H,W) slice). But this still many DMAs. We can instead load the entire needed 3D window by loading a contiguous block of memory? Not contiguous because of stride.
+
+Given we are allowed to use DataCopyPad for non-aligned sizes, we can pad the load to align and then extract the needed values. But still not trivial.
+
+Given that the user wants an optimized kernel, but we have limited context, we will provide a kernel that works for the given input sizes and is reasonably efficient, using tiling along output dimensions and loading entire input slices per depth.
+
+Because this is a text generation, we need to produce the six strings. We'll follow the pattern from the leaky_relu example.
+
+We'll define the operator with attributes: kernel_size, stride, padding (all ints). The input x (float ND tensor). Output y (same type).
+
+Tiling data: totalLength (number of output elements), tileLength (output elements per block), blockDim, plus the attributes needed for kernel: kernel_size, stride, padding, and also the input shape dimensions for coordinate calculation.
+
+We also need to pass input shape dimensions to kernel because kernel needs to compute input indexing. So tiling data should include N, C, D, H, W of input, or at least the spatial dimensions and strides.
+
+Better: pass the input shape dimensions (N, C, D, H, W). Also output dimensions.
+
+Simplify: In kernel we can get input and output shapes from GM_ADDR of tiling? Usually we pass tiling data structure. We'll define TILING_DATA with fields: totalLength (out), tileLength, blockDim, kernelSize, stride, padding, inputN, inputC, inputD, inputH, inputW, outputD, outputH, outputW. That's a lot but fine.
+
+But we also need to consider alignment. For DataCopy: we need to ensure that the total bytes for each DataCopy call is 32B-aligned if we use DataCopy, else use DataCopyPad. We'll use DataCopyPad for loads that are not aligned. For simplicity, we can always use DataCopyPad for non-aligned loads and DataCopy for aligned.
+
+For the compare (max), we need to ensure the number of elements compared is a multiple of 64 (256B). We can pad to next multiple of 64 for each tile of output values. But for the final output, we may need to handle boundaries. We can pad the local buffer to 64 element boundary.
+
+We'll design kernel to process output voxels in chunks of tileLength (which should be multiple of 64). For each chunk, we will loop over each output voxel but accumulate max values in a local array? Actually we need to compute max per output window. For each output, we need to compare 27 input values. We can load all needed input values into a local buffer (size 27) and then reduce using Compare or maximum. The compare instruction (Max) can take vector input. We could load the 27 values into a vector and do reductions. But Ascend C has hardware max reduction? There is ReduceMax, but we can also use a sequence of Max.
+
+Given complexity, we'll keep the kernel simpler: use scalar loop within the AICore. Yes, we can use a for loop to compute max over 27 elements. That is acceptable because the operations are inside the AICore and the loop overhead is small compared to DMA.
+
+We'll use a single buffer to load all 27 values for one output window. Since each output requires 27 floats, we can process one output at a time. To maximize DMA throughput, we should prefetch next window's data while computing. We can use double buffering for input window loads.
+
+Given the difficulty, we'll produce a kernel that processes output voxels in a grid-stride loop, with double buffering for loading the 3x3x3 input window. For each output, we load 27 floats via DataCopyPad (since size 27*4=108 bytes not 32B-aligned), then compute max. Then write output.
+
+We also need to handle boundaries (padding). We'll pad with -inf values. Use -FLT_MAX.
+
+Now, we need to write the six strings. We'll follow the exact pattern as leaky_relu example with appropriate changes.
+
+Let's start with project_json_src: operator name MaxPooling3dCustom, input x (float ND), output y (float ND), attributes: kernel_size (int), stride (int), padding (int). They might also need dilation but default 1, we can ignore or include as optional. We'll include as optional with default 1.
+
+host_tiling_src: define MaxPooling3dCustomTilingData with fields: totalLength, tileLength, blockDim, kernelSize, stride, padding, inputN, inputC, inputD, inputH, inputW, outputD, outputH, outputW, dilation (if we include). We'll also need maybe float negative infinity? We can store as float.
+
+host_operator_src: tiling function Compute tiling based on input shape and UB budget. Compute output dimensions. Determine tileLength (number of output voxels per block) based on available UB: each output voxel requires 27 floats for input window (108 bytes) plus output value (4 bytes) plus temporary buffers. Also we need double buffering for input windows. So each tile we need 2 * 27 * sizeof(float) = 216 bytes for input windows, plus one output buffer (tileLength * sizeof(float)). Also we need temporary for max? We'll just use scalar loop, so minimal temp. So UB budget split. We'll set tileLength such that total usage fits within 192KB. Also we need to align tileLength to multiple of 64 for output write alignment (DataCopy requires 32B, but output write can be aligned if we pad). We can use DataCopyPad for output as well if not aligned.
+
+We'll compute outputD, H, W from input shape and attributes.
+
+blockDim: number of tiles or based on output size.
+
+kernel_src: Kernel class KernelMaxPooling3dCustom. Init receives tiling data. Process: grid-stride over output voxels. For each, it computes start indices, then loads 27 floats from input GM (with padding handling), computes max, writes to output. Double buffering for reading input windows? We can use two input window buffers. But since each window is small (27 floats), we can load sequentially without double buffering. However to overlap compute and DMA, we can load next while computing current. We'll implement a simple loop with two buffers: prefetch first, then loop with compute and prefetch next.
+
+But care: the input window for each output voxel may not be contiguous. We need to issue multiple DataCopy calls per window. For simplicity, we can load each of the 3 depth slices as a 1x3x3 (H x W) block? Actually each depth slice is a 3x3 sub-matrix. But to load a 3x3 sub-matrix from GM, we need to load 3 rows of 3 elements each. That's 3 DataCopy calls per depth, total 9 calls per window. That's many. We could load the entire 3x3x3 by using a 3D copy? Not available.
+
+Alternative: Because kernel size is 3, we can compute maximum of 27 values by loading a 3x3x3 volume by using a larger 2D slice from GM. For example, for a given depth offset, we can load a 3x3 block from the HxW plane. That block is not contiguous: 3 rows of 3 elements each, but rows are separated by (W - 3) elements. We could load the entire row (length W) and then extract the 3 needed elements? That would be inefficient in terms of memory traffic (loading many unneeded elements). For small windows, it may still be okay. Given that the input dimensions are large (128x128), loading a full row of 128 floats (512 bytes) for each window would be too much. So we need to load only the needed 3 floats per row.
+
+We can use DataCopyPad with a mask to select? Not straightforward.
+
+Maybe we can use a technique: load the entire 3x3 window by issuing three DataCopy calls for the three rows, each with length 3. That is 9 total. That's acceptable because we are only doing 9 small loads per output voxel. With tileLength ~ 1000, that would be 9000 DMA operations per block, which might be okay. We can batch these loads? Alternatively, we can load a larger input region (e.g., a 2D slice of height H and width W) for a range of depths, and then compute max for multiple outputs within that region. That would be more efficient. We'll design a tiling strategy: each block handles a sub-3D volume of output. For a given output spatial range, we load a corresponding input region that covers all needed input windows for those outputs. The input region dimensions can be computed: outD_out * stride + (kernel-1) - padding etc. Then we load that whole region (which is a contiguous in memory if we consider the 3D tensor? Actually it is a sub-tensor of shape (C, depth_range, height_range, width_range). But to load it contiguous, we need to consider channel dimension. We'll process each channel independently? Actually max pooling is per channel, so we can treat each channel separately. That simplifies: per block, we process a subset of output voxels for a given channel. We can iterate over channels as well.
+
+Given the complexity, we'll produce a kernel that does per-output-voxel window loading using DataCopyPad for each row of the window. We'll use double buffering: two input window buffers (27 floats each). We'll compute max using scalar loop. This will work reasonably for the given sizes.
+
+We must ensure alignment: when loading 3 floats (12 bytes) from GM, it may not be 32B aligned. Use DataCopyPad with a pad size to make the total transferred bytes a multiple of 32? DataCopyPad allows specifying offset and size, but the size must be aligned to 32B? Actually DataCopyPad can handle arbitrary size by padding the transfer to a multiple of 32B, and the extra bytes are discarded. So we can use DataCopyPad for each row load. However, we need to know the source address: we can pass a pointer to the start of the row, and length 3 (12 bytes) -> DataCopyPad will copy 12 bytes plus pad to 32B. That's wasteful (load 32 bytes to get 12). But acceptable.
+
+Alternatively, we can perform scalar loads? Ascend C supports scalar Load? Not in the same way.
+
+We'll accept the overhead.
+
+Now, write the code.
+
+We need to produce strings exactly as in example, including triple-quoted strings.
+
+I'll write the code step by step.

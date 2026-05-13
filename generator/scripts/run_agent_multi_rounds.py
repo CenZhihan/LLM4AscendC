@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 OUTPUT_ROOT = REPO_ROOT / "output"
 ARTIFACTS_ROOT = REPO_ROOT / "artifacts"
 
@@ -66,6 +68,32 @@ def _eval_result_json_path(txt_path: pathlib.Path, op: str) -> pathlib.Path:
     rel_group = _artifact_group_rel_from_txt_path(txt_path)
     art_root = ARTIFACTS_ROOT / rel_group if rel_group is not None else ARTIFACTS_ROOT
     return art_root / op / f"result_{op}.json"
+
+
+def _apply_parallel_opp_env_if_needed(*, op_slot: int, parallel_ops: int) -> None:
+    """
+    When multiple operator jobs run concurrently (ProcessPoolExecutor), each child must install
+    custom OPP under its own root — same convention as eval_operator --txt-dir --workers (see
+    _parallel_worker_main): <base>/_parallel_w<bucket>.
+
+    With max_workers=parallel_ops, concurrently running tasks have distinct op_slot % parallel_ops.
+    """
+    if parallel_ops <= 1:
+        return
+    from tools.common.env import load_env_config
+
+    cfg = load_env_config()
+    if not cfg.ascend_custom_opp_path:
+        return
+    base = pathlib.Path(cfg.ascend_custom_opp_path)
+    bucket = op_slot % parallel_ops
+    isolated = base / f"_parallel_w{bucket}"
+    isolated.mkdir(parents=True, exist_ok=True)
+    os.environ["LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH"] = str(isolated)
+    print(
+        f"[ALLOC] LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH={isolated} "
+        f"(slot={op_slot} mod parallel_ops={parallel_ops} -> bucket={bucket})"
+    )
 
 
 def _run_eval_for_txt(
@@ -232,6 +260,9 @@ def _generate_one_attempt(
     repair_error_logs_raw: str = "",
     previous_attempt_code: str = "",
     ascend_search_version_filter: Optional[str] = None,
+    retrieved_repair_memories: str = "",
+    retrieved_repair_memories_applied: Optional[List[Dict[str, Any]]] = None,
+    eval_mode: str = "full",
 ) -> Dict[str, Any]:
     from generator.agent.agent_runner import KernelGenerationTask, generate_kernel_with_agent
 
@@ -249,6 +280,9 @@ def _generate_one_attempt(
         repair_error_logs_raw=repair_error_logs_raw,
         previous_attempt_code=previous_attempt_code,
         ascend_search_version_filter=ascend_search_version_filter,
+        retrieved_repair_memories=retrieved_repair_memories,
+        retrieved_repair_memories_applied=retrieved_repair_memories_applied,
+        eval_mode=eval_mode,
     )
     paths = _save_generation_outputs(
         out_dir=out_dir,
@@ -285,9 +319,16 @@ def run_multi_attempt_for_op(
     eval_workers: int,
     eval_npu: int,
     ascend_search_version_filter: Optional[str] = None,
+    run_slug: str = "",
+    memory_root: Optional[pathlib.Path] = None,
+    use_repair_memory: bool = False,
 ) -> Dict[str, Any]:
     if max_attempts < 2:
         raise ValueError("max_attempts must be >= 2")
+    if not (run_slug or "").strip():
+        from generator.repair_memory.paths import run_slug_from_run_dir
+
+        run_slug = run_slug_from_run_dir(run_dir) if use_repair_memory else ""
     op_summary: Dict[str, Any] = {
         "op": op,
         "category": category,
@@ -317,6 +358,7 @@ def run_multi_attempt_for_op(
             repair_context_path="",
         )
         try:
+            saved_prev_for_memory = previous_attempt_code
             repair_logs_raw = ""
             if attempt_id >= 2:
                 if not previous_repair_context_path:
@@ -324,6 +366,27 @@ def run_multi_attempt_for_op(
                 repair_logs_raw = pathlib.Path(previous_repair_context_path).read_text(
                     encoding="utf-8", errors="replace"
                 )
+            retrieved_repair_memories = ""
+            retrieved_repair_memories_applied: List[Dict[str, Any]] = []
+            if use_repair_memory:
+                try:
+                    from generator.repair_memory import build_retrieval_block_for_attempt
+
+                    retrieved_repair_memories, retrieved_repair_memories_applied = (
+                        build_retrieval_block_for_attempt(
+                            llm_config=llm_config,
+                            op=op,
+                            category=category,
+                            tool_mode=tool_mode,
+                            eval_mode=eval_mode,
+                            repair_error_logs_raw=repair_logs_raw,
+                            attempt_id=attempt_id,
+                            memory_root=memory_root,
+                        )
+                    )
+                except Exception:
+                    retrieved_repair_memories = ""
+                    retrieved_repair_memories_applied = []
             gen = _generate_one_attempt(
                 op=op,
                 category=category,
@@ -335,6 +398,9 @@ def run_multi_attempt_for_op(
                 repair_error_logs_raw=repair_logs_raw,
                 previous_attempt_code=previous_attempt_code,
                 ascend_search_version_filter=ascend_search_version_filter,
+                retrieved_repair_memories=retrieved_repair_memories,
+                retrieved_repair_memories_applied=retrieved_repair_memories_applied,
+                eval_mode=eval_mode,
             )
             outcome.generated = True
             outcome.txt_path = str(gen["txt_path"])
@@ -376,6 +442,30 @@ def run_multi_attempt_for_op(
             repair_path = attempt_dir / f"{op}_repair_context.txt"
             _write_text(repair_path, repair_text)
             outcome.repair_context_path = str(repair_path)
+
+            if use_repair_memory:
+                try:
+                    from generator.repair_memory import maybe_write_repair_memory_after_eval
+
+                    maybe_write_repair_memory_after_eval(
+                        op=op,
+                        category=category,
+                        strategy=strategy,
+                        tool_mode=tool_mode,
+                        eval_mode=eval_mode,
+                        attempt_id=attempt_id,
+                        run_dir=run_dir,
+                        run_slug=run_slug,
+                        llm_config=llm_config,
+                        op_summary_attempts=dict(op_summary.get("attempts") or {}),
+                        curr_outcome=outcome.__dict__,
+                        curr_payload=payload,
+                        prev_code=saved_prev_for_memory,
+                        curr_code=gen["result"].generated_code or "",
+                        memory_root=memory_root,
+                    )
+                except Exception:
+                    pass
 
             previous_attempt_code = gen["result"].generated_code
             previous_repair_context_path = str(repair_path)
@@ -424,8 +514,13 @@ def _run_single_op_job(
     eval_workers: int,
     eval_npu: int,
     op_slot: int,
+    parallel_ops: int,
     ascend_search_version_filter: Optional[str] = None,
+    run_slug: str = "",
+    memory_root: Optional[pathlib.Path] = None,
+    use_repair_memory: bool = False,
 ) -> Dict[str, Any]:
+    _apply_parallel_opp_env_if_needed(op_slot=op_slot, parallel_ops=parallel_ops)
     device_id = op_slot % eval_npu
     os.environ["ASCEND_VISIBLE_DEVICES"] = str(device_id)
     print(f"[ALLOC] op={op} slot={op_slot} ASCEND_VISIBLE_DEVICES={device_id} (eval_npu={eval_npu})")
@@ -443,13 +538,27 @@ def _run_single_op_job(
         eval_workers=eval_workers,
         eval_npu=eval_npu,
         ascend_search_version_filter=ascend_search_version_filter,
+        run_slug=run_slug,
+        memory_root=memory_root,
+        use_repair_memory=use_repair_memory,
     )
 
 
-def _default_run_dir(*, model_slug: str, tool_mode: str, strategy: str, run: int, test: bool) -> pathlib.Path:
+def _default_run_dir(
+    *,
+    model_slug: str,
+    tool_mode: str,
+    strategy: str,
+    run: int,
+    test: bool,
+    use_repair_memory: bool = False,
+) -> pathlib.Path:
     from generator.agent.agent_config import parse_tool_mode, tool_mode_to_string
 
-    out_root = pathlib.Path("output/test/ascendc" if test else "output/ascendc")
+    if use_repair_memory:
+        out_root = pathlib.Path("output/test/memory_on/ascendc" if test else "output/memory_on/ascendc")
+    else:
+        out_root = pathlib.Path("output/test/ascendc" if test else "output/ascendc")
     return out_root / model_slug / f"agent_{tool_mode_to_string(parse_tool_mode(tool_mode))}" / strategy / f"run{run}"
 
 
@@ -556,6 +665,15 @@ def main() -> int:
             "省略则不限制版本。适用于 ascend_search + ascend_fetch 组合。"
         ),
     )
+    parser.add_argument(
+        "--use-repair-memory",
+        action="store_true",
+        help=(
+            "启用跨轮修复记忆：检索注入、评测后写入记忆、默认输出到 output/memory_on/ascendc/... "
+            "（与 --test 组合时为 output/test/memory_on/ascendc/...）。"
+            "省略本参数时行为与未接入记忆机制前一致。"
+        ),
+    )
     args = parser.parse_args()
     if args.max_attempts < 2:
         raise ValueError("--max-attempts must be >= 2")
@@ -592,8 +710,16 @@ def main() -> int:
         strategy=args.strategy,
         run=args.run,
         test=args.test,
+        use_repair_memory=args.use_repair_memory,
     )
     out_run_dir.mkdir(parents=True, exist_ok=True)
+    if args.use_repair_memory and args.out_dir:
+        p = str(out_run_dir.resolve()).replace("\\", "/")
+        if "memory_on" not in p:
+            print(
+                "[WARN] --use-repair-memory 建议将产物放在包含 memory_on 的路径下（未设置 --out-dir 时默认如此）；"
+                f"当前 run_dir={out_run_dir}"
+            )
 
     if args.ops is not None and args.kernelbench102:
         print(
@@ -642,7 +768,12 @@ def main() -> int:
         "ops_resolution": "explicit" if args.ops is not None else "from_categories",
         "operator_keys": resolved_ops,
         "ops": {},
+        "use_repair_memory": args.use_repair_memory,
     }
+
+    from generator.repair_memory.paths import run_slug_from_run_dir
+
+    memory_run_slug = run_slug_from_run_dir(out_run_dir) if args.use_repair_memory else ""
 
     if args.parallel_ops == 1:
         results = []
@@ -663,7 +794,10 @@ def main() -> int:
                 eval_workers=args.eval_workers,
                 eval_npu=args.eval_npu,
                 op_slot=op_slot,
+                parallel_ops=args.parallel_ops,
                 ascend_search_version_filter=ascend_vf,
+                run_slug=memory_run_slug,
+                use_repair_memory=args.use_repair_memory,
             )
             results.append({"op": op, "summary": summary})
     else:
@@ -688,7 +822,10 @@ def main() -> int:
                     eval_workers=args.eval_workers,
                     eval_npu=args.eval_npu,
                     op_slot=op_slot,
+                    parallel_ops=args.parallel_ops,
                     ascend_search_version_filter=ascend_vf,
+                    run_slug=memory_run_slug,
+                    use_repair_memory=args.use_repair_memory,
                 )
                 fut_to_op[fut] = op
             for fut in concurrent.futures.as_completed(fut_to_op):
@@ -720,6 +857,16 @@ def main() -> int:
     aggregate_path = out_run_dir / _all_ops_summary_filename(args.max_attempts)
     _write_json(aggregate_path, all_summaries)
     print(f"[WROTE] {aggregate_path}")
+    if args.use_repair_memory:
+        try:
+            from generator.repair_memory import merge_run_inbox
+            from generator.repair_memory.paths import get_memory_root
+
+            merged_n = merge_run_inbox(get_memory_root(), memory_run_slug)
+            if merged_n:
+                print(f"[REPAIR_MEMORY] final merge: appended {merged_n} record(s) (run_slug={memory_run_slug})")
+        except Exception as exc:
+            print(f"[REPAIR_MEMORY] final merge skipped: {exc}")
     return 0
 
 

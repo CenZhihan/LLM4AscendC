@@ -1,0 +1,93 @@
+We need to fix the previous attempt. The error log says:
+- compiled: False
+- correctness: False
+- ValueError: txt bundle missing blocks: ['host_operator_src', 'kernel_src', 'python_bind_src']
+
+This means that when parsing the generated code from the previous attempt, it failed because the required blocks (host_operator_src, kernel_src, python_bind_src) were missing. Looking at the previous attempt full generated code, it seems it got cut off (the host_operator_src is incomplete and the later blocks are missing). The error says "txt bundle missing blocks", meaning the output didn't contain those strings.
+
+Thus, the repair must ensure the complete six strings are present. Also, we need to generate a correct GELU kernel. The example uses LeakyReLU with a specific pattern. For GELU, we need to compute the GELU activation: x * 0.5 * (1.0 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))). That is the standard GELU approximation.
+
+We'll write a GELU kernel using AscendC vector intrinsics. We'll need to compute x^3, multiply by constants, compute tanh, etc. We must ensure proper tiling and UB buffer management. Use the pattern from leaky_relu but adapt for GELU.
+
+Key points:
+- project_json_src: op name "GeluCustom", no attributes needed (negative_slope not needed). Input "x", output "y", both float, ND format.
+- host_tiling_src: define tiling data with totalLength, tileLength, blockDim (no extra float attribute). 
+- host_operator_src: implement TilingFunc, infer shape/dtype, register operator. Use PascalCase: GeluCustom.
+- kernel_src: implement GELU using approximation. Use Multiply, Add, Mul, Tanh, etc. We'll compute:
+   t1 = x * x (square)
+   x2 = x * x (could use Square but may not exist; use Mul(x, x))
+   x3 = x2 * x
+   inner = 0.044715 * x3 + x
+   inner_scaled = inner * sqrt(2/pi) = inner * 0.7978845608
+   tanh_val = Tanh(inner_scaled)
+   result = 0.5 * x * (1.0 + tanh_val)
+   But we can also use the formula: 0.5 * x * (1.0 + tanh(...)). Need to handle sign and precision.
+   We'll use AscendC vector intrinsics: Muls, Adds, Mul, Tanh (if available; if not, use approximation via Exp? But Tanh is available in AscendC? Typically, AscendC math functions include Tanh for LocalTensor. We'll assume Tanh is available. If not, we can use: tanh(x) = (exp(2x)-1)/(exp(2x)+1), but using Tanh is simpler. We'll use Tanh.)
+   We'll allocate multiple temp tensors: sq, cube, inner, tanh_out, etc. Need enough UB space. Use BUFFER_NUM=2 for in/out queues, and one temp queue maybe for intermediate? But we need more locals. We can allocate multiple local tensors from tmpQueue or from a separate queue. In leaky_relu example, they used tmpQueue_ for one temporary. For GELU, we need several temps. We can either use multiple temp queues or reuse buffers. Simpler: we can use a single tmpQueue with multiple tensors from it, but need to manage lifetimes. Or we can allocate from pipe_ directly with pipe_.InitBuffer. But the example pattern uses TQue. We can create additional queues: tmpQueue1, tmpQueue2 etc, but that increases UB usage. Instead, we can compute step by step reusing the same local tensor for intermediate results. For example:
+   - Copy x to local: xLocal.
+   - Compute sq = x * x (Muls? Actually Mul(x, x) requires two tensors. But we can't multiply same tensor? We can use Mul(xLocal, xLocal, sq, len) if we have separate output tensor. So allocate sq from tmpQueue.
+   - Then compute cube = sq * xLocal, allocate cube from tmpQueue (but sq is still needed? Actually we can reuse: after computing sq, then compute cube = sq * x, but we need sq later? For inner, we need x and x^3. We can keep sq not needed after cube, so we can free sq and allocate cube. Or use separate tensors to avoid dependency. Let's allocate three temps: sq, cube, inner, and later tanh_out. But UB may be tight. We can compute inner = x + 0.044715*cube in place (using Adds and Muls). Then compute inner_scaled = inner * 0.7978845608, then tanh, then result = 0.5 * x * (1+tanh). We can reuse some buffers. Let's allocate:
+       tmp1 = inner (initial x, later overwritten)
+       tmp2 = cube (or x)
+       But we also need x for the final multiply. So we must keep xLocal until the end. So we need:
+       - xLocal (from inQueue)
+       - out = yLocal (from outQueue)
+       - sq (temp)
+       - cube (temp)
+       - inner (temp)
+       - tanh_val (temp)
+       That's 5 temps, each tileLen floats. With tileLen up to maybe 8192 etc, 5*8K*4 = 160KB, which might exceed UB budget. So we need to be conservative and reuse buffers. We can do:
+         // Steps:
+         // 1. sq = Mul(x, x)
+         // 2. cube = Mul(sq, x)
+         // 3. inner = Muls(cube, 0.044715)
+         // 4. Adds(inner, inner, x)  // inner = 0.044715*x^3 + x
+         // 5. Muls(inner, inner, sqrt2pi)
+         // 6. tanh_val = Tanh(inner) // but Tanh expects input and output tensors. We can use Tanh(inner, tanh_val) if available, or we can overwrite inner.
+         // 7. Adds(tanh_val, tanh_val, 1.0)
+         // 8. Mul(tanh_val, x, tanh_val) // tanh_val = x * (1+tanh(inner))
+         // 9. Muls(tanh_val, tanh_val, 0.5)
+         // 10. Copy to out.
+        We can reuse temp tensors: we only need one temp for sq, then after cube computed, we can reuse sq buffer for inner? But we need to be careful with lifetimes. Safer to allocate a single temp queue with enough space for one tile and reuse it. Since we process sequentially, we can allocate one temporary local tensor from tmpQueue and reuse it for each step by freeing and re-allocating? Not allowed because we need to keep previous values. Better to allocate multiple temporary tensors from tmpQueue but we need to know how many. Let's estimate UB usage:
+          inQueue: 2 tiles (double buffer) = 2*tile floats
+          outQueue: 2 tiles = 2*tile floats
+          tmpQueue: we need at least 3 temporary tensors at same time (sq, cube, inner) but we can reduce to 2 by reusing sq for inner after cube is computed. Let's design:
+          - sq from tmpQueue (alloc, dealloc after cube)
+          - cube from tmpQueue (alloc after sq freed, dealloc after inner computed)
+          - inner from tmpQueue (alloc after cube freed, keep until end)
+          But we also need tanh_val. We can compute tanh in-place on inner (if Tanh can do in-place? Usually it requires separate input and output). So we need another temp for tanh output. So at most we need 2 temps simultaneously (inner and tanh_val). So tmpQueue size should be enough for 2 tiles? Actually we need 2 local tensors from tmpQueue: one for inner, one for tanh_val. That's 2 * tile floats. Plus we have inQueue and outQueue double buffers: 2+2 = 4 tiles. Total 6 floats = 6 * 4 * tile = 24 * tile bytes. So UB budget / 24 = tile size. Previously leaky_relu used 5*tile (20*tile) for 5 floats. Here we have 6 floats, so tile size = UB_BUDGET_BYTES / 24 = 192*1024/24 = 8192 bytes = 2048 floats. That's small. But we can increase UB budget? The example used 192KB, but actual UB per core might be larger. However, we can reduce double buffers to single buffer? That would limit pipelining. But the example used double buffers. Alternatively, we can reduce temp usage by not storing tanh_val separately. Can we compute result without a separate tanh_val? Let's see:
+          // Step: compute inner_scaled = (0.044715*x^3 + x)*sqrt2pi
+          // Then we want y = 0.5*x*(1 + tanh(inner_scaled)).
+          // We have xLocal still in inQueue (but it's dequed and freed after compute? In leaky_relu pattern, they dequeue x, compute, then free x, then enqueue y. So x is consumed. But we need x for final multiply. So we cannot free xLocal until after final mul. So we need to keep xLocal. That means we have at least:
+          //   - xLocal (from inQueue, kept)
+          //   - yLocal (from outQueue, to fill)
+          //   - temp1 for intermediate compute (reusable)
+          // We can use temp1 for square, then cube, then inner, then tanh (in-place), then we use it for (1+tanh) and multiply by x. So we can do:
+          // 1. sq = Mul(xLocal, xLocal, temp1) // temp1 = x^2
+          // 2. cube = Mul(sq, xLocal, temp1) // temp1 = x^3 (overwrites)
+          // 3. Muls(temp1, temp1, 0.044715)
+          // 4. Adds(temp1, temp1, xLocal) // temp1 = 0.044715*x^3 + x
+          // 5. Muls(temp1, temp1, sqrt2pi)
+          // 6. Tanh(temp1, temp1) // in-place? Tanh cannot in-place? Typically AscendC math functions have signature Tanh(LocalTensor dst, LocalTensor src, ...). So we need separate dst. So we need another temp for tanh output. But we can allocate yLocal early and use it as destination for tanh? yLocal is for final output. We could compute tanh into yLocal, then later multiply by x and 0.5. That would work: 
+          //    - compute inner_scaled in temp1
+          //    - Tanh(yLocal, temp1, len)  // yLocal = tanh(inner_scaled)
+          //    - Adds(yLocal, yLocal, 1.0) // yLocal = 1+tanh
+          //    - Mul(yLocal, xLocal, yLocal) // yLocal = x * (1+tanh)
+          //    - Muls(yLocal, yLocal, 0.5) // yLocal = 0.5 * x * (1+tanh)
+          // But this overwrites yLocal from outQueue, which is fine.
+          // So we only need one temp (temp1) from tmpQueue. That reduces UB usage to: inQueue 2 tiles, outQueue 2 tiles, tmpQueue 1 tile = 5 tiles = 5 * tile floats = 20 * tile bytes, same as leaky_relu. So tile size ~8000 floats? Actually 192KB/20 = 9.6KB = 2400 floats. But we need to ensure 32B alignment. That's fine.
+          // So we can set tileLen = 2048 or 4096 etc.
+          // We'll set tileLen = 2048 (since 2048*4 = 8KB, 20*8KB=160KB, within budget). But we need to align to 32B (8 floats). 2048 is aligned.
+          // We'll keep the tiling logic similar.
+
+Thus we can implement kernel_src with reuse of one temp and using yLocal as tanh destination.
+
+For host operator, we need to register "GeluCustom" with appropriate input/output, and no attrs.
+
+For python bind, we need to call the operator. The example used `aclnnLeakyReluCustom` - we need the corresponding aclnn API for GeluCustom. Typically it's `aclnnGeluCustom`. We'll assume that.
+
+The error also said "blockDim = num num num" which suggests truncation. We must ensure full code.
+
+We'll produce the complete six strings as Python string literals.
+
+Let's write them.

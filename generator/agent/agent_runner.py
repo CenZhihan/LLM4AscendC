@@ -141,6 +141,11 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "reasoning_content": final_state.get("reasoning_content", ""),
         "final_generation_reasoning_content": final_state.get("reasoning_content", ""),
         "answer": _extract_final_answer(final_state),
+        "repair_memories_applied": (
+            final_state.get("retrieved_repair_memories_applied")
+            if isinstance(final_state.get("retrieved_repair_memories_applied"), list)
+            else []
+        ),
         "tool_selection_trace": [_summarize_reasoning_entry(x) for x in choice_reasoning],
         "tool_calls": tool_calls,
         "tool_choice_parse_errors": [_summarize_parse_entry(x) for x in parse_errors],
@@ -162,6 +167,9 @@ def generate_kernel_with_agent(
     repair_error_logs_raw: str = "",
     previous_attempt_code: str = "",
     ascend_search_version_filter: Optional[str] = None,
+    retrieved_repair_memories: str = "",
+    retrieved_repair_memories_applied: Optional[List[Dict[str, Any]]] = None,
+    eval_mode: str = "full",
 ) -> AgentGenerationResult:
     """
     Generate kernel code using the integrated agent with KB, WEB, and Code RAG.
@@ -220,6 +228,9 @@ def generate_kernel_with_agent(
         attempt_id=attempt_id,
         repair_error_logs_raw=repair_error_logs_raw,
         previous_attempt_code=previous_attempt_code,
+        retrieved_repair_memories=retrieved_repair_memories or "",
+        retrieved_repair_memories_applied=retrieved_repair_memories_applied,
+        eval_mode=eval_mode or "full",
     )
 
     # 4. Invoke agent
