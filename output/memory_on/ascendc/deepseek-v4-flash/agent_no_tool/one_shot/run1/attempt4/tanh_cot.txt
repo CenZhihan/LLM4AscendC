@@ -1,0 +1,111 @@
+We need to fix the kernel to avoid UB out-of-bounds error. The error "VEC instruction error: the ub address out of bounds" indicates that the kernel is accessing memory beyond allocated buffers. The kernel uses two queues: inQueueX and outQueueY, each with BUFFER_NUM (2) tiles of tileLen floats. But in the Process loop, we are doing double buffering: we prefetch next tile while computing current tile. However, note that we have only two buffers per queue. The loop structure: first copy in current tile, then in while loop: prefetch next tile (which uses inQueueX to enqueue second tile), compute current (dequeues first tile from inQueueX and allocates from outQueueY), copy out (dequeues from outQueueY). Then if next tile exists, we set base to nextBase, curLen to nextLen, and loop again. At the top of loop we will again prefetch next tile? Actually the loop structure: inside while, we first prefetch next tile (if next base valid). Then compute current. Then copy out. Then if nextLen==0 break; else set base=nextBase, curLen=nextLen; then loop back. Next iteration: again prefetch next tile. That means each iteration prefetches one tile ahead. With 2 buffers, this should be okay. However, we need to ensure that we are not overrunning the queues. The compute uses one inQueue and one outQueue per iteration, and the prefetch uses another inQueue buffer. Since we have 2 buffers per queue, this should be fine. But the error indicates UB address out of bounds, possibly because the tile length computed by tiling is not aligned or too large for UB? The tiling code sets tileLen based on UB budget: 16 bytes per element (4 floats * 4 bytes). But note: we only have 2 queues of floats, not 4. Actually we have inQueueX (2 tiles) and outQueueY (2 tiles). That's 4 tiles total. Each tile is tileLen floats. So total floats = 4 * tileLen, bytes = 16 * tileLen. That matches the UB budget calculation. However, the kernel does not allocate any temporary queue (tmpQueue) like in leaky_relu. So UB usage is: inQueueX (2*tileLen floats) + outQueueY (2*tileLen floats) = 4*tileLen floats. So UB_BUDGET_BYTES/16 is correct.
+
+But the error might be because we are using tileLen as the number of elements in DataCopy, but DataCopy expects the number of bytes? Actually AscendC::DataCopy takes the number of elements? Let's check the kernel_operator.h API: DataCopy(LocalTensor dst, GlobalTensor src, uint32_t len, ...) where len is the number of elements (for float, len elements). So that's fine.
+
+Possible issues:
+1. The tiling may set tileLen to zero or too small? It handles totalLength < tileLen by aligning down, but if totalLength is small and aligned to 0, it sets tileLen = totalLength (non-zero). Should be okay.
+2. In Process, we compute strideElems = blockNum * tileLen. But if blockNum is large, the stride may exceed totalLen. Then base = blockIdx * tileLen may be beyond totalLen? We check if base >= totalLen_ return. Good.
+3. The loop logic: prefetch next tile before compute. But note that after first iteration, we have already consumed the first tile's buffer from inQueueX? Let's trace:
+   - Initially: CopyIn(base, curLen) -> enqueues one tile into inQueueX.
+   - While loop iteration 1:
+     - Prefetch next tile: if nextBase < totalLen, CopyIn(nextBase, nextLen) -> enqueues second tile into inQueueX. Now inQueueX has 2 tiles.
+     - Compute: DeQue from inQueueX (gets first tile), AllocTensor from outQueueY, compute, EnQue to outQueueY, FreeTensor inQueueX. Now inQueueX has 1 tile (the prefetched one), outQueueY has 1 tile.
+     - CopyOut: DeQue from outQueueY, DataCopy, FreeTensor. outQueueY empty.
+     - Check nextLen: if 0 break, else set base=nextBase, curLen=nextLen.
+   - Iteration 2:
+     - Prefetch next tile: if nextBase valid, CopyIn again. Now inQueueX currently has 1 tile from previous prefetch. Allocating another tile will succeed because we have 2 buffers. After enqueue, inQueueX has 2 tiles (the old prefetched and new prefetch). Good.
+     - Compute: DeQue from inQueueX (gets the old prefetched tile), AllocTensor from outQueueY, compute, EnQue, FreeTensor. inQueueX now 1 tile, outQueueY 1 tile.
+     - CopyOut: DeQue, copy, FreeTensor.
+     - Continue.
+   This seems correct. But the error shows all cores failing with UB address out of bounds. Possibly the tileLen is too large? Or the totalLength is not a multiple of tileLen, causing last tile to have length less than tileLen, but DataCopy handles partial? It should.
+
+Another potential issue: The kernel uses `AscendC::Tanh` which is a built-in vector function. It might require the input and output to be in different buffers? But we are using xLocal and yLocal which are different local tensors. That should be fine.
+
+Check the error code: "mte error info: 0x100000075", "VEC instruction error: the ub address out of bounds". This often happens when the tile length is not a multiple of the vector length (e.g., 128 bytes = 32 floats). The kernel does not require alignment but the hardware may. In the tiling, we align to ALIGN_ELEMS=2048 which is 4*512? Actually 2048 floats = 8192 bytes, which is aligned to 128-byte boundary. But maybe the issue is that the Compute uses `Tanh(yLocal, xLocal, len)` where len might not be aligned to vector length. The AscendC builtins often require length to be a multiple of the vector length (32 floats for float32). But the kernel should handle unaligned tail? Actually the builtin functions might expect aligned length, or they can handle partial but need to be careful. However, the error is UB address, not misalignment.
+
+Let's examine the host_tiling_src: It does not include `negativeSlope` because Tanh has no attr. That's fine.
+
+But the error log shows "AICORE exception: aivec error, core id is 24...". The report shows many cores failing. Possibly the issue is that `blockDim` is set to numTiles clamped between 8 and 24. But for a tensor of size batch_size * dim = 256*65536 = 16777216 floats. tileLen = UB_BUDGET_BYTES / 16 = 192*1024/16 = 12288? Wait 192*1024=196608 bytes, divided by 16 bytes per element gives 12288 elements. Then numTiles = ceil(16777216 / 12288) ≈ 1365. So blockDim set to 24 (max). That's fine.
+
+But the kernel uses `blockNum` and `blockIdx` from GetBlockNum() and GetBlockIdx(). These are set by the runtime to the actual block dimension (which is 24). So strideElems = 24 * 12288 = 294912. That's fine.
+
+Now, maybe the issue is that the tiling data structure is not correctly passing tileLength? The kernel Init takes only totalLength and tileLength, but the tiling data has totalLength, tileLength, blockDim. The kernel ignores blockDim. That's fine.
+
+Check the kernel signature: `extern "C" __global__ __aicore__ void tanh_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)`. The GET_TILING_DATA macro extracts tiling_data. That should work.
+
+But the error says "VEC instruction error: the ub address out of bounds." Could be that the queue buffers are allocated with size tileLen * sizeof(float), but when we do DataCopy for the last tile which may have length less than tileLen, we still allocate a LocalTensor of size tileLen, but only fill part of it? Actually we allocate the full tileLen, then copy only curLen elements. That is fine because the buffer is sized for tileLen, and we only touch the first curLen elements. So no out-of-bounds there.
+
+Perhaps the Tanh intrinsic requires that the output buffer be separate from input buffer? We have separate xLocal and yLocal, so it's fine.
+
+Wait, we are using `AscendC::Tanh(yLocal, xLocal, len);` This is a vector operation that may require the output to be in a different buffer than input. We have that.
+
+Another possibility: The `CopyIn` function uses `AscendC::DataCopy(xLocal, xGm_[gmOffset], len);` This copies len elements from global to local. The local tensor xLocal is allocated with size tileLen. If len is not a multiple of 32? DataCopy uses DMA engine which may have alignment requirements. For Ascend, DataCopy typically requires both source and destination addresses to be aligned to 32 bytes, and length to be a multiple of 32 bytes (8 floats)?? Actually for float, it's 4 bytes each. 32 bytes = 8 floats. But the ALIGN_ELEMS we use is 2048, which is a multiple of 8, so tileLen is a multiple of 8. The last tile length curLen = totalLen - base, which might not be aligned to 8. That could cause DMA error? But DataCopy may handle unaligned lengths, but might cause out-of-bounds if the previous tile was aligned and we copy fewer elements, it should be okay. However, the error is UB address out of bounds, not DMA error.
+
+Looking at the error details: "fixp_error0 info: 0x75, fixp_error1 info: 0x1". This might indicate a specific instruction error. For Tanh, the implementation might use polynomial approximation that requires specific buffer sizes or alignment. Maybe the Tanh function expects the input and output to be aligned to 128 bytes? Or it might have an internal temporary buffer requirement that exceeds the available UB.
+
+The kernel only uses inQueueX and outQueueY, no temporary queue. For Tanh, the implementation may need extra temporary space for the series computation. That could cause UB address out of bounds. Indeed, the leaky_relu kernel had a tmpQueue for intermediate values. For Tanh, the builtin might use internal temporary storage? But the user should not need to allocate additional buffer if using builtin, because the builtin should manage its own temporary space. However, the builtin might require additional UB space for its operation. If the UB budget is fully occupied by our queues, the Tanh may overflow.
+
+The leaky_relu kernel used 3 queues: inQueueX (2), outQueueY (2), tmpQueue (1) total 5 tiles. It computed UB budget as 20 * tileLen (5 tiles * 4 bytes). For Tanh, we only use 4 tiles (2+2). But Tanh might internally require more temporary space. For instance, the tanh implementation might need to compute exp(2x) etc. That could require additional temporary local tensors. Therefore, the UB budget might be insufficient, causing out-of-bounds when Tanh tries to use more UB than allocated.
+
+Thus, we should allocate a tmpQueue for the Tanh kernel as well, to provide extra UB space for the builtin to work safely. Or we should reduce the tile size to leave room for the builtin's internal usage. The safe approach: include a tmpQueue of size tileLen (like leaky_relu) and adjust UB budget accordingly.
+
+In the leaky_relu example, the UB budget calculation assumed 5 tiles total: inQueueX (2), outQueueY (2), tmpQueue (1). So we should do the same for Tanh. But we don't need to use tmpQueue explicitly; we just allocate it to reserve UB space. The builtin Tanh will then have enough space.
+
+Let's modify the kernel to include a tmpQueue, allocate it but not use it. This will increase UB usage to 5 tiles, so UB_BUDGET_BYTES/20 instead of /16.
+
+Also, the Compute function will keep as before, just without using tmpQueue. But we must allocate and free it properly to ensure UB reservation.
+
+Alternatively, we can allocate a dummy local tensor and free immediately, but simpler: add tmpQueue_ to class, initialize it in Init, and in Compute allocate and free it (or just allocate once and free at end?). Better to allocate and free each time to keep consistent with pipeline.
+
+But note: The queues are part of the pipe; allocating a tensor from a queue reserves UB space. So we need to ensure the buffer is allocated. However, if we allocate and free in Compute, the space is reserved only during Compute, which is when Tanh runs, so that's fine.
+
+Let's adjust:
+- Add `AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;` member.
+- In Init: `pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));`
+- In Compute: AllocTensor from tmpQueue_, then after Tanh, FreeTensor. This ensures UB space is reserved during compute.
+
+Also adjust UB budget calculation in host_operator_src to use 5 tiles: bytes = 20 * tileLen.
+
+Also, we need to ensure that the tiling's tileLen is computed accordingly. Currently, UB_BUDGET_BYTES / 16; change to UB_BUDGET_BYTES / 20.
+
+We should also keep the blockDim logic same.
+
+Now, also the kernel Process loop: We need to be careful with the queue ordering. Since we now have tmpQueue, we must allocate and free it each iteration. The Compute function will be:
+
+```
+AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+AscendC::LocalTensor<float> tLocal = tmpQueue_.AllocTensor<float>();
+
+AscendC::Tanh(yLocal, xLocal, len);
+
+tmpQueue_.FreeTensor(tLocal);
+outQueueY_.EnQue<float>(yLocal);
+inQueueX_.FreeTensor(xLocal);
+```
+
+This should provide the necessary UB space.
+
+Additionally, check that the host_operator_src tiling cap: HARD_CAP_ELEMS = 32768. With 20*32768 = 655360 bytes, still under UB budget? Actually 20*32768=655360 bytes, which is 640 KB, exceeding 192 KB. So the HARD_CAP_ELEMS should be reduced to keep UB budget. The max tile from UB budget is UB_BUDGET_BYTES/20 = 192*1024/20 = 9830.4 -> 9830 elements. AlignDown to 2048 gives 8192. So tileLen will be 8192 at most. That's fine. The HARD_CAP_ELEMS=32768 is too high; we can leave it as is but it won't be reached because UB_BUDGET_BYTES/20 is smaller.
+
+But we should also adjust the UB budget comment in host_operator_src to reflect 5 tiles.
+
+Also, the kernel's Process loop uses double buffering with inQueueX and outQueueY. The tmpQueue is single buffered, so we allocate and free each iteration. That's fine.
+
+Now, also need to ensure synchronization: The Tanh operation might be vector and use the tmpQueue memory. Should be fine.
+
+Thus, the corrections needed:
+1. In kernel_src: add tmpQueue_ member, initialize it, allocate and free in Compute.
+2. In host_operator_src: change UB_BUDGET_BYTES comment and calculation to /20.
+3. In host_operator_src: Update UB budget comment to reflect total floats = 5 * tile (inQueueX 2, outQueueY 2, tmpQueue 1).
+4. No change to tiling data structure (no need for extra fields).
+
+Also, we should ensure that the kernel's Compute function uses the same memory reservation. The Compute currently does not have tmpQueue; we add it.
+
+Now, let's produce the full corrected code. We'll only change the necessary parts.
+
+Also note: The previous attempt's kernel_src had `Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileLength)` with only these parameters. The tiling data has blockDim but we ignore it. That's fine.
+
+We'll also adjust the comment in host_operator_src to match.
+
+Now, generate the final answer with all six strings.

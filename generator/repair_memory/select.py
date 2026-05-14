@@ -10,8 +10,16 @@ from .llm_util import openai_client_from_llm_config
 SYSTEM = """You pick past repair memories that help the current AscendC kernel repair task.
 Each manifest line is one memory (tab-separated fields: id, op, category, tool_mode, tier, anchor, summary).
 Return a JSON object ONLY of the form: {"memory_ids": ["..."]} with at most N ids from the manifest.
-If none are clearly useful for this task, return {"memory_ids": []}.
-When uncertain, return an empty list (prefer precision over recall)."""
+
+Selection policy (prefer recall over empty):
+- If the manifest contains entries whose anchor or summary plausibly matches the current failure
+  (same error class, overlapping log phrases, same toolchain stage such as txt bundle / CPack /
+  opbuild / tiling / NPU runtime), include their ids even when the originating op differs.
+- Prefer diverse, complementary hints (e.g. one about missing txt blocks and one about CPack)
+  when both are relevant.
+- Return {"memory_ids": []} only when every manifest line is clearly unrelated to the query
+  repair_context and operator context, or the manifest is empty.
+- Do not fabricate ids: every id MUST appear exactly as id=... on a manifest line."""
 
 
 def select_memory_ids(

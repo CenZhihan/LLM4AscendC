@@ -1,0 +1,151 @@
+We need to fix the kernel compilation errors. The errors are:
+
+1. `AscendC::CumSumMode` doesn't exist. We need to use the correct API for cumulative sum. On AscendC, the function is `AscendC::CumSum` but it doesn't have a `CumSumMode` enum. Actually, the correct signature is likely `AscendC::CumSum(LocalTensor<T>& dst, const LocalTensor<T>& src, uint32_t len, bool exclusive=false)`. The mode is likely a boolean for exclusive vs inclusive. In the error log, it shows the attempt to use `AscendC::CumSumMode::INCLUSIVE` which is not defined. So we should change to `AscendC::CumSum(tmp, tmp, len, false)` for inclusive (false means inclusive? Need to check typical ascendingc API. Actually in some versions, the fourth param is a bool `exclusive` default false, so inclusive. Let's assume false for inclusive. Alternatively, we can just call `AscendC::CumSum(tmp, tmp, len)` and it will be inclusive by default.
+
+2. `AscendC::Copy(yLocal, tmp, len)` is wrong. `Copy` requires 5 arguments: `Copy(dst, src, len, 0, 0)`? Actually the error says candidate requires 5 arguments. The correct signature is `AscendC::Copy(dst, src, len, 0, 0)`? Let's look at the error: note: candidate function template not viable: requires 5 arguments, but 3 were provided. In the error, the candidate is from `kernel_operator_data_copy_intf_impl.h`. Possibly it's `Copy(dst, src, len, 0, 0)` where last two are repeat and burst? Actually typical AscendC DataCopy is used for global-to-local and local-to-global. For local-to-local, we might need a different copy. But we are trying to copy from tmp (local) to yLocal (local). However, we computed directly into yLocal? Actually we allocated yLocal from outQueueY_, and we computed into tmp. Then we want to copy tmp to yLocal. But we can compute directly into yLocal instead of tmp to avoid the copy. Alternatively, we can use `AscendC::DataCopy` but that is for global-local. For local-to-local, we might just use assignment? Actually local tensors are just views, so we can compute directly into yLocal. Let's restructure: Compute into yLocal directly: `AscendC::Mul(yLocal, xt, mt, len); AscendC::CumSum(yLocal, yLocal, len); AscendC::Adds(yLocal, yLocal, carry, len);`. That avoids the Copy.
+
+Also need to ensure the mask is float, not bool. The input mask is bool tensor, but we convert to float in Python bind. In kernel, we treat mask as float. So that's fine.
+
+Another issue: The project_json_src has mask as float, which matches kernel. The python_bind_src converts mask to float. So fine.
+
+Also need to adjust the tiling: currently tiling has rows, cols, tileLen, blockDim. We need to ensure tileLen is properly aligned to 32 bytes? The ALIGN_ELEMS is 2048 (2048 floats = 8192 bytes). That's fine.
+
+Now we need to produce the corrected six strings. We'll modify kernel_src to fix the two errors. Also adjust kernel_src to remove `blockDim` from Init? Actually we store blockDim but it's not needed if we use `GetBlockNum()` inside Process. But in the Init we used blockDim_ from tiling. However, tiling sets blockDim as the number of blocks to use. In kernel, we should use that instead of GetBlockNum(). So we keep blockDim_.
+
+But note: In Process(), we used `blockNum = blockDim_` and loop over rows with stride. That's fine.
+
+One more: The kernel uses `AscendC::DataCopy` for global-to-local, which is correct.
+
+Also ensure that we don't need `workspace` in the kernel function signature (it's there but unused, fine).
+
+Now let's produce the corrected kernel_src.
+
+We'll also check the rest of the code for consistency.
+
+Let's write the corrected kernel_src:
+
+```cpp
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelMaskedCumsumCustom {
+public:
+    __aicore__ inline KernelMaskedCumsumCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR mask, GM_ADDR y,
+                                uint32_t rows, uint32_t cols, uint32_t tileLen,
+                                uint32_t blockDim)
+    {
+        rows_ = rows;
+        cols_ = cols;
+        tileLen_ = tileLen;
+        blockDim_ = blockDim;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, rows_ * cols_);
+        maskGm_.SetGlobalBuffer((__gm__ float*)mask, rows_ * cols_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, rows_ * cols_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueMask_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (rows_ == 0 || cols_ == 0) return;
+
+        uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        uint32_t blockNum = blockDim_;
+
+        // Each block processes rows in stride
+        for (uint32_t row = blockIdx; row < rows_; row += blockNum) {
+            ProcessRow(row);
+        }
+    }
+
+private:
+    __aicore__ inline void ProcessRow(uint32_t rowIdx)
+    {
+        float carry = 0.0f;
+        for (uint32_t tileStart = 0; tileStart < cols_; tileStart += tileLen_) {
+            uint32_t len = (tileStart + tileLen_ <= cols_) ? tileLen_ : (cols_ - tileStart);
+
+            // Copy x and mask for current tile
+            uint32_t offset = rowIdx * cols_ + tileStart;
+            AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            AscendC::LocalTensor<float> maskLocal = inQueueMask_.AllocTensor<float>();
+            AscendC::DataCopy(xLocal, xGm_[offset], len);
+            AscendC::DataCopy(maskLocal, maskGm_[offset], len);
+            inQueueX_.EnQue(xLocal);
+            inQueueMask_.EnQue(maskLocal);
+
+            // Compute y = cumsum(x * mask) + carry
+            AscendC::LocalTensor<float> xt = inQueueX_.DeQue<float>();
+            AscendC::LocalTensor<float> mt = inQueueMask_.DeQue<float>();
+            AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+
+            // y = x * mask
+            AscendC::Mul(yLocal, xt, mt, len);
+            // inclusive prefix sum on y
+            AscendC::CumSum(yLocal, yLocal, len);  // inclusive by default
+            // add carry from previous tile
+            AscendC::Adds(yLocal, yLocal, carry, len);
+
+            // update carry from last element
+            carry = yLocal(len - 1);
+
+            // Enqueue result
+            outQueueY_.EnQue(yLocal);
+            inQueueX_.FreeTensor(xt);
+            inQueueMask_.FreeTensor(mt);
+
+            // Copy out
+            yLocal = outQueueY_.DeQue<float>();
+            AscendC::DataCopy(yGm_[offset], yLocal, len);
+            outQueueY_.FreeTensor(yLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueMask_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> maskGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t rows_ {0};
+    uint32_t cols_ {0};
+    uint32_t tileLen_ {0};
+    uint32_t blockDim_ {0};
+};
+
+extern "C" __global__ __aicore__ void masked_cumsum_custom(GM_ADDR x, GM_ADDR mask, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMaskedCumsumCustom op;
+    op.Init(x, mask, y, tiling_data.rows, tiling_data.cols, tiling_data.tileLen, tiling_data.blockDim);
+    op.Process();
+}
+```
+
+We removed tmpQueue_ entirely because we no longer need it. Also removed the Copy call.
+
+Now we need to produce the full six strings. The previous attempt code had all six, we just need to replace kernel_src with the corrected version.
+
+Also note: In the host_operator_src, we have tiling data fields: totalLength, rows, cols, tileLen, blockDim. That's fine.
+
+But we also had a typo in host_operator_src: the `mask` input in project_json_src is float, but in host_operator_src we have Input("mask") with DataType ge::DT_FLOAT, which is correct. In the model_src, we convert mask to float. So fine.
+
+Now we need to output the six strings exactly as required.
+
+We also need to ensure that the host_tiling_src does not have a typo: `TILING_DATA_FIELD_DEF(uint32_t, totalLength);` is there but we don't use it in kernel. That's fine.
+
+One more: In the kernel Init, we receive `rows` and `cols` but we also have `totalLength` in tiling data but not used. That's okay.
+
+Now we produce the final answer with the six strings.

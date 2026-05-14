@@ -1,0 +1,288 @@
+We need to generate the six embedded strings for the "triplet_margin_loss_custom" kernel. The original model uses F.triplet_margin_loss which computes: loss = max(0, margin + d(anchor, positive) - d(anchor, negative)) where d is Euclidean distance (p=2) by default. The custom kernel should replace this entire operation? The instruction says "replace specific operators for performance gains". Likely we want to create a custom kernel that computes the triplet margin loss in a single fused operation. The kernel name is triplet_margin_loss_custom (snake_case). PascalCase: TripletMarginLossCustom.
+
+We need to define input/output descriptions. Inputs: anchor, positive, negative (all float tensors of same shape, presumably ND format), and margin (float attribute, not a tensor? The original model receives margin as a tensor but reshapes to scalar; in the custom op we can pass margin as an attribute float). Outputs: a scalar loss? Or per-sample losses? Typically triplet margin loss returns a scalar (mean over batch). The original forward returns F.triplet_margin_loss which returns a scalar tensor (mean loss). However, the custom kernel could compute per-sample losses and then reduce. But for simplicity, perhaps output a scalar? The ASCEND C kernel must handle ND tensors; output could be a 1-element tensor. However, the typical pattern in the example: leaky_relu_custom had same shape input and output. For loss, output is scalar. That's fine.
+
+We need to decide tiling: it's a reduction (sum and mean). The kernel will compute element-wise squared distances? Actually Euclidean distance squared: sum((a - p)^2) and sum((a - n)^2). Then loss = max(0, margin + sqrt(dist_ap) - sqrt(dist_an)), but typically triplet loss uses squared distances? Actually F.triplet_margin_loss uses p=2 (Euclidean) and margin, with reduction='mean'. So we compute sqrt of sum of squares per sample. Then loss = clamp(margin + dist_ap - dist_an, min=0). Then mean over batch.
+
+Given that, the kernel should take three input tensors of shape (N, D), compute per-sample loss, then sum and divide by N. Output scalar.
+
+We need to define tiling data: totalLength could be N (batch size), but we also have D dimension. The kernel will iterate over samples. Each tile could process a chunk of samples. Or we can process entire batch at once if small. But careful with UB budget.
+
+Let's design: The kernel will process a batch of samples. Inputs: anchor, positive, negative all of shape (N, D). Output: scalar y. We'll use two levels: for each sample, compute sum of squared differences. We'll do it in a vectorized manner.
+
+We need to generate all six strings. Let's write them.
+
+First, project_json_src: define inputs anchor, positive, negative (ND, float), output loss (ND, float, but scalar shape [1]?), and attribute margin (float, optional with default 1.0). Actually the original model uses margin=1.0 typical. Attribute optional.
+
+Second, host_tiling_src: define TilingData with fields: totalSamples (N), featureDim (D), tileLength (number of samples per tile), blockDim, margin. Also perhaps we need workspace? The reduction will need workspace for partial sums? Possibly we can use a single block and do atomic reduction or use a dedicated reduction kernel. Since it's a simple mean, we could compute on a single block (blockDim=1) and handle reduction in the kernel itself using a local scalar accumulator. That avoids complexity. For tiling, we can process each sample in a loop, accumulate sum, then write output. For UB, we need to bring in a tile of samples (a few rows). Let's set tileLength as number of samples processed per iteration (like 64 or 128). We'll use double buffering.
+
+Host_operator_src: define TilingFunc, InferShape, InferDataType, and OpDef. InferShape: output shape should be (1,) (scalar). InferDataType: float. Tiling: compute totalSamples, featureDim from input shape. Compute tileLength based on UB budget: we need to hold 2 tiles of anchor, positive, negative? Actually we can compute on the fly: for each sample, we need to load its D features. To pipeline, we could load a block of samples. Let's keep it simple: tileLength = number of samples per iteration. UB budget: need space for 2 * (3 * D) floats? But D may be large. Better to tile along D dimension as well? That's more complex. For simplicity, we can restrict to small D? Or we assume D is moderate (128 as in example). We'll set max tileElements from UB: each sample requires 3*D floats for inputs, plus 1 for accumulator? Actually we need to read features per sample, compute distances. We can load a chunk of samples (say B) and process each sample within inner loop. So buffer size: 3 * B * D floats. For double buffering, 2 * that. That's heavy. Alternatively, we can load entire D for one sample at a time, but that's less efficient but simpler. Since D=128, B=64, 3*64*128=24576 floats = 98304 bytes < 192KB. So it's okay. We'll set tileLength based on UB budget for 3 times D*B.
+
+Actually let's compute: UB total for this kernel (assuming vector depth of 2) we need 6 tiles? Not exactly. Let's allocate as needed.
+
+Given the complexity, we might simplify the kernel to process all samples in one block if N is small, but we need tiling for large N. I'll design a tiling that processes a batch of samples per iteration: number of samples per tile such that the data for those samples fits in UB. We'll have double buffering for inputs. Since we are doing reduction across samples, we need an accumulator per block, not per tile. We'll accumulate in a local variable over all tiles in the block.
+
+Let's proceed with a kernel that:
+
+- One block only (blockDim=1) to avoid cross-block reduction complexity.
+- Loop over sample indices in increments of tileLength. For each tile, we load 3 tensors of that many samples * D floats.
+- For each sample in the tile, compute squared Euclidean distances: dist_ap = sum_{j=0..D-1} (a[j]-p[j])^2; dist_an = sum_{j=0..D-1} (a[j]-n[j])^2. Then loss = max(0, margin + sqrt(dist_ap) - sqrt(dist_an)). Accumulate to totalLoss.
+- After loop, compute mean = totalLoss / N, store to output.
+
+We'll need sqrt function (AscendC has Sqrt). Use vector instructions for elementwise subtraction, square, sum reduce per sample? We can use ReduceSum per sample. But reduction per sample within tile: we can loop over D sequentially using scalar operations or vector reductions. Since D<=4096, we can do vector operations on the whole tile and then do per-sample reduction by summing over D dimension using ReduceSum across? Or we can compute squared differences per element, then use a reduction across D for each sample. We can use the AscendC reduction API: ReduceSum on a local tensor with shape (B, D) and axis=1 to get (B,) tensor of sums. That would be efficient. So we need to allocate tensors for the per-sample distances.
+
+Thus UB allocation: for a tile of B samples:
+- Three input tensors of (B, D) each = 3*B*D floats.
+- Two temporary tensors for squared differences for ap and an: (B, D) each = 2*B*D floats.
+- Two tensors for sums: (B,) each = 2*B floats.
+- Output per-sample losses: (B,) floats.
+- Then final scalar.
+Total ~ (5*B*D + 3*B) floats.
+Assuming D=128, B=64 => 5*64*128=40960 + 192 = 41152 floats = 164608 bytes < 192KB. With double buffering for input only, we need double for three input tensors: 2*3*B*D=6*B*D=49152 floats=196608 bytes > 192KB. So double buffering of all three inputs may exceed UB. We can perhaps use triple buffering? Or reduce B. Let's set B=32: 6*32*128=24576 floats=98KB, plus others, total ~98+? 2*B*D=8192? Actually we need to recalc: double buffer only for inputs: 2*3*B*D=6*B*D=6*32*128=24576 floats=98304 bytes. Add temp tensors: 2*B*D=2*32*128=8192 floats=32768 bytes; plus sums: 2*B=64 floats; plus per-sample loss: B=32. Total ~131072 bytes <192KB. So B=32 is safe. Set tileLength as B=32. If totalSamples <32, use that.
+
+So tiling: tileLength = min(32, totalSamples) but aligned? We'll just use min.
+
+BlockDim=1 (single block).
+
+Thus:
+
+host_tiling_src: fields: totalSamples, featureDim, tileLength (samples per iteration), blockDim, margin.
+
+host_operator_src: TilingFunc sets these. InferShape: output shape {1}. InferDataType: float.
+
+kernel_src: Implement KernelTripletMarginLossCustom with Init, Process methods. Process: for each tile, load three input matrices, compute squared differences using vector sub, mul (square), then reduce sum along last dim (axis=1) to get per-sample dist_ap and dist_an. Then compute loss = max(0, margin + sqrt(dist_ap) - sqrt(dist_an)). Accumulate totalLoss. After loop, compute mean and store to output.
+
+Need to handle sqrt: AscendC Sqrt. Use local tensors of shape (B,) for dists and losses.
+
+Implementation details:
+- Use GlobalTensor for anchor, positive, negative (3D? Actually we can treat as 2D: [N, D] contiguous). We'll compute offset for sample row.
+- We'll use double buffering for inputs: we have three input queues? Actually we can load all three for a tile in one shot using DataCopy from global to local. We'll need three separate local tensors per tile. We can allocate them once and reuse if we don't double buffer? But to pipeline, we could double buffer only the whole tile data (three tensors together) using a single queue? More common to have separate queues per buffer. We can use a single queue for all inputs? Or just use a single buffer set and not double buffer to simplify, as long as compute time > load time? Given D=128 and B=32, compute might be fast; but we can still implement double buffering by using two sets of local tensors and swapping. To keep code manageable, we can forgo double buffering and just load, compute, store sequentially. The performance may still be okay. But the example uses double buffering. I'll try to include double buffering for the inputs. That requires two sets of local tensors for anchor, positive, negative. We'll have inQueueAnchor, inQueuePos, inQueueNeg each with BUFFER_NUM=2.
+
+But we also need temporary tensors for squared differences and sums, which are allocated per compute stage and freed. So we can allocate them inside Compute.
+
+Let's write the kernel.
+
+We'll use AscendC::LocalTensor<float> for local buffers.
+
+In Process: loop over tiles using grid-stride? Since blockDim=1, we just iterate from 0 to totalSamples in steps of tileLength.
+
+But we can still use grid-stride if blockDim>1 later? For simplicity, assume blockDim=1.
+
+Implementation steps in the kernel:
+
+1. Compute row stride (featureDim).
+2. For idx = 0; idx < totalSamples; idx += tileLength:
+    curSamples = min(tileLength, totalSamples - idx).
+    Load tile data for anchor, positive, negative from global to local (using DataCopy from offset idx * featureDim, size curSamples * featureDim).
+    Compute:
+        - For each sample in tile, compute squared differences:
+            Subtract anchor - positive -> tmp1
+            Multiply tmp1 * tmp1 -> sq_ap (same shape)
+            ReduceSum along axis=1 (over D) to get dist_ap (size curSamples)
+        - Similarly for anchor - negative -> sq_an, reduce -> dist_an.
+        - Compute loss = max(0, margin + sqrt(dist_ap) - sqrt(dist_an)) elementwise.
+        - Add to totalLoss scalar.
+3. After loop, compute mean = totalLoss / totalSamples.
+4. Copy totalLoss to output (scalar at global).
+
+For reduction, we can use AscendC::ReduceSum along axis=1. This operates on a LocalTensor of shape (curSamples, featureDim) and outputs (curSamples,). We need to set the reduce shape. AscendC's ReduceSum expects a mask or axis. We'll use ReduceSum with last axis. The API: ReduceSum(dst, src, mask, len) where mask is the reduce axis? Actually typical: ReduceSum(dst, src, reduceLen, shape) but need to check. We'll use the vector-like reduction: AscendC::ReduceSum(localTensorOut, localTensorIn, false, 0, curSamples) but that's for vector reduction? Better to use the Matmul? Maybe simpler: loop over D per sample? That would be inefficient but easier. However, to show vectorization, we can use the inline assembly or use the function: AscendC::ReduceSum(dst, src, reduceParams). Let's use the simpler scalar loop: for each sample, sum over D manually using vector addition? Actually we can compute per-sample sum using a loop over D with vector adds, but that's sequential. Alternatively, we can use the AscendC reduction API as in examples: AscendC::ReduceSum(dst, src, {1})? Not sure.
+
+Given the complexity, I'll implement using a double loop: for each sample in tile (0..curSamples), compute sum over D using a vectorized reduction (like reduceSum on a vector across D). AscendC has a function: AscendC::ReduceSum(dst, src, false, 0, D) for a single vector of length D? That would sum a vector of D elements to a scalar. We can apply it to each sample by extracting the row? But we can also use the batch reduction: treat the 2D tensor as a flat array and reduce with stride? Simpler: for each sample i, we can compute inner product using two local tensors of length D: difference and square, then sum.
+
+We can create a local tensor for per-sample accumulation of size 1, but we need to do it for each sample. A straightforward approach: allocate a local tensor sqDiff of shape (1, D) or just use the first row, compute difference and square, then sum with ReduceSum to get a scalar. Then move to next sample. This would be a loop over samples, but each iteration uses vector operations of length D. That's fine.
+
+So in Compute, we loop over s = 0..curSamples-1:
+- Load one row from each of the tile local tensors (anchorRow, posRow, negRow). But since tile local tensors are 2D (curSamples, D) contiguous, we can get pointer to row s.
+- Compute diff = anchorRow - posRow, square, reduce sum to get dist_ap scalar.
+- Similarly for dist_an.
+- Compute loss = max(0.0f, margin + sqrtf(dist_ap) - sqrtf(dist_an)) (scalar math).
+- Add to totalLoss.
+
+We'll use vector operations on the row local tensors. This avoids complex batch reduction.
+
+Thus UB allocation: per row, we need two temporary vectors of length D for diff and squared (we can reuse one). Actually we can compute squared diff in place: diff = anchor - pos; then square = diff * diff; then reduce. So need one vector for diff, then we can reduce from that same vector. So a single temp of length D per row. Similarly for negative.
+
+We'll allocate them in the loop and free. But that means many allocations/deallocations. Better to pre-allocate two temp vectors of length D and reuse them across rows. We'll allocate them outside the loop inside Compute and reuse.
+
+So in Compute:
+- Allocate diffApLocal(D) and diffAnLocal(D) (or just one if sequential? but we need both simultaneously). We can compute ap first, then an.
+- For s in 0..curSamples-1:
+    - Load row from anchor, pos, neg local tiles into temporary registers? Actually we can use set operations: AscendC::LocalTensor<float> anchorRow = anchorLocal[s*D]; but LocalTensor doesn't support indexing? We can use pointer arithmetic: anchorLocal[0] is the whole buffer; we can get sub-tensor by offset using pipe.Alloc? Better to use DataCopy for each row? That's heavy. Instead, we can treat the tile as a flat array of length curSamples * D, and for each sample, we can extract a sub-vector using AscendC::DataCopyExt? Not trivial.
+
+Given time, we can simplify: the per-sample approach may be inefficient but okay for demonstration. Actually we can compute batch reduction using AscendC's built-in reduce APIs. Let's research: AscendC provides `ReduceSum` function for 2D tensors? In the documentation, there is `AscendC::ReduceSum(dst, src, reduceLen, mask)` where mask indicates which axes to reduce. For 2D tensor of shape (B, D), reduceLen = D (the length of the axis to reduce), and mask = set the reduce axis? For example, reduceSum on last axis: `ReduceSum(dst, src, D, 0)` maybe? Actually from AscendC samples: `ReduceSum(dst, src, false, 0, len)` reduces a vector of len to a scalar. For 2D, they might use `ReduceSum(dst, src, false, 0, totalLen)` with shape? Another approach: use `ReduceSum` with parameter `reduceMask` where bit0 indicates axis 0, bit1 indicates axis 1. For 2D, if we want to reduce along axis=1 (columns), we set reduceMask=2 (binary 10). The function would be `ReduceSum(dst, src, reduceMask, totalLen)`? I'm not fully certain.
+
+Given the complexity, I'll implement a simple per-sample loop with scalar reductions using vector operations on a single row. But to load a row from a 2D local tensor, we can use `AscendC::DataCopy` with offset? Actually the local tensor is essentially a 1D buffer of size curSamples * D. We can index into it using pointer arithmetic: `anchorLocal + s * D` gives the start of row s. But `LocalTensor` doesn't support pointer arithmetic directly. We can use `AscendC::SubTensor`? In AscendC, to get a sub-tensor, we can use `AscendC::LocalTensor<T> subTensor = anchorLocal[offset]`? There is no built-in indexing. We can create a new local tensor pointing to the same buffer but with offset using `AscendC::LocalTensor<T> subTensor = anchorLocal[s * D]`? Actually the `[]` operator returns the scalar value. So we cannot get a sub-tensor that way.
+
+Instead, we can avoid 2D tiles and process one sample at a time in the tile loop: for each sample index s in the tile, we load its entire row from global memory directly (three global addresses). That might be simpler: in the main loop over samples, we load one sample's anchor, positive, negative vectors (each D floats) from global to local, compute, then move to next. This avoids the need for double buffering large 2D tiles. The overhead of many small DMA transfers may be high but for D=128 it's okay. But the instruction says "replace specific operators for performance gains" so we assume the kernel will be called for large batches. For production, better to batch loads. However, for this code generation task, we can produce a valid kernel that works.
+
+Given the example provided is complex, the expected answer might be simpler. The user expects a complete set of six strings. I'll produce a kernel that processes all samples in one block (blockDim=1) and loops over each sample, loading its data from global, computing loss, accumulating. That is straightforward and works for any N and D. It uses vector operations for each sample: load three vectors of D, compute squared differences, reduce, etc.
+
+We'll need to allocate temporary on-chip vectors for each sample: we can allocate them in each iteration or pre-allocate buffers of size D and reuse.
+
+Implementation:
+
+In Init: store totalSamples, featureDim, margin. Pre-allocate buffers: diffAp(D), diffAn(D), distAp(1), distAn(1), loss(1). Actually we can compute using scalar operations after reduction.
+
+In Process: loop idx from 0 to totalSamples-1:
+- Load anchor[idx*D] to local diffAp (using DataCopy from global to local).
+- Load positive[idx*D] to local posLocal (can be same diffAp after subtracting? We need separate. We'll load anchor and positive into two different locals: anchorLocal and posLocal. Or we can load anchor, then sub, then square, then reduce. Use temporary buffers.
+
+We'll allocate:
+- aLocal (size D) for anchor row.
+- pLocal (size D) for positive row.
+- nLocal (size D) for negative row.
+- tLocal (size D) for temporary diff.
+
+In each iteration:
+- DataCopy aLocal from global anchor offset.
+- DataCopy pLocal from global positive offset.
+- DataCopy nLocal from global negative offset.
+- Compute diffAp: tLocal = aLocal - pLocal (element-wise)
+- Compute sqAp: tLocal = tLocal * tLocal
+- ReduceSum distAp = sum(tLocal) -> scalar using AscendC::ReduceSum on vector of length D.
+- Similarly for negative: tLocal2? We can reuse tLocal after copying stored anchor? We need anchor for both. Actually we need anchor for both differences. So we need to keep aLocal. We can compute distAp first, then compute distAn using aLocal (still available) and nLocal. So we need to keep aLocal. So we need separate buffer for anchor (aLocal). For difference, we can use tLocal.
+- Compute distAp and distAn scalars.
+- loss = max(0.0f, margin + sqrt(distAp) - sqrt(distAn)).
+- Add to totalLoss (scalar accumulated in a local variable, not a tensor).
+
+After loop, write totalLoss / totalSamples to output.
+
+That's simple and uses vector operations on D-length vectors.
+
+We'll need AscendC::Sub, AscendC::Mul, AscendC::ReduceSum, AscendC::Sqrt, AscendC::Max (or compare manually). We'll implement using scalar math after reduction.
+
+Let's write the kernel accordingly.
+
+Kernel class:
+
+class KernelTripletMarginLossCustom {
+public:
+    __aicore__ inline void Init(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR lossOut,
+                                uint32_t totalSamples, uint32_t featureDim, float margin) {
+        anchorGm_.SetGlobalBuffer((__gm__ float*)anchor, totalSamples * featureDim);
+        posGm_.SetGlobalBuffer((__gm__ float*)positive, totalSamples * featureDim);
+        negGm_.SetGlobalBuffer((__gm__ float*)negative, totalSamples * featureDim);
+        lossGm_.SetGlobalBuffer((__gm__ float*)lossOut, 1);
+        totalSamples_ = totalSamples;
+        featureDim_ = featureDim;
+        margin_ = margin;
+        // Allocate local buffers of size featureDim for a row
+        pipe_.InitBuffer(aLocalBuf_, 1, featureDim_ * sizeof(float));
+        pipe_.InitBuffer(pLocalBuf_, 1, featureDim_ * sizeof(float));
+        pipe_.InitBuffer(nLocalBuf_, 1, featureDim_ * sizeof(float));
+        pipe_.InitBuffer(tLocalBuf_, 1, featureDim_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        if (totalSamples_ == 0 || featureDim_ == 0) return;
+
+        float totalLoss = 0.0f;
+
+        for (uint32_t i = 0; i < totalSamples_; ++i) {
+            uint32_t offset = i * featureDim_;
+
+            // Load anchor row
+            AscendC::LocalTensor<float> aLocal = aLocalBuf_.Get<float>();
+            AscendC::DataCopy(aLocal, anchorGm_[offset], featureDim_);
+
+            // Load positive row
+            AscendC::LocalTensor<float> pLocal = pLocalBuf_.Get<float>();
+            AscendC::DataCopy(pLocal, posGm_[offset], featureDim_);
+
+            // Load negative row
+            AscendC::LocalTensor<float> nLocal = nLocalBuf_.Get<float>();
+            AscendC::DataCopy(nLocal, negGm_[offset], featureDim_);
+
+            // Compute distAp: sum((a-p)^2)
+            AscendC::LocalTensor<float> tLocal = tLocalBuf_.Get<float>();
+            AscendC::Sub(tLocal, aLocal, pLocal, featureDim_);
+            AscendC::Mul(tLocal, tLocal, tLocal, featureDim_);
+            float distAp = 0.0f;
+            // ReduceSum: sum all elements of tLocal -> scalar
+            AscendC::LocalTensor<float> scalarOne = tmpScalarBuf_.Get<float>();
+            AscendC::ReduceSum(scalarOne, tLocal, false, 0, featureDim_);
+            // Copy scalarOne to CPU? Actually we can use scalarOne[0] as float
+            distAp = scalarOne[0];  // Access first element
+            tmpScalarBuf_.Free(scalarOne);
+
+            // Compute distAn: sum((a-n)^2)
+            AscendC::Sub(tLocal, aLocal, nLocal, featureDim_);
+            AscendC::Mul(tLocal, tLocal, tLocal, featureDim_);
+            float distAn = 0.0f;
+            AscendC::LocalTensor<float> scalarTwo = tmpScalarBuf_.Get<float>();
+            AscendC::ReduceSum(scalarTwo, tLocal, false, 0, featureDim_);
+            distAn = scalarTwo[0];
+            tmpScalarBuf_.Free(scalarTwo);
+
+            // loss = max(0, margin + sqrt(distAp) - sqrt(distAn))
+            float loss = margin_ + sqrtf(distAp) - sqrtf(distAn);
+            if (loss < 0.0f) loss = 0.0f;
+            totalLoss += loss;
+
+            // Free local tensors (by destructor or manually) - we can just let them go out of scope; they are allocated per iteration.
+            // But we used Get without alloc? Actually we need to manage pipe again? Better to use pipe.AllocTensor? We used Get which assumes it's already allocated via InitBuffer. It's not safe to Get multiple times without freeing? We'll use different approach: allocate temporary tensors inside loop and free.
+            // Actually with pipe, we should use aLocalBuf_.AllocTensor<float>() and then FreeTensor after use. Let's correct.
+        }
+
+        // Write mean loss to output
+        float meanLoss = totalLoss / totalSamples_;
+        AscendC::LocalTensor<float> outLocal = outBuf_.Get<float>();
+        outLocal[0] = meanLoss;
+        // DataCopy from local to global
+        AscendC::DataCopy(lossGm_, outLocal, 1);
+        outBuf_.Free(outLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> aLocalBuf_; // Actually we need queue with BUFFER_NUM 1? For simple, use TBuf
+    AscendC::TBuf<AscendC::TPosition::VECCALC> aLocalBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> pLocalBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> nLocalBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tLocalBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tmpScalarBuf_; // for reduction output (size 1)
+    AscendC::TBuf<AscendC::TPosition::VECOUT> outBuf_; // for output scalar
+    AscendC::GlobalTensor<float> anchorGm_;
+    AscendC::GlobalTensor<float> posGm_;
+    AscendC::GlobalTensor<float> negGm_;
+    AscendC::GlobalTensor<float> lossGm_;
+    uint32_t totalSamples_ {0};
+    uint32_t featureDim_ {0};
+    float margin_ {1.0f};
+};
+
+But we need to ensure proper memory management. I'll restructure using queues and alloc/free inside loop.
+
+Alternative: use AscendC::LocalTensor<float> with pipe.AllocTensor and FreeTensor inside loop. That's fine.
+
+Simplify: inside loop, for each sample:
+
+AscendC::LocalTensor<float> aLocal = pipe.AllocTensor<float>(featureDim_);
+AscendC::DataCopy(aLocal, anchorGm_[offset], featureDim_);
+... similarly for pLocal, nLocal.
+AscendC::LocalTensor<float> tLocal = pipe.AllocTensor<float>(featureDim_);
+AscendC::LocalTensor<float> reduceOut = pipe.AllocTensor<float>(1);
+
+Then compute.
+
+At end of loop, Free all allocated tensors.
+
+That avoids pre-buffer queues.
+
+We'll adjust.
+
+Now, write the complete kernel_src.
+
+Also need to update tiling data: totalSamples, featureDim, margin. blockDim=1.
+
+host_tiling_src accordingly.
+
+host_operator_src: TilingFunc sets these from input shape, set blockDim=1.
+
+project_json_src: inputs and outputs as described.
+
+python_bind_src: similar to example but with TripletMarginLossCustom.
+
+model_src: uses custom_ops_lib.
+
+Let's produce final answer.
