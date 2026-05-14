@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from .llm_util import openai_client_from_llm_config
+from .llm_util import assistant_message_text, openai_client_from_llm_config
 
 
 def _has_template_parts(s: str) -> bool:
@@ -59,7 +59,7 @@ def generate_repair_natural_language(
             temperature=0.2,
             max_tokens=512,
         )
-        text = (resp.choices[0].message.content or "").strip()
+        text = assistant_message_text(resp.choices[0].message)
     except Exception:
         return ""
     if not _has_template_parts(text):

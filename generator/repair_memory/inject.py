@@ -5,9 +5,21 @@ from typing import Any, Dict, List, Tuple
 
 from .manifest import build_manifest_text, load_canonical_tail, manifest_cache_key
 from .paths import get_memory_root, is_repair_memory_enabled
-from .select import select_memory_ids
+from .select import select_repair_memories
 
 _MANIFEST_CACHE: Dict[str, Any] = {"key": None, "text": ""}
+
+
+def _disabled_selection_meta() -> Dict[str, Any]:
+    return {
+        "memory_ids": [],
+        "memory_ids_resolved": [],
+        "memory_ids_dropped": [],
+        "selection_rationale": "Repair memory disabled (LLM4ASCENDC_REPAIR_MEMORY is unset or 0).",
+        "raw_model_output": "",
+        "parse_ok": True,
+        "parse_error": "",
+    }
 
 
 def memory_entries_for_report(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -54,6 +66,18 @@ def format_injection_block(records: List[Dict[str, Any]], max_chars: int = 6000)
     return text[:max_chars]
 
 
+def _merge_selection_meta(
+    sel: Dict[str, Any],
+    *,
+    memory_ids_resolved: List[str],
+    memory_ids_dropped: List[str],
+) -> Dict[str, Any]:
+    meta: Dict[str, Any] = dict(sel)
+    meta["memory_ids_resolved"] = list(memory_ids_resolved)
+    meta["memory_ids_dropped"] = list(memory_ids_dropped)
+    return meta
+
+
 def build_retrieval_block_for_attempt(
     *,
     llm_config: Dict[str, Any],
@@ -65,13 +89,16 @@ def build_retrieval_block_for_attempt(
     attempt_id: int,
     max_n: int = 5,
     memory_root: Any = None,
-) -> Tuple[str, List[Dict[str, Any]]]:
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Returns (injection_text_for_prompt, structured_memory_rows_for_report).
-    When memory is disabled or nothing is selected, returns ("", []).
+    Returns (injection_text_for_prompt, structured_memory_rows_for_report, selection_debug_dict).
+
+    ``selection_debug`` includes model ``memory_ids``, ``selection_rationale``, ``raw_model_output``,
+    ``parse_ok`` / ``parse_error``, and after canonical lookup ``memory_ids_resolved`` /
+    ``memory_ids_dropped`` (ids returned by the model but not found in the loaded tail window).
     """
     if not is_repair_memory_enabled():
-        return "", []
+        return "", [], _disabled_selection_meta()
     root = memory_root if memory_root is not None else get_memory_root()
     cache_key = manifest_cache_key(root)
     global _MANIFEST_CACHE
@@ -90,18 +117,25 @@ def build_retrieval_block_for_attempt(
         query_parts.append("repair_context:\n" + repair_error_logs_raw.strip()[:8000])
     query = "\n".join(query_parts)
 
-    ids = select_memory_ids(
+    sel = select_repair_memories(
         llm_config=llm_config,
         manifest_text=manifest_text,
         query_text=query,
         max_n=max_n,
     )
+    ids: List[str] = list(sel.get("memory_ids") or [])
     if not ids:
-        return "", []
+        return "", [], _merge_selection_meta(sel, memory_ids_resolved=[], memory_ids_dropped=[])
+
     recs = load_canonical_tail(memory_root=root, max_records=2000)
     by_id = {str(r.get("memory_id")): r for r in recs if r.get("memory_id")}
+    dropped = [i for i in ids if i not in by_id]
     chosen: List[Dict[str, Any]] = [by_id[i] for i in ids if i in by_id]
+    resolved_ids = [str(r.get("memory_id")) for r in chosen if r.get("memory_id")]
+    meta = _merge_selection_meta(
+        sel, memory_ids_resolved=resolved_ids, memory_ids_dropped=dropped
+    )
     if not chosen:
-        return "", []
+        return "", [], meta
     block = format_injection_block(chosen)
-    return block, memory_entries_for_report(chosen)
+    return block, memory_entries_for_report(chosen), meta

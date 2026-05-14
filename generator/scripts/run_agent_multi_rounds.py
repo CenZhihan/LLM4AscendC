@@ -262,6 +262,7 @@ def _generate_one_attempt(
     ascend_search_version_filter: Optional[str] = None,
     retrieved_repair_memories: str = "",
     retrieved_repair_memories_applied: Optional[List[Dict[str, Any]]] = None,
+    repair_memory_selection: Optional[Dict[str, Any]] = None,
     eval_mode: str = "full",
 ) -> Dict[str, Any]:
     from generator.agent.agent_runner import KernelGenerationTask, generate_kernel_with_agent
@@ -282,6 +283,7 @@ def _generate_one_attempt(
         ascend_search_version_filter=ascend_search_version_filter,
         retrieved_repair_memories=retrieved_repair_memories,
         retrieved_repair_memories_applied=retrieved_repair_memories_applied,
+        repair_memory_selection=repair_memory_selection,
         eval_mode=eval_mode,
     )
     paths = _save_generation_outputs(
@@ -368,25 +370,39 @@ def run_multi_attempt_for_op(
                 )
             retrieved_repair_memories = ""
             retrieved_repair_memories_applied: List[Dict[str, Any]] = []
+            repair_memory_selection: Optional[Dict[str, Any]] = None
             if use_repair_memory:
                 try:
                     from generator.repair_memory import build_retrieval_block_for_attempt
 
-                    retrieved_repair_memories, retrieved_repair_memories_applied = (
-                        build_retrieval_block_for_attempt(
-                            llm_config=llm_config,
-                            op=op,
-                            category=category,
-                            tool_mode=tool_mode,
-                            eval_mode=eval_mode,
-                            repair_error_logs_raw=repair_logs_raw,
-                            attempt_id=attempt_id,
-                            memory_root=memory_root,
-                        )
+                    (
+                        retrieved_repair_memories,
+                        retrieved_repair_memories_applied,
+                        repair_memory_selection,
+                    ) = build_retrieval_block_for_attempt(
+                        llm_config=llm_config,
+                        op=op,
+                        category=category,
+                        tool_mode=tool_mode,
+                        eval_mode=eval_mode,
+                        repair_error_logs_raw=repair_logs_raw,
+                        attempt_id=attempt_id,
+                        memory_root=memory_root,
                     )
-                except Exception:
+                except Exception as e:
                     retrieved_repair_memories = ""
                     retrieved_repair_memories_applied = []
+                    repair_memory_selection = {
+                        "memory_ids": [],
+                        "memory_ids_resolved": [],
+                        "memory_ids_dropped": [],
+                        "selection_rationale": (
+                            f"build_retrieval_block_for_attempt raised: {e!s}"
+                        ),
+                        "raw_model_output": "",
+                        "parse_ok": False,
+                        "parse_error": repr(e),
+                    }
             gen = _generate_one_attempt(
                 op=op,
                 category=category,
@@ -400,6 +416,7 @@ def run_multi_attempt_for_op(
                 ascend_search_version_filter=ascend_search_version_filter,
                 retrieved_repair_memories=retrieved_repair_memories,
                 retrieved_repair_memories_applied=retrieved_repair_memories_applied,
+                repair_memory_selection=repair_memory_selection,
                 eval_mode=eval_mode,
             )
             outcome.generated = True

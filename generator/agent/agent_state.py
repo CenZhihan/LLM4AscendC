@@ -128,6 +128,7 @@ class GeneratorAgentState(MessagesState):
     previous_attempt_code: NotRequired[str]  # Full previous attempt code for repair attempt
     retrieved_repair_memories: NotRequired[str]  # Injected cross-run repair memory (natural language)
     retrieved_repair_memories_applied: NotRequired[List[Dict[str, Any]]]  # Structured rows for report
+    repair_memory_selection: NotRequired[Dict[str, Any]]  # Selection LLM debug (ids, rationale, parse)
     eval_mode: NotRequired[str]  # e.g. full — used for memory filtering only
 
 
@@ -142,6 +143,7 @@ def create_initial_state(
     previous_attempt_code: str = "",
     retrieved_repair_memories: str = "",
     retrieved_repair_memories_applied: Optional[List[Dict[str, Any]]] = None,
+    repair_memory_selection: Optional[Dict[str, Any]] = None,
     eval_mode: str = "full",
 ) -> Dict[str, Any]:
     """
@@ -159,7 +161,7 @@ def create_initial_state(
     """
     from langchain_core.messages import HumanMessage
 
-    return {
+    state: Dict[str, Any] = {
         "messages": [HumanMessage(content=base_prompt)],
         "op_name": op_name,
         "category": category,
@@ -196,3 +198,6 @@ def create_initial_state(
         "tool_choice_reasoning_log": [],
         "query_round_count": 0,
     }
+    if repair_memory_selection is not None:
+        state["repair_memory_selection"] = dict(repair_memory_selection)
+    return state

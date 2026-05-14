@@ -1,555 +1,64 @@
-The user wants me to replace the sequence of operations (Linear + BiasAdd + Hardtanh + Mish + GroupNorm) with a single custom AscendC kernel named `gemm_bias_add_hardtanh_mish_group_norm_custom` (PascalCase: `GemmBiasAddHardtanhMishGroupNormCustom`).
+We need to generate the six strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src, for the fused operator "gemm_bias_add_hardtanh_mish_group_norm_custom" (kernel name in snake_case: gemm_bias_add_hardtanh_mish_group_norm_custom, PascalCase for operator: GemmBiasAddHardtanhMishGroupNormCustom). The kernel takes multiple inputs: x, weight, lin_bias, bias, gn_gamma, gn_beta. Also the group norm needs num_groups attribute. So the operator has many inputs and attributes.
 
-Let me understand the pipeline:
-1. `F.linear(x, weight, lin_bias)` → y = x @ W^T + lin_bias
-2. `x = x + bias` (element-wise addition of bias, presumably broadcasted if needed)
-3. `F.hardtanh(x)` → clamp(x, -1, 1) (default hardtanh limits)
-4. `F.mish(x)` → x * tanh(softplus(x)) = x * tanh(log(1 + exp(x)))
-5. `F.group_norm(x, num_groups, gn_gamma, gn_beta)` → (gamma, beta) with mean/std over groups
+We need to design a custom operator that fuses: linear (x @ weight.T + lin_bias), then add bias, hardtanh, mish, group_norm. Hardtanh is clamp(-1,1) default? Actually F.hardtanh default min_val=-1, max_val=1. Mish is x * tanh(softplus(x)) where softplus = ln(1+exp(x)). Group norm: computes mean and var over groups, then normalize.
 
-This is a complex fused operator. I need to design the tiling, host, kernel, and Python binding code.
+We must define the tiling and kernel. The kernel will be complex but we can write a simplified version that processes tiles. We need to handle the linear multiplication: x is (batch, in_features), weight is (out_features, in_features), so the output is (batch, out_features). So the kernel should compute per row of x? Actually we can do block-wise computation: each block processes a certain number of output rows? Given large dimensions, we can tile along batch and out_features. Use tensor of shape (batch, out_features). The linear operation is matrix multiplication. We'll need to do gemm. In AscendC, we can use matrix multiplication instructions like Matmul. But to keep it manageable, maybe we assume we can use aicore matmul or we can implement a tile-based matmul. However, the example used simple element-wise operations. For linear, we need matrix multiplication. We can design the kernel to do a block of the output: each block computes a portion of the output rows and all columns? Actually typical approach: each block computes a tile of the output matrix. We'll define tile sizes for rows (batch) and columns (out_features). The kernel will compute gemm for a tile of (tileM, tileN) using the shared weight and input tile. This is complex but we can outline.
 
-Let me think about the implementation:
+Alternatively, we can implement the linear as a separate op? The instruction says replace relevant operators, so we could fuse all into one kernel. Given the complexity, we'll provide a simplified but valid kernel that does the operations sequentially but still in one kernel. We'll assume we use tiled matmul as part of the kernel. The kernel will load tiles of x, weight, and compute partial sum. Then add bias, hardtanh, mish, group_norm. The group norm requires computing mean and var over groups within each sample. So we need to compute per-group statistics. That adds complexity.
 
-**Data flow:**
-- Input: x [batch_size, in_features] (2D), weight [out_features, in_features], lin_bias [out_features], bias [out_features], gn_gamma [out_features], gn_beta [out_features]
-- Output: y [batch_size, out_features]
+To make it feasible, we'll design the kernel to handle a single batch element? No, we can process multiple batch elements in one kernel by distributing batches across blocks. But group norm is per sample, so each sample's groups are independent. We can process one sample per block? Or process multiple samples per block. For simplicity, assume each block processes one sample (one row of x). Then the linear weight needs to be shared across blocks. We can broadcast weight.
 
-**Intermediate shapes:**
-- After linear: [batch_size, out_features]
-- After bias add: same
-- After hardtanh: same
-- After mish: same
-- After group_norm: same
+Given the huge dimensions (batch=1024, in/out=8192, groups=256, so group size=32). Out_features = 8192, so each group has 32 channels. We can design kernel where each block processes a tile of output channels (maybe a group or multiple groups). Let's define: each block processes a single sample (batch index) and a range of output channels (tileN). Then the linear part: load a tile of x (1, in_features) and weight (tileN, in_features) and compute matmul vector (tileN). Then add bias[tile], hardtanh, mish, then group norm: we need mean and var over the groups of that tile. But if tile does not cover full group, we need partial stats. Simpler: each block processes a whole sample's output? That would be 8192 floats per block, but UB budget limited. Actually UB budget is 192KB = 49152 floats. So one sample's output (8192) is fine. But the weight matrix is huge (8192x8192 = 67M floats) cannot fit in UB. So we must tile the weight loading.
 
-**Group Norm:**
-- Input shape: [batch_size, out_features]
-- num_groups = 256
-- We need to reshape to [batch_size, num_groups, out_features // num_groups] and compute mean/std along last dimension.
-- out_features = 8192, num_groups = 256, so groups_size = 8192/256 = 32
+So typical approach: each block processes a tile of the output (submatrix of batch and out_features). We'll have blockDim = number of blocks? But we need to synchronize per-sample group norm? Group norm requires statistics across all groups for the same sample, so if we split sample's output channels across blocks, we need synchronization to compute global mean/var? Actually group norm's mean and var are computed over all channels within each group. A group spans all channels of that group. If we split a group across blocks, we need to combine partial sums. That's complex. Alternative: assign each block to handle one entire sample completely. Then each block loads the entire x of that sample (8192 floats), and computes linear output for that sample by tiling over weight rows? But weight rows are 8192, each row is 8192. Loading entire weight per block is impossible. So we must tile weight rows (output channels). So a block handles a subset of output channels for a given sample. Then to compute group norm for that sample, we need the mean/var over all channels of each group. If a block only computes a subset of channels, it cannot compute the full group norm. So we need to either have a separate kernel for group norm, or have all blocks for a sample share data via global memory? That would require synchronization and multiple kernel launches.
 
-**Kernel design approach:**
-- Since this is complex and involves multiple operations, I'll design the kernel to process one output row at a time (batch_size, out_features).
-- Tiling: process in tiles of rows (or partial rows) to fit in UB.
-- For each tile:
-  1. Load input x tile, weight tile, lin_bias, bias, gn_gamma, gn_beta
-  2. Compute linear: matmul with weight
-  3. Add bias
-  4. hardtanh: clamp between -1 and 1
-  5. mish: x * tanh(log(1 + exp(x)))
-  6. group_norm: compute mean and std over groups, then normalize and scale/shift
+Given the instructions, we can treat this as a single fused kernel but we may need to launch multiple kernels? The user wants to replace the entire sequence with one custom operator, but internally we can have multiple phases? Usually in AscendC, you can have a single kernel that does multiple passes by using multiple loops and using global memory as intermediate. But the kernel is a single function. We can design it such that each block computes a tile of the output (partial linear + bias + hardtanh + mish) and writes to global memory, then synchronizes, then another loop to compute group norm using the full output in global memory. However, synchronization across blocks is not straightforward in a single kernel without using atomic operations or multiple grids. But we can have a two-step kernel: first pass compute the linear part, second pass compute group norm. But that would require two kernel launches. The user expects a single custom operator, but internally we can schedule two kernels? The operator definition can have two kernel calls? Actually in AscendC, an operator implementation can launch multiple kernels via SetTiling and multiple calls? But typically one kernel per operator. However, we can use a single kernel that does both phases by using global memory: each block processes a chunk of output, then after all blocks finish (via fence?), we need a second phase to compute group norm. That requires another kernel launch.
 
-For efficiency and simplicity within UB constraints, I'll process one batch element at a time (one row of out_features). But for large out_features (8192), this should fit in UB.
+Maybe we should simplify: we can assume the group norm is not fused into the same kernel but handled separately? The instruction says "Replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels." The model has: linear, bias add, hardtanh, mish, group_norm. We could fuse all but group_norm? But the kernel name includes "group_norm", so it should be fused.
 
-Actually, let me reconsider. With 8192 out_features, that's 32KB for float data, which fits in UB (192KB). But we also need weight and other data.
+Given the complexity, we can provide a kernel that assumes each block processes the entire output for a single sample (batch index) by using a loop over output channels to compute linear via gemm (tiling over weight columns). But the weight matrix is large; we can load a tile of weight rows (output channels) and compute partial sums. We'll need to store intermediate results in global memory? No, we can accumulate in local memory. For a block processing a sample, we need to compute the full output (8192 floats). We can tile over output channels: each iteration load a chunk of weight rows (say 1024) and the corresponding tile of x (8192), do matmul (1, 1024), store in local buffer for that tile. After processing all tiles, we have the full linear output in local memory? But local memory per block is limited to UB (~48KB). 8192 floats = 32KB, plus other temps, so maybe we can fit 8192 floats in UB if we use the whole UB. Then we can do bias add, hardtanh, mish, and then group norm. For group norm, we need to compute mean and var over groups. Since we have the full output in UB, we can compute per-group statistics. So each block processes one sample entirely. This is feasible if UB can hold the full output (8192 floats = 32KB) plus weight tile? But we don't need to keep all weight at once; we load weight tiles sequentially and accumulate. So we need local memory for partial sums. We can keep the output buffer in UB and accumulate in it. So each iteration: load weight tile (tileN x in_features) from GM, load x tile (in_features) from GM (x is the same for all output tiles for that sample), compute vector * matrix = accumulate output tile. After all tiles, we have the full output in UB (say out_local). Then do bias_add, hardtanh, mish, compute group norm using out_local. Write result to GM. This is a single block processing one sample. We can have multiple blocks, each handling a different batch index. So blockDim = batch_size = 1024. That's fine. Tiling for weight loading: we partition output channels into tiles (tileN). So we need to load weight tiles sequentially. The weight matrix is (out_features, in_features). We'll have an inner loop over out_features in steps of tileN. For each step, load weight_tile (tileN * in_features) from GM, load x (in_features) from GM (same x for steps), compute gemm using AscendC matmul or manual multiply. Use vector instructions: for each output channel in tile, compute dot product with x. We can use vector compute: load x into a local vector, weight tile into a matrix (row-major), then for each row compute vmul, vreduce? Actually we can do matrix-vector multiply using vmul and reduce_add. But AscendC has Matmul for small matrices? We can use a loop over in_features: load a chunk of x and the corresponding weight chunk, multiply and accumulate.
 
-Better approach: Process one batch row at a time, with tiling within the row for the linear operation.
+Simplify: use the aicore's native matmul instruction? Not sure. We'll write a simple tiled GEMM using vector instructions: for each output channel, we compute dot product by iterating over in_features tiles. This is inefficient but possible.
 
-**Tiling strategy:**
-- totalLength = batch_size * out_features (total elements in output)
-- tileLength: based on UB budget
-  - For linear: we need input tile (in_features), weight tile (tile_in * tile_out), but this is complex
-  - Actually for fused linear + activations + group_norm, we need to process whole row at once for group_norm to work correctly
+Given the scope, we can produce a design that is functional but not highly optimized. The user expects the complete code strings. We'll generate them with appropriate tiling and kernel.
 
-Let me think about this differently. Since group_norm operates across groups within one sample, we need the entire row to compute mean/std.
+We'll define tiling data: total batch, in_features, out_features, num_groups, tileN (output channels per tile), tileK (in_features per inner tile), etc. For simplicity we can fix tile sizes based on UB budget.
 
-So the kernel should:
-- Take one batch element (row) at a time
-- For each row, compute the entire pipeline
-- Linear: matmul with weight (out_features, in_features) → needs entire row of x and entire weight matrix
-- This might be too large for UB
+Let's define: each block handles one batch sample. blockDim = batch_size (1024). For each block, we need to load x (in_features floats) into UB. Then loop over output channels in steps of tileN. For each step, load weight_tile (tileN * in_features), compute linear output tile, accumulate into output buffer (size out_features). But the output buffer is out_features floats, which for 8192 is 32KB, fits in UB. We'll also need temp buffers for weight tile, x tile, etc. We'll manage UB carefully.
 
-Let me reconsider the tiling. Maybe process in tiles of output features.
+UB budget: 192KB. Use 32KB for output, 32KB for weight tile? weight tile: tileN * in_features floats. If tileN=1024, in_features=8192 => 32MB? No, that's huge. tileN cannot be large because in_features is 8192, so tileN * in_features would be huge. So we must tile both output channels and input features. So we need double tiling: tileM (none, for batch we handle one sample), tileN (output channels), tileK (input features). For linear, we compute for a tile of output channels (tileN) using a tile of input features (tileK). So we need to load a tile of weight (tileN x tileK) and a tile of x (tileK) and produce a partial sum for output tile. Then iterate over tileK to accumulate. So we need a partial sum buffer for output tile (tileN floats). This fits.
 
-For a tile of output features (tileOut):
-- Need x tile from input of size [tileOut, in_features]? No, linear is x @ W^T, so for each output element j: sum(x_i * W_ji). So for a tile of output elements [j_start:j_end], we need all input elements (complete row of x) and the corresponding rows of weight.
+Thus, for each sample, we have:
+- output partial buffer tileN floats (kept in UB across tileK iterations)
+- then after all tileK, we have output tile in UB, we can do bias add, hardtanh, mish, then store to global output (maybe we need to store all output channels after processing all tiles). But we are storing to GM per tile? Actually the final result should be the full output after group norm. So we need to compute the full output before group norm. So we need to have the entire out_features in UB (or accumulate in GM). To avoid large UB, we can process the full output in tiles: compute a tile of linear output, then apply bias, hardtanh, mish, and then need to combine these tiles for group norm. But group norm requires stats over entire groups. If we process output in tiles, we cannot compute stats until all tiles are done. So we need to either store each tile to GM and then do group norm in a separate pass, or keep full output in UB. Given out_features=8192, that's 32KB, which fits in UB (192KB). So we can keep the entire output in UB. Then we can compute linear by sequentially processing tiles of output channels and input features. For each output channel tile, we zero a local buffer (tileN floats) and then iterate over input feature tiles, load weight tile and x tile, multiply and accumulate into that local buffer. After finishing all input tiles, we have the linear output for that output tile. Then we apply bias_add, hardtanh, mish to that tile and store to output buffer at appropriate offset. But wait: the bias_add, hardtanh, mish are element-wise and can be applied per tile. However, group norm requires the entire output to compute mean/var per group. So we can apply bias/hardtanh/mish per tile and store full output in UB. After processing all output tiles, we have the full output in UB. Then we compute group norm: for each group, compute mean and variance over all channels in that group, normalize, multiply by gamma and add beta. Since groups are 256, group size=32. So we can compute per-group stats by scanning the output buffer in groups. Then apply normalization.
 
-So for a tile of tileOut output features:
-- Load x row: in_features floats
-- Load weight rows for tileOut: tileOut * in_features floats
-- Compute partial linear
-- Then within tileOut, do bias_add, hardtanh, mish
-- For group_norm, we need stats over the entire groups, so we need the full output features for this row
+Thus the kernel for one sample: allocate UB buffer out_buf (out_features floats). For each output tile (size tileN, where tileN divides out_features or we handle last tile):
+- allocate temp tile_buf (tileN floats) in UB
+- for each input tile (tileK, where tileK divides in_features):
+    load weight tile (tileN * tileK) from GM into weight_buf (maybe reuse tile_buf? need separate)
+    load x tile (tileK) from GM into x_buf
+    multiply and accumulate: for each output channel (tileN), compute dot with x tile and sum.
+After inner loop, tile_buf contains linear output for this output tile. Then add bias[tile_offset], apply hardtanh, mish. Store to out_buf at offset.
+After all output tiles, compute group norm using out_buf.
 
-Hmm, this is getting complicated. Let me simplify:
+We need to define tile sizes: tileN and tileK based on UB budget. UB budget: 192KB = 49152 floats. We'll have out_buf: 8192 floats (32KB). For weight tile: tileN * tileK floats. We'll keep a separate weight_buf. Also x_buf: tileK floats. Tile_buf: tileN floats. So total UB needed: out_buf + weight_buf + x_buf + tile_buf + temp for compute. Let's say weight_buf = tileN * tileK. To maximize tile sizes, we set tileN = tileK = 256? Then weight_buf = 256*256=65536 floats = 256KB too big. So need smaller. Actually tileN * tileK must be small. Let's set tileN = 64, tileK = 2048? Then weight_buf = 64*2048=131072 floats = 512KB, too big. So we must use a smaller weight tile. Since we only need to load a small portion at a time, we can reuse a small weight buffer. For each input tile, we load weight_tile (tileN, tileK). To keep weight_buf small, set tileN = 256, tileK = 16? Then weight_buf = 4096 floats = 16KB. x_buf=16 floats, tile_buf=256 floats, out_buf=8192 floats. Total ~ 32KB + 16KB + negligible + 1KB = ~49KB, fits in 192KB. So we can process inner loop with tileK=16, tileN=256. Then number of inner iterations: in_features/tileK = 8192/16=512. Outer iterations: out_features/tileN = 8192/256=32. So total inner loops: 32*512=16384. This is reasonable. We'll need to manage the weight matrix access pattern: weight is stored row-major (out_features, in_features). For each output tile (256 rows of weight), for each input tile (16 columns), we need to load a submatrix of weight of size 256x16. So we can compute offsets.
 
-**Simplified approach:** Process one row at a time for one batch element.
-- For each batch element i:
-  - Load x row (in_features floats)
-  - Load weight (out_features, in_features) - this is too large for UB (8192*8192 floats)
-  
-Clearly can't load all weight at once. We need to tile the matmul.
+We'll define tiling data: total batch, out_features, in_features, num_groups, tileN, tileK. Also other params.
 
-**Practical approach:** 
-- Use AscendC's Matmul API or implement tiled matmul
-- After full linear for one row, do the rest of operations on the output row
+Now generate the six strings.
 
-For the matmul, we can use `Matmul` API from AscendC, or implement a tiled approach.
+We'll write project_json_src with inputs: x, weight, lin_bias, bias, gn_gamma, gn_beta. Output: y. Attrs: num_groups, maybe other? Actually we need to pass num_groups as attribute. Also we need to pass group norm parameters. The op will have attributes: num_groups (int).
 
-Given the complexity, let me design a more practical kernel that:
-1. Processes one batch element at a time
-2. Tiles the matmul along in_features dimension
-3. Accumulates partial results in UB
-4. After complete linear, applies bias_add, hardtanh, mish, group_norm
+host_tiling_src: define tiling data struct with fields: totalBatch, outFeatures, inFeatures, numGroups, tileN, tileK, etc. Also blockDim.
 
-Since this is a fused kernel, I'll simplify by assuming the kernel is invoked for each batch element independently, or with parallelism across batch elements.
+host_operator_src: define operator class and tiling function. Compute tiling sizes based on UB budget.
 
-Let me design the tiling:
+kernel_src: implement kernel function with class KernelGemmBiasAddHardtanhMishGroupNormCustom. Use the described scheme.
 
-**Tiling data:**
-- totalLength: batch_size * out_features (not directly used, more for reference)
-- tileLength: number of output features processed per iteration (should be out_features for group_norm to work)
-- Actually, let's process one row at a time per block, with each block handling a subset of batch elements
+python_bind_src: bind the custom op to PyTorch.
 
-Better approach from AscendC perspective:
-- BlockDim: number of blocks (parallel units)
-- Each block handles a portion of batch_size rows
-- For each row, compute the entire pipeline
+model_src: new model using custom op.
 
-**UB budget calculation:**
-For one row processing:
-- Input x: in_features * 4 bytes = 8192 * 4 = 32KB
-- Weight: need to tile this
-- Accumulator (output row): out_features * 4 = 32KB
-- Temp buffers: for group_norm stats, mish temp, etc.
+We need to ensure kernel name matches: "gemm_bias_add_hardtanh_mish_group_norm_custom", PascalCase: "GemmBiasAddHardtanhMishGroupNormCustom".
 
-If we process in tiles of output features, for a tile of size T_out:
-- Weight slice: T_out * in_features * 4 bytes
-- Input x: in_features * 4 bytes (shared across tiles)
-- Output tile: T_out * 4 bytes
-- Temp: T_out * 4 bytes (for mish, etc.)
-
-With UB ~192KB:
-- Let T_out = 1024 → weight: 1024*8192*4 = 32MB → too large!
-
-Clearly we need to also tile along in_features dimension.
-
-So for each output tile of size T_out, we process in_features in chunks of T_in:
-- For each in_features chunk:
-  - Load x chunk: T_in * 4 bytes
-  - Load weight chunk for all output tiles: T_out * T_in * 4 bytes
-  - Accumulate partial dot products
-
-This gives UB usage per sub-iteration:
-- x_chunk: T_in * 4
-- weight_chunk: T_out * T_in * 4
-- acc tile: T_out * 4
-
-With UB = 192KB:
-- Let T_in = 2048, T_out = 1024
-- x_chunk: 2048*4 = 8KB
-- weight_chunk: 1024*2048*4 = 8MB → still too large!
-
-Need to further reduce. Actually, for AscendC, the typical approach for matmul is to use the cube unit or vector unit with proper tiling.
-
-Given the complexity, and that this is a kernel generation task, let me simplify the design:
-
-I'll make the kernel process one output element at a time in the inner loop, or use a simpler approach where we handle the compute efficiently.
-
-Actually, let me reconsider the constraints. The user wants a complete working solution. Let me design it step by step:
-
-**Kernel design:**
-1. Each block handles a subset of the output (batch elements × output features)
-2. For each assigned element, compute the full pipeline
-3. Use grid-stride loop
-
-For the linear part, we need to compute dot product with weight. This can be done as a reduction.
-
-Let me think about a practical approach:
-
-**Approach: Process one output element at a time across all blocks.**
-- total work: batch_size * out_features elements
-- Each block computes a subset of these elements
-- For each element (b, o):
-  - Load x[b] row (in_features)
-  - Load weight[o] row (in_features)
-  - Dot product → linear result
-  - Add bias[o]
-  - hardtanh
-  - mish (needs scalar computation)
-  - After computing all elements for row b, do group_norm
-
-This is problematic because group_norm needs the full row.
-
-**Better approach: Process one batch row at a time, in parallel across blocks.**
-- Blocks handle different batch rows
-- For each row, compute all out_features elements using the linear + activations
-- Then compute group_norm on the full row
-
-For group_norm within one row:
-- reshape to [num_groups, group_size]
-- compute mean and var for each group
-- normalize and apply gamma/beta
-
-This requires processing the full row for group_norm.
-
-Given the complexity of implementing full matmul + group_norm in one kernel, let me make a reasonable trade-off:
-
-**Practical kernel design:**
-- Assume the kernel is called per-row, or with proper tiling to handle the matmul efficiently
-- Use a tile-based approach for the linear part
-- Accumulate results in UB, then apply activations and group_norm
-
-Let me write the code now. I'll make assumptions about tiling that are reasonable for the given problem size.
-
-Actually, let me simplify even further. For the purpose of this exercise, I'll create a kernel that:
-1. Uses a simple approach where each block handles one batch row
-2. Within a row, processes out_features in tiles
-3. For each tile, accumulates the linear result using tiled matmul
-4. Applies bias_add, hardtanh, mish to the tile
-5. After all tiles are computed, does group_norm (this requires a second pass or storing intermediate results)
-
-Wait, group_norm requires the full row statistics. This means we either:
-- Compute all tiles first (store results), then compute group_norm
-- Or use a two-pass approach
-
-Given UB constraints, we can't store the full row. So we need to either:
-- Process row by row in global memory (write linear+activations to global, then read back for group_norm)
-- Or compute group_norm stats incrementally
-
-For simplicity, let me use this approach:
-1. For each row, compute linear + bias_add + hardtanh + mish and write to global memory
-2. Then in a separate step compute group_norm (or include it in the same kernel with a second pass)
-
-Actually, for a truly fused kernel, we can do it in one pass:
-1. First, compute all outputs for the row and simultaneously compute mean (sum_x and sum_x^2) for each group
-2. Then normalize using the pre-computed stats
-
-But computing group stats requires iterating over all outputs first, which conflicts with the tile-based matmul.
-
-Let me simplify by assuming the kernel computes the full row in multiple tiles, writing partial results to global memory, then reads them back for group norm.
-
-Or better yet, since this is a kernel generation task for documentation/exercise purposes, I'll make a reasonable design that demonstrates the concept.
-
-Let me design the kernel as follows:
-
-**Tiling:**
-- Process batch rows in parallel across blocks
-- For each row, process out_features in tiles
-- For each tile, accumulate matmul result using in_features tiles
-- Apply bias_add, hardtanh, mish to the tile
-- Write tile to global (temporary storage)
-- After all tiles for the row are done, compute group_norm stats and normalize
-
-Actually, for group_norm we can compute mean and var on the fly as we process tiles, since mean is sum/len and variance is E[X^2] - E[X]^2.
-
-Modified approach:
-1. Process row's output in tiles
-2. For each tile, compute linear + activations, write to global
-3. Also accumulate sum and sum_sq for each group
-4. After all tiles, compute mean and var for each group
-5. Normalize the stored outputs using gamma/beta
-
-This requires reading back the output, which is acceptable.
-
-Let me now write the code.
-
-Given the page constraints and complexity, I'll provide a reasonable implementation.
-
-Let me write each component:
-
-**project_json_src:** Define the operator with its inputs, outputs, and attributes.
-
-**host_tiling_src:** Define tiling data structure with fields for the computation.
-
-**host_operator_src:** Implement tiling function with UB budget calculation.
-
-**kernel_src:** Implement the fused kernel.
-
-**python_bind_src:** Python binding code.
-
-**model_src:** Updated PyTorch model.
-
-Let me write these now.
-
-For the kernel, I need to handle:
-- Linear: matmul with weight matrix
-- Bias add
-- Hardtanh: clamp to [-1, 1]
-- Mish: x * tanh(log(1 + exp(x)))
-- Group norm: normalize within groups, apply gamma, beta
-
-Given the complexity, I'll make some practical simplifications but keep it realistic.
-
-Let me write the code now.
-
-Actually, let me think about the inputs/outputs more carefully:
-
-Inputs:
-- x: [batch_size, in_features] (float)
-- weight: [out_features, in_features] (float)
-- lin_bias: [out_features] (float, optional, can be None)
-- bias: [out_features] (float) - added after linear
-- gn_gamma: [out_features] (float)
-- gn_beta: [out_features] (float)
-
-Parameters (attributes):
-- num_groups: int
-
-Output:
-- y: [batch_size, out_features] (float)
-
-For the kernel, we process one output element at a time across blocks.
-
-Let me design the tiling:
-
-**Tiling data:**
-- totalLength: batch_size * out_features
-- tileLength: number of output elements per tile
-- blockDim: number of blocks
-- inFeatures: in_features
-- outFeatures: out_features
-- numGroups: number of groups
-- groupSize: out_features / num_groups
-
-For each tile of output elements, we need to compute the linear part by iterating over in_features.
-
-Let me think about UB usage:
-- x tile: tileLength (input positions) - actually for linear, each output element uses all in_features
-- weight tile: tileLength * in_features
-- y tile: tileLength
-- temp buffers: tileLength for various ops
-
-With tileLength = 1024:
-- weight tile: 1024 * 8192 * 4 = 32MB → too large
-
-We need to tile both dimensions. Let me define inner tile sizes:
-- T_out: number of output elements processed at once
-- T_in: number of input elements processed at once (for matmul accumulation)
-
-For a (T_out, T_in) tile:
-- x chunk: T_in (shared across all T_out outputs for this tile)
-- weight chunk: T_out * T_in
-- acc: T_out (accumulating partial sums)
-
-UB usage: (T_in + T_out * T_in + T_out) * 4 bytes
-
-With UB = 192KB:
-Let T_out = 128, T_in = 4096:
-- x: 4096*4 = 16KB
-- weight: 128*4096*4 = 2MB → still too large!
-
-Let T_out = 128, T_in = 512:
-- x: 512*4 = 2KB
-- weight: 128*512*4 = 256KB → still too large
-
-Let T_out = 32, T_in = 256:
-- x: 256*4 = 1KB
-- weight: 32*256*4 = 32KB
-- acc: 32*4 = 128B
-Total: ~33KB
-
-This works! But we need to process out_features (8192) and in_features (8192) with small tiles, which means many iterations.
-
-For each block's assigned output elements (in tile of T_out), we iterate over in_features in T_in chunks, accumulating partial sums.
-
-This is complex but doable.
-
-For group_norm, after computing all outputs for a row, we need to:
-1. Compute mean and var for each group (out_features elements divided into num_groups groups)
-2. Normalize and apply gamma/beta
-
-This requires a two-pass approach or storing intermediate results.
-
-Let me simplify: I'll make the kernel handle one batch row at a time per block, process output in tiles, compute the linear + activations, and then do group_norm by reading back from global memory.
-
-Actually, let me reconsider the problem size:
-- batch_size = 1024
-- out_features = 8192
-- num_groups = 256
-- group_size = 8192 / 256 = 32
-
-This is manageable. Each group has 32 elements, so we can compute group stats for an entire row in UB by storing the full row (8192 floats = 32KB, fits in UB).
-
-So for one row:
-1. Compute all 8192 outputs (linear + bias + hardtanh + mish)
-2. Store them in a UB buffer
-3. Compute group_norm: for each group (256 groups), compute mean and var of 32 elements, then normalize
-4. Write normalized results to global memory
-
-This approach works well within UB budget!
-
-For the matmul part:
-- We have x (8192 floats) and weight (8192x8192 floats)
-- Need to compute y[j] = sum(x[i] * weight[j][i]) + lin_bias[j]
-- Weight is too large for UB, so we tile:
-  - For each output tile T_out:
-    - For each input tile T_in:
-      - Load weight[T_out][T_in]
-      - Load x[T_in]
-      - Accumulate partial results
-
-Let me design the tiling:
-
-UB budget ~192KB = 49152 floats
-
-For one row, we need:
-- x_temp: in_features = 8192 floats
-- weight_temp: T_out * T_in floats
-- y_temp: T_out floats
-- temp buffers: T_out for mish/hardtanh
-- group_norm: group_size * num_groups = 8192 floats (can be y_temp reused)
-
-Let T_out = 1024, T_in = 2048:
-- weight_temp: 1024*2048 = 2M → too large
-
-Let T_out = 32, T_in = 8192:
-- weight_temp: 32*8192 = 262144 → 1MB, still too large
-
-Let T_out = 64, T_in = 2048:
-- weight_temp: 64*2048 = 131072 → 512KB, still too large
-
-Let's think differently. What if we process one output element at a time?
-For one output element j:
-- Need x[0:in_features] and weight[j][0:in_features]
-- x can stay in UB (8192 floats = 32KB)
-- Load weight row j (8192 floats = 32KB)
-- Dot product: 8192 multiply-adds
-This requires loading weight in tiles of T_in from GM to UB.
-
-For T_in = 2048:
-- x_chunk: 2048*4 = 8KB
-- weight_chunk: 2048*4 = 8KB
-- acc: 1 float
-
-Total per inner iteration: ~16KB
-
-We process in_features/T_in = 8192/2048 = 4 inner iterations per output element.
-
-Then for out_features = 8192 elements, we'd iterate 8192 times. This is a lot but feasible.
-
-However, this is slow. Let me optimize by processing multiple output elements using the same x data.
-
-**Better approach:**
-- Load entire x row: 8192 floats = 32KB
-- For each output element j (in tiles of T_out):
-  - Load weight[T_out][in_features] (this is large)
-  
-Actually, the key insight is that weight is huge (8192x8192 = 64M floats = 256MB), so we must access it tile by tile from global memory.
-
-For AscendC, we can use DataCopy to load tiles from GM to UB.
-
-Let me use this design:
-- T_out = 32 (output elements processed together)
-- T_in = 4096 (input elements processed together)
-
-For each (T_out, T_in) tile:
-- Load weight[T_out][T_in] from GM → weight_temp in UB
-- Load x[T_in] from GM (or from x_temp buffer)
-- Compute partial dot products for T_out outputs
-- Accumulate in y_temp[T_out]
-
-For each (T_out) tile, iterate over T_in in chunks of T_in = 4096:
-- Number of inner iterations: in_features / T_in = 8192/4096 = 2
-
-For each output row, iterate T_out tiles: out_features / T_out = 8192/32 = 256
-
-Total inner tiles: 256 * 2 = 512
-
-This is a tractable number of iterations.
-
-UB usage for this tile:
-- x_chunk: T_in = 4096 floats = 16KB (can be reused from a larger x buffer)
-- weight_chunk: T_out * T_in = 32*4096 = 131072 floats = 512KB → TOO LARGE!
-
-Hmm, still too large. Let me reduce T_in:
-T_in = 1024:
-- weight_chunk: 32*1024 = 32768 floats = 128KB
-- x_chunk: 1024 floats = 4KB
-- y_acc: 32 floats = 128B
-Total: ~132KB → fits in 192KB!
-
-Number of inner iterations: 8192/1024 = 8
-Number of outer tiles: 8192/32 = 256
-Total: 256 * 8 = 2048 iterations per batch row
-
-This works.
-
-But wait, we also need space for x_temp (full row: 8192 floats = 32KB), and y_temp (full row or partial), and group_norm compute.
-
-Let me recalculate UB budget:
-- x_buffer (full row): 8192 * 4 = 32KB
-- weight_tile: 32 * 1024 * 4 = 128KB
-- y_acc: 32 * 4 = 128B
-- tmp_buffer for mish/hardtanh: 32 * 4 = 128B
-- group_norm stats buffer: num_groups * 2 (mean, var) * 4 = 256*2*4 = 2KB
-
-Total: ~162KB → fits in 192KB (with some margin)
-
-Good!
-
-But wait, we need x_buffer to stay resident while processing tiles for one row. The weight_tile is loaded per iteration.
-
-Actually, we don't need the full x_buffer at once. We can load x in chunks of T_in as we iterate. So x_chunk replaces x_buffer.
-
-Let me redesign:
-- y_output[T_out]: accumulated output for current tile (stays in UB across inner iterations)
-- For each outer tile (T_out output elements):
-  - Initialize y_output with lin_bias[T_out]
-  - For each inner tile (T_in input elements):
-    - Load x_chunk[T_in] from GM
-    - Load weight_chunk[T_out][T_in] from GM
-    - Compute: y_output[t] = sum(x_chunk[i] * weight_chunk[t][i]) for all t in [0,T_out), i in [0,T_in)
-    - Accumulate into y_output
-  - After inner loop, apply bias_add, hardtanh, mish
-  - Store temporarily for group_norm
-
-This requires T_out * 4 bytes for y_output (tiny) plus T_in * 4 bytes for x_chunk plus T_out * T_in * 4 bytes for weight_chunk.
-
-With T_out = 32, T_in = 1024:
-- y_output: 32 * 4 = 128B
-- x_chunk: 1024 * 4 = 4KB
-- weight_chunk: 32 * 1024 * 4 = 128KB
-Total: ~132KB
-
-After computing the tile, we store the result (T_out elements) to a local buffer (row buffer) for group_norm. The row buffer size is out_features = 8192 floats = 32KB.
-
-So total UB: 132KB + 32KB (row buffer) = 164KB → fits!
-
-Then after all tiles for the row are computed, we compute group_norm on the row buffer and write to global memory.
-
-This design works.
-
-Let me now write the code.
-
-Actually, I realize the kernel code is going to be quite long. Let me write a clean, well-organized kernel.
-
-For the mish activation: mish(x) = x * tanh(log(1 + exp(x)))
-In AscendC, we can use:
-- Exp(x) for exp
-- Add(1, exp(x)) for 1+exp
-- Log for log
-- Tanh for tanh
-- Mul for multiplication
-
-AscendC has vector math functions: `Exp`, `Log`, `Tanh`, etc.
-
-Let me now write all six components.
-
-Actually, the user says: "Just output the code, no other text, and NO testing code!"
-
-Let me write the complete solution.
-
-For the python_bind_src, I need to use the correct PyTorch operator registration. The example uses `aclnnLeakyReluCustom`, which suggests there's a corresponding ACL operator. For our custom operator, we'd need similar binding.
-
-Let me write the code now. I'll be thorough but practical.
-
-Let me first define the data types and shapes more carefully:
-
-Inputs to kernel:
-- x: [batch_size, in_features] float32
-- weight: [out_features, in_features] float32
-- lin_bias: [out_features] float32 (optional, can be nullptr)
-- bias: [out_features] float32
-- gn_gamma: [out_features] float32
-- gn_beta: [out_features] float32
-
-Attributes:
-- num_groups: int (256)
-
-Output:
-- y: [batch_size, out_features] float32
-
-Let me write the JSON, tiling, host, kernel, etc.
-
-For the kernel, I'll use the tiling approach described above with T_out and T_in as tiling parameters.
+Let's write the code strings.

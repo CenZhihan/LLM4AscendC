@@ -143,7 +143,7 @@
 
 ##### 4. 选条 LLM 的完整 prompt
 
-由 **`generator/repair_memory/select.py::select_memory_ids`** 调用：一条 **system**（要求只返回 `{"memory_ids":[...]}`）+ 一条 **user**（`Select up to N` + `=== Manifest ===` + `=== Current query ===`）。
+由 **`generator/repair_memory/select.py::select_repair_memories`**（及兼容包装 **`select_memory_ids`**）调用：一条 **system**（要求只返回 `{"memory_ids":[...], "selection_rationale":"..."}`）+ 一条 **user**（`Select up to N memory ids and explain your choice.` + `=== Manifest ===` + `=== Current query ===`）。**`selection_rationale`** 为必填短文本：若选了 id 则说明与当前 **`repair_context`** 的对应关系；若 **`memory_ids` 为空**则说明为何不注入。
 
 **完整实录**：**`select_memory_ids_llm_messages_example.txt`**。
 
@@ -152,9 +152,10 @@
 1. **入口**：多轮脚本在 **`attempt_id >= 2`** 且开启 **`--use-repair-memory`** 时，在生成前调用 **`build_retrieval_block_for_attempt`**（`inject.py`）。
 2. **Manifest**：从 **`repair_memory/canonical/repair_memories.jsonl` 尾部窗口** 读入记录，**仅按 `schema_version` 过滤** 后打成 **每行一条的短 manifest**（见上文第 2 点）；**不再**按当前 run 的 `tool_mode`/`eval_mode` 预筛，以便其它工具配置下沉淀的经验也可进入候选；文件 mtime/size 变化会刷新缓存，避免重复读盘解析。
 3. **Query**：由当前 **`op` / `category` / `tool_mode` / `eval_mode` / `attempt_id`** 与 **上一轮修复用原始日志**（`repair_error_logs_raw` 截断）拼成 **`query_text`**。
-4. **选条**：单独一次 chat completion，模型在 **「不确定则不选」** 的 system 约束下，从 manifest 里选出至多 **`max_n`（默认 5）** 个 **`memory_id`**；返回需能被正则 **`\{[\s\S]*\}`** 截出并 **`json.loads`** 成功。
-5. **取全文**：用返回的 id 在尾部窗口的完整记录里 **按 id 查表**；找不到的 id 丢弃。
+4. **选条**：与主 agent 一致使用 **streaming** ``chat.completions``（``generator/repair_memory/llm_util.py::chat_completion_stream_content_reasoning``），累积 **``delta.content``**；若仍为空再拼 **``delta.reasoning_content``**。解析时用 **``JSONDecoder.raw_decode``** 扫描所有合法 ``{...}``：若第一个 ``memory_ids`` JSON 前仅有空白，则取 **第一个**（与 system 要求「回复首字符即 ``{``」一致）；否则取 **最后一个**（长 CoT 后再给 JSON 的情形）。``max_tokens`` 默认 **4096**。若流式异常或双空，再 **非流式** 回退一次并 ``assistant_message_text``。
+5. **取全文**：用返回的 id 在尾部窗口的完整记录里 **按 id 查表**；找不到的 id 记入 **`memory_ids_dropped`**，成功加载的 id 记入 **`memory_ids_resolved`**。
 6. **注入**：将命中记录的 **`natural_language` + tier + transition + anchors_after** 格式化为 **`format_injection_block`** 文本，写入 agent state 的 **`retrieved_repair_memories`**，供 **工具路由（choose_tool）** 与 **最终写代码（answer）** 两段 user 文本拼接使用。
+7. **报告**：同一轮写入 **`{op}_report.json`** 的 **`repair_memory_selection`** 字段（含 **`raw_model_output`**（过长截断）、**`selection_rationale`**、**`parse_ok`/`parse_error`**、**`memory_ids`/`memory_ids_resolved`/`memory_ids_dropped`**），与已有的 **`repair_memories_applied`**（实际注入条目的结构化摘要）并列，便于对照分析选条 agent 的决策。
 
 ##### 6. 融入检索记忆后的「算子生成」完整 prompt（写代码阶段）
 

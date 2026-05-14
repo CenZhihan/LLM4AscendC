@@ -24,9 +24,9 @@ project_json_src='''
     "attr": [
       {
         "name": "dim",
-        "param_type": "optional",
-        "type": "int64",
-        "default_value": "1"
+        "param_type": "required",
+        "type": "int",
+        "default_value": "0"
       }
     ]
   }
@@ -39,13 +39,13 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(MeanReductionOverADimensionCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalInputLength);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, outputLength);
-  TILING_DATA_FIELD_DEF(uint32_t, reduceLength);
-  TILING_DATA_FIELD_DEF(uint32_t, strideAfter);
-  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, preSize);
+  TILING_DATA_FIELD_DEF(uint32_t, dimSize);
+  TILING_DATA_FIELD_DEF(uint32_t, postSize);
+  TILING_DATA_FIELD_DEF(uint32_t, tilePost);
   TILING_DATA_FIELD_DEF(uint32_t, blockDim);
-  TILING_DATA_FIELD_DEF(float, invReduceLength);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(MeanReductionOverADimensionCustom, MeanReductionOverADimensionCustomTilingData)
@@ -56,86 +56,76 @@ host_operator_src="""
 
 #include "mean_reduction_over_a_dimension_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include <vector>
-#include <cstdint>
 
 namespace optiling {
 
+// UB model:
+//   inQueue: 1 tile (for load) + accumulator = 2 * tilePost floats = 8 * tilePost bytes
+//   plus temporary for division
 static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
-static constexpr uint32_t ALIGN_ELEMS = 256;
-static constexpr uint32_t HARD_CAP_ELEMS = 8192;
+static constexpr uint32_t MIN_TILE_POST = 256;
+static constexpr uint32_t MAX_TILE_POST = 16384;
 
-static inline uint32_t AlignDown(uint32_t x, uint32_t a) {
-    return (x / a) * a;
-}
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) { return (x / a) * a; }
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
 
-static inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
-    return (a + b - 1u) / b;
-}
-
-static ge::graphStatus TilingFunc(gert::TilingContext *context) {
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
     MeanReductionOverADimensionCustomTilingData tiling;
+    const gert::StorageShape *inShape = context->GetInputShape(0);
+    const gert::StorageShape *outShape = context->GetOutputShape(0);
+    int64_t totalIn = inShape->GetOriginShape().GetShapeSize();
+    int64_t totalOut = outShape->GetOriginShape().GetShapeSize();
 
-    const gert::StorageShape *inputShape = context->GetInputShape(0);
-    uint32_t ndim = inputShape->GetDimNum();
-    const int64_t *dims = inputShape->GetDimData();
     const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    int64_t reduceDim = attrs->GetAttrPointer<int64_t>(0)[0];
-    if (reduceDim < 0) reduceDim += ndim;
-    uint32_t redIdx = static_cast<uint32_t>(reduceDim);
-
-    uint32_t totalInputLength = 1;
-    uint32_t outputLength = 1;
-    uint32_t reduceLength = 1;
-    uint32_t strideAfter = 1;
-    for (uint32_t i = 0; i < ndim; ++i) {
-        uint32_t dimSize = static_cast<uint32_t>(dims[i]);
-        totalInputLength *= dimSize;
-        if (i < redIdx) {
-            outputLength *= dimSize;
-        } else if (i == redIdx) {
-            reduceLength = dimSize;
-        } else {
-            strideAfter *= dimSize;
-        }
-    }
-    if (reduceLength == 0) {
-        return ge::GRAPH_FAILED;
-    }
-    outputLength *= strideAfter;
-
-    tiling.set_totalInputLength(totalInputLength);
-    tiling.set_outputLength(outputLength);
-    tiling.set_reduceLength(reduceLength);
-    tiling.set_strideAfter(strideAfter);
-    tiling.set_invReduceLength(1.0f / static_cast<float>(reduceLength));
-
-    uint32_t maxTile = UB_BUDGET_BYTES / sizeof(float);
-    maxTile = AlignDown(maxTile, ALIGN_ELEMS);
-    if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
-    if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
-
-    uint32_t tileLen = maxTile;
-    if (outputLength < tileLen) {
-        uint32_t aligned = AlignDown(outputLength, ALIGN_ELEMS);
-        tileLen = (aligned > 0) ? aligned : outputLength;
+    int32_t dim = attrs->GetAttrPointer<int32_t>(0)[0];
+    // dim must be valid non-negative
+    int32_t ndim = inShape->GetOriginShape().GetDimNum();
+    if (dim < 0) dim += ndim;
+    uint32_t preSize = 1;
+    uint32_t dimSize = 1;
+    uint32_t postSize = 1;
+    for (int32_t i = 0; i < ndim; ++i) {
+        uint32_t s = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(i));
+        if (i < dim) preSize *= s;
+        else if (i == dim) dimSize = s;
+        else postSize *= s;
     }
 
-    uint32_t numTiles = (tileLen == 0) ? 1u : CeilDiv(outputLength, tileLen);
-    uint32_t blockDim = numTiles;
-    if (blockDim < 8u) blockDim = 8u;
-    if (blockDim > 24u) blockDim = 24u;
+    // Tile over postSize (the inner dimensions after reduction)
+    // Each tile: load buffer + accumulator = 2 * tilePost floats
+    uint32_t maxFloats = UB_BUDGET_BYTES / (2 * sizeof(float));
+    maxFloats = AlignDown(maxFloats, 128); // align to 128 floats for DMA
+    if (maxFloats < MIN_TILE_POST) maxFloats = MIN_TILE_POST;
+    if (maxFloats > MAX_TILE_POST) maxFloats = MAX_TILE_POST;
+
+    uint32_t tilePost = maxFloats;
+    if (tilePost > postSize) tilePost = postSize;
+    // ensure tilePost is at least 1
+    if (tilePost == 0) tilePost = 1;
+
+    // Block dimension: aim for moderate occupancy
+    uint32_t numOuter = CeilDiv(preSize, 4u); // rough tiles of outer
+    uint32_t blockDim = numOuter;
+    if (blockDim < 8) blockDim = 8;
+    if (blockDim > 24) blockDim = 24;
 
     context->SetBlockDim(blockDim);
-    tiling.set_tileLength(tileLen);
+
+    tiling.set_totalLength(static_cast<uint32_t>(totalIn));
+    tiling.set_outputLength(static_cast<uint32_t>(totalOut));
+    tiling.set_preSize(preSize);
+    tiling.set_dimSize(dimSize);
+    tiling.set_postSize(postSize);
+    tiling.set_tilePost(tilePost);
     tiling.set_blockDim(blockDim);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 
@@ -143,32 +133,31 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
 
 namespace ge {
 
-static ge::graphStatus InferShape(gert::InferShapeContext *context) {
-    const gert::StorageShape *inputShape = context->GetInputShape(0);
-    uint32_t ndim = inputShape->GetDimNum();
-    const int64_t *dims = inputShape->GetDimData();
-    const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    int64_t reduceDim = attrs->GetAttrPointer<int64_t>(0)[0];
-    if (reduceDim < 0) reduceDim += ndim;
-    uint32_t redIdx = static_cast<uint32_t>(reduceDim);
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::StorageShape *x_storage = context->GetInputShape(0);
+    const gert::Shape &x_shape = x_storage->GetOriginShape();
+    int32_t ndim = x_shape.GetDimNum();
 
-    std::vector<int64_t> outDims;
-    for (uint32_t i = 0; i < ndim; ++i) {
-        if (i != redIdx) {
-            outDims.push_back(dims[i]);
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    int32_t dim = attrs->GetAttrPointer<int32_t>(0)[0];
+    if (dim < 0) dim += ndim;
+
+    gert::StorageShape *y_storage = context->GetOutputShape(0);
+    gert::Shape &y_shape = y_storage->GetStorageShape();  // mutable Shape reference
+    y_shape.SetDimNum(ndim - 1);
+    int32_t outIdx = 0;
+    for (int32_t i = 0; i < ndim; ++i) {
+        if (i != dim) {
+            y_shape.SetDim(outIdx, x_shape.GetDim(i));
+            ++outIdx;
         }
     }
-
-    gert::Shape outputShape;
-    outputShape.SetDimNum(outDims.size());
-    for (size_t i = 0; i < outDims.size(); ++i) {
-        outputShape.SetDim(i, outDims[i]);
-    }
-    *context->GetOutputShape(0) = outputShape;
     return GRAPH_SUCCESS;
 }
 
-static ge::graphStatus InferDataType(gert::InferDataTypeContext *context) {
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
     const ge::DataType x_dtype = context->GetInputDataType(0);
     context->SetOutputDataType(0, x_dtype);
     return GRAPH_SUCCESS;
@@ -178,7 +167,8 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context) {
 namespace ops {
 class MeanReductionOverADimensionCustom : public OpDef {
 public:
-    explicit MeanReductionOverADimensionCustom(const char* name) : OpDef(name) {
+    explicit MeanReductionOverADimensionCustom(const char* name) : OpDef(name)
+    {
         this->Input("x")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -191,7 +181,7 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        this->Attr("dim").AttrType(OPTIONAL).Int(1);
+        this->Attr("dim").AttrType(REQUIRED).Int(0);
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
@@ -208,117 +198,57 @@ kernel_src="""
 
 #include "kernel_operator.h"
 
-constexpr int32_t BUFFER_NUM = 1;
+constexpr int32_t BUFFER_NUM = 2;
 
-class KernelMeanReductionOverADimensionCustom {
+class KernelMeanReduction {
 public:
-    __aicore__ inline KernelMeanReductionOverADimensionCustom() {}
+    __aicore__ inline KernelMeanReduction() {}
 
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t totalInputLength,
-                                uint32_t outputLength,
-                                uint32_t reduceLength,
-                                uint32_t strideAfter,
-                                float invReduceLength)
+                                uint32_t totalLength, uint32_t outputLength,
+                                uint32_t preSize, uint32_t dimSize,
+                                uint32_t postSize, uint32_t tilePost)
     {
-        totalInputLen_ = totalInputLength;
+        totalLen_ = totalLength;
         outputLen_ = outputLength;
-        reduceLen_ = reduceLength;
-        strideAfter_ = strideAfter;
-        invReduceLen_ = invReduceLength;
+        preSize_ = preSize;
+        dimSize_ = dimSize;
+        postSize_ = postSize;
+        tilePost_ = tilePost;
 
-        xGm_.SetGlobalBuffer((__gm__ float*)x, totalInputLen_);
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
         yGm_.SetGlobalBuffer((__gm__ float*)y, outputLen_);
+
+        pipe_.InitBuffer(inQueue_, BUFFER_NUM, tilePost_ * sizeof(float));
+        pipe_.InitBuffer(accQueue_, 1, tilePost_ * sizeof(float));
+        pipe_.InitBuffer(delayQueue_, 1, tilePost_ * sizeof(float)); // not used but placeholder
     }
 
     __aicore__ inline void Process()
     {
-        if (outputLen_ == 0) return;
+        if (totalLen_ == 0 || dimSize_ == 0) return;
 
         uint32_t blockNum = AscendC::GetBlockNum();
         uint32_t blockIdx = AscendC::GetBlockIdx();
 
-        uint32_t perBlock = (outputLen_ + blockNum - 1) / blockNum;
-        uint32_t start = blockIdx * perBlock;
-        uint32_t end = (blockIdx + 1) * perBlock;
-        if (start >= outputLen_) return;
-        if (end > outputLen_) end = outputLen_;
+        // Each block handles a disjoint set of outer indices (preSize)
+        uint32_t outerPerBlock = (preSize_ + blockNum - 1) / blockNum;
+        uint32_t outerStart = blockIdx * outerPerBlock;
+        uint32_t outerEnd = outerStart + outerPerBlock;
+        if (outerStart >= preSize_) return;
+        if (outerEnd > preSize_) outerEnd = preSize_;
 
-        for (uint32_t i = start; i < end; i++)
-        {
-            uint32_t beforeGroup = i / strideAfter_;
-            uint32_t afterOffset = i % strideAfter_;
-            uint32_t baseIdx = beforeGroup * (reduceLen_ * strideAfter_) + afterOffset;
+        for (uint32_t i = outerStart; i < outerEnd; ++i) {
+            // For this outer index, process all postSize tiles
+            for (uint32_t t = 0; t < postSize_; t += tilePost_) {
+                uint32_t curTile = postSize_ - t;
+                if (curTile > tilePost_) curTile = tilePost_;
 
-            float sum = 0.0f;
-            for (uint32_t k = 0; k < reduceLen_; k++)
-            {
-                uint32_t idx = baseIdx + k * strideAfter_;
-                sum += xGm_.GetValue(idx);
-            }
-            yGm_.SetValue(i, sum * invReduceLen_);
-        }
-    }
+                // Initialize accumulator to zero
+                AscendC::LocalTensor<float> acc = accQueue_.AllocTensor<float>();
+                AscendC::Duplicate(acc, 0.0f, curTile);
 
-private:
-    AscendC::GlobalTensor<float> xGm_;
-    AscendC::GlobalTensor<float> yGm_;
-
-    uint32_t totalInputLen_ {0};
-    uint32_t outputLen_ {0};
-    uint32_t reduceLen_ {0};
-    uint32_t strideAfter_ {0};
-    float invReduceLen_ {0.0f};
-};
-
-extern "C" __global__ __aicore__ void mean_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tiling_data, tiling);
-    KernelMeanReductionOverADimensionCustom op;
-    op.Init(x, y,
-            tiling_data.totalInputLength,
-            tiling_data.outputLength,
-            tiling_data.reduceLength,
-            tiling_data.strideAfter,
-            tiling_data.invReduceLength);
-    op.Process();
-}
-"""
-
-python_bind_src="""
-
-#include <torch/library.h>
-#include <torch/extension.h>
-#include "pytorch_npu_helper.hpp"
-
-at::Tensor mean_reduction_impl_npu(const at::Tensor& self, int64_t dim) {
-    at::Tensor result = at::empty({0}, self.options());
-    EXEC_NPU_CMD(aclnnMeanReductionOverADimensionCustom, self, dim, result);
-    return result;
-}
-
-TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("mean_reduction_over_a_dimension_custom", &mean_reduction_impl_npu);
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("mean_reduction_over_a_dimension_custom", &mean_reduction_impl_npu, "Mean reduction over a dimension (MeanReductionOverADimensionCustom on NPU)");
-}
-"""
-
-model_src='''
-import torch
-import torch_npu
-import custom_ops_lib
-
-_FN = 'mean_reduction_over_a_dimension_custom'
-
-class ModelNew(torch.nn.Module):
-    def __init__(self, dim):
-        super(ModelNew, self).__init__()
-        self.dim = dim
-
-    def forward(self, x):
-        return custom_ops_lib.mean_reduction_over_a_dimension_custom(x, self.dim)
-'''
-```
+                // Loop over reduction dimension rows
+                for (uint32_t r = 0; r < dimSize_; ++r) {
+                    // Load one row segment
+                    AscendC::LocalTensor<float> row = inQueue_.AllocTensor<float>();

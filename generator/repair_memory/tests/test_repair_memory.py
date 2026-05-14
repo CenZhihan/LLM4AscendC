@@ -6,11 +6,83 @@ from pathlib import Path
 from unittest import TestCase
 
 from generator.repair_memory.failure_stage import infer_failure_stage
+from generator.repair_memory.llm_util import assistant_message_text
 from generator.repair_memory.merge import merge_run_inbox
 from generator.repair_memory.paths import run_slug_from_run_dir
 from generator.repair_memory.schema import SCHEMA_VERSION, validate_record
 from generator.repair_memory.tier_gate import classify_tier_and_gates, code_digest
 from generator.repair_memory.inject import memory_entries_for_report
+from generator.repair_memory.select import parse_memory_selection_output
+
+
+class TestAssistantMessageText(TestCase):
+    def test_prefers_content_over_reasoning(self) -> None:
+        class Msg:
+            content = "  hello  "
+            reasoning_content = "reason"
+
+        self.assertEqual(assistant_message_text(Msg()), "hello")
+
+    def test_fallback_reasoning_content(self) -> None:
+        class Msg:
+            content = ""
+            reasoning_content = '{"memory_ids": [], "selection_rationale": "x"}'
+
+        self.assertTrue(assistant_message_text(Msg()).startswith("{"))
+
+
+class TestParseMemorySelectionOutput(TestCase):
+    def test_parses_ids_and_rationale(self) -> None:
+        raw = (
+            '{"memory_ids": ["u1", "u2"], "selection_rationale": '
+            '"u1 matches txt bundle; u2 matches CPack stage."}'
+        )
+        d = parse_memory_selection_output(raw, max_n=5)
+        self.assertTrue(d["parse_ok"])
+        self.assertEqual(d["memory_ids"], ["u1", "u2"])
+        self.assertEqual(d["selection_rationale"], "u1 matches txt bundle; u2 matches CPack stage.")
+        self.assertEqual(d["parse_error"], "")
+
+    def test_empty_ids_with_rationale(self) -> None:
+        raw = '{"memory_ids": [], "selection_rationale": "No manifest line matches this log."}'
+        d = parse_memory_selection_output(raw, max_n=5)
+        self.assertTrue(d["parse_ok"])
+        self.assertEqual(d["memory_ids"], [])
+        self.assertEqual(d["selection_rationale"], "No manifest line matches this log.")
+
+    def test_omitted_rationale_placeholder(self) -> None:
+        d = parse_memory_selection_output('{"memory_ids": ["x"]}', max_n=5)
+        self.assertTrue(d["parse_ok"])
+        self.assertEqual(d["memory_ids"], ["x"])
+        self.assertEqual(d["selection_rationale"], "(model omitted selection_rationale)")
+
+    def test_respects_max_n(self) -> None:
+        raw = '{"memory_ids": ["a","b","c"], "selection_rationale": "x"}'
+        d = parse_memory_selection_output(raw, max_n=2)
+        self.assertEqual(d["memory_ids"], ["a", "b"])
+
+    def test_no_json_object(self) -> None:
+        d = parse_memory_selection_output("not json", max_n=5)
+        self.assertFalse(d["parse_ok"])
+        self.assertEqual(d["memory_ids"], [])
+        self.assertEqual(d["parse_error"], "no_json_object_in_output")
+
+    def test_picks_first_json_when_reply_leads_with_json(self) -> None:
+        raw = '{"memory_ids": ["only"], "selection_rationale": "first"}\nextra note not json'
+        d = parse_memory_selection_output(raw, max_n=5)
+        self.assertTrue(d["parse_ok"])
+        self.assertEqual(d["memory_ids"], ["only"])
+        self.assertEqual(d["selection_rationale"], "first")
+
+    def test_picks_last_json_when_multiple_memory_ids_objects(self) -> None:
+        raw = (
+            'CoT echoes example {"memory_ids": ["fake"], "selection_rationale": "x"}\n'
+            'Answer {"memory_ids": [], "selection_rationale": "No line matches CPack error."}'
+        )
+        d = parse_memory_selection_output(raw, max_n=5)
+        self.assertTrue(d["parse_ok"])
+        self.assertEqual(d["memory_ids"], [])
+        self.assertEqual(d["selection_rationale"], "No line matches CPack error.")
 
 
 class TestMemoryReportEntries(TestCase):

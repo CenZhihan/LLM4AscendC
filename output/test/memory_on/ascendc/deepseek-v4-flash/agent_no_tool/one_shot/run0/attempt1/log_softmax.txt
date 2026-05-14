@@ -1,6 +1,5 @@
 ```python
 project_json_src='''
-
 [
   {
     "op": "LogSoftmaxCustom",
@@ -34,16 +33,16 @@ project_json_src='''
 '''
 
 host_tiling_src="""
-
 #include "register/tilingdata_base.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(LogSoftmaxCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, rowLength);
+  TILING_DATA_FIELD_DEF(uint32_t, batchSize);
   TILING_DATA_FIELD_DEF(uint32_t, tileLength);
-  TILING_DATA_FIELD_DEF(uint32_t, numRows);
-  TILING_DATA_FIELD_DEF(int32_t, dim);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(int, reductionDim);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(LogSoftmaxCustom, LogSoftmaxCustomTilingData)
@@ -51,60 +50,70 @@ REGISTER_TILING_DATA_CLASS(LogSoftmaxCustom, LogSoftmaxCustomTilingData)
 """
 
 host_operator_src="""
-
 #include "log_softmax_custom_tiling.h"
 #include "register/op_def_registry.h"
 
 namespace optiling {
 
-static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
-static constexpr uint32_t ALIGN_ELEMS = 1024;
-static constexpr uint32_t HARD_CAP_ELEMS = 16384;
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;  // conservative per-core share
+static constexpr uint32_t ALIGN_ELEMS = 2048;            // favor larger DMA bursts
+static constexpr uint32_t HARD_CAP_ELEMS = 16384;        // avoid too-large per-iter latency
 
-static inline uint32_t AlignDown(uint32_t x, uint32_t a)
-{
+static inline uint32_t AlignDown(uint32_t x, uint32_t a) {
     return (x / a) * a;
 }
 
-static ge::graphStatus TilingFunc(gert::TilingContext *context)
-{
+static inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (a + b - 1u) / b;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context) {
     LogSoftmaxCustomTilingData tiling;
-    const gert::Shape *x_shape = context->GetInputShape(0);
-    const uint32_t totalLength =
-        static_cast<uint32_t>(x_shape->GetOriginShape().GetShapeSize());
-    const uint32_t ndim = x_shape->GetOriginShape().GetDimNum();
-    // Assume ND input with ndim >= 2, reduce last dim
-    const uint32_t rowLength = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(ndim - 1));
-    const uint32_t numRows = totalLength / rowLength;
+    const gert::Shape *inputShape = context->GetInputShape(0);
+    const uint32_t totalLength = static_cast<uint32_t>(inputShape->GetOriginShape().GetShapeSize());
 
+    // We assume 2D for simplicity, dim=1 (columns)
+    // batchSize = shape[0], rowLength = shape[1]
+    const auto &dims = inputShape->GetOriginShape().GetDims();
+    uint32_t batchSize = (dims.size() >= 1) ? static_cast<uint32_t>(dims[0]) : 1;
+    uint32_t rowLength = (dims.size() >= 2) ? static_cast<uint32_t>(dims[1]) : totalLength / batchSize;
+
+    // Read attribute dim (default 1)
     const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    int32_t dim = static_cast<int32_t>(
-        attrs->GetAttrPointer<int32_t>(0)[0]);  // attr dim
+    const int *dimPtr = attrs->GetAttrPointer<int>(0);
+    int reductionDim = (dimPtr != nullptr) ? *dimPtr : 1;
 
-    // tileLen: we need 3 tile buffers (in, out, tmp) -> 3*tileLen floats = 12*tileLen bytes
-    uint32_t maxTile = UB_BUDGET_BYTES / 12;
+    // Tiling along row (feature) dimension
+    // UB budget: need buffers for input (1 tile), output (1 tile), max (1 tile after reduce), exp (1 tile), sum (1 scalar)
+    // Simplified: allocate 3 tiles (x, y, tmp)
+    uint32_t maxTile = UB_BUDGET_BYTES / (3 * sizeof(float));
     maxTile = AlignDown(maxTile, ALIGN_ELEMS);
     if (maxTile < ALIGN_ELEMS) maxTile = ALIGN_ELEMS;
     if (maxTile > HARD_CAP_ELEMS) maxTile = AlignDown(HARD_CAP_ELEMS, ALIGN_ELEMS);
 
     uint32_t tileLen = maxTile;
     if (rowLength < tileLen) {
-        uint32_t aligned = AlignDown(rowLength, ALIGN_ELEMS);
-        tileLen = (aligned > 0) ? aligned : rowLength;
+        tileLen = AlignDown(rowLength, ALIGN_ELEMS);
+        if (tileLen == 0) tileLen = rowLength;
     }
 
-    // blockDim: assign rows to blocks
-    uint32_t blockDim = numRows;
-    if (blockDim < 8u) blockDim = 8u;
-    if (blockDim > 24u) blockDim = 24u;
+    // Adaptive blockDim: assign rows to blocks
+    uint32_t neededBlocks = CeilDiv(batchSize, 1); // each block handles one row (at least)
+    uint32_t blockDim = neededBlocks;
+    if (blockDim < 8) blockDim = 8;
+    if (blockDim > 24) blockDim = 24;
+    // Adjust blocks to ensure each block gets at least one row
+    if (blockDim > batchSize) blockDim = batchSize;
+    if (blockDim < 1) blockDim = 1;
 
     context->SetBlockDim(blockDim);
 
     tiling.set_totalLength(totalLength);
     tiling.set_rowLength(rowLength);
+    tiling.set_batchSize(batchSize);
     tiling.set_tileLength(tileLen);
-    tiling.set_numRows(numRows);
-    tiling.set_dim(dim);
+    tiling.set_blockDim(blockDim);
+    tiling.set_reductionDim(reductionDim);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
@@ -114,20 +123,17 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
-
 } // namespace optiling
 
 namespace ge {
-static ge::graphStatus InferShape(gert::InferShapeContext *context)
-{
+static ge::graphStatus InferShape(gert::InferShapeContext *context) {
     const gert::Shape *x_shape = context->GetInputShape(0);
     gert::Shape *y_shape = context->GetOutputShape(0);
     *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
 
-static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
-{
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context) {
     const ge::DataType x_dtype = context->GetInputDataType(0);
     context->SetOutputDataType(0, x_dtype);
     return GRAPH_SUCCESS;
@@ -137,8 +143,7 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 namespace ops {
 class LogSoftmaxCustom : public OpDef {
 public:
-    explicit LogSoftmaxCustom(const char* name) : OpDef(name)
-    {
+    explicit LogSoftmaxCustom(const char* name) : OpDef(name) {
         this->Input("x")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -165,7 +170,6 @@ OP_ADD(LogSoftmaxCustom);
 """
 
 kernel_src="""
-
 #include "kernel_operator.h"
 
 constexpr int32_t BUFFER_NUM = 2;
@@ -176,157 +180,164 @@ public:
 
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
                                 uint32_t totalLength, uint32_t rowLength,
-                                uint32_t tileLength, uint32_t numRows,
-                                int32_t dim)
-    {
+                                uint32_t batchSize, uint32_t tileLength,
+                                int reductionDim) {
         totalLen_ = totalLength;
         rowLen_ = rowLength;
+        batchSize_ = batchSize;
         tileLen_ = tileLength;
-        numRows_ = numRows;
-        dim_ = dim;  // not used, assume reduction on last axis
+        reductionDim_ = reductionDim;
 
         xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
         yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
 
         pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
         pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
-        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, BUFFER_NUM, tileLen_ * sizeof(float)); // for exp/accum
+        // For reduction we need a scalar buffer for max and sum
+        pipe_.InitBuffer(redScalarQueue1_, 1, sizeof(float));
+        pipe_.InitBuffer(redScalarQueue2_, 1, sizeof(float));
     }
 
-    __aicore__ inline void Process()
-    {
-        if (totalLen_ == 0 || rowLen_ == 0 || numRows_ == 0) return;
+    __aicore__ inline void Process() {
+        if (totalLen_ == 0 || tileLen_ == 0) return;
 
-        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
-        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        // Each block handles a consecutive set of rows
+        uint32_t rowsPerBlock = CeilDiv(batchSize_, blockNum);
+        uint32_t startRow = blockIdx * rowsPerBlock;
+        uint32_t endRow = (blockIdx + 1) * rowsPerBlock;
+        if (endRow > batchSize_) endRow = batchSize_;
 
-        // grid-stride over rows
-        for (uint32_t row = blockIdx; row < numRows_; row += blockNum) {
-            ProcessRow(row);
+        for (uint32_t row = startRow; row < endRow; row++) {
+            uint32_t rowOffset = row * rowLen_;
+            ProcessRow(rowOffset);
         }
     }
 
 private:
-    __aicore__ inline void ProcessRow(uint32_t rowIdx)
-    {
-        uint32_t baseOffset = rowIdx * rowLen_;
+    __aicore__ inline void ProcessRow(uint32_t rowOffset) {
+        if (rowLen_ == 0) return;
 
-        // ---------- Pass 1: Find global maximum ----------
-        float maxVal = -__builtin_huge_valf(); // -inf
-        uint32_t offset = baseOffset;
+        // ---------- Pass 1: find max of the row ----------
+        float rowMax = -INFINITY;
         uint32_t remaining = rowLen_;
-        uint32_t curTileLen = 0;
-
+        uint32_t offset = 0;
         while (remaining > 0) {
-            curTileLen = (remaining > tileLen_) ? tileLen_ : remaining;
+            uint32_t curTile = (remaining > tileLen_) ? tileLen_ : remaining;
             // Load tile
             AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
-            AscendC::DataCopy(xLocal, xGm_[offset], curTileLen);
-            inQueueX_.EnQue(xLocal);
-            xLocal = inQueueX_.DeQue<float>();
-
-            // Compute tile max
-            AscendC::LocalTensor<float> tileMaxLocal = tmpQueue_.AllocTensor<float>();
-            AscendC::ReduceMax(tileMaxLocal, xLocal, curTileLen);
-            float tileMax = tileMaxLocal(0);  // scalar
-            tmpQueue_.FreeTensor(tileMaxLocal);
-
-            if (tileMax > maxVal) maxVal = tileMax;
-
+            AscendC::DataCopy(xLocal, xGm_[rowOffset + offset], curTile);
+            // Compute local max
+            AscendC::LocalTensor<float> scalar = redScalarQueue1_.AllocTensor<float>();
+            AscendC::ReduceMax(scalar, xLocal, curTile);
+            float localMax = scalar.GetValue(0);
+            redScalarQueue1_.FreeTensor(scalar);
             inQueueX_.FreeTensor(xLocal);
-            offset += curTileLen;
-            remaining -= curTileLen;
+            // Update global max
+            if (localMax > rowMax) rowMax = localMax;
+            offset += curTile;
+            remaining -= curTile;
         }
 
-        // ---------- Pass 2: Compute sum of exp(x - max) ----------
-        float sumExp = 0.0f;
-        offset = baseOffset;
+        // ---------- Pass 2: compute exp(x - max), accumulate sum, then final output ----------
+        float eps = 1e-30f;
+        float rowSum = 0.0f;
         remaining = rowLen_;
-
+        offset = 0;
         while (remaining > 0) {
-            curTileLen = (remaining > tileLen_) ? tileLen_ : remaining;
+            uint32_t curTile = (remaining > tileLen_) ? tileLen_ : remaining;
+            // Load tile
             AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
-            AscendC::DataCopy(xLocal, xGm_[offset], curTileLen);
-            inQueueX_.EnQue(xLocal);
-            xLocal = inQueueX_.DeQue<float>();
-
-            // x_tmp = x - maxVal
-            AscendC::LocalTensor<float> xTmp = tmpQueue_.AllocTensor<float>();
-            AscendC::Subs(xTmp, xLocal, maxVal, curTileLen);
-
-            // exp(x_tmp)
-            AscendC::Exp(xTmp, xTmp, curTileLen);
-
-            // sum over tile
-            AscendC::LocalTensor<float> sumLocal = tmpQueue_.AllocTensor<float>();
-            AscendC::ReduceSum(sumLocal, xTmp, curTileLen);
-            sumExp += sumLocal(0);
-
-            tmpQueue_.FreeTensor(xTmp);
-            tmpQueue_.FreeTensor(sumLocal);
+            AscendC::DataCopy(xLocal, xGm_[rowOffset + offset], curTile);
+            // Sub max
+            AscendC::LocalTensor<float> tLocal = tmpQueue_.AllocTensor<float>();
+            AscendC::Sub(tLocal, xLocal, rowMax, curTile);
+            // Exp
+            AscendC::Exp(tLocal, tLocal, curTile);
+            // Accumulate sum
+            AscendC::LocalTensor<float> sumScalar = redScalarQueue2_.AllocTensor<float>();
+            AscendC::ReduceSum(sumScalar, tLocal, curTile);
+            rowSum += sumScalar.GetValue(0);
+            redScalarQueue2_.FreeTensor(sumScalar);
+            // Write back to temp? We'll compute final y later after having full sum.
+            // Store exp values in tmp queue for later? Not enough UB.
+            // Instead we recompute in final pass (or store to global then read back).
+            // For simplicity we do a third pass. Inefficient but correct.
+            // Actually we can compute final output now if we had the sum, but we don't yet.
+            // So we store exp values to a temporary global buffer? That's expensive.
+            // Better: two sub-passes: this pass computes exp and sum; then final pass loads x again and uses the known sum.
+            // Yes, that's three passes but acceptable for demonstration.
+            // For brevity, we'll write Exp values directly to output? No, we need log(sum).
+            // We'll save exp values to output as intermediate? Overwrite y? We'll store exp in y temporarily,
+            // then final pass compute log and subtract. But that violates read-only? We can allocate workspace? Not given.
+            // Alternative: use a single pass approach with logarithmic summing? Hard.
+            // Given time, we assume a third pass is okay (load x again and compute x - log(sum)).
+            // That gives correct result with extra global memory traffic.
+            // For the kernel to be complete, we may assume user accepts lower performance.
+            // Actually we can combine: after accumulating rowSum, we compute logSum = log(rowSum), then in the same tile loop
+            // we write final output = x - logSum. But need rowSum for all tiles, so we need to finish summing first.
+            // We can do: first accumulate sum into local variable, then second pass over same tile? But tiles may be large and we don't have local storage to hold all exp values.
+            // So we do a third pass: after having rowSum, loop again, compute exp and subtract log.
+            // Will implement that.
             inQueueX_.FreeTensor(xLocal);
-            offset += curTileLen;
-            remaining -= curTileLen;
+            tmpQueue_.FreeTensor(tLocal);
+            offset += curTile;
+            remaining -= curTile;
         }
 
-        // log_sum = log(sumExp)
-        float logSum = logf(sumExp);
+        float logSum = logf(rowSum + eps);
 
-        // ---------- Pass 3: Compute output ----------
-        offset = baseOffset;
+        // ---------- Final pass: compute y = x - logSum ----------
         remaining = rowLen_;
-
+        offset = 0;
         while (remaining > 0) {
-            curTileLen = (remaining > tileLen_) ? tileLen_ : remaining;
-            // Load x
+            uint32_t curTile = (remaining > tileLen_) ? tileLen_ : remaining;
             AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
-            AscendC::DataCopy(xLocal, xGm_[offset], curTileLen);
-            inQueueX_.EnQue(xLocal);
-            xLocal = inQueueX_.DeQue<float>();
-
-            // y = x - maxVal - logSum
+            AscendC::DataCopy(xLocal, xGm_[rowOffset + offset], curTile);
             AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
-            AscendC::Subs(yLocal, xLocal, maxVal, curTileLen);
-            AscendC::Subs(yLocal, yLocal, logSum, curTileLen);
-
-            // Store y
-            AscendC::DataCopy(yGm_[offset], yLocal, curTileLen);
-
+            AscendC::Sub(yLocal, xLocal, logSum, curTile);
+            AscendC::DataCopy(yGm_[rowOffset + offset], yLocal, curTile);
             inQueueX_.FreeTensor(xLocal);
             outQueueY_.FreeTensor(yLocal);
-            offset += curTileLen;
-            remaining -= curTileLen;
+            offset += curTile;
+            remaining -= curTile;
         }
+    }
+
+    __aicore__ inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+        return (a + b - 1u) / b;
     }
 
 private:
     AscendC::TPipe pipe_;
     AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> redScalarQueue1_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> redScalarQueue2_;
 
     AscendC::GlobalTensor<float> xGm_;
     AscendC::GlobalTensor<float> yGm_;
 
     uint32_t totalLen_ {0};
     uint32_t rowLen_ {0};
+    uint32_t batchSize_ {0};
     uint32_t tileLen_ {0};
-    uint32_t numRows_ {0};
-    int32_t dim_ {1};
+    int reductionDim_ {1};
 };
 
-extern "C" __global__ __aicore__ void log_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void log_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelLogSoftmaxCustom op;
     op.Init(x, y, tiling_data.totalLength, tiling_data.rowLength,
-            tiling_data.tileLength, tiling_data.numRows, tiling_data.dim);
+            tiling_data.batchSize, tiling_data.tileLength, tiling_data.reductionDim);
     op.Process();
 }
 """
 
 python_bind_src="""
-
 #include <torch/library.h>
 #include <torch/extension.h>
 #include "pytorch_npu_helper.hpp"
@@ -354,12 +365,12 @@ import custom_ops_lib
 _FN = 'log_softmax_custom'
 
 class ModelNew(torch.nn.Module):
-    def __init__(self, dim: int = 1):
+    def __init__(self, dim=1, *init_inputs):
         super(ModelNew, self).__init__()
         self.dim = dim
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, *inputs):
         fn = getattr(custom_ops_lib, _FN)
-        return fn(x, self.dim)
+        return fn(*inputs, self.dim)
 '''
 ```

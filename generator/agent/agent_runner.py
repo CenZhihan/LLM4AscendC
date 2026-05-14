@@ -115,6 +115,13 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
             "ts": e.get("ts"),
         }
 
+    def _summarize_repair_memory_selection(sel: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(sel)
+        raw = out.get("raw_model_output") or ""
+        if len(raw) > 2000:
+            out["raw_model_output"] = raw[:2000] + "...(truncated)"
+        return out
+
     tool_calls = [
         {
             "round": t.get("round"),
@@ -136,7 +143,8 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(r, int):
             item["tool_choice"] = reasoning_by_round.get(r, {})
 
-    return {
+    repair_sel = final_state.get("repair_memory_selection")
+    report_body: Dict[str, Any] = {
         "attempt_id": int(final_state.get("attempt_id") or 1),
         "reasoning_content": final_state.get("reasoning_content", ""),
         "final_generation_reasoning_content": final_state.get("reasoning_content", ""),
@@ -156,6 +164,9 @@ def _build_report(final_state: Dict[str, Any]) -> Dict[str, Any]:
         "ascend_fetch_results_count": len(final_state.get("ascend_fetch_results", [])),
         "ascend_search_allowed_urls_count": len(final_state.get("ascend_search_allowed_urls", [])),
     }
+    if isinstance(repair_sel, dict) and repair_sel:
+        report_body["repair_memory_selection"] = _summarize_repair_memory_selection(repair_sel)
+    return report_body
 
 
 def generate_kernel_with_agent(
@@ -169,6 +180,7 @@ def generate_kernel_with_agent(
     ascend_search_version_filter: Optional[str] = None,
     retrieved_repair_memories: str = "",
     retrieved_repair_memories_applied: Optional[List[Dict[str, Any]]] = None,
+    repair_memory_selection: Optional[Dict[str, Any]] = None,
     eval_mode: str = "full",
 ) -> AgentGenerationResult:
     """
@@ -181,6 +193,8 @@ def generate_kernel_with_agent(
         llm_config: Optional LLM config (api_key, base_url, model)
         ascend_search_version_filter: Optional substring for Ascend docs ``version`` field filtering;
             ``None`` or empty means no restriction.
+        repair_memory_selection: Optional dict from repair-memory selection LLM (ids, rationale, parse);
+            written into ``report["repair_memory_selection"]`` when provided.
 
     Returns:
         AgentGenerationResult with generated_code, reasoning, and tool_usage
@@ -230,6 +244,7 @@ def generate_kernel_with_agent(
         previous_attempt_code=previous_attempt_code,
         retrieved_repair_memories=retrieved_repair_memories or "",
         retrieved_repair_memories_applied=retrieved_repair_memories_applied,
+        repair_memory_selection=repair_memory_selection,
         eval_mode=eval_mode or "full",
     )
 
