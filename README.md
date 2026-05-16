@@ -547,11 +547,46 @@ python3 generator/scripts/run_agent_multi_rounds.py \
 
 多轮脚本支持 **`--use-repair-memory`**（`run_agent_multi_rounds.py` / `run_agent_cuda_agent_multi_rounds.py`）：开启后会在 **`attempt ≥ 2`** 时从全局记忆库 **检索**若干条经验注入 Agent，并在评测通过后按规则 **写入**新记忆；默认产物根路径在 **`output/memory_on/...`**（与 `--test` 组合时为 `output/test/memory_on/...`），关闭该开关则与接入记忆前行为一致。
 
-- **存储根目录**：默认 **`<REPO_ROOT>/repair_memory/`**（`canonical/repair_memories.jsonl`、`inbox/<run_slug>/` 等）；可用 **`LLM4ASCENDC_REPAIR_MEMORY_ROOT`** 覆盖；**`LLM4ASCENDC_REPAIR_MEMORY=0`** 关闭写入与检索。
-- **自然语言**：新写入记忆的 `natural_language` 由 Review LLM 生成，**固定为英文**一句（`When ... do not ...; instead ...` 模板）；**已存在于 canonical 的历史行不会自动改写**。
-- **Manifest 选条**：选条模型所见的 manifest **不按**当前 run 的 `tool_mode` / `eval_mode` 预筛（仅 `schema_version` + 尾部窗口），便于跨工具配置复用；`query_text` 仍会带上当前 `tool_mode` / `eval_mode` 与 repair 日志供模型判断相关性。
-- **总结输入**：除评测信号外，Review 侧会附带相邻两轮 **txt 的 unified diff（有长度上限）**，便于针对具体 API/符号改动写记忆。
-- **设计说明与示例 prompt 快照**：[`docs/repair_memory_design.md`](docs/repair_memory_design.md)、[`generator/agent/_example_prompts_memory/`](generator/agent/_example_prompts_memory/)（给展示用的英文 message 实录）。
+- **存储根目录**：默认 **`<REPO_ROOT>/repair_memory/`**；可用 **`LLM4ASCENDC_REPAIR_MEMORY_ROOT`** 覆盖；**`LLM4ASCENDC_REPAIR_MEMORY=0`** 关闭写入与检索。常见子路径：
+  - `canonical/repair_memories.jsonl` — 全局记忆真源（JSONL，一行一条）
+  - `inbox/<run_slug>/` — 单次 run 待 merge 的 `mem_*.jsonl`
+  - `archive/removed_memories.jsonl` — 维护脚本删除条的完整归档（便于排查误删）
+  - `maintenance_reports/report_<timestamp>.json` — 维护 dry-run / 审阅报告
+- **单条 schema（`repair_memory_v1`）**：除 `natural_language`、tier、transition 外，支持 **`symptom_anchor_*`**（流水线表象：CPack、txt 缺块等）与 **`root_cause_anchor_*`**（编译/API 根因，从 build/eval 日志优先抽取）。旧条可无 root 字段，与新区块共存，无需迁移。
+- **自然语言**：Review LLM 生成 **英文**一句（`When ... do not ...; instead ...`）；写库前经模板校验，拒绝 CoT 污染（如 `We need to...`）。**canonical 已有行不会自动改写**。
+- **评测与 Review 日志对齐**：失败时 `eval_operator` 使用 **02-build / 06-eval 日志 tail（默认 220 行）** 与分层 `correctness_info`（`root_cause` / `symptom`）；写记忆与修代码 agent 共用 `build_attempt_error_bundle` / `format_repair_error_context`，避免 Review 只见 CPack 尾日志。
+- **Manifest 选条**：`build_manifest_lines` 每行 `id, op, category, tool_mode, tier, root, symptom, summary`；**不按**当前 run 的 `tool_mode` / `eval_mode` 预筛；选条 LLM 优先匹配 **root/summary** 中的 compile/API 线索。注入块含 `root_cause_anchor_after` / `symptom_anchor_after` + NL。
+- **总结输入**：相邻两轮 `format_attempt_signals_for_review`（含 `log_excerpt`）+ 可选 **txt unified diff**（有上限）。
+- **记忆库维护**（独立脚本，不改动保留条的 NL）：
+
+```bash
+# 预览：规则清洗 + 桶内 LLM 去重（默认 dry-run，写 report）
+python generator/scripts/maintain_repair_memory.py --model <your-model>
+
+# 仅规则清洗（不调去重 LLM）
+python generator/scripts/maintain_repair_memory.py --skip-dedup
+
+# 确认 report 后写回 canonical（.bak 备份 + 删除条进 archive）
+python generator/scripts/maintain_repair_memory.py --model <your-model> --apply
+
+# 按已审阅 report 精确删除，避免重跑 LLM 导致报告不一致（推荐）
+python generator/scripts/maintain_repair_memory.py \
+  --apply-report repair_memory/maintenance_reports/report_<timestamp>.json --apply
+```
+
+  - Phase1 **固定规则**删除：schema/模板不合格、CoT 残留、仅 CPack 表象且无 API 细节的泛泛条。
+  - Phase2 **规则分桶**（txt 缺块 / CPack / opbuild / 507035 / Shape API / compile / pybind 等）。
+  - Phase3 **桶内 LLM 去重**：只输出 `drop_ids`，不合并或改写记忆；同桶内不同修复点可都保留。
+  - `--apply-report` 默认 `remove_list`：只删 report 中列出的 id；若 report 之后又 append 了新记忆，**新条会保留**。canonical 自 report 后未变时可用 `--apply-report-mode kept_ids`。
+
+- **其它工具**：
+
+```bash
+# 从 canonical 渲染人类可读的 manifest.txt
+python generator/scripts/render_repair_memory_manifest.py
+```
+
+- **设计说明与示例 prompt 快照**：[`docs/repair_memory_design.md`](docs/repair_memory_design.md)（含 §8 维护流程）、[`generator/agent/_example_prompts_memory/`](generator/agent/_example_prompts_memory/)（Review / 选条 / inject 的英文 message 实录，已与 `root`/`symptom`/`log_excerpt` 实现对齐）。
 
 ### 3.6 配置与依赖
 
@@ -581,10 +616,13 @@ python3 generator/scripts/run_agent_multi_rounds.py \
 | `generator/agent/retrievers/ascend_docs_search_retriever.py` | 在线 Ascend 文档搜索 retriever（hiascend） |
 | `generator/agent/retrievers/ascend_docs_fetch_retriever.py` | 在线 Ascend 文档详情抓取与结构化解析 retriever |
 | `generator/agent/agent_config.py` | 工具键常量、`parse_tool_mode`、`tool_mode_to_string`、Agent LLM 本地文件加载 |
-| `generator/repair_memory/` | 跨轮修复记忆：schema、tier、写入 pipeline、manifest 选条、merge 等 |
-| `repair_memory/`（仓库根下） | 默认记忆库存储目录（`canonical/`、`inbox/`）；见 `.gitignore` |
-| `generator/agent/_example_prompts_memory/` | Repair-memory 相关 LLM prompt 英文快照（展示用） |
-| `docs/repair_memory_design.md` | 修复记忆机制设计说明（与实现对齐） |
+| `generator/repair_memory/` | 跨轮修复记忆：schema、tier、写入 pipeline、`error_signals`、manifest 选条、merge、`maintenance` 等 |
+| `generator/scripts/maintain_repair_memory.py` | 记忆库维护：规则清洗、桶内 LLM 去重、`--apply-report` 按报告写回 |
+| `generator/scripts/render_repair_memory_manifest.py` | 从 canonical 导出 `repair_memory_manifest.txt` |
+| `tools/common/error_extract.py` | 分层抽取 `root_cause` / `symptom`（eval 与 repair memory 共用） |
+| `repair_memory/`（仓库根下） | 默认记忆库：`canonical/`、`inbox/`、`archive/`、`maintenance_reports/`；见 `.gitignore` |
+| `generator/agent/_example_prompts_memory/` | Repair-memory 相关 LLM prompt 英文快照（Review / 选条 / 注入，展示用） |
+| `docs/repair_memory_design.md` | 修复记忆机制设计说明（含维护与 log parity，与实现对齐） |
 | `tools/test_ascend_docs_tools.py` | 在线文档工具本地试跑脚本（search/fetch/chain） |
 | `generator/rag/` | RAG 代码索引与嵌入检索（ChromaDB + BGE-M3） |
 | `generator/prompt_generators/` | 提示策略实现（rag、add_shot、selected_shot 等） |

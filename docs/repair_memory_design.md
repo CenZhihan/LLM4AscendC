@@ -160,7 +160,7 @@
 3. **Query**：由当前 **`op` / `category` / `tool_mode` / `eval_mode` / `attempt_id`** 与 **上一轮修复用原始日志**（`repair_error_logs_raw` 截断）拼成 **`query_text`**。
 4. **选条**：与主 agent 一致使用 **streaming** ``chat.completions``（``generator/repair_memory/llm_util.py::chat_completion_stream_content_reasoning``），累积 **``delta.content``**；若仍为空再拼 **``delta.reasoning_content``**。解析时用 **``JSONDecoder.raw_decode``** 扫描所有合法 ``{...}``：若第一个 ``memory_ids`` JSON 前仅有空白，则取 **第一个**（与 system 要求「回复首字符即 ``{``」一致）；否则取 **最后一个**（长 CoT 后再给 JSON 的情形）。``max_tokens`` 默认 **4096**。若流式异常或双空，再 **非流式** 回退一次并 ``assistant_message_text``。
 5. **取全文**：用返回的 id 在尾部窗口的完整记录里 **按 id 查表**；找不到的 id 记入 **`memory_ids_dropped`**，成功加载的 id 记入 **`memory_ids_resolved`**。
-6. **注入**：将命中记录的 **`natural_language` + tier + transition + anchors_after** 格式化为 **`format_injection_block`** 文本，写入 agent state 的 **`retrieved_repair_memories`**，供 **工具路由（choose_tool）** 与 **最终写代码（answer）** 两段 user 文本拼接使用。
+6. **注入**：将命中记录的 **`natural_language` + tier + transition + root_cause_anchor_after + symptom_anchor_after** 格式化为 **`format_injection_block`** 文本，写入 agent state 的 **`retrieved_repair_memories`**，供 **工具路由（choose_tool）** 与 **最终写代码（answer）** 两段 user 文本拼接使用。
 7. **报告**：同一轮写入 **`{op}_report.json`** 的 **`repair_memory_selection`** 字段（含 **`raw_model_output`**（过长截断）、**`selection_rationale`**、**`parse_ok`/`parse_error`**、**`memory_ids`/`memory_ids_resolved`/`memory_ids_dropped`**），与已有的 **`repair_memories_applied`**（实际注入条目的结构化摘要）并列，便于对照分析选条 agent 的决策。
 
 ##### 6. 融入检索记忆后的「算子生成」完整 prompt（写代码阶段）
@@ -180,3 +180,37 @@
 | `review_memory_llm_messages_example.txt` | Review LLM messages 实录 |
 | `select_memory_ids_llm_messages_example.txt` | 选条 LLM messages 实录 |
 | `answer_node_generation_with_memories_example.txt` | 写代码 LLM messages 实录（含记忆块） |
+
+---
+
+## 8. 记忆库维护（canonical 清洗与去重）
+
+独立脚本 **`generator/scripts/maintain_repair_memory.py`**，对 **`repair_memory/canonical/repair_memories.jsonl`** 做两阶段维护（**不**改写或凝练保留条目的 `natural_language`）：
+
+| 阶段 | 机制 | 说明 |
+| --- | --- | --- |
+| Phase 1 清洗 | 固定规则 | `validate_record` 失败、NL 不满足 Review 模板（CoT 等）、仅 CPack/INSTALL 表象且无具体 API 细节的泛泛条 → 从 canonical **删除** |
+| Phase 2 分桶 | 规则 | 按 txt 缺块 / CPack / opbuild / 507035 / Shape API / compile / pybind 等粗分类 |
+| Phase 3 去重 | 桶内 LLM | 对同桶 ≥2 条调用模型输出 `{"drop_ids":[...], "rationale":"..."}`；冗余才删，**不同修复点可都保留**；解析失败则跳过该桶 |
+
+**默认 `--dry-run`**：只写 **`maintenance_reports/report_<timestamp>.json`**，不改 canonical。审阅后加 **`--apply`**：备份 `repair_memories.jsonl.bak` → 重写 canonical（保持顺序）→ 删除条 **追加** 到 **`archive/removed_memories.jsonl`**（含 `phase` / `reason` / 完整 `record`，便于排查误删）。
+
+```bash
+# 预览（推荐先跑）
+python generator/scripts/maintain_repair_memory.py --model <your-model>
+
+# 仅规则清洗、不调 LLM
+python generator/scripts/maintain_repair_memory.py --skip-dedup --dry-run
+
+# 确认报告后写回
+python generator/scripts/maintain_repair_memory.py --model <your-model> --apply
+
+# 按已审阅的报告精确删除（不再调 LLM；避免重跑报告不一致）
+python generator/scripts/maintain_repair_memory.py \
+  --apply-report repair_memory/maintenance_reports/report_20260516T124738Z.json --apply
+
+# 若报告生成后又 append 了新记忆，用默认 remove_list 只删报告里的 id，新条会保留
+# 若 canonical 自报告后未变，也可用 --apply-report-mode kept_ids
+```
+
+实现细节见 **`generator/repair_memory/maintenance.py`**；单测 **`generator/repair_memory/tests/test_maintenance.py`**。

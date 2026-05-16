@@ -11,7 +11,7 @@ from .llm_util import (
 
 
 SYSTEM = """You pick past repair memories that help the current AscendC kernel repair task.
-Each manifest line is one memory (tab-separated fields: id, op, category, tool_mode, tier, anchor, summary).
+Each manifest line is one memory (tab-separated fields: id, op, category, tool_mode, tier, root, symptom, summary).
 
 CRITICAL (machine parsing):
 - The first non-whitespace character of your reply MUST be `{` starting the JSON object below.
@@ -27,9 +27,10 @@ Rules for selection_rationale (required, non-empty string):
 - If memory_ids is empty: briefly explain why none of the manifest lines are worth injecting for this repair (e.g. unrelated stages/ops, or empty manifest).
 
 Selection policy (prefer recall over empty):
-- If the manifest contains entries whose anchor or summary plausibly matches the current failure
+- If the manifest contains entries whose root, symptom, or summary plausibly matches the current failure
   (same error class, overlapping log phrases, same toolchain stage such as txt bundle / CPack /
   opbuild / tiling / NPU runtime), include their ids even when the originating op differs.
+- Prefer entries whose root/summary names compile/API fixes when repair_context shows C++ or kernel errors.
 - Prefer diverse, complementary hints when both are relevant.
 - Return an empty memory_ids list only when every manifest line is clearly unrelated to the query
   repair_context and operator context, or the manifest is empty."""
