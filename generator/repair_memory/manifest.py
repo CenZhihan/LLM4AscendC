@@ -47,8 +47,14 @@ def build_manifest_lines(records: List[Dict[str, Any]]) -> List[str]:
         nl = (r.get("natural_language") or "").replace("\n", " ").strip()
         if len(nl) > 160:
             nl = nl[:157] + "..."
-        anchor = extract_anchor(r.get("error_anchors_after") or r.get("correctness_info", "") or nl)
-        lines.append(f"id={mid}\top={op}\tcategory={cat}\ttool_mode={tm}\ttier={tier}\tanchor={anchor[:120]}\tsummary={nl}")
+        root_anchor = (r.get("root_cause_anchor_after") or "").strip()
+        if not root_anchor:
+            root_anchor = extract_anchor(r.get("error_anchors_after") or "")
+        symptom_anchor = (r.get("symptom_anchor_after") or r.get("error_anchors_after") or "")[:120]
+        lines.append(
+            f"id={mid}\top={op}\tcategory={cat}\ttool_mode={tm}\ttier={tier}\t"
+            f"root={root_anchor[:120]}\tsymptom={symptom_anchor}\tsummary={nl}"
+        )
     return lines
 
 

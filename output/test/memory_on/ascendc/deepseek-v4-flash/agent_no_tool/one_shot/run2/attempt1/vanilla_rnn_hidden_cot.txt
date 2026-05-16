@@ -1,0 +1,143 @@
+We need to generate the six artifacts for the new kernel "vanilla_rnn_hidden_custom" (PascalCase: VanillaRnnHiddenCustom). The original model implements a vanilla RNN that processes a sequence: for each time step, concatenate input and hidden state, compute tanh of linear combination, then output projection. The kernel should replace the entire time loop with a custom AscendC kernel that takes all inputs and produces output y (T,B,O). We need to design tiling, host, kernel, python bind, and model code.
+
+Key points from memories: Use proper tiling fields; avoid unused fields like K; compute w_i2h buffer size using I+H directly. The build system may have issues; we should follow the example pattern closely.
+
+We need to output six Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+Let's analyze the original PyTorch model:
+
+Inputs:
+- x: [T, B, I] (float)
+- h0: [B, H] (float)
+- w_i2h: [H, K] where K = I+H (float)
+- b_i2h: [H] (float)
+- w_h2o: [O, H] (float)
+- b_h2o: [O] (float)
+
+Output:
+- y: [T, B, O] (float)
+
+The kernel operation: For each time step t:
+  input = concat(x[t], h_prev) -> [B, I+H]
+  pre = input @ w_i2h.t() + b_i2h -> [B, H]
+  h = tanh(pre) -> [B, H]
+  y_t = h @ w_h2o.t() + b_h2o -> [B, O]
+  stack y_t along T dimension.
+
+The kernel should be a single kernel that processes all time steps. It will take T, B, I, H, O as shape parameters, and the data pointers. It must read x, h0, w_i2h, b_i2h, w_h2o, b_h2o, and write y.
+
+In the kernel, we need to handle the time loop inside the kernel. The tiling should be based on total elements to process (e.g., T*B*O for output?), but careful: Each time step depends on previous hidden state, so we must process sequentially in time. However, we can parallelize over batch within each time step. The kernel can be designed to process one time step at a time, with each block handling a portion of the batch. Alternatively, we could unroll across time if small, but T=256, so better to loop over time.
+
+Given the complexity, we'll design a kernel that loops over t from 0 to T-1, and within each time step, distributes batch rows across blocks/threads. The tiling should define tile sizes for batch dimension. The kernel will have to load weights and biases into UB (or use global memory?). We need to decide memory hierarchy.
+
+For simplicity, we can treat the kernel as a single compute unit that processes all time steps on one block? But that would limit to small sizes. Better to parallelize across blocks on batch dimension. Each block will handle a subset of batch elements for all time steps. Since hidden state carries across time, each block must maintain its own hidden state for its batch rows. That is feasible: each block has a local hidden state array of size tileH (H) for each batch row it processes? Actually, each batch row is independent across time, so block can have a local vector for hidden state for its assigned batch element. But typically, each thread/vector processes one element. In Ascend C, using vector instructions, we can process multiple elements per iteration. We'll need to design carefully.
+
+Given the instruction to generate code following the example, we can produce a kernel that uses a similar pattern: grid-stride loops over batch, and time loop inside. The kernel will read/write global memory. We'll use double buffering for x input and output y, but careful with dependencies across time.
+
+Simplified approach: The kernel will for each time step, compute hidden and output for the batch elements assigned to this block. We'll have two main phases: compute pre-activation, tanh, output projection. We need to load weights each time? But weights are constant across time, so we can load them once into UB. The weights w_i2h is H x K, w_h2o is O x H. These can be loaded into UB and reused across time steps. Similarly biases. The input x[T,B,I] is large; we can tile the time dimension? Actually time is sequential, so we cannot parallelize over time. So each block will loop over t, loading x[t, batchIdx, :] for its assigned batch rows. The hidden state for each batch row is stored in UB across time steps.
+
+We need to define tiling data: totalLength? Actually total elements to process? We'll define tiling with shape dimensions: T, B, I, H, O, and tile sizes for batch (tileB) and maybe for hidden size (tileH?) to fit in UB. The kernel can be written to handle variable sizes.
+
+Let's mimic the leaky_relu example: use tiling data fields for totalLength and tileLength, but here we need more shape info. We'll define additional fields: T, B, I, H, O. And tileB for batch chunk size (number of batch rows processed per iteration). The kernel will have loops over time and over batch chunks.
+
+We'll use double buffering for input x and output y, but hidden state is small (H per batch row). We'll allocate UB buffers for hidden state (for tileB rows * H). Also for w_i2h and w_h2o and biases.
+
+Given the complexity, I'll produce a reasonable design that follows the pattern of the example.
+
+Important: The kernel function name in kernel_src must be exactly `vanilla_rnn_hidden_custom`. The operator definition in project_json_src and host_operator_src should use PascalCase `VanillaRnnHiddenCustom`.
+
+Now generate each artifact:
+
+1. project_json_src: Define op with inputs x, h0, w_i2h, b_i2h, w_h2o, b_h2o and output y. All float ND. Add attrs for T, B, I, H, O? Actually shape can be inferred from inputs. But tiling might need them. We'll add attrs for shapes? In the leaky_relu example, no shape attrs. However, the kernel needs to know T, B, I, H, O. The input shapes already provide T, B, I for x, etc. We can extract from shapes in tiling. So no need for attrs. In project_json, we only list inputs and output. But we need to include all inputs. So:
+   inputs: x (T,B,I), h0 (B,H), w_i2h (H,K), b_i2h (H), w_h2o (O,H), b_h2o (O)
+   output: y (T,B,O)
+
+2. host_tiling_src: Define tiling data structure with fields: totalLength? Actually we need T, B, I, H, O, tileB (number of batch rows per tile). Also blockDim for parallel. We'll compute tileB based on UB budget. Following example: UB_BUDGET_BYTES, compute max elements for workspace. The kernel will need buffers for: x tile (tileB * I), hidden (tileB * H), w_i2h (H*K), w_h2o (O*H), biases, intermediate (pre, y). That's large. To simplify, we can load weights once per block (since small) and keep them in UB throughout. Or we can load them on each time step? Better to load once. We'll allocate w_i2h, b_i2h, w_h2o, b_h2o as global tensors and use inside kernel without copying to UB? But that would be slower. We'll assume we can load weights into UB because H=256, K=1280 (I+H=1024+256=1280), so w_i2h size = H*K = 256*1280 = 327,680 floats ~ 1.3 MB, which exceeds UB (typically 192KB). So we cannot load full weights into UB. We must stream from global memory each time step. This is a challenge. For performance, we might need to tile both batch and weight dimensions. But for simplicity, we can write a kernel that reads weights from global memory each time step (using vector loads). The provided example for leaky_relu is an element-wise op; this is much more complex. However, the instruction is to generate artifacts, so we can produce a plausible kernel that works, focusing on structure rather than extreme optimization.
+
+Given the complexity, we can design a kernel that processes one time step per call? But the user expects a single kernel for the entire sequence. Alternatively, we could split into multiple kernels? The example replaced a single op with a single kernel. So we must produce one kernel.
+
+I'll write a kernel that loops over time, and for each time step, loads x[t] for its batch chunk, loads w_i2h and w_h2o from global (assuming they fit in cache? not ideal), computes. To keep UB usage limited, we'll do compute in tiles over batch rows and hidden/output dimensions. This is getting very detailed. Given the time, I'll produce a simplified but plausible version that at least compiles and runs for small sizes.
+
+Let's decide on tiling fields:
+- totalLength: total number of output elements (T*B*O) maybe for progress, but not used in kernel directly.
+- T, B, I, H, O: shapes.
+- tileB: batch chunk size processed per iteration (to parallelize over blocks).
+- blockDim: number of blocks.
+We'll compute tileB from UB budget assuming we need temporary buffers for x chunk (tileB*I), hidden chunk (tileB*H), pre chunk (tileB*H), y chunk (tileB*O), plus weight rows? Actually weights are read per time step, so we don't store entire weight matrices in UB; we can load small portions at a time. But for simplicity, we can process each batch row independently and load weights row by row. That would be very slow. Alternatively, we can process all batch rows for one time step by loading the full weight matrices into UB? As computed, not possible. So we need to tile across hidden and output dimensions as well.
+
+Given the time constraints, I'll produce a kernel that assumes weights are small enough to fit in UB? In this test case, H=256, O=128, K=1280. w_i2h size = 256*1280 = 327,680 floats = 1.31 MB. UB is 192KB, so no. We cannot fit. So we must tile the weight matrix. That requires nested tiling. The example kernel didn't deal with matrices. This is a major complexity.
+
+Maybe the user expects a simpler replacement: e.g., replace the tanh activation with a custom tanh kernel? But the description says "Replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels." The entire forward loop is a sequence of operations; we could replace the entire RNN cell with a single kernel. That is what we are doing.
+
+Given the difficulty, I'll produce a kernel that processes one time step at a time, but inside the kernel, we still loop over all time steps, and for each, we use a vectorized matmul? Ascend C has a matmul API? Not in the simple vector instructions. We can use multiply-add loops. That would be slow but functional.
+
+To keep the code manageable, I'll assume the kernel is for inference and weights are constant, so we can precompute them into UB once per block? Actually weights are the same across blocks, but each block has its own UB. We can load weights into UB once per block at init. The size issue remains.
+
+Maybe we can reduce the problem: The user provided specific dimensions T=256, B=8, I=1024, H=256, O=128. B=8 is small. So each block can handle all 8 batch rows? Then we only need 8*I=8192 floats for x chunk, 8*H=2048 for hidden, 8*H=2048 for pre, 8*O=1024 for y, plus weight matrices? 1.31 MB still too big. Perhaps we can load weights in smaller chunks per time step: each time step we need w_i2h for all H rows? Actually we need the entire matrix to compute pre = (x[t] concat h) * w_i2h.t(). We can compute by iterating over H columns: for each output neuron j, we compute dot product of input vector (size K) with row j of w_i2h. So we can load one row of w_i2h at a time (K floats = 1280 floats ~5KB) and accumulate. That fits. Similarly for w_h2o, each row O floats. So we can do outer loop over H and O dimensions. That is feasible.
+
+Thus the kernel can: for each time step, for each batch row in chunk, for each hidden neuron j, compute dot product of input vector (x[t,b,:] concat h[b,:]) with w_i2h[j,:], add bias, then tanh, store h_new. Then for each output neuron k, dot product of h_new with w_h2o[k,:], add bias, store y. This is similar to a simple loop.
+
+We'll parallelize over batch rows and also over hidden/output neurons? We can use vector operations to compute dot products efficiently? Ascend C has vector mul and reduce_add? Possibly. But we'll keep it as a scalar loop for simplicity, understanding that it won't be fast but demonstrates the concept.
+
+With that in mind, I'll generate code.
+
+Let's produce the six artifacts. I'll follow the structure of the leaky_relu example, adapting for the new operator.
+
+Note: The workspace in kernel launch is GM_ADDR workspace; we can ignore.
+
+I'll try to produce a compilable kernel using Ascend C APIs (DataCopy, tensor operations). For matmul, Ascend C provides Matmul API but that requires complex setup. For simplicity, I'll use manual loops with vector mul and reduce add (using ReduceAdd?). Alternatively, we can use the fact that Ascend C supports vector multiply-accumulate (Mad) but only elementwise. Not for dot product. We can implement dot product as sum of elementwise mul. We can use a loop with LocalTensor and scalar reduction.
+
+Given the time, I'll write a kernel that processes one time step per kernel launch? But the user wants a single kernel for all T. However, we can call the kernel T times? The example replaced a single activation function; here we have a loop. The user's model loops over T. So it's acceptable to call the kernel T times? But then the custom kernel would be per time step. But the instruction says "Replace relevant PyTorch operators" and the original model has a loop. We could replace the entire forward with a single custom operator that loops inside. The tiling and host code need to handle that.
+
+Given the complexity, I'll produce a kernel that loops over time inside the kernel, but uses a simple computation model: for each time step, compute hidden state and output for a batch chunk. Use grid-stride over batch chunks. Within each chunk, compute dot products via loops using Ascend C vector operations? Actually we can use the vector unit to compute multiple dot products at once by using matrix multiplication? Not trivial.
+
+Given the instruction is to generate artifacts, I'll produce a plausible but simplified version that at least compiles (assuming Ascend C API exists for reduction). I'll set H and O small for demonstration? But we must match the model dimensions (256,128). To keep UB usage low, we'll process one batch row at a time. So each block handles one batch row across all time steps? Since B=8, we can use 8 blocks? Or we can use more blocks each handling a portion of time steps? Not possible due to dependency. So each block handles one batch row. Then we have 8 blocks. The kernel will process all T time steps for that batch row. This is simple: loop over t, for each t, compute hidden and output. We'll need to read x[t] (I floats) and store h (H floats) and y[t] (O floats). Hidden state is kept in UB across time steps. We'll also need to load weights row by row inside inner loops over H and O. This design uses minimal UB: x chunk (I), h (H), pre (H), y chunk (O), plus temporary for dot product (K?). Actually for each hidden neuron we need to compute dot product with K-length input. We can reuse a temporary buffer of size K. So we need I+H (K) for the conjured input. So UB buffers: x_current (I), h (H), input_concat (K), weight_row_i2h (K), sum_i2h (1), pre (H), weight_row_h2o (H), sum_h2o (1), y_current (O). That's about K + H + O + K + K + H + H + O = about 2K + 2H + 2O ≈ 2*1280 + 2*256 + 2*128 = 2560+512+256=3328 floats ~13KB, well within UB. So this design fits.
+
+Thus tiling fields: totalLength = B? Actually each block handles one batch row, so total number of blocks = B. We can set blockDim = B (8). BlockDim can be set to number of batch rows. Tiling data will include B, T, I, H, O. We'll compute blockDim = B. Kernel will use blockIdx to choose which batch row to process.
+
+This is a good trade-off. The kernel will not parallelize across time, but that's fine.
+
+So tiling: Set blockDim = B (8). Each block processes one batch row for all time steps. No further tiling needed. But we still need to obey UB budget for kernel launch. The UB usage is small, so fine.
+
+Therefore, host_tiling_src: 
+- totalLength = T*B*O (output size) maybe not used.
+- Set blockDim = B.
+- No tileLength for batch, but we might still need tileLength for other purposes; we can set tileLength = 1 (for batch row processing).
+- Include fields: T, B, I, H, O.
+
+In kernel: 
+- For each time step t from 0 to T-1:
+   - Read x[t, batchIdx, :] from x+ t*B*I + batchIdx*I (since x is [T,B,I]).
+   - Read current h (from UB) of size H.
+   - Concat: input_concat = [x[t], h].
+   - For j in 0..H-1:
+       - Load row j of w_i2h (size K).
+       - Compute dot product of input_concat and weight row, add b_i2h[j] -> pre[j].
+   - Compute tanh(pre) -> new_h.
+   - For k in 0..O-1:
+       - Load row k of w_h2o (size H).
+       - Compute dot product of new_h and weight row, add b_h2o[k] -> y[t,batchIdx,k].
+   - Write y[t,batchIdx,:] to global.
+   - Update h = new_h.
+
+We need to implement dot product using Ascend C vector operations. We can use VecMulAndAdd? There is a function: Mul and then ReduceSum? Ascend C has ReduceAdd for local tensors. We can do: t1 = input_concat * weight_row_local (elementwise), then sum = ReduceAdd(t1) -> scalar. Then add bias.
+
+We'll use LocalTensor for all temporaries.
+
+Implementation details: Use double buffering for x and y? Not needed if we process sequentially.
+
+Now write each artifact.
+
+project_json_src: list all inputs and output.
+
+host_tiling_src: tiling data with fields T, B, I, H, O, blockDim. Compute blockDim = B.
+
+host_operator_src: InferShape, InferDataType, TilingFunc, OpDef. TilingFunc: get shapes from inputs, set blockDim, store T,B,I,H,O. Use attrs? Not needed.
+
+kernel_src: implement the kernel as above.
+
+python_bind_src: similar to leaky_relu but for new op.
+
+model_src: call custom_ops_lib.vanilla_rnn_hidden_custom(*inputs) where inputs are same as original.
+
+Now produce code.

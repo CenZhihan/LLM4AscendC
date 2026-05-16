@@ -28,6 +28,10 @@ class RepairMemoryRecord:
     code_digest_before: str
     code_digest_after: str
     natural_language: str
+    symptom_anchor_before: str = ""
+    symptom_anchor_after: str = ""
+    root_cause_anchor_before: str = ""
+    root_cause_anchor_after: str = ""
     evidence_refs: List[str] = field(default_factory=list)
     created_at: str = ""
 

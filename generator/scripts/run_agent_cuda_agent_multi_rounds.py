@@ -178,33 +178,6 @@ def _extract_eval_core(payload: Dict[str, Any], op: str) -> Dict[str, Any]:
     }
 
 
-def _select_error_logs(logs: Dict[str, str]) -> List[str]:
-    preferred = ["02-build", "06-eval"]
-    selected: List[str] = []
-    for key in preferred:
-        value = (logs.get(key) or "").strip()
-        if value:
-            selected.append(value)
-    if selected:
-        return selected
-
-    fallback_order = ["01-msopgen", "03-install-run", "04-pybind-build", "05-pybind-install"]
-    for key in fallback_order:
-        value = (logs.get(key) or "").strip()
-        if value:
-            selected.append(value)
-    return selected
-
-
-def _tail_lines(raw: str, max_lines: int) -> str:
-    if max_lines <= 0:
-        return raw
-    lines = raw.splitlines()
-    if len(lines) <= max_lines:
-        return raw
-    return "\n".join(lines[-max_lines:])
-
-
 def _build_repair_error_context(
     *,
     op: str,
@@ -212,29 +185,13 @@ def _build_repair_error_context(
     selected_logs: List[str],
     max_log_lines: int,
 ) -> str:
-    core = _extract_eval_core(result_payload, op)
-    sections: List[str] = []
-    sections.append(f"=== attempt1 eval summary for {op} ===")
-    sections.append(f"compiled: {core['compiled']}")
-    sections.append(f"correctness: {core['correctness']}")
-    sections.append("")
-    if core["correctness_info"]:
-        sections.append("=== correctness_info (raw text) ===")
-        sections.append(core["correctness_info"])
-        sections.append("")
-    for p in selected_logs:
-        path = pathlib.Path(p)
-        try:
-            raw = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            sections.append(f"=== log read failed: {p} ({exc}) ===")
-            sections.append("")
-            continue
-        trimmed = _tail_lines(raw, max_lines=max_log_lines)
-        sections.append(f"=== log file: {p} (tail {max_log_lines} lines) ===")
-        sections.append(trimmed)
-        sections.append("")
-    return "\n".join(sections).strip() + "\n"
+    from generator.repair_memory.error_signals import (
+        build_attempt_error_bundle,
+        format_repair_error_context,
+    )
+
+    bundle = build_attempt_error_bundle(result_payload, op, max_log_lines=max_log_lines)
+    return format_repair_error_context(op=op, bundle=bundle, attempt_label="prior attempt")
 
 
 def _save_generation_outputs(
@@ -470,7 +427,9 @@ def run_multi_attempt_for_cuda_row(
             outcome.compiled = core["compiled"]
             outcome.correctness = core["correctness"]
             outcome.correctness_info = core["correctness_info"]
-            outcome.selected_log_paths = _select_error_logs(core["logs"])
+            from generator.repair_memory.error_signals import select_error_log_paths
+
+            outcome.selected_log_paths = select_error_log_paths(core["logs"])
 
             repair_text = _build_repair_error_context(
                 op=op_key,
@@ -502,6 +461,7 @@ def run_multi_attempt_for_cuda_row(
                         prev_code=saved_prev_for_memory,
                         curr_code=gen["result"].generated_code or "",
                         memory_root=memory_root,
+                        max_log_lines=max_log_lines,
                     )
                 except Exception:
                     pass

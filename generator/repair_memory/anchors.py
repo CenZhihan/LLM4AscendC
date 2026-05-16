@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import List
 
+from tools.common.error_extract import anchor_from_excerpt, parse_layered_correctness_info
+
 
 def _strip_paths(s: str) -> str:
     s = re.sub(r"/[\w./\-+]+", "<path>", s)
@@ -16,27 +18,10 @@ def normalize_anchor(s: str) -> str:
 
 
 def extract_anchor(text: str, max_len: int = 256) -> str:
-    """Short stable substring for manifest / comparison."""
-    raw = (text or "").strip().replace("\r\n", "\n")
-    if not raw:
-        return ""
-    lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
-    pick: List[str] = []
-    for ln in lines:
-        if any(
-            x in ln
-            for x in (
-                "error:",
-                "Error",
-                "CMake",
-                "undefined reference",
-                "fatal:",
-                "APIStatusError",
-                "correctness",
-            )
-        ):
-            pick.append(ln[:200])
-        if sum(len(x) for x in pick) >= max_len:
-            break
-    blob = " | ".join(pick) if pick else (lines[-1][:200] if lines else raw[:200])
-    return blob[:max_len]
+    """Short stable substring for manifest / comparison (prefers root_cause when layered)."""
+    root, symptom = parse_layered_correctness_info(text or "")
+    if root.strip():
+        a = anchor_from_excerpt(root, max_len=max_len)
+        if a:
+            return a
+    return anchor_from_excerpt(symptom or text, max_len=max_len)

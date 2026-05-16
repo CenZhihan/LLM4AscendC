@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .anchors import extract_anchor
 from .code_diff import format_attempt_code_diff
+from .error_signals import build_attempt_error_bundle, format_attempt_signals_for_review
 from .failure_stage import infer_failure_stage
 from .inbox import write_memory_inbox_line
 from .merge import merge_run_inbox
@@ -37,6 +37,7 @@ def maybe_write_repair_memory_after_eval(
     prev_code: str,
     curr_code: str,
     memory_root: Optional[Path] = None,
+    max_log_lines: int = 220,
 ) -> None:
     if not is_repair_memory_enabled():
         return
@@ -86,19 +87,12 @@ def maybe_write_repair_memory_after_eval(
         correctness=cc.get("correctness"),
         meta_logs=meta_c.get("logs") or {},
     )
-    anchor_b = extract_anchor(str(pc.get("correctness_info") or ""))
-    anchor_a = extract_anchor(str(cc.get("correctness_info") or ""))
 
-    prev_summary = (
-        f"compiled={pc.get('compiled')} correctness={pc.get('correctness')}\n"
-        f"failure_stage={stage_b}\nanchor={anchor_b}\n"
-        f"info_tail:\n{str(pc.get('correctness_info') or '')[-4000:]}"
-    )
-    curr_summary = (
-        f"compiled={cc.get('compiled')} correctness={cc.get('correctness')}\n"
-        f"failure_stage={stage_a}\nanchor={anchor_a}\n"
-        f"info_tail:\n{str(cc.get('correctness_info') or '')[-4000:]}"
-    )
+    bundle_prev = build_attempt_error_bundle(prev_payload, op, max_log_lines=max_log_lines)
+    bundle_curr = build_attempt_error_bundle(curr_payload, op, max_log_lines=max_log_lines)
+
+    prev_summary = format_attempt_signals_for_review(bundle_prev, failure_stage=stage_b)
+    curr_summary = format_attempt_signals_for_review(bundle_curr, failure_stage=stage_a)
 
     code_diff_text = format_attempt_code_diff(
         prev_code or "",
@@ -142,8 +136,12 @@ def maybe_write_repair_memory_after_eval(
         transition=transition,
         failure_stage_before=stage_b,
         failure_stage_after=stage_a,
-        error_anchors_before=anchor_b,
-        error_anchors_after=anchor_a,
+        error_anchors_before=bundle_prev.symptom_anchor,
+        error_anchors_after=bundle_curr.symptom_anchor,
+        symptom_anchor_before=bundle_prev.symptom_anchor,
+        symptom_anchor_after=bundle_curr.symptom_anchor,
+        root_cause_anchor_before=bundle_prev.root_cause_anchor,
+        root_cause_anchor_after=bundle_curr.root_cause_anchor,
         code_digest_before=code_digest(prev_code),
         code_digest_after=code_digest(curr_code),
         natural_language=nl,

@@ -20,13 +20,19 @@
 | 分层标签   | `tier`：`A` 或 `B`；`confidence`：`high`（仅 A）/ `medium`（B）。                              |
 | 状态转移   | 上轮与本轮的 `compiled` / `correctness` 对比（机器可读、不可由 LLM 改写）。                               |
 | 失败阶段   | `failure_stage_before` / `failure_stage_after`：由评测产物中的阶段信息（如构建链各阶段、数值评测阶段）规则映射得到粗标签。 |
-| 错误锚点   | 各轮短锚点（从 `correctness_info` 与关键日志尾部抽取的稳定子串），用于检索与人工核对。                                |
+| 错误锚点（表象） | `symptom_anchor_before` / `symptom_anchor_after`：流水线末段失败（CPack、INSTALL、opbuild、txt 缺块等）；`error_anchors_*` 与之相同，兼容旧条。 |
+| 根因锚点   | `root_cause_anchor_before` / `root_cause_anchor_after`：从 **02-build / 06-eval 日志 tail（默认 220 行）** 优先抽取的编译/API 错误（如 C++ `error:`、kernel 编译失败）；旧条可为空，manifest/inject 回退 `error_anchors_*`。 |
 | 代码侧证据  | 可选：代码摘要或 hash，用于否定「无实质改动却写记忆」。                                                       |
 | 证据引用   | 相对路径或 run 内定位：相邻两轮产物、结果 JSON、修复上下文文件等。                                               |
 | 自然语言经验 | **English** conditional: **When** [trigger] **do not** [bad] **; instead** [good]; no absolutes.            |
 
 
-**Review 模型职责**：在**规则已判定可写**之后，仅生成/润色 **`natural_language`（英文一句）**；输入含相邻两轮 **日志信号摘要** 与 **unified diff（截断）**；若与客观 `transition` 矛盾则丢弃本条。
+**Review 模型职责**：在**规则已判定可写**之后，仅生成/润色 **`natural_language`（英文一句）**；输入与下一轮修代码 agent **同源**：
+
+- 相邻两轮 `build_attempt_error_bundle`（`compiled` / `correctness` / `failure_stage` / `symptom_anchor` / `root_cause_anchor` / 分层 `correctness_info` / **02-build·06-eval log tail**）；
+- 相邻两轮 operator txt 的 **unified diff（截断）**。
+
+`eval_operator` 失败时 `correctness_info` 为分层文本（`=== root_cause ===` / `=== symptom ===`），避免仅保留 CPack 尾日志。Review 须以 **root_cause** 为 trigger 优先；输出须为单句 `When ... do not ...; instead ...`（拒绝 CoT 污染稿）。若与客观 `transition` 矛盾则丢弃本条。
 
 ---
 
@@ -78,7 +84,7 @@
 
 ## 6. 实现落地（与 Claude manifest 思路对齐）
 
-**代码位置**：`generator/repair_memory/`（`schema`、`tier_gate`、`failure_stage`、`anchors`、`inbox`、`merge`、`manifest`、`inject`、`select`、`review_llm`、`pipeline`）；多轮挂接在 `generator/scripts/run_agent_multi_rounds.py` 与 `generator/scripts/run_agent_cuda_agent_multi_rounds.py`；Agent 状态字段 `retrieved_repair_memories` / `eval_mode` 在 `generator/agent/agent_state.py`、`agent_runner.py`，注入在 `nodes/choose_tool.py` 与 `nodes/answer.py`。
+**代码位置**：`generator/repair_memory/`（`schema`、`tier_gate`、`failure_stage`、`anchors`、`error_signals`、`inbox`、`merge`、`manifest`、`inject`、`select`、`review_llm`、`pipeline`）；分层抽取纯函数在 `tools/common/error_extract.py`；多轮挂接在 `generator/scripts/run_agent_multi_rounds.py` 与 `generator/scripts/run_agent_cuda_agent_multi_rounds.py`；Agent 状态字段 `retrieved_repair_memories` / `eval_mode` 在 `generator/agent/agent_state.py`、`agent_runner.py`，注入在 `nodes/choose_tool.py` 与 `nodes/answer.py`。
 
 **存储布局**（默认根目录 `<REPO_ROOT>/repair_memory/`，可用环境变量覆盖）：
 
@@ -131,7 +137,7 @@
 
 **不是**把整段 `natural_language` 原样塞进 manifest：实现上由 **`generator/repair_memory/manifest.py::build_manifest_lines`** 为每条记忆生成 **一行**，形如：
 
-`id=<uuid>\top=<op>\tcategory=<cat>\ttool_mode=<tm>\ttier=<A|B>\tanchor=<短锚点>\tsummary=<natural_language 单行截断约160字>>`
+`id=<uuid>\top=<op>\tcategory=<cat>\ttool_mode=<tm>\ttier=<A|B>\troot=<root_cause_anchor_after 约120字>\tsymptom=<symptom_anchor_after>\tsummary=<natural_language 单行截断约160字>>`
 
 多条 manifest 用换行拼接成 `manifest_text`。**多行示例**：**`example_manifest_lines.txt`**。
 

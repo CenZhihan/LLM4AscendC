@@ -11,7 +11,8 @@ from generator.repair_memory.merge import merge_run_inbox
 from generator.repair_memory.paths import run_slug_from_run_dir
 from generator.repair_memory.schema import SCHEMA_VERSION, validate_record
 from generator.repair_memory.tier_gate import classify_tier_and_gates, code_digest
-from generator.repair_memory.inject import memory_entries_for_report
+from generator.repair_memory.inject import format_injection_block, memory_entries_for_report
+from generator.repair_memory.manifest import build_manifest_lines
 from generator.repair_memory.select import parse_memory_selection_output
 
 
@@ -101,6 +102,10 @@ class TestMemoryReportEntries(TestCase):
                 "failure_stage_after": "correctness",
                 "error_anchors_before": "e0",
                 "error_anchors_after": "e1",
+                "symptom_anchor_before": "e0",
+                "symptom_anchor_after": "e1",
+                "root_cause_anchor_before": "error: no member named 'GetValue'",
+                "root_cause_anchor_after": "",
                 "natural_language": "When compile fails with OPP install errors, do not randomize tiling; instead verify custom OPP path and reinstall.",
             }
         ]
@@ -109,6 +114,43 @@ class TestMemoryReportEntries(TestCase):
         self.assertEqual(rows[0]["memory_id"], "u1")
         self.assertEqual(rows[0]["display_order"], 1)
         self.assertIn("natural_language", rows[0])
+        self.assertIn("root_cause_anchor_before", rows[0])
+
+
+class TestManifestAndInject(TestCase):
+    def test_manifest_prefers_root_anchor(self) -> None:
+        recs = [
+            {
+                "schema_version": SCHEMA_VERSION,
+                "memory_id": "u1",
+                "op_key": "masked_cumsum",
+                "category": "math",
+                "tool_mode": "no_tool",
+                "tier": "A",
+                "error_anchors_after": "CPack Error",
+                "root_cause_anchor_after": "error: no member named 'GetValue'",
+                "symptom_anchor_after": "CPack Error",
+                "natural_language": "When GetValue is missing, do not use AscendC::GetValue; instead use tensor methods.",
+            }
+        ]
+        line = build_manifest_lines(recs)[0]
+        self.assertIn("root=", line)
+        self.assertIn("GetValue", line)
+
+    def test_injection_block_includes_root_and_symptom(self) -> None:
+        block = format_injection_block(
+            [
+                {
+                    "tier": "A",
+                    "transition": {"compiled": [False, True]},
+                    "root_cause_anchor_after": "error: cannot convert Shape",
+                    "symptom_anchor_after": "CMake Error CPack",
+                    "natural_language": "When Shape pointer types mismatch, do not assign GetOriginShape to Shape*; instead use StorageShape*.",
+                }
+            ]
+        )
+        self.assertIn("root_cause_anchor_after", block)
+        self.assertIn("symptom_anchor_after", block)
 
 
 class TestTierGate(TestCase):

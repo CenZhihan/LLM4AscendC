@@ -44,6 +44,10 @@ def memory_entries_for_report(records: List[Dict[str, Any]]) -> List[Dict[str, A
                 "failure_stage_after": rec.get("failure_stage_after", ""),
                 "error_anchors_before": (rec.get("error_anchors_before") or "")[:500],
                 "error_anchors_after": (rec.get("error_anchors_after") or "")[:500],
+                "symptom_anchor_before": (rec.get("symptom_anchor_before") or "")[:500],
+                "symptom_anchor_after": (rec.get("symptom_anchor_after") or "")[:500],
+                "root_cause_anchor_before": (rec.get("root_cause_anchor_before") or "")[:500],
+                "root_cause_anchor_after": (rec.get("root_cause_anchor_after") or "")[:500],
                 "natural_language": nl,
             }
         )
@@ -57,9 +61,12 @@ def format_injection_block(records: List[Dict[str, Any]], max_chars: int = 6000)
         tier = r.get("tier", "")
         tr = r.get("transition")
         tr_s = json.dumps(tr, ensure_ascii=False) if isinstance(tr, dict) else str(tr)
+        root_a = (r.get("root_cause_anchor_after") or "").strip()
+        sym_a = (r.get("symptom_anchor_after") or r.get("error_anchors_after") or "").strip()
         parts.append(
             f"[Memory {i}] tier={tier} transition={tr_s}\n"
-            f"anchors_after={(r.get('error_anchors_after') or '')[:200]}\n"
+            f"root_cause_anchor_after={root_a[:200]}\n"
+            f"symptom_anchor_after={sym_a[:200]}\n"
             f"{nl}"
         )
     text = "\n\n".join(parts)
