@@ -510,13 +510,86 @@ python3 tools/test_ascend_docs_tools.py \
 
 ### 3.7 多轮自动修复脚本（按轮次命名汇总）
 
-`generator/scripts/run_agent_multi_rounds.py` 现已支持 **可配置轮次**（`--max-attempts >= 2`）与 **算子级并行**（`--parallel-ops`）。算子列表可与单轮脚本对齐：**显式传 `--ops`**，或 **省略 `--ops` 并用 `--categories` + 可选 `--kernelbench102`** 从数据集中展开（规则同 `generator/scripts/generation/generate_agent.py`；例如 `--categories activation --kernelbench102` 对应 12 个激活类算子）。虚拟类别 **`test_set`** 表示学长指定的固定 12 个评测算子，列表维护在 `generator/test_set_ops.py`。
+入口：[`generator/scripts/run_agent_multi_rounds.py`](generator/scripts/run_agent_multi_rounds.py)（MKB / AscendC 单算子）；CUDA-Agent 6K 见 [`generator/scripts/run_agent_cuda_agent_multi_rounds.py`](generator/scripts/run_agent_cuda_agent_multi_rounds.py)。
 
-**自定义 OPP 与并行**：当 **`--parallel-ops > 1`** 时，每个并发子进程会把 **`LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH`**（未设置时见 [`tools/common/env.py`](tools/common/env.py) 默认仓库下 `ascend_custom_opp`）解析为逻辑根目录 **`<base>`**，再将实际安装路径设为 **`<base>/_parallel_w(slot mod parallel_ops)`**，与 **`tools/eval_operator.py --txt-dir` + `--workers > 1`** 下每个 worker 使用 `_parallel_w<id>` 的约定一致，避免多个 `.run` 同时写入同一目录覆盖 **`libcust_opapi.so`** / 头文件。当 **`--parallel-ops` 为 1** 时不创建该子目录，安装位置与过去行为相同。大规模任务结束后，可在无任务运行时按需删除 `<base>/_parallel_w*` 以回收磁盘。
+| 能力 | 说明 |
+|------|------|
+| 可配置轮次 | `--max-attempts >= 2`，**全局上限**（见下文「首轮 / 续跑」） |
+| 算子级并行 | `--parallel-ops`；每 attempt 内评测仍建议 `--eval-workers 1` |
+| 续跑 | `--continue-attempt` + `--continue-from <已有 run 目录>`，原地追加 `attempt(N+1)..M` |
+| 修复记忆 | `--use-repair-memory`，产物默认在 `output/memory_on/...`（见 [§3.7.1](#371-跨轮修复记忆repair-memory)） |
 
-**CUDA-Agent 6K 多轮**（[`generator/scripts/run_agent_cuda_agent_multi_rounds.py`](generator/scripts/run_agent_cuda_agent_multi_rounds.py)）在 **`--parallel-ops > 1`** 时采用 **相同的 OPP 沙箱规则**，避免 6k 行级并行评测时互相踩踏自定义算子安装树。
+**算子列表（首轮）**：显式 `--ops`，或 `--categories` + 可选 `--kernelbench102`（规则同 [`generate_agent.py`](generator/scripts/generation/generate_agent.py)）。虚拟类别 **`test_set`** 为固定 12 个评测算子，见 [`generator/test_set_ops.py`](generator/test_set_ops.py)。
 
-示例：
+**自定义 OPP 与并行**：当 **`--parallel-ops > 1`** 时，每个并发子进程会把 **`LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH`** 解析为 **`<base>/_parallel_w(slot mod parallel_ops)`**，与 `eval_operator --txt-dir --workers` 约定一致，避免多进程覆盖 `libcust_opapi.so`；**`--parallel-ops 1`** 时不创建子目录。
+
+#### 首轮 / 续跑语义
+
+- **首轮**：`--max-attempts 5` → 生成 `attempt1` .. `attempt5`（未 pass 的算子跑满 5 轮或中途 pass 早停）。
+- **续跑**：`--max-attempts 10` + `--continue-attempt` → 仅对**尚未 pass** 的算子继续 `attempt6` .. `attempt10`；目录名**全局连续**，**原地写入**同一 `runN` 目录（不新建 run）。
+- **pass 跳过**：`fixed_on_attempt` 已设置，或最后一次 attempt 上 `compiled` 与 `correctness` 均为 true。
+- **续修起点**：取该算子**数字最大的** `attemptK/` 中 `{op}.txt` 与 `{op}_repair_context.txt`（**不**使用「最后一次仅 compile 通过」的 attempt）。
+
+#### 续跑专用参数
+
+| 参数 | 说明 |
+|------|------|
+| `--continue-attempt` | 开启续跑 |
+| `--continue-from PATH` | **必填**（与 `--continue-attempt` 成对）；已有 run 目录，建议写绝对路径 |
+| `--max-attempts M` | 新的**全局**上限，必须 **> 源目录** 最新 `attempts{N}_summary_*.json` 中的 N |
+| `--ops` | 可选；仅续跑列出的算子（须在源 run 的 summary 中存在） |
+
+续跑时**忽略** `--run`、`--categories`、`--kernelbench102`（算子集合以源 run 的 `attempts*_summary_all_ops.json` 中 `operator_keys` 为准）。若同时传 `--out-dir`，必须与 `--continue-from` resolve 后路径一致。**勿**对同一 run 目录并行启动两个续跑进程。
+
+#### 产物路径与命名
+
+默认根目录（无 `--out-dir`）：
+
+- 常规：`output/test/ascendc/<model>/agent_<tool_mode>/<strategy>/run<k>/`（`--test`）
+- 记忆开启：`output/test/memory_on/ascendc/.../run<k>/`（`--use-repair-memory`）
+
+按 `N = --max-attempts` 命名：
+
+- 单算子：`<op>_attemptsN_summary.json`
+- 全量：`attemptsN_summary_all_ops.json`
+- 每次续跑额外：`continue_report_<UTC>.json`（审计：基于哪条绝对路径、`skip_passed` / `continue` 等）
+
+旧文件（如 `attempts5_*`）**保留**；续跑结束后会新增 `attempts10_*` 等，不覆盖历史快照。
+
+#### 示例 A：test_set + repair memory（首轮 5 轮，tmux 后台）
+
+环境（与单轮 / 评测一致，按需 export）：
+
+```bash
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate czh_environ
+cd /root/czh/LLM4AscendC
+export USE_API_CONFIG=1
+export LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH=/root/czh/LLM4AscendC/ascend_custom_opp
+export LLM4ASCENDC_REF_ON_CPU=1
+```
+
+首轮（`--run 0` 写入 `.../one_shot/run0/`，`attempt1`..`attempt5`）：
+
+```bash
+tmux new-session -d -s run_test_set_ds_v4_mem_run0 \
+  "bash -lc 'source /root/miniconda3/etc/profile.d/conda.sh && conda activate czh_environ && cd /root/czh/LLM4AscendC && export USE_API_CONFIG=1 && export LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH=/root/czh/LLM4AscendC/ascend_custom_opp && export LLM4ASCENDC_REF_ON_CPU=1 && python generator/scripts/run_agent_multi_rounds.py --model deepseek-v4-flash --categories test_set --test --tool-mode no_tool --strategy one_shot --run 0 --use-repair-memory --max-attempts 5 --parallel-ops 4 --eval-workers 1 --eval-npu 4 --eval-mode full --clean-policy force 2>&1 | tee /root/czh/LLM4AscendC/run_test_set_ds_v4_mem_test_run0.log'"
+```
+
+查看进度：`tmux attach -t run_test_set_ds_v4_mem_run0` 或 `tail -f .../run_test_set_ds_v4_mem_test_run0.log`。
+
+#### 示例 B：在同一 run 上再跑 5 轮（attempt6..10）
+
+对比各次 `attempts5_summary_all_ops.json` 中 pass 数量后，选定表现最好的 run 目录（例如 `run0`），再执行：
+
+```bash
+tmux new-session -d -s run_test_set_ds_v4_mem_run0_cont \
+  "bash -lc 'source /root/miniconda3/etc/profile.d/conda.sh && conda activate czh_environ && cd /root/czh/LLM4AscendC && export USE_API_CONFIG=1 && export LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH=/root/czh/LLM4AscendC/ascend_custom_opp && export LLM4ASCENDC_REF_ON_CPU=1 && python generator/scripts/run_agent_multi_rounds.py --model deepseek-v4-flash --test --tool-mode no_tool --strategy one_shot --use-repair-memory --continue-attempt --continue-from /root/czh/LLM4AscendC/output/test/memory_on/ascendc/deepseek-v4-flash/agent_no_tool/one_shot/run0 --max-attempts 10 --parallel-ops 4 --eval-workers 1 --eval-npu 4 --eval-mode full --clean-policy force 2>&1 | tee /root/czh/LLM4AscendC/run_test_set_ds_v4_mem_test_run0_cont.log'"
+```
+
+说明：无需 `--run` / `--categories`；`--continue-from` 指向首轮产物目录；`--max-attempts 10` 表示全局上限 10。结束后查看 `attempts10_summary_all_ops.json` 与 `continue_report_*.json`。
+
+#### 示例 C：小规模调试（前台，3 个算子）
 
 ```bash
 python3 generator/scripts/run_agent_multi_rounds.py \
@@ -531,42 +604,20 @@ python3 generator/scripts/run_agent_multi_rounds.py \
   --eval-mode full --clean-policy force
 ```
 
-输出命名规则（按 `N = --max-attempts` 动态命名）：
+#### CUDA-Agent 6K 多轮与续跑
 
-- 单算子汇总：`<op>_attemptsN_summary.json`
-- 全算子汇总：`attemptsN_summary_all_ops.json`
-
-例如 `--max-attempts 3` 时：
-
-- `gelu_attempts3_summary.json`
-- `elu_attempts3_summary.json`
-- `softmax_attempts3_summary.json`
-- `attempts3_summary_all_ops.json`
-
-**`--max-attempts` 为全局上限**：首轮 `--max-attempts 5` 生成 `attempt1`..`attempt5`；续跑时提高到 `--max-attempts 10`，仅对**尚未 pass** 的算子继续生成 `attempt6`..`attempt10`（目录编号全局连续，原地写入同一 `runN` 目录）。
-
-**续跑（`--continue-attempt`）**：
-
-- 必须同时指定 **`--continue-from <已有 run 目录>`**（解析为绝对路径）；若同时传 `--out-dir`，必须与 `--continue-from` 一致。
-- 算子列表以源 run 最新 `attempts*_summary_*.json` 为准；**`--ops`** 仅作子集过滤。续跑时忽略 **`--categories` / `--run`**。
-- 已在某轮 **pass**（`fixed_on_attempt` 或最后一次 attempt 编译+正确性均通过）的算子**跳过**。
-- 未 pass 算子从**最后一次 attempt** 的 `{op}.txt` + `{op}_repair_context.txt` 续修（**不**选「最后一次仅 compile 通过」的 attempt）。
-- 每次续跑额外写入 **`continue_report_<UTC>.json`**，记录 `continued_from` 绝对路径与每个算子的决策；全量汇总写入 `attemptsM_summary_all_ops.json`（旧 `attempts5_*` 保留不删）。
+[`run_agent_cuda_agent_multi_rounds.py`](generator/scripts/run_agent_cuda_agent_multi_rounds.py) 使用相同 OPP 沙箱规则；汇总为 `attemptsN_summary_all_rows.json`。续跑时：
 
 ```bash
-# 首轮
-python3 generator/scripts/run_agent_multi_rounds.py \
-  --categories test_set --test --use-repair-memory \
-  --max-attempts 5 --run 4
-
-# 续跑 attempt6..10（原地追加到 run4）
-python3 generator/scripts/run_agent_multi_rounds.py \
+python3 generator/scripts/run_agent_cuda_agent_multi_rounds.py \
   --continue-attempt \
-  --continue-from /path/to/.../run4 \
-  --max-attempts 10 --use-repair-memory
+  --continue-from /path/to/cuda_agent_ops_6k/.../run0 \
+  --max-attempts 10 \
+  --use-repair-memory \
+  --dataset-path /root/czh/LLM4AscendC/data/external/CUDA-Agent-Ops-6K/cuda_agent_ops_6k.jsonl
 ```
 
-**CUDA-Agent 6K 续跑**：[`run_agent_cuda_agent_multi_rounds.py`](generator/scripts/run_agent_cuda_agent_multi_rounds.py) 同样支持 `--continue-attempt` / `--continue-from`；汇总文件为 `attemptsM_summary_all_rows.json`；可用 **`--row-keys ca6k_00055 ...`** 或 **`--indices`** 过滤子集。续跑时不要对同一 run 目录并行启动多个进程。
+可选 **`--row-keys ca6k_00055 ...`** 或 **`--indices`** 仅续跑部分行。首轮仍须 **`--indices` / `--range` / `--all` 三选一**。
 
 #### 3.7.1 跨轮修复记忆（repair memory）
 
