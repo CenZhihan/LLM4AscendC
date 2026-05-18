@@ -10,7 +10,7 @@ import subprocess
 import sys
 import traceback
 from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -281,9 +281,15 @@ def run_multi_attempt_for_op(
     run_slug: str = "",
     memory_root: Optional[pathlib.Path] = None,
     use_repair_memory: bool = False,
+    start_attempt_id: int = 1,
+    seed_previous_code: str = "",
+    seed_repair_context_path: str = "",
+    prior_attempts: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if max_attempts < 2:
         raise ValueError("max_attempts must be >= 2")
+    if start_attempt_id < 1 or start_attempt_id > max_attempts:
+        raise ValueError(f"start_attempt_id must be in [1, {max_attempts}], got {start_attempt_id}")
     if not (run_slug or "").strip():
         from generator.repair_memory.paths import run_slug_from_run_dir
 
@@ -291,16 +297,16 @@ def run_multi_attempt_for_op(
     op_summary: Dict[str, Any] = {
         "op": op,
         "category": category,
-        "attempts": {},
+        "attempts": dict(prior_attempts or {}),
         "fixed_in_attempt2": False,
         "fixed_on_attempt": None,
         "max_attempts": max_attempts,
         "final_status": "unknown",
     }
-    previous_attempt_code = ""
-    previous_repair_context_path = ""
+    previous_attempt_code = seed_previous_code
+    previous_repair_context_path = seed_repair_context_path
 
-    for attempt_id in range(1, max_attempts + 1):
+    for attempt_id in range(start_attempt_id, max_attempts + 1):
         attempt_dir = run_dir / f"attempt{attempt_id}"
         outcome = AttemptOutcome(
             attempt_id=attempt_id,
@@ -496,6 +502,10 @@ def _run_single_op_job(
     run_slug: str = "",
     memory_root: Optional[pathlib.Path] = None,
     use_repair_memory: bool = False,
+    start_attempt_id: int = 1,
+    seed_previous_code: str = "",
+    seed_repair_context_path: str = "",
+    prior_attempts: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     _apply_parallel_opp_env_if_needed(op_slot=op_slot, parallel_ops=parallel_ops)
     device_id = op_slot % eval_npu
@@ -518,6 +528,10 @@ def _run_single_op_job(
         run_slug=run_slug,
         memory_root=memory_root,
         use_repair_memory=use_repair_memory,
+        start_attempt_id=start_attempt_id,
+        seed_previous_code=seed_previous_code,
+        seed_repair_context_path=seed_repair_context_path,
+        prior_attempts=prior_attempts,
     )
 
 
@@ -545,6 +559,312 @@ def _per_op_summary_filename(op: str, max_attempts: int) -> str:
 
 def _all_ops_summary_filename(max_attempts: int) -> str:
     return f"attempts{max_attempts}_summary_all_ops.json"
+
+
+def _continue_single_op_worker(
+    ent_dict: Dict[str, Any],
+    *,
+    args_dict: Dict[str, Any],
+    out_run_dir_str: str,
+    llm_config: Dict[str, Any],
+    ascend_vf: Optional[str],
+    memory_run_slug: str,
+    memory_root_str: str,
+    continued_from_abs: str,
+    continue_session_at: str,
+    new_max_attempts: int,
+    op_slot: int,
+) -> Tuple[str, Dict[str, Any]]:
+    from generator.scripts.multi_round_continue import merge_op_summary
+
+    ent = ent_dict
+    out_run_dir = pathlib.Path(out_run_dir_str)
+    memory_root = pathlib.Path(memory_root_str) if memory_root_str else None
+    seed_code = ""
+    if ent.get("seed_txt_path"):
+        seed_code = pathlib.Path(ent["seed_txt_path"]).read_text(encoding="utf-8", errors="replace")
+    from vendor.mkb.dataset import dataset
+
+    category = ent.get("category") or dataset.get(ent["entity_key"], {}).get("category", "activation")
+    new_partial = _run_single_op_job(
+        op=ent["entity_key"],
+        category=category,
+        strategy=args_dict["strategy"],
+        tool_mode=args_dict["tool_mode"],
+        llm_config=llm_config,
+        run_dir=out_run_dir,
+        eval_mode=args_dict["eval_mode"],
+        clean_policy=args_dict["clean_policy"],
+        max_log_lines=args_dict["max_log_lines"],
+        max_attempts=new_max_attempts,
+        eval_workers=args_dict["eval_workers"],
+        eval_npu=args_dict["eval_npu"],
+        op_slot=op_slot,
+        parallel_ops=args_dict["parallel_ops"],
+        ascend_search_version_filter=ascend_vf,
+        run_slug=memory_run_slug,
+        memory_root=memory_root,
+        use_repair_memory=args_dict["use_repair_memory"],
+        start_attempt_id=int(ent["last_attempt_id"]) + 1,
+        seed_previous_code=seed_code,
+        seed_repair_context_path=str(ent.get("seed_repair_context_path") or ""),
+        prior_attempts=ent.get("prior_attempts") or {},
+    )
+    merged = merge_op_summary(
+        ent.get("prior_op_summary") or {},
+        new_partial,
+        new_max_attempts=new_max_attempts,
+        continued_from_abs=continued_from_abs,
+        source_last_attempt=int(ent["last_attempt_id"]),
+        continue_session_at=continue_session_at,
+        ran_new_attempts=True,
+    )
+    return ent["entity_key"], merged
+
+
+def _run_continue_session(
+    *,
+    args: argparse.Namespace,
+    out_run_dir: pathlib.Path,
+    llm_config: Dict[str, Any],
+    resolved_model: str,
+    ascend_vf: Optional[str],
+    memory_run_slug: str,
+    memory_root: Optional[pathlib.Path],
+) -> int:
+    from generator.scripts.multi_round_continue import (
+        ContinuePlan,
+        OpContinueState,
+        aggregate_summary_filename,
+        build_continue_plan,
+        merge_op_summary,
+        per_entity_summary_filename,
+        utc_now_iso,
+        write_continue_report,
+    )
+
+    continue_session_at = utc_now_iso()
+    try:
+        plan = build_continue_plan(
+            run_dir=out_run_dir,
+            new_max_attempts=args.max_attempts,
+            kind="ascendc",
+            ops_filter=args.ops,
+            max_log_lines=args.max_log_lines,
+        )
+    except (ValueError, FileNotFoundError) as e:
+        print(f"[ERROR] {e}")
+        return 2
+
+    to_run = [e for e in plan.entities if e.action == "continue"]
+    if not to_run:
+        print(
+            "[ERROR] No operators to continue (all passed, missing seed, or already at max_attempts). "
+            f"stats: continued=0 entities={len(plan.entities)}"
+        )
+        return 2
+
+    print(
+        f"[INFO] Continue session: {len(to_run)} op(s) to run attempt "
+        f"{to_run[0].last_attempt_id + 1}..{args.max_attempts}; "
+        f"skipped={[e.entity_key for e in plan.entities if e.action != 'continue']}"
+    )
+
+    from vendor.mkb.dataset import dataset
+
+    entity_results: Dict[str, Dict[str, Any]] = {}
+    order_index = {e.entity_key: i for i, e in enumerate(plan.entities)}
+
+    def _process_entity(ent: OpContinueState, op_slot: int) -> Dict[str, Any]:
+        if ent.action != "continue":
+            return merge_op_summary(
+                ent.prior_op_summary,
+                {},
+                new_max_attempts=args.max_attempts,
+                continued_from_abs=plan.continued_from_abs,
+                source_last_attempt=ent.last_attempt_id,
+                continue_session_at=continue_session_at,
+                ran_new_attempts=False,
+            )
+        seed_code = ent.seed_txt_path.read_text(encoding="utf-8", errors="replace") if ent.seed_txt_path else ""
+        seed_repair = str(ent.seed_repair_context_path or "")
+        category = ent.category or dataset.get(ent.entity_key, {}).get("category", "activation")
+        print(
+            f"[RUN] op={ent.entity_key} continue from attempt{ent.last_attempt_id} "
+            f"-> {ent.last_attempt_id + 1}..{args.max_attempts}"
+        )
+        new_partial = _run_single_op_job(
+            op=ent.entity_key,
+            category=category,
+            strategy=args.strategy,
+            tool_mode=args.tool_mode,
+            llm_config=llm_config,
+            run_dir=out_run_dir,
+            eval_mode=args.eval_mode,
+            clean_policy=args.clean_policy,
+            max_log_lines=args.max_log_lines,
+            max_attempts=args.max_attempts,
+            eval_workers=args.eval_workers,
+            eval_npu=args.eval_npu,
+            op_slot=op_slot,
+            parallel_ops=args.parallel_ops,
+            ascend_search_version_filter=ascend_vf,
+            run_slug=memory_run_slug,
+            memory_root=memory_root,
+            use_repair_memory=args.use_repair_memory,
+            start_attempt_id=ent.last_attempt_id + 1,
+            seed_previous_code=seed_code,
+            seed_repair_context_path=seed_repair,
+            prior_attempts=ent.prior_attempts,
+        )
+        return merge_op_summary(
+            ent.prior_op_summary,
+            new_partial,
+            new_max_attempts=args.max_attempts,
+            continued_from_abs=plan.continued_from_abs,
+            source_last_attempt=ent.last_attempt_id,
+            continue_session_at=continue_session_at,
+            ran_new_attempts=True,
+        )
+
+    merged_summaries: Dict[str, Dict[str, Any]] = {}
+    if args.parallel_ops == 1:
+        slot = 0
+        for ent in plan.entities:
+            merged = _process_entity(ent, slot)
+            merged_summaries[ent.entity_key] = merged
+            entity_results[ent.entity_key] = merged
+            if ent.action == "continue":
+                slot += 1
+    else:
+        args_dict = {
+            "strategy": args.strategy,
+            "tool_mode": args.tool_mode,
+            "eval_mode": args.eval_mode,
+            "clean_policy": args.clean_policy,
+            "max_log_lines": args.max_log_lines,
+            "eval_workers": args.eval_workers,
+            "eval_npu": args.eval_npu,
+            "parallel_ops": args.parallel_ops,
+            "use_repair_memory": args.use_repair_memory,
+        }
+        memory_root_str = str(memory_root) if memory_root else ""
+        continue_entities = [e for e in plan.entities if e.action == "continue"]
+        slot_map = {e.entity_key: i for i, e in enumerate(continue_entities)}
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.parallel_ops) as ex:
+            fut_to_key = {}
+            for ent in plan.entities:
+                if ent.action != "continue":
+                    merged_summaries[ent.entity_key] = _process_entity(ent, 0)
+                    entity_results[ent.entity_key] = merged_summaries[ent.entity_key]
+                    continue
+                ent_dict = {
+                    "entity_key": ent.entity_key,
+                    "last_attempt_id": ent.last_attempt_id,
+                    "seed_txt_path": str(ent.seed_txt_path) if ent.seed_txt_path else "",
+                    "seed_repair_context_path": str(ent.seed_repair_context_path or ""),
+                    "prior_attempts": ent.prior_attempts,
+                    "prior_op_summary": ent.prior_op_summary,
+                    "category": ent.category,
+                }
+                fut = ex.submit(
+                    _continue_single_op_worker,
+                    ent_dict,
+                    args_dict=args_dict,
+                    out_run_dir_str=str(out_run_dir),
+                    llm_config=llm_config,
+                    ascend_vf=ascend_vf,
+                    memory_run_slug=memory_run_slug,
+                    memory_root_str=memory_root_str,
+                    continued_from_abs=plan.continued_from_abs,
+                    continue_session_at=continue_session_at,
+                    new_max_attempts=args.max_attempts,
+                    op_slot=slot_map[ent.entity_key],
+                )
+                fut_to_key[fut] = ent.entity_key
+            for fut in concurrent.futures.as_completed(fut_to_key):
+                key = fut_to_key[fut]
+                try:
+                    _, merged = fut.result()
+                    merged_summaries[key] = merged
+                except Exception:
+                    ent = next(e for e in plan.entities if e.entity_key == key)
+                    merged_summaries[key] = merge_op_summary(
+                        ent.prior_op_summary,
+                        {
+                            "op": key,
+                            "final_status": "op_level_parallel_runtime_failed",
+                            "error": traceback.format_exc(),
+                        },
+                        new_max_attempts=args.max_attempts,
+                        continued_from_abs=plan.continued_from_abs,
+                        source_last_attempt=ent.last_attempt_id,
+                        continue_session_at=continue_session_at,
+                        ran_new_attempts=True,
+                    )
+                entity_results[key] = merged_summaries[key]
+
+    prior_agg = plan.previous_aggregate
+    operator_keys = [e.entity_key for e in plan.entities]
+    all_summaries: Dict[str, Any] = {
+        "model": resolved_model,
+        "tool_mode": args.tool_mode,
+        "ascend_search_version_filter": ascend_vf,
+        "strategy": args.strategy,
+        "eval_mode": args.eval_mode,
+        "clean_policy": args.clean_policy,
+        "max_attempts": args.max_attempts,
+        "parallel_ops": args.parallel_ops,
+        "eval_workers": args.eval_workers,
+        "eval_npu": args.eval_npu,
+        "run_dir": str(out_run_dir),
+        "categories": prior_agg.get("categories", list(args.categories)),
+        "kernelbench102": prior_agg.get("kernelbench102", args.kernelbench102),
+        "ops_resolution": "continue_from_run",
+        "operator_keys": operator_keys,
+        "ops": {},
+        "use_repair_memory": args.use_repair_memory,
+    }
+
+    report_path = write_continue_report(
+        run_dir=out_run_dir,
+        plan=plan,
+        continue_session_at=continue_session_at,
+        model=resolved_model,
+        use_repair_memory=args.use_repair_memory,
+        entity_results=entity_results,
+    )
+    all_summaries["continue"] = {
+        "enabled": True,
+        "continued_from": plan.continued_from_abs,
+        "previous_max_attempts": plan.previous_max_attempts,
+        "new_max_attempts": args.max_attempts,
+        "continue_report": report_path.name,
+    }
+
+    for ent in sorted(plan.entities, key=lambda e: order_index.get(e.entity_key, 10**9)):
+        summary = merged_summaries[ent.entity_key]
+        all_summaries["ops"][ent.entity_key] = summary
+        per_path = out_run_dir / per_entity_summary_filename(ent.entity_key, args.max_attempts)
+        _write_json(per_path, summary)
+        print(f"[WROTE] {per_path}")
+
+    aggregate_path = out_run_dir / aggregate_summary_filename("ascendc", args.max_attempts)
+    _write_json(aggregate_path, all_summaries)
+    print(f"[WROTE] {aggregate_path}")
+    print(f"[WROTE] {report_path}")
+
+    if args.use_repair_memory:
+        try:
+            from generator.repair_memory import merge_run_inbox
+            from generator.repair_memory.paths import get_memory_root
+
+            merged_n = merge_run_inbox(get_memory_root(), memory_run_slug)
+            if merged_n:
+                print(f"[REPAIR_MEMORY] final merge: appended {merged_n} record(s) (run_slug={memory_run_slug})")
+        except Exception as exc:
+            print(f"[REPAIR_MEMORY] final merge skipped: {exc}")
+    return 0
 
 
 def _resolve_ops_for_multi_round(
@@ -651,7 +971,22 @@ def main() -> int:
             "Omit for legacy behavior without memory."
         ),
     )
+    parser.add_argument(
+        "--continue-attempt",
+        action="store_true",
+        help="Continue multi-round repair in an existing run directory (append attemptN+1..max).",
+    )
+    parser.add_argument(
+        "--continue-from",
+        type=str,
+        default="",
+        help="Existing run directory to continue from (required with --continue-attempt).",
+    )
     args = parser.parse_args()
+    if args.continue_attempt and not (args.continue_from or "").strip():
+        raise ValueError("--continue-from is required when --continue-attempt is set")
+    if (args.continue_from or "").strip() and not args.continue_attempt:
+        raise ValueError("--continue-attempt is required when --continue-from is set")
     if args.max_attempts < 2:
         raise ValueError("--max-attempts must be >= 2")
     if args.parallel_ops < 1:
@@ -681,16 +1016,28 @@ def main() -> int:
                 "[WARN] --ascend-search-version 建议在同时启用 ascend_search 与 ascend_fetch 时使用；"
                 f"当前 ascend_search={has_ascend_search(_tm)}, ascend_fetch={has_ascend_fetch(_tm)}。"
             )
-    out_run_dir = pathlib.Path(args.out_dir) if args.out_dir else _default_run_dir(
-        model_slug=model_slug,
-        tool_mode=args.tool_mode,
-        strategy=args.strategy,
-        run=args.run,
-        test=args.test,
-        use_repair_memory=args.use_repair_memory,
-    )
-    out_run_dir.mkdir(parents=True, exist_ok=True)
-    if args.use_repair_memory and args.out_dir:
+    if args.continue_attempt:
+        out_run_dir = pathlib.Path(args.continue_from).resolve()
+        if not out_run_dir.is_dir():
+            raise ValueError(f"--continue-from is not a directory: {out_run_dir}")
+        if args.out_dir:
+            out_explicit = pathlib.Path(args.out_dir).resolve()
+            if out_explicit != out_run_dir:
+                raise ValueError(
+                    f"--out-dir ({out_explicit}) must match --continue-from ({out_run_dir}) in continue mode"
+                )
+        print(f"[INFO] Continue mode: run_dir={out_run_dir} (ignoring --run and --categories)")
+    else:
+        out_run_dir = pathlib.Path(args.out_dir) if args.out_dir else _default_run_dir(
+            model_slug=model_slug,
+            tool_mode=args.tool_mode,
+            strategy=args.strategy,
+            run=args.run,
+            test=args.test,
+            use_repair_memory=args.use_repair_memory,
+        )
+        out_run_dir.mkdir(parents=True, exist_ok=True)
+    if args.use_repair_memory and args.out_dir and not args.continue_attempt:
         p = str(out_run_dir.resolve()).replace("\\", "/")
         if "memory_on" not in p:
             print(
@@ -698,6 +1045,38 @@ def main() -> int:
                 "(default when --out-dir is unset); "
                 f"current run_dir={out_run_dir}"
             )
+
+    from generator.repair_memory.paths import run_slug_from_run_dir
+
+    memory_run_slug = run_slug_from_run_dir(out_run_dir) if args.use_repair_memory else ""
+    memory_root: Optional[pathlib.Path] = None
+    if args.use_repair_memory:
+        from generator.repair_memory.paths import get_memory_root
+
+        memory_root = get_memory_root()
+
+    if args.continue_attempt:
+        prev_model = None
+        try:
+            from generator.scripts.multi_round_continue import find_latest_aggregate_summary
+
+            _sp, _ = find_latest_aggregate_summary(out_run_dir, "ascendc")
+            prev_model = json.loads(_sp.read_text(encoding="utf-8")).get("model")
+        except Exception:
+            pass
+        if prev_model and prev_model != resolved_model:
+            print(
+                f"[WARN] Continue run model ({resolved_model}) differs from previous summary ({prev_model})"
+            )
+        return _run_continue_session(
+            args=args,
+            out_run_dir=out_run_dir,
+            llm_config=llm_config,
+            resolved_model=resolved_model,
+            ascend_vf=ascend_vf,
+            memory_run_slug=memory_run_slug,
+            memory_root=memory_root,
+        )
 
     if args.ops is not None and args.kernelbench102:
         print(
@@ -748,10 +1127,6 @@ def main() -> int:
         "ops": {},
         "use_repair_memory": args.use_repair_memory,
     }
-
-    from generator.repair_memory.paths import run_slug_from_run_dir
-
-    memory_run_slug = run_slug_from_run_dir(out_run_dir) if args.use_repair_memory else ""
 
     if args.parallel_ops == 1:
         results = []

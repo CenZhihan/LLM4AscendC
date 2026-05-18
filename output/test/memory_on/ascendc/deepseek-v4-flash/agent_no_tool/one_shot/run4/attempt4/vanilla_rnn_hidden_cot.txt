@@ -1,0 +1,208 @@
+We need to fix the kernel_src to resolve the compilation errors. The errors are:
+
+1. `InitBuffer` called on `LocalTensor` directly, but it expects a `TBuf` or a queue. The earlier pattern in the example used `TQue` with `BUFFER_NUM`. The previous attempt incorrectly used `pipe.InitBuffer(inpLocal, K_ * sizeof(float))` which is wrong. It should use `TPipe` with `Que` objects, not directly on `LocalTensor`. The correct pattern is to declare `TQue` for input, output, etc., and then allocate from them.
+
+2. Matmul usage is wrong: `Matmul` class is for tiling matmul, but the previous code tried to redeclare `Matmul matmul;` while a `matmul1` member existed. The kernel needs to use proper Matmul API with `SetTensorA`, `SetTensorB`, etc., but the issue is a redeclaration conflict and incorrect usage. Also, the weight transpose assumption is problematic. The original model does `inp @ w_i2h.t()`, i.e., the weight is [H, K] and we multiply inp [B, K] by its transpose [K, H]. So w_i2h is stored as [H, K]. For Matmul we need to either transpose in the kernel or pre-transpose in host. For simplicity, we can assume weight is already transposed from the host side? But the operator's inputs come from PyTorch where w_i2h is shape [H, K]. The kernel expects w_i2h to be [K, H] to do inp (B,K) * w (K,H). We need to either transpose in kernel (inefficient) or change contract to require transposed weights. The original model uses `inp @ w_i2h.t()` so the transpose is done in the forward. The custom kernel should accept w_i2h as [H, K] and perform the transpose internally, or accept the transposed version. The cleanest: in the host operator, we can have an attribute to indicate whether weights are transposed, but that's complex. Alternative: we restrict the kernel to require w_i2h to be [K, H] (i.e., already transposed) and the python binding must pass the transposed version. But the original model forward in ModelNew should then transpose. In the previous model_src, they passed w_i2h directly from original model which is [H, K]. So we need to either transpose in model_src or in kernel. Since kernel is performance-sensitive, we should do transpose once in host (in the operator's host code) or in the python binding. The simplest fix: in model_src, pass w_i2h.t() and w_h2o.t() to the kernel, so the kernel expects transposed weights. Let's do that. Then the kernel code can treat w_i2h as [K, H] and w_h2o as [H, O].
+
+Thus, in kernel Init, we should set buffers accordingly. Also, we need to use proper pipe and queues. The kernel should process one batch at a time (batchSize_B). Each batch we concatenate x[B,I] and h[B,H] into inp[B,K]. We'll use local tensors via queues.
+
+We need to write a correct kernel that does two matmuls and a tanh. Let's design:
+
+- Use TPipe with two queues: inQueueX, inQueueH, outQueueY, outQueueHnew, etc. But matmul works on global tensors or local tensors? The Matmul class typically works on global tensors and writes to a local tensor. The API: SetTensorA(GlobalTensor), SetTensorB(GlobalTensor), SetBias(GlobalTensor), SetTensorC(LocalTensor), IterateAll(). So we can directly use global tensors for the large inputs and local for output. That avoids copying large weight matrices into UB. So we can keep w_i2h, b_i2h, w_h2o, b_h2o as global tensors. For each batch, we need the concatenated input [x[b], h[b]] which we can form by copying x[b] and h[b] from global into a local concatenated buffer, then use that as TensorA for matmul. But Matmul expects a GlobalTensor for TensorA? Actually the API: SetTensorA can take either GlobalTensor or LocalTensor? The documentation shows that Matmul can work with LocalTensor or GlobalTensor. For simplicity, we can copy the concatenated input to a local tensor and use it. Or we can use a global tensor for the concatenated input but that would require global memory allocation which is not practical. So we'll use local concatenated input.
+
+Because the batch size might be large (e.g., 8) and we process sequentially, we can allocate a single local tensor for concatenated input of one batch (size K), and reuse.
+
+We also need to handle tiling for matmul. The Matmul class expects to be initialized with tile parameters (M, N, K). We need to set the shape before IterateAll. Use SetM(1) for batch=1, SetN(hiddenSize for first matmul, outputSize for second), SetK(K for first, H for second). Also set the transpose flags: for first matmul, we want B transposed? Since we have w_i2h as [K, H] (already transposed), we do not need transpose_ to be true. For second, w_h2o is [H, O], no transpose. So we set transposeA=false, transposeB=false. Also need to set the data type.
+
+Given the complexity, we can adopt a simpler approach: use the old pattern with TQue for input and output, but since Matmul expects global tensors for A and B, we can directly use global tensors without copying into local for matmul. The only need for local is the concatenated input. We'll copy x[b] and h[b] into a local buffer, then treat that as TensorA (local). So we need a local buffer for inp. We also need local buffers for pre, hNew, y.
+
+We must avoid using `pipe.InitBuffer` on LocalTensor directly. The correct way is to allocate memory using `TBuf` or using `AllocTensor` from a `TQue`. The usual pattern is:
+
+1. Declare TQue for input and output.
+2. `pipe.InitBuffer(inQue, BUFFER_NUM, size_in_bytes);`
+3. Allocate from que: `LocalTensor<float> xLocal = inQue.AllocTensor<float>();`
+4. Copy data from global to xLocal.
+5. Enque/Deque.
+
+But for matmul, we need to keep the local tensor while matmul uses it. We can avoid queues and just use TBuf to allocate directly:
+`TBuf<TPosition::VECCALC> buf;`
+`pipe.InitBuffer(buf, size);`
+`LocalTensor<float> inpLocal = buf.Get<float>();`
+This is simpler and avoids queues. Use TBuf for each tensor we need.
+
+Let's redesign the kernel accordingly.
+
+Also fix naming: `K_` should be `K_` (inputSize_ + hiddenSize_).
+
+We'll use `Matmul` objects for the two matmuls. We'll set them up inside the loop.
+
+We need to include `matmul_operator.h`? The existing includes `kernel_operator.h` which includes matmul? Usually Matmul is in `matmul.h`. But the previous error shows `matmul1` declared as `Matmul matmul1;` at class scope. We should declare two Matmul objects as members or local inside Process. The error "use of undeclared identifier 'Matmul'; did you mean 'matmul1'?" suggests that `Matmul` class is not known in a scope where we tried to declare a new one. The previous code had `Matmul matmul1;` as a member, and later inside loop tried `Matmul matmul;` which caused conflict. So we should either declare both as members or as local variables inside Process. Since Matmul objects need to be initialized with shapes, we can declare them inside Process, but they need to be created each iteration? Better to declare as members and initialize in Init.
+
+But the member `matmul1` was declared but not initialized. The error "use of undeclared identifier 'Matmul'" occurs in the loop because `Matmul` is not a type known? Actually it is known from `kernel_operator.h`? It should be. The error line: `Matmul matmul;` - it says use of undeclared identifier 'Matmul'. That suggests that `Matmul` is not a type in the namespace. Perhaps we need to use `AscendC::Matmul` or include a specific header. In many examples, Matmul is used as `Matmul<TPosition::VECCALC, CubeFormat::ND, float>`? The simpler API with `Matmul` might be `MatmulCube`? Let's check: In AscendC, the Matmul for vector is `Matmul` class in `matmul.h`. But often it's templated. The previous attempt used `Matmul matmul1;` and the compiler didn't complain about that type, only about the re-declaration. So the type exists. The error was "use of undeclared identifier 'Matmul'; did you mean 'matmul1'?" This indicates that the compiler knows `matmul1` as an object but not the type `Matmul`? Actually the full error: "error: use of undeclared identifier 'Matmul'; did you mean 'matmul1'?" means that when trying to write `Matmul matmul;` it doesn't know what `Matmul` is, but it knows `matmul1` as a variable (of type Matmul). That suggests that the type is actually something else, maybe `Matmul` is a member variable? No, the earlier line declared `Matmul matmul1;` and that worked. So `Matmul` is a type. The error occurs in the loop because `Matmul` is not visible? Perhaps the loop is inside a nested scope? No. The error may be due to the missing semicolon after the class definition? Actually look at the previous kernel_src: after the class `KernelVanillaRnnHidden`, there is a stray `};`? Let's re-examine the previous kernel_src: It contains many errors. The simplest fix is to rewrite the kernel cleanly.
+
+Given time, we'll produce a corrected kernel_src that uses the TBuf approach and two matmul objects declared as members, properly initialized in Init. We'll also adjust the model_src to pass transposed weights (w_i2h.t(), w_h2o.t()) so the kernel can use them directly.
+
+Also fix host_tiling_src: it only passes batchSize, inputSize, hiddenSize, outputSize. But we also need K = inputSize+hiddenSize, which can be computed in kernel from those values. So fine.
+
+The host_operator_src: the InferShape currently returns shapes with dim 0 set to batchSize from x_shape->GetDim(0). But x shape from forward is [T, B, I] and we only handle one time step? The kernel is designed to process one time step's batch of data. So x shape is [B, I]. That matches.
+
+We must ensure that the operator's input descriptors in project_json and host_operator match the kernel expectations. Currently, they are fine.
+
+Now produce the corrected six strings.
+
+I'll write a corrected kernel_src:
+
+```cpp
+#include "kernel_operator.h"
+using namespace AscendC;
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelVanillaRnnHidden {
+public:
+    __aicore__ inline KernelVanillaRnnHidden() {}
+
+    __aicore__ inline void Init(
+        GM_ADDR x, GM_ADDR h, GM_ADDR w_i2h, GM_ADDR b_i2h,
+        GM_ADDR w_h2o, GM_ADDR b_h2o,
+        GM_ADDR y, GM_ADDR h_new,
+        uint32_t batchSize, uint32_t inputSize,
+        uint32_t hiddenSize, uint32_t outputSize)
+    {
+        batchSize_ = batchSize;
+        inputSize_ = inputSize;
+        hiddenSize_ = hiddenSize;
+        outputSize_ = outputSize;
+        K_ = inputSize_ + hiddenSize_;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x);
+        hGm_.SetGlobalBuffer((__gm__ float*)h);
+        w_i2hGm_.SetGlobalBuffer((__gm__ float*)w_i2h);  // weight is [K, H] (transposed)
+        b_i2hGm_.SetGlobalBuffer((__gm__ float*)b_i2h);
+        w_h2oGm_.SetGlobalBuffer((__gm__ float*)w_h2o);  // weight is [H, O] (transposed)
+        b_h2oGm_.SetGlobalBuffer((__gm__ float*)b_h2o);
+        yGm_.SetGlobalBuffer((__gm__ float*)y);
+        h_newGm_.SetGlobalBuffer((__gm__ float*)h_new);
+
+        // Initialize pipe with buffers for concatenated input (size K)
+        pipe_.InitBuffer(bufInp_, K_ * sizeof(float));
+        pipe_.InitBuffer(bufPre_, hiddenSize_ * sizeof(float));
+        pipe_.InitBuffer(bufHnew_, hiddenSize_ * sizeof(float));
+        pipe_.InitBuffer(bufY_, outputSize_ * sizeof(float));
+        // Also allocate temporary for copying h
+        pipe_.InitBuffer(bufH_, hiddenSize_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Initialize matmul objects with shapes
+        // First matmul: inp [1, K] * w_i2h [K, H] + bias [H] -> pre [1, H]
+        matmul1_.SetM(1);
+        matmul1_.SetN(hiddenSize_);
+        matmul1_.SetK(K_);
+        matmul1_.SetTransA(false);
+        matmul1_.SetTransB(false);
+        matmul1_.SetBias(b_i2hGm_);
+        // Second matmul: hnew [1, H] * w_h2o [H, O] + bias [O] -> y [1, O]
+        matmul2_.SetM(1);
+        matmul2_.SetN(outputSize_);
+        matmul2_.SetK(hiddenSize_);
+        matmul2_.SetTransA(false);
+        matmul2_.SetTransB(false);
+        matmul2_.SetBias(b_h2oGm_);
+
+        for (uint32_t b = 0; b < batchSize_; b++) {
+            // Get local tensors
+            LocalTensor<float> inpLocal = bufInp_.Get<float>();
+            LocalTensor<float> hLocal = bufH_.Get<float>();
+            // Copy x[b] and h[b] into local concatenated buffer
+            DataCopy(inpLocal, xGm_[b * inputSize_], inputSize_);
+            DataCopy(hLocal, hGm_[b * hiddenSize_], hiddenSize_);
+            DataCopy(inpLocal[inputSize_], hLocal, hiddenSize_); // concatenate
+
+            // First matmul
+            matmul1_.SetTensorA(inpLocal);       // local tensor [1, K] but treat as row-major? Actually it's [1,K] flattened to K elements.
+            matmul1_.SetTensorB(w_i2hGm_);       // global [K, H]
+            LocalTensor<float> preLocal = bufPre_.Get<float>();
+            matmul1_.SetTensorC(preLocal);       // output local [1, H]
+            matmul1_.IterateAll();
+
+            // Tanh
+            LocalTensor<float> hnewLocal = bufHnew_.Get<float>();
+            Tanh(hnewLocal, preLocal, hiddenSize_);
+
+            // Write h_new to global
+            DataCopy(h_newGm_[b * hiddenSize_], hnewLocal, hiddenSize_);
+
+            // Second matmul
+            matmul2_.SetTensorA(hnewLocal);      // local [1, H]
+            matmul2_.SetTensorB(w_h2oGm_);       // global [H, O]
+            LocalTensor<float> yLocal = bufY_.Get<float>();
+            matmul2_.SetTensorC(yLocal);         // output local [1, O]
+            matmul2_.IterateAll();
+
+            // Write y to global
+            DataCopy(yGm_[b * outputSize_], yLocal, outputSize_);
+        }
+    }
+
+private:
+    GlobalTensor<float> xGm_;
+    GlobalTensor<float> hGm_;
+    GlobalTensor<float> w_i2hGm_;
+    GlobalTensor<float> b_i2hGm_;
+    GlobalTensor<float> w_h2oGm_;
+    GlobalTensor<float> b_h2oGm_;
+    GlobalTensor<float> yGm_;
+    GlobalTensor<float> h_newGm_;
+
+    TPipe pipe_;
+    TBuf<TPosition::VECCALC> bufInp_;
+    TBuf<TPosition::VECCALC> bufH_;
+    TBuf<TPosition::VECCALC> bufPre_;
+    TBuf<TPosition::VECCALC> bufHnew_;
+    TBuf<TPosition::VECCALC> bufY_;
+
+    Matcube matmul1_;  // Actually the type might be Matmul, but we'll use Matmul
+    Matcube matmul2_;
+
+    uint32_t batchSize_;
+    uint32_t inputSize_;
+    uint32_t hiddenSize_;
+    uint32_t outputSize_;
+    uint32_t K_;
+};
+```
+
+But wait: The Matmul API might be different. The correct type is `Matmul` (from `matmul.h`). However, I've seen examples using `Matmul` with `SetTensorA(GlobalTensor)` etc. The above assumes `Matmul` has `SetM`, `SetN`, `SetK`, `SetTransA`, `SetTransB`, `SetBias`, `SetTensorA`, `SetTensorB`, `SetTensorC`, `IterateAll`. I think that's correct. But need to confirm that `SetTensorA` can take a `LocalTensor`. Usually, it can take both. The example in the leaky_relu did not use matmul. But we can rely on the API.
+
+Alternatively, we could use a simpler approach: since the matmuls are small (K up to 1280, H=256, O=128), we can implement using vectorized operations? That would be too complex. So we stick with Matmul.
+
+To be safe, we should include the matmul header if needed: `#include "matmul.h"`. But `kernel_operator.h` may already include it. We'll add it.
+
+Also note: the previous error about `Matmul` not being declared may have been due to missing include. We'll add it.
+
+Now, we also need to adjust the model_src to transpose weights before passing to the kernel. The kernel expects w_i2h to be [K, H] and w_h2o to be [H, O]. So in model_src, after getting inputs, we transpose:
+
+```python
+w_i2h_t = w_i2h.t().contiguous()  # [H, K] -> [K, H]
+w_h2o_t = w_h2o.t().contiguous()  # [O, H] -> [H, O]
+```
+
+Then call fn with these transposed versions. We also need to ensure that the kernel's input tensors are in ND format and contiguous. The original inputs are float tensors, contiguous.
+
+We'll update model_src accordingly.
+
+Now, we also need to ensure that the host_operator_src supports the transposed assumption? Not necessary, because the kernel is a black box; the host just passes the tensors as given. The operator's host_operator_src defines the op with input w_i2h of shape [H, K] and w_h2o [O, H]. The binding in python will transpose them, so the kernel receives transposed ones. This changes the contract slightly, but that's okay as long as the model_src handles it.
+
+Alternatively, we could have the kernel do the transpose internally, but that's inefficient.
+
+Thus, the correction is minimal: fix the kernel's InitBuffer usage (use TBuf), fix matmul declaration (use proper type, possibly include matmul.h), and adjust model_src to transpose weights.
+
+Also, in the kernel, we used `Matcube` by mistake; should be `Matmul`. Let's fix that.
+
+Also, in the kernel, we need to use `DataCopy` from `AscendC::DataCopy`. It's fine.
+
+One more thing: in the previous kernel, there was a `K_` variable used but not defined? It was defined as `K_ = inputSize_ + hiddenSize_`. We'll keep that.
+
+Now, produce the full corrected code.

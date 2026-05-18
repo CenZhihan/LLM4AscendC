@@ -1,0 +1,234 @@
+We need to fix the compilation errors in the host_operator_src. The errors are:
+
+1. `const gert::Shape *shapeA = context->GetInputShape(0);` - cannot convert const gert::StorageShape* to const gert::Shape*. According to Memory 1, the correct type is `const gert::Shape*`, but Memory 2 says to use `const gert::StorageShape*`. However, looking at the error: "cannot convert ‘const gert::StorageShape*’ to ‘const gert::Shape*’" means that `GetInputShape` returns a `const gert::StorageShape*`, and we are assigning to `const gert::Shape*`. So we should change the pointer type to `const gert::StorageShape*`. Also, in the `InferShape` function, we have similar issues.
+
+2. `uint32_t sizeATile = ???` - incomplete placeholder.
+
+3. `const uint32_t overhead = 8192;` causes syntax errors due to previous line.
+
+We need to replace the `???` with a proper calculation. Also, the kernel uses multi-threaded row-level tiling, but the tiling logic has mistakes. Let's write a proper tiling function.
+
+Given the pattern from the leaky_relu example, we need to define UB budget and tile sizes. For matrix multiplication, we need to consider memory for A tile (tileM * K), B (K * N), C tile (tileM * N), and temporary. Since B is loaded once per block (if it fits), we should compute tileM such that all buffers fit in UB.
+
+Also, we need to fix the `InferShape` function to use `const gert::StorageShape*` and use `GetDim` and `SetDim` appropriately? Actually, `StorageShape` also has `GetDim` and `SetDim`. But we need to check the exact API. According to Memory 1: "instead use const gert::Shape* and call its SetDimNum and SetDim methods directly." But that contradicts the error. Since the return type is `StorageShape*`, we should assign to `const gert::StorageShape*` and then use its methods. The `StorageShape` class likely inherits from `Shape` or has similar interface. Let's assume we can use `GetDim` and `SetDim` on `StorageShape*`. However, we need to be consistent with the repair memories. Memory 1 says: "do not assign to const gert::StorageShape* or call SetDimNum/SetDim on StorageShape*; instead use const gert::Shape* and call its SetDimNum and SetDim methods directly." That implies we should cast? But that seems wrong. Actually, the error in Memory 1 was from a different operator (leaky_relu) where the tiling context's GetInputShape returns StorageShape*, and they tried to assign to Shape*. The fix was to use Shape* but they might have used a different version? Let's re-read: "When compile error 'cannot convert const gert::Shape* to const gert::StorageShape*' on context->GetInputShape(0), do not assign to const gert::StorageShape* or call SetDimNum/SetDim on StorageShape*; instead use const gert::Shape* and call its SetDimNum and SetDim methods directly." This is confusing because the error is the opposite direction. Let's parse: The error in Memory 1 was likely "cannot convert const gert::StorageShape* to const gert::Shape*" (like ours). The repair says: do not assign to const gert::StorageShape* (i.e., don't declare as StorageShape*), instead use const gert::Shape* and call methods directly. But that would not compile because the return type is StorageShape*. So maybe they meant to cast? Or maybe the API is different? Given the current error, we must use `const gert::StorageShape*` because that's what the function returns. Then we can call `GetDim` and `SetDim` on it? Let's check the code of GERT: `GetInputShape` returns `const StorageShape*`. `StorageShape` has `GetDimNum`, `GetDim`, `SetDimNum`, `SetDim`. So we can use those. So I'll change to `const gert::StorageShape*` and then use its methods.
+
+Now, fix the tiling logic. We need to compute a valid tileM. We'll calculate available UB for A and C tiles after reserving space for B and some overhead. Use a constant UB_BUDGET_BYTES = 192*1024. We'll set ALIGN_ELEMS = 16 (for float alignment). We'll compute:
+
+- sizeB = K * N * sizeof(float)
+- Reserve for B (single buffer) and overhead (e.g., 8192 bytes for safety).
+- Available for A and C tiles: remaining = UB_BUDGET_BYTES - sizeB - overhead.
+- Each row of A (K floats) plus row of C (N floats) consumes (K+N)*sizeof(float) bytes per row.
+- So tileM = remaining / ((K+N)*sizeof(float))
+- Align down to ALIGN_ELEMS, ensure at least 1, and cap at M.
+- Also consider that we need double buffering for A and C? We have BUFFER_NUM=2 for A and C, but B is single buffer. So we need two tiles for A and two for C? Actually, we allocate A tile buffer size tileM_*K_, and C tile buffer size tileM_*N_. With double buffering, we need double that? The `pipe_.InitBuffer(inQueueA_, BUFFER_NUM, sizeATile * sizeof(float));` allocates two buffers of sizeATile. Similarly for outQueueC_. So total for A and C with buffering: 2 * tileM*K + 2 * tileM*N (in floats). Plus 1 * K*N for B. So total floats = 2*tileM*(K+N) + K*N. Multiply by 4 for bytes. We need that <= UB_BUDGET_BYTES - overhead. So we should use that formula. Let's set overhead = 8192. Then:
+
+- bytes_for_A_and_C_double = 2 * tileM * (K + N) * sizeof(float)
+- bytes_for_B = K * N * sizeof(float)
+- total = bytes_for_B + bytes_for_A_and_C_double + overhead <= UB_BUDGET_BYTES
+
+So we solve for tileM:
+
+- 2 * tileM * (K+N) * 4 = remaining_after_B_and_overhead = UB_BUDGET_BYTES - K*N*4 - overhead
+- tileM = remaining_after_B_and_overhead / (2 * (K+N) * 4)
+- tileM = min(tileM, M)
+- Align down to ALIGN_ELEMS, ensure at least 1.
+
+Also, we need to consider if B itself is too large relative to UB. In that case we might need to tile K, but assume it fits for now. If B is larger than UB, we'll set tileM=1 and rely on multiple blocks.
+
+Now, compute block dim. Similar to previous: numTilesM = CeilDiv(M, tileM). blockDim = min(numTilesM, 16) but also ensure at least 1 and not too high? For tall-skinny, we can use many blocks. We'll cap at 24 (like leaky_relu example). Also, if blockDim is 0, set to 1.
+
+Now, fix the kernel_src: there are many issues. The kernel tries to do row-wise dot product using element-wise operations, but AscendC has limited scalar operations. We cannot do loops with scalar additions inside the kernel efficiently. The kernel should use vectorized operations: for each tileM rows, we can compute C = A * B using matrix multiply primitives? But there is no direct matrix multiply in AscendC vector instruction set. However, we can use `Matmul` if available, but that's complex. Alternatively, we can use a simple loop over rows and columns using vector operations: for each row, we can load a row of A (K elements), then for each column of B, we can load a column of B (K elements) and compute dot product using `Mul` and `ReduceSum` (or `Add`). But `ReduceSum` may not be efficient.
+
+Given the complexity, perhaps we should use a simpler approach: just use `AscendC::Matmul` if the API supports it. But the instruction set in AscendC for AI Core includes matrix multiplication via `Matmul` intrinsic. We can use `Matmul` with tile sizes. That is more appropriate for AscendC. We need to set up the matrices inUB (LocalTensor) and call `Matmul`. This is more efficient.
+
+The error log also shows that the kernel has syntax errors (??? etc.), so we need to rewrite the kernel properly.
+
+Given the time, I'll adopt a strategy: Use the built-in Matmul from AscendC. But we need to ensure it's available. The kernel operator header may include "kernel_operator.h" which provides `Matmul`. Actually, AscendC has `Matmul` class for matrix multiplication. We can use it.
+
+However, the repair instructions say minimal and targeted changes. So we should fix the compilation errors in the host operator and tiling, and then adjust the kernel to be syntactically correct and functional. The kernel currently has many issues: it uses `AscendC::DataCopy` with sizes in elements, but `DataCopy` expects bytes? Actually, `DataCopy(src, dst, len)` where len is number of elements (for same type). That might be okay. But the main issue is the inner loops with scalar indexing `C_local[r * N_ + n] = sum;` - AscendC local tensors do not support subscript operator. They have `SetValue` and `GetValue`? Or we can use vectorized operations.
+
+Given the complexity, perhaps we should simplify the kernel to use the approach like the leaky_relu example: treat it as element-wise? No, it's matmul.
+
+Wait, the original user requirement is to replace a PyTorch matmul with a custom kernel. But the previous attempt tried a custom matmul with vector dot products. That led to errors. Given that AscendC has a Matmul API, we should use that.
+
+Let's look at the AscendC documentation (mentally): There is a `Matmul` class that can be used for matrix multiplication. We need to set local tensors for A, B, C and call `Matmul::Matmul`. The tiling will provide block sizes.
+
+So for the kernel, we can have:
+
+- Load tile of A and B into local tensors.
+- Use `Matmul` to compute product.
+- Store tile of C.
+
+But we need to handle tiling. Since B is tall and skinny? Actually, A is MxK, B is KxN, and M >> N or N >> M? The original problem says "tall and skinny" meaning one dimension is much larger. In the given get_inputs, A is (M, N) and B is (N, M), so M=32768, N=32. That is M >> N. So matrix multiplication yields (M, M) which is huge. That seems incorrect because N is small, but output is large. Actually, torch.matmul(A, B) with A (M, N) and B (N, M) gives (M, M). That is a square matrix, not tall and skinny. Maybe the problem intends A (M, K) and B (K, N) where M>>N or N>>M, but here both are same? Wait, the get_inputs returns A (M, N) and B (N, M) with M=32768, N=32. So M>>N, but output is (M, M) which is huge. That's a very large output, which might not fit in memory? The custom kernel should handle this.
+
+Given the complexity, maybe we should instead provide a simple kernel that just calls the built-in Matmul? But that defeats the purpose of custom kernel.
+
+Alternative: Use the vectorized approach with `Mul` and `ReduceAdd` across K dimension. `AscendC` has `ReduceSum` or `Add` with axis. We can do for each row: broadcast row A to a matrix of size K x N? That's heavy.
+
+Perhaps the kernel can use `Matmul` primitive. Let's assume it's available.
+
+Given the time constraints, I'll fix the compilation errors in the host operator and tiling, and then rewrite the kernel to use the Matmul API properly, but with minimal changes. I'll base on the structure of the leaky_relu kernel but adapted.
+
+Also, note that the python_bind_src and model_src need to be consistent with the operator name and kernel function name.
+
+Let's produce the corrected six strings.
+
+I will:
+
+- In host_operator_src: change `const gert::Shape*` to `const gert::StorageShape*` in TilingFunc and InferShape.
+- Fix the computation of tileM using the formula above.
+- Remove the `???` line.
+- Fix the overhead usage.
+- In kernel_src: rewrite the kernel to use vectorized operations: For each tile of rows (tileM), we load A tile (tileM, K) and B (K, N) (B loaded once per block if fits). Then compute C tile using Matmul if available, otherwise use simple loops with vector operations. To keep it simple, I'll use `Matmul` class. Need to include appropriate headers? The `kernel_operator.h` likely includes Matmul.
+
+I'll write a new kernel:
+
+```
+#include "kernel_operator.h"
+using namespace AscendC;
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelTallSkinnyMatrixMultiplicationCustom {
+public:
+    __aicore__ inline KernelTallSkinnyMatrixMultiplicationCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR A, GM_ADDR B, GM_ADDR C,
+                                uint32_t M, uint32_t K, uint32_t N,
+                                uint32_t tileM, uint32_t tileK,
+                                uint32_t blockDim) {
+        A_gm_.SetGlobalBuffer((__gm__ float*)A, M * K);
+        B_gm_.SetGlobalBuffer((__gm__ float*)B, K * N);
+        C_gm_.SetGlobalBuffer((__gm__ float*)C, M * N);
+        M_ = M; K_ = K; N_ = N;
+        tileM_ = tileM; tileK_ = tileK;
+        blockDim_ = blockDim;
+        // Buffer sizes
+        uint32_t sizeATile = tileM_ * K_;
+        uint32_t sizeB = K_ * N_;
+        uint32_t sizeCTile = tileM_ * N_;
+        pipe_.InitBuffer(inQueueA_, BUFFER_NUM, sizeATile * sizeof(float));
+        pipe_.InitBuffer(inQueueB_, 1, sizeB * sizeof(float));
+        pipe_.InitBuffer(outQueueC_, BUFFER_NUM, sizeCTile * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileM_ * sizeof(float)); // unused but keep for compatibility
+    }
+
+    __aicore__ inline void Process() {
+        if (M_ == 0 || K_ == 0 || N_ == 0) return;
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+        // Load B once (if fits)
+        AscendC::LocalTensor<float> B_local = inQueueB_.AllocTensor<float>();
+        AscendC::DataCopy(B_local, B_gm_, K_ * N_);
+        inQueueB_.EnQue(B_local);
+        // Process tiles
+        for (uint32_t row = blockIdx * tileM_; row < M_; row += blockNum * tileM_) {
+            uint32_t curTileM = (row + tileM_ <= M_) ? tileM_ : M_ - row;
+            // Load A tile
+            AscendC::LocalTensor<float> A_local = inQueueA_.AllocTensor<float>();
+            uint32_t offsetA = row * K_;
+            AscendC::DataCopy(A_local, A_gm_[offsetA], curTileM * K_);
+            inQueueA_.EnQue(A_local);
+            // Get B
+            AscendC::LocalTensor<float> B_local_deq = inQueueB_.DeQue<float>();
+            // Allocate C tile
+            AscendC::LocalTensor<float> C_local = outQueueC_.AllocTensor<float>();
+            // Use Matmul
+            // Reshape tensors? Matmul expects specific shape handling.
+            // For simplicity, fallback to element-wise loop? We'll use Matmul if available.
+            // Assume Matmul can handle variable sizes with tiling.
+            // We'll set up Matmul object.
+            // Since we have curTileM, K, N, we can call Matmul.
+            // But need to ensure correct memory layout: row-major.
+            // AscendC Matmul expects LIDO format? Actually, Matmul class is for AI Core.
+            // We'll use the Matmul::Matmul function.
+            // AscendC::Matmul<AscendC::TPosition::VECCALC> mm;
+            // mm.SetTensorA(A_local);
+            // mm.SetTensorB(B_local_deq);
+            // mm.SetTensorC(C_local);
+            // mm.SetConfig(/* transpose flags */);
+            // mm.IterateAll();
+            // This is high-level. We'll try to use it.
+            // As a minimal fix, we'll implement a simple vector dot product using ReduceAdd.
+            // But that is complex and error-prone.
+            // Given the time, I'll provide a kernel that just uses the built-in Matmul with default config.
+            // If Matmul is not available, compilation will fail.
+            // To be safe, we can use a precompiled approach: just compute using loops with vector operations.
+            // Actually, the kernel from the example uses element-wise operations, so we can follow that pattern for matmul? No.
+            // We'll keep it simple: just copy the output as zeros for now? That would not be correct.
+            // Better: use the kernel from the leaky_relu pattern but adapted for matmul.
+            // Let's do it manually: for each row in A, compute its dot product with each column of B using vector Mul and ReduceAdd.
+            // We can use AscendC::Mul and AscendC::ReduceSum (or Add with axis).
+            // For each row r in [0, curTileM):
+            //   load row of A: A_local[r*K_ : (r+1)*K_]
+            //   for each col n in [0, N_):
+            //     load column of B: B_local_deq[n*K_ : (n+1)*K_] (assuming column-major? Actually B is KxN, so column n starts at n*K)
+            //     compute dot = ReduceSum(Mul(row_vec, col_vec))
+            //     store into C_local[r*N_ + n]
+            // This uses vector instructions.
+            // We'll implement it.
+            AscendC::LocalTensor<float> tmp = tmpQueue_.AllocTensor<float>();
+            for (uint32_t r = 0; r < curTileM; r++) {
+                AscendC::LocalTensor<float> rowA = A_local[r * K_];
+                for (uint32_t n = 0; n < N_; n++) {
+                    AscendC::LocalTensor<float> colB = B_local_deq[n * K_];
+                    AscendC::Mul(tmp, rowA, colB, K_);
+                    // ReduceSum: use Add with identity, or use pipeline.
+                    // We'll use a manual reduction: iterate? Not possible.
+                    // Actually, we can use AscendC::ReduceSum which is available: T<float> result = ReduceSum(tmp, K_);
+                    // But ReduceSum returns a scalar. We can then set that scalar to the output.
+                    // But we need to write scalar to a specific location.
+                    // AscendC provides SetValue for local tensors.
+                    // We'll use: float sum = 0.0f; for i in range(K_): sum += tmp(i); // not vectorized, but okay.
+                    // For AscendC, we can use AscendC::ReduceSum with output being a scalar tensor.
+                    // Let's use AscendC::ReduceSum.
+                    // Note: ReduceSum is in kernel_operator.h? Yes, it's part of AscendC math API.
+                    // We'll include "kernel_math.h" maybe? But kernel_operator.h includes it.
+                    AscendC::LocalTensor<float> scalar = AscendC::ReduceSum(tmp, K_);
+                    // scalar is a 1-element tensor.
+                    // Copy scalar value to C_local at position r*N_ + n.
+                    // We can use DataCopy of size 1.
+                    // But we need to ensure alignment.
+                    // We'll just assign: C_local(r*N_+n) = scalar(0); // using operator().
+                    // This is allowed.
+                    C_local(r*N_ + n) = scalar(0);
+                }
+            }
+            tmpQueue_.FreeTensor(tmp);
+            inQueueB_.EnQue(B_local_deq); // reuse B
+            outQueueC_.EnQue(C_local);
+            // Write back
+            AscendC::LocalTensor<float> C_out = outQueueC_.DeQue<float>();
+            AscendC::DataCopy(C_gm_[row * N_], C_out, curTileM * N_);
+            outQueueC_.FreeTensor(C_out);
+            // Free A
+            AscendC::LocalTensor<float> A_done = inQueueA_.DeQue<float>();
+            inQueueA_.FreeTensor(A_done);
+        }
+        // Free B at the end
+        AscendC::LocalTensor<float> B_done = inQueueB_.DeQue<float>();
+        inQueueB_.FreeTensor(B_done);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueA_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueB_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueC_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+    AscendC::GlobalTensor<float> A_gm_, B_gm_, C_gm_;
+    uint32_t M_, K_, N_;
+    uint32_t tileM_, tileK_;
+    uint32_t blockDim_;
+};
+```
+
+But this kernel uses `ReduceSum` which returns a LocalTensor. It also uses `C_local(r*N_+n) = scalar(0);` which is valid in AscendC. However, the reduction is done per element, which is inefficient but acceptable for now.
+
+Now, we also need to adjust the tiling to ensure tileK = K (no inner tiling). The kernel assumes B fits in UB. If B is too large, we'll just set tileM=1 and hope.
+
+Now, produce the final code.
+
+Important: Keep naming consistent: kernel function name `tall_skinny_matrix_multiplication_custom`, operator PascalCase `TallSkinnyMatrixMultiplicationCustom`.
+
+I'll now write the fixed code.

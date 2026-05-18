@@ -6,12 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from generator.repair_memory.error_signals import select_error_log_paths
 from generator.scripts.run_agent_multi_rounds import (
     _attempt_failed,
     _build_repair_error_context,
     _resolve_ops_for_multi_round,
     _run_eval_for_txt,
-    _select_error_logs,
     run_multi_attempt_for_op,
 )
 from generator.test_set_ops import TEST_SET_OP_KEYS, select_ops_by_categories
@@ -101,7 +101,7 @@ class TestTwoRoundRunnerHelpers(unittest.TestCase):
             "06-eval": "/tmp/06.log",
             "04-pybind-build": "/tmp/04.log",
         }
-        selected = _select_error_logs(logs)
+        selected = select_error_log_paths(logs)
         self.assertEqual(selected, ["/tmp/02.log", "/tmp/06.log"])
 
     def test_select_error_logs_falls_back_when_no_build_eval(self):
@@ -109,7 +109,7 @@ class TestTwoRoundRunnerHelpers(unittest.TestCase):
             "01-msopgen": "/tmp/01.log",
             "04-pybind-build": "/tmp/04.log",
         }
-        selected = _select_error_logs(logs)
+        selected = select_error_log_paths(logs)
         self.assertEqual(selected, ["/tmp/01.log", "/tmp/04.log"])
 
     def test_build_repair_context_keeps_raw_text_sections(self):
@@ -125,7 +125,13 @@ class TestTwoRoundRunnerHelpers(unittest.TestCase):
                         "correctness": False,
                         "correctness_info": "raw correctness info",
                     }
-                }
+                },
+                "meta": {
+                    "logs": {
+                        "02-build": str(build_log),
+                        "06-eval": str(eval_log),
+                    }
+                },
             }
             ctx = _build_repair_error_context(
                 op="softmax",

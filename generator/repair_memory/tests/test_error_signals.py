@@ -10,7 +10,8 @@ from generator.repair_memory.error_signals import (
     format_repair_error_context,
     select_error_log_paths,
 )
-from generator.repair_memory.review_llm import _has_template_parts
+from generator.repair_memory.nl_patches import NL_PATCHES
+from generator.repair_memory.review_llm import _has_scenario_scope, _has_template_parts
 from tools.common.tests.test_error_extract import MASKED_CUMSUM_TAIL
 
 
@@ -56,6 +57,34 @@ class TestErrorSignals(unittest.TestCase):
             "do not call AscendC::GetValue on LocalTensor; instead use GetValue/SetValue methods."
         )
         self.assertTrue(_has_template_parts(good))
+
+    def test_review_rejects_shape_advice_without_scope(self) -> None:
+        vague = (
+            "When GetInputShape returns Shape*, do not assign StorageShape*; "
+            "instead use const gert::Shape* and SetDimNum."
+        )
+        self.assertTrue(_has_template_parts(vague))
+        self.assertFalse(_has_scenario_scope(vague))
+
+    def test_review_accepts_shape_advice_with_infershape_scope(self) -> None:
+        scoped = (
+            "When opbuild fails in InferShape with cannot convert Shape* to StorageShape*, "
+            "do not use StorageShape* from GetInputShape; instead use const gert::Shape* and SetDim."
+        )
+        self.assertTrue(_has_template_parts(scoped))
+        self.assertTrue(_has_scenario_scope(scoped))
+
+    def test_nl_patches_pass_validation(self) -> None:
+        for mid, nl in NL_PATCHES.items():
+            self.assertTrue(_has_template_parts(nl), msg=mid)
+            self.assertTrue(_has_scenario_scope(nl), msg=mid)
+
+    def test_review_accepts_non_shape_without_host_scope(self) -> None:
+        txt = (
+            "When parse_txt_bundle raises ValueError for missing host_operator_src in the txt bundle, "
+            "do not omit blocks; instead include host_operator_src, kernel_src, and python_bind_src."
+        )
+        self.assertTrue(_has_scenario_scope(txt))
 
 
 if __name__ == "__main__":

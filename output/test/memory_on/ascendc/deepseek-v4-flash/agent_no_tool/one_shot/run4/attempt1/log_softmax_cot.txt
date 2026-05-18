@@ -1,0 +1,98 @@
+We need to generate the six Python strings for a custom AscendC kernel for log_softmax. The kernel name is log_softmax_custom (and PascalCase LogSoftmaxCustom). The original model uses torch.log_softmax(x, dim=dim). We need to replace this with a custom kernel.
+
+We must produce: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+Let's think about the log_softmax operation. It's softmax then log: log_softmax(x_i) = x_i - log(sum_j exp(x_j)) along a dimension. For simplicity, we can assume the input is 2D (batch_size, dim) and we apply along dim=1 (the feature dimension). The kernel should handle that. We'll design the kernel to compute log_softmax along the last dimension (or we can pass dim as an attribute). In the original model, dim is specified as 1. So we can hardcode dim=1 in the kernel's tiling/host, or better, pass it as an attribute. Since the original model allows different dim, we should support it. But the user instruction only shows that the forward takes a tensor, and the dim is stored as self.dim, but in get_inputs() they only pass x. The original model has dim=1 as default. So we'll create a kernel that takes the dim as an attribute. However, in the example leaky_relu, the negative_slope is an attribute. So we'll make dim an attribute.
+
+Now, we need to implement log_softmax efficiently on AscendC. Common approach: for each row, compute max, subtract, exponentiate, sum, then compute log and subtract. We'll use vector instructions. We'll need to handle multi-dimensional tensors? For simplicity, we can assume input is 2D and compute along columns (dim=1). But we can also generalize using strides. Given the complexity, I'll design for 2D with dim=1, but include dim as an attribute for generality. The host tiling will set the tile length appropriately.
+
+We need to define the tiling data structure: totalLength, tileLength, blockDim, dim (int). Also perhaps the number of rows and cols. Since we process row by row, we can treat the input as contiguous in memory along the last dimension. For 2D tensor of shape (N, D), the data layout is rows contiguous. We can process each row independently. We'll tile along rows? Or tile along the entire data? Since rows are independent, we can assign rows to blocks. Better to use grid-stride loops over rows.
+
+We'll define tiling data: totalLen (total number of elements), rowLen (length of each row), numRows, tileLen (elements per tile? Actually we need to tile the row processing because each row is long: 393216 elements). So we need to process each row in chunks (tiles). The tile length should be based on UB budget. For each tile, we need to compute max, exp, sum, etc. We'll need multiple local tensors: input, output, max, sum, etc. Let's design.
+
+For each row, compute global max of that row (reduction), then compute exp(x - max) and sum, then log and subtract. To avoid two passes, we could compute max first, then compute exp and sum simultaneously using vector operations. We'll do two phases: first find max per row, then compute exp and sum, then log and subtract. But in AscendC, we can use reduction operations. However, we need to be careful with UB usage.
+
+We can use the following algorithm:
+- For each row, iterate over tiles.
+- Tile 1: compute max of the tile (using ReduceMax), then accumulate row max (using pipe with a scalar variable). After processing all tiles, we have rowMax.
+- Tile 2: for each tile, compute exp(x - rowMax) and accumulate sum (using ReduceAdd). After all tiles, we have rowSum.
+- Tile 3: for each tile, compute log(rowSum) (scalar) and subtract from x after subtracting rowMax? Wait: log_softmax(x) = x - log(sum(exp(x))) actually: softmax(x) = exp(x - max) / sum(exp(x - max)). So log_softmax(x) = (x - max) - log(sum(exp(x - max))). So we need max and logSumExp = max + log(sum(exp(x-max))). So we can compute: x - max, then sum of exp, then log, then subtract from (x - max) to get log_softmax. Alternatively, compute log_sum_exp = max + log(sum(exp(x-max))). Then output = x - log_sum_exp.
+
+Implementation steps per row:
+1. Compute max of row (reduction).
+2. Compute sum of exp(x_i - max) (reduction).
+3. Compute logSumExp = max + log(sum).
+4. For each element, output = x - logSumExp.
+
+To avoid multiple passes, we can do: first pass compute max, second pass compute exp and sum, third pass compute output. But each pass touches the same tile. We can combine second and third passes? Not easily because we need sum before we compute log. So we need at least three passes per tile (max, then exp+sum, then output). But we can pipeline with double buffering like leaky_relu. However, the reductions need to be done across tiles within a row. That's tricky with pipelining because reductions are cross-tile. We could do all three passes sequentially within each row but tile-wise with double buffering to overlap DMA? Actually, for log_softmax, we need to compute per-row reduction. It's not element-wise independent like leaky_relu. So we need to process all tiles of a row to compute max and sum before we can compute the final output. This implies that for each row, we need to load the entire row into UB (or process in two stages: first pass over all tiles to compute max and store the row in global or UB? But UB size limits). The usual approach for softmax on AscendC is to process rows in tiles, but you need to keep the entire row in UB to do the reduction? Actually, you can do reduction across tiles using a scalar accumulator, but you need to read each tile twice: once for max, then again for exp+sum and then output. That means you need to reload the same row twice. That's okay.
+
+A common pattern for softmax on AscendC: For each row, first compute max by iterating over tiles (using a scalar variable to hold the max), then compute exp and sum by iterating again (using scalar sum), then compute output by iterating again. This is three passes over the row. This can be done with double buffering to overlap loading and computing, but since we need to compute reduction across tiles, we cannot pipeline across rows? We can pipeline rows: while processing row r, we can preload row r+1? But careful with dependencies.
+
+For simplicity, I'll implement a straightforward kernel that processes rows sequentially, with tile loops for each phase. This may not be fully optimized but will work. Alternatively, we can do the max-reduce and sum-reduce in a single pass using vector reduction intrinsics? There are instructions like ReduceMax, ReduceAdd. But they operate on a local tensor of a tile. To accumulate across tiles, we need to use scalar variables. So three passes.
+
+We'll design the kernel to handle a 2D input. We'll have attributes: dim (int). The tiling will provide rowLen (number of elements per row), numRows (total rows = totalLen/rowLen), tileLen (elements per tile). We'll iterate over rows, and for each row, we iterate over tiles.
+
+Block assignment: each block handles a set of rows. We'll use grid-stride over rows: each block handles rows starting from blockIdx, stride blockDim.
+
+Now implement.
+
+For the host_tiling_src, we need to define tiling data: totalLength, rowLength, tileLength, blockDim, dim (or maybe not needed if dim is always 1?). We'll include dim as attribute in op definition.
+
+In host_operator_src, we set tiling: compute totalLength from input shape (2D). Compute rowLength = shape[1] (if dim=1). tileLength based on UB budget. We need to consider UB usage: For each tile, we need local tensors: input, output, temp for exp, max, sum scalar? Actually we need scalar variables. Also we need to store intermediate max and sum across tiles. Those can be scalar registers. So UB usage per tile: input (tileLen floats), output (tileLen floats), maybe temp for exp (tileLen floats). That's 3*tileLen floats = 12*tileLen bytes. Also we need a local tensor for reduction? Not needed if we use scalar. So UB budget: 192KB allows about 16K floats (64KB for 3 tiles? Actually 12 bytes per float? wait float=4 bytes. So 3*tileLen*4 = 12*tileLen bytes. 192KB/12 = 16K floats. So tileLen up to 16K? But alignment: use 2048. Also consider overhead. So we can set tileLen accordingly.
+
+We also need to set blockDim based on number of rows. We can set blockDim = min(numRows, maxBlockDim) like 24.
+
+Now the kernel: We'll implement a class KernelLogSoftmaxCustom with Init and Process. We'll have global tensors xGm_, yGm_. Tiling data provides totalLen, rowLen, tileLen, blockDim. We'll compute numRows = totalLen / rowLen.
+
+In Process:
+- blockIdx, blockNum.
+- For each row assigned to this block (row = blockIdx; row < numRows; row += blockNum):
+   - Process row: three phases.
+   - Phase 1: find max of row. Use scalar maxVal = -FLT_MAX. Loop over tiles of this row (tileStart = 0; tileStart < rowLen; tileStart += tileLen). Load tile from global, compute local max via ReduceMax (or vector max). Update global max using max(maxVal, localMax). After loop, we have maxVal.
+   - Phase 2: compute sum of exp(x - maxVal). Use scalar sumVal = 0. Loop over tiles again. Load tile, subtract maxVal, compute exp (using VecExp or a custom approximation? AscendC has Exp intrinsic), then sum via ReduceAdd. Update sumVal += localSum. After loop, compute logSumExp = maxVal + log(sumVal). (Use log intrinsic).
+   - Phase 3: compute output. Loop over tiles again. Load tile, compute y = x - logSumExp, store.
+We can use double buffering within each phase to overlap DMA and compute? But for simplicity, I'll use a single buffer and no double buffering to reduce complexity. However, to meet performance expectations, we can at least use double buffering for the data copies. But given the three passes, it's complicated. I'll implement a simple version with pipeline using 2 buffers for each phase? Actually, we can process each tile in a pipeline: load, compute, store. But since we need to load the same tile multiple times, we can store the row in a local buffer if the row fits in UB? Not possible because rowLen is large (393216). So we reload. We can still pipeline: for each phase, we have a queue for input and output. E.g., in phase 1, we load tile, compute localMax, free, and accumulate scalar. That's sequential. But we can overlap loading next tile while computing current? That's possible with double buffering: use two local buffers for input. However, the compute is simple (max), so maybe not critical. For simplicity, I'll do sequential without double buffering. For a production kernel, you'd want double buffering, but given the example leaky_relu had double buffering, we should include it. But for log_softmax, we can still double buffer within each phase. Since we are not in the best position, I'll include double buffering for the data copies in each phase. That means we need to manage multiple queues. Let's design with a single input queue of 2 buffers for each phase, and an output queue for phase3. For phase1 and phase2, we only need input queue (no output). For phase3, we need input and output queues. We can reuse the queues.
+
+Alternatively, we can implement the kernel without double buffering and mention it's simplified. But the instruction says "generate the complete Ascend C artifacts", and the example used double buffering. So I'll try to include double buffering.
+
+Better: Use a single set of queues (xQueue, yQueue, tmpQueue) but we need to manage three passes. We can use a single input queue with 2 buffers and an output queue with 2 buffers. For each pass, we still need to load tiles sequentially. We can still pipeline: while processing a tile, we load next tile. But for reduction, we need the scalar result of the tile before we can combine. That's fine: we can have a loop that loads tile i, computes, then moves to next. The pipeline can be: after loading tile i, we start compute on tile i and simultaneously load tile i+1. This is possible with double buffering. So we can implement a generic copyin-compute-copyout pipeline for each phase. For phase1 and phase2, we don't have output to GM, so we only do copyin and compute. We'll use xQueue for input.
+
+Implementation outline:
+- Use pipe with inQueueX (2 buffers), outQueueY (2 buffers), and possibly a tmpQueue for exp computation.
+- Phase1: For each tile:
+   - CopyIn tile.
+   - DeQue, compute localMax, combine with scalar max.
+   - Free tensor.
+- Phase2: Similar, compute exp and sum.
+- Phase3: For each tile:
+   - CopyIn tile.
+   - DeQue, compute y = x - logSumExp, enqueue to outQueueY.
+   - CopyOut tile.
+
+To pipeline, we can use a simple double-loop: while processing tile i, we start DMA for tile i+1. I'll implement using a "prefetch" pattern like leaky_relu.
+
+Let's write code.
+
+We'll need to include "kernel_operator.h". Use AscendC functions: DataCopy, Mins, Maxs? Actually for max, we can use ReduceMax or VecMax? For a tile, we can compute local max by initializing a scalar and comparing each element? More efficient: use VectorMax (vec_max) across all elements? There's a function: `AscendC::Max(localMax, localTensor, 0.0f)` but that's element-wise. To get the maximum of all elements, we can use `AscendC::ReduceMax(localTensor, localMax, len)`. That returns a scalar? Actually ReduceMax outputs a scalar tensor? Let's recall: In AscendC, `ReduceMax` is a function that computes the maximum over a vector and stores the result in a scalar local tensor. So we can use that. Similarly, `ReduceAdd` for sum.
+
+For exp, `AscendC::Exp` computes element-wise exponential.
+
+For log, `AscendC::Log` computes element-wise log. But we need log of a scalar (sum). We can compute log on a scalar local tensor.
+
+Now, we need to be careful about precision and negative numbers. Log softmax requires stable max subtraction.
+
+Now, writing the strings.
+
+First, project_json_src: define op LogSoftmaxCustom with input x (float, ND), output y (float, ND), attributes: dim (int, default 1). We'll keep same format.
+
+host_tiling_src: define TilingData with totalLength, rowLength, tileLength, blockDim, dim (int). We'll include dim for generality.
+
+host_operator_src: implement TilingFunc: get input shape (2D?), compute rowLength = shape[1], totalLength = shape[0]*shape[1], tileLength based on UB budget (considering 3 passes, UB needed: input tile, output tile, exp temp = 3 tiles, also maybe maxSum scalars? But scalars are negligible. So budget bytes = 3 * tileLength * 4? Actually we need input (1), output (1), and temp for exp (1) = 3 tiles. So 12 * tileLen bytes. UB_BUDGET = 192KB = 196608 bytes. So max tile = 196608/12 = 16384. So tileLen = min(16384, rowLen) aligned to 2048. Also set blockDim = min(numRows, 24). Also set using attrs for dim.
+
+kernel_src: implement KernelLogSoftmaxCustom class with Init and Process. Use three-phase approach with double buffering.
+
+python_bind_src: similar to leaky_relu but with function name log_softmax_custom. We'll need to bind to aclnnLogSoftmaxCustom? The kernel should be called by aclnn interface. We'll generate a simple binding that calls the custom op via EXEC_NPU_CMD with aclnnLogSoftmaxCustom. We'll need to define the API in python bind.
+
+model_src: replace original model with ModelNew using custom_ops_lib.log_softmax_custom.
+
+Now, I'll write the code.

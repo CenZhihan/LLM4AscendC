@@ -543,6 +543,31 @@ python3 generator/scripts/run_agent_multi_rounds.py \
 - `softmax_attempts3_summary.json`
 - `attempts3_summary_all_ops.json`
 
+**`--max-attempts` 为全局上限**：首轮 `--max-attempts 5` 生成 `attempt1`..`attempt5`；续跑时提高到 `--max-attempts 10`，仅对**尚未 pass** 的算子继续生成 `attempt6`..`attempt10`（目录编号全局连续，原地写入同一 `runN` 目录）。
+
+**续跑（`--continue-attempt`）**：
+
+- 必须同时指定 **`--continue-from <已有 run 目录>`**（解析为绝对路径）；若同时传 `--out-dir`，必须与 `--continue-from` 一致。
+- 算子列表以源 run 最新 `attempts*_summary_*.json` 为准；**`--ops`** 仅作子集过滤。续跑时忽略 **`--categories` / `--run`**。
+- 已在某轮 **pass**（`fixed_on_attempt` 或最后一次 attempt 编译+正确性均通过）的算子**跳过**。
+- 未 pass 算子从**最后一次 attempt** 的 `{op}.txt` + `{op}_repair_context.txt` 续修（**不**选「最后一次仅 compile 通过」的 attempt）。
+- 每次续跑额外写入 **`continue_report_<UTC>.json`**，记录 `continued_from` 绝对路径与每个算子的决策；全量汇总写入 `attemptsM_summary_all_ops.json`（旧 `attempts5_*` 保留不删）。
+
+```bash
+# 首轮
+python3 generator/scripts/run_agent_multi_rounds.py \
+  --categories test_set --test --use-repair-memory \
+  --max-attempts 5 --run 4
+
+# 续跑 attempt6..10（原地追加到 run4）
+python3 generator/scripts/run_agent_multi_rounds.py \
+  --continue-attempt \
+  --continue-from /path/to/.../run4 \
+  --max-attempts 10 --use-repair-memory
+```
+
+**CUDA-Agent 6K 续跑**：[`run_agent_cuda_agent_multi_rounds.py`](generator/scripts/run_agent_cuda_agent_multi_rounds.py) 同样支持 `--continue-attempt` / `--continue-from`；汇总文件为 `attemptsM_summary_all_rows.json`；可用 **`--row-keys ca6k_00055 ...`** 或 **`--indices`** 过滤子集。续跑时不要对同一 run 目录并行启动多个进程。
+
 #### 3.7.1 跨轮修复记忆（repair memory）
 
 多轮脚本支持 **`--use-repair-memory`**（`run_agent_multi_rounds.py` / `run_agent_cuda_agent_multi_rounds.py`）：开启后会在 **`attempt ≥ 2`** 时从全局记忆库 **检索**若干条经验注入 Agent，并在评测通过后按规则 **写入**新记忆；默认产物根路径在 **`output/memory_on/...`**（与 `--test` 组合时为 `output/test/memory_on/...`），关闭该开关则与接入记忆前行为一致。

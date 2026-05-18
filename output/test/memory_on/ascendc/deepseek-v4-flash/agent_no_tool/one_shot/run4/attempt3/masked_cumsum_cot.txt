@@ -1,0 +1,109 @@
+We need to fix the previous attempt where the generated code was missing host_operator_src, kernel_src, and python_bind_src blocks. The error log shows that the evaluation framework expects those blocks to be present. The previous attempt only provided project_json_src and host_tiling_src, but not the other four.
+
+Based on the repair memories, we need to include all six blocks: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, and model_src.
+
+We must adapt the pattern from the LeakyReluCustom example to the MaskedCumsumCustom kernel. The kernel should implement torch.cumsum(x * mask, dim=dim). But note: the custom operator will take x, mask, and dim as inputs. Since dim is an attribute, we can pass it as an attribute. The kernel must perform masked cumulative sum along the specified dimension.
+
+However, the cumsum operation is inherently sequential along the dimension (prefix sum). On AscendC, we can use a parallel prefix sum algorithm? For simplicity and correctness, we can implement a straightforward approach: for each row (along dimension), compute the cumulative sum. Since the input shape is (batch_size, ...), and dim=1, we need to handle the last dimension? Actually the user instruction shows input shape (32768,) with dim=1, but that's 1D. However, cumsum on a 1D tensor with dim=1 is just cumsum over all elements. But we should support general shape. For efficiency, we can design the kernel to handle 1D or 2D? To be safe, we can follow a tiled approach where each tile covers a contiguous chunk of the flattened tensor, but cumulative sum requires sequential processing. However, we can use multiple blocks to process independent segments (rows) if the cumsum is along the last dimension (dim = -1). In the given model, dim=1 for 1D tensor is ambiguous, but we can assume dim=0 is the batch dimension? Actually the original input shape is (batch_size, *input_shape) and dim=1, so cumsum is performed over the second dimension (the input_shape dimension). That means each sample (along batch) is independent. So we can parallelize over the batch dimension: each block handles a set of rows (each row is a sequence of length input_shape). The cumulative sum along each row is sequential, but we can process each row independently.
+
+We need to design the tiling: totalLength = number of elements, rowLen = product of non-batch dimensions? Actually the shape is (batch_size, input_shape) so rowLen = input_shape[0] if input_shape is a tuple (32768,). But to be general, we need to know the dimension to compute the row length. We can get the shape from tiling data: we can pass rowLen as the number of elements along the dimension to sum over. However, the cumsum is applied elementwise; we can use the fact that for a given row, the operation is: for i in range(rowLen): y[i] = x[i]*mask[i] + (i>0 ? y[i-1] : 0). This can be done sequentially within a block.
+
+Alternatively, we can use a more efficient parallel prefix sum (blelloch) on the entire tensor if flattened, but that's more complex. Since the instruction example used a simple elementwise, but cumsum is not elementwise. The user wants to replace torch.cumsum with a custom kernel. We should produce a correct implementation.
+
+Given the constraints, we'll implement a kernel that works for 1D or 2D where the cumulative sum is along the last dimension. We'll pass the row length as part of tiling data. The host tiling will compute rowLen from the shape (the size of the dimension specified by 'dim'). Since the kernel will be used with dim=1 as per contract, we can fix it. But better to support arbitrary dim by passing rowLen.
+
+We'll also need to handle the 'dim' attribute in host_operator_src.
+
+Let's generate the six blocks.
+
+Important: The kernel name is masked_cumsum_custom, PascalCase MaskedCumsumCustom.
+
+We'll follow the pattern of the LeakyReluCustom closely for the host_operator_src, kernel_src, python_bind_src, and model_src.
+
+For the tiling data, we need totalLength, rowLen (number of elements in the dimension to be cumsummed), tileLen (elements per tile per block), blockDim. Since we are processing rows, each block can handle multiple rows? Or each block handles one tile which is a segment of a row? But cumsum along row requires full row. Simpler: each block processes one row at a time. If rowLen is too large for one tile, we need to process in segments and combine partial sums across segments. That would require inter-block communication, which is complex. Instead, we can limit tileLen to be rowLen and have each block process one row (or multiple rows if rowLen is small). But rowLen might be up to 32768 which is manageable within UB. We can set tileLen = rowLen (aligned to some factor). Then each block processes a contiguous set of rows. The number of rows = totalLength / rowLen.
+
+Thus, tiling: totalLength, rowLen, tileLen (which is rowLen aligned), blockDim (minimum cores covering all rows). The kernel: each block gets a range of rows (from blockIdx to totalRows with stride blockDim). For each row, it loads the entire row of x and mask into local tensors, computes cumsum, and writes out.
+
+But we need to handle the tmp buffer for cumsum. We can do in-place or using extra local tensor.
+
+Let's design:
+
+- totalLen = total elements
+- rowLen = number of elements along the cumsum dimension (the last dim in our assumption)
+- tileLen = rowLen (aligned?)
+- blockDim = number of blocks (we can set to min(rows, 24) etc.)
+
+Each block processes rows = (totalLen / rowLen) elements per block? Grid-stride: for (row_idx = blockIdx; row_idx < numRows; row_idx += blockNum) { load row data, compute cumsum, store }
+
+The compute: we have a local array of length rowLen for x, mask, y. We can load with DataCopy. Then compute prefix sum sequentially.
+
+We need to be careful about UB budget: 3 * rowLen * sizeof(float) (x, mask, y) plus potential double buffering? We'll use double buffering for loading next row while computing current? To simplify, we can do one row at a time without double buffering (since rowLen is limited). But to keep the pattern, we can use double buffered queues. However, the row may be larger than UB budget? With rowLen up to 32768, that's 3*32768*4 = 393KB > 192KB. So we need to tile within a row. That complicates cumsum. We need to process a row in tiles and propagate the carry.
+
+Alternatively, we can treat the entire tensor as 1D and use a parallel prefix sum algorithm that works for any shape but is more complex. Given time, we can assume the row dimension is small (like 32 or 64) – but the example input_shape is (32768,), which is large. That means rowLen = 32768, which is too large for a single tile.
+
+We need a scalable solution. We can implement a tiled cumulative sum: each block processes a segment of the flattened tensor (contiguous intervals). For each segment, we compute the local cumulative sum and also compute the total sum of the segment (to propagate). Then in a second pass, we add the prefix from previous segments. This is a two-pass algorithm. However, that requires two kernel launches or synchronization. The standard way in AscendC for prefix sum is to use a single kernel with block-level cooperation via atomic operations or global memory. But that's advanced.
+
+Maybe the evaluation expects a simpler approach: since the cumsum is only along a single dimension, and the input is 2D (batch, dim), we can parallelize over batch and compute cumsum sequentially within each row. If rowLen is 32768, that exceeds UB budget. We must tile within a row.
+
+We can process a row in tiles: each tile computes prefix sum within that tile, but we need to add the cumulative sum from previous tile(s). That requires storing the partial sums (the final value of each tile) and then doing a second pass to add offsets. Alternatively, we can have each block handle one tile of a row, and then use global atomic for prefix? Not trivial.
+
+Given the constraints, we might be able to cheat by using the built-in CumSum operator from the Ascend ACLL? But the task requires custom kernel.
+
+Let's look at the original user instruction: they want to replace torch.cumsum with custom kernel. The example for leaky_relu was straightforward because it's elementwise. For cumsum, it's more complex. However, the error log shows that the previous attempt only provided project_json_src and host_tiling_src, but not the other blocks. So the main issue is missing blocks. So we can produce a kernel that is correct for at least the given dimensions? But the correctness test might fail.
+
+But the repair memories indicate that we must include all blocks, not that the implementation must be fully correct. The evaluation had "compiled: False" because the txt bundle was missing blocks. So if we provide all blocks, it may compile and potentially pass correctness if the implementation is correct. But we should aim for correctness.
+
+We can try a simple approach: use a single kernel launch where each block processes a single element and uses atomicAdd? No, cumsum is not additive across elements.
+
+We can implement a wavefront of log2 complexity using shared memory (local tensor). But the local tensor on AI Core is limited. There is a paper "Prefix Sum on the Ascend AI Processor" but not accessible.
+
+Given time, I'll produce a kernel that works for small rowLen (like up to 2048) and hope that the test uses small dimensions? But the example uses 32768. That might fail.
+
+Alternatively, we can implement a variant: treat the operation as a sequence of element-wise ops with a running sum, but that's sequential. The kernel could be slow but correct.
+
+We can implement a loop over tiles for each row: for each tile, load x and mask, compute running sum with carry from previous tile, store output. This can be done in a single kernel pass. Each block handles one row. The row is processed sequentially. Since the block processes only one row, we don't need multiple cores for a single row. So we can set blockDim = number of rows (or min(rows, 24)). Each block computes its row sequentially in tiles.
+
+Implementation details:
+- For each row, we loop over tiles of size tileLen (maybe 4096). We keep a running sum 'carry'.
+- For each tile, we load xTile and maskTile, compute yTile[i] = xTile[i]*maskTile[i] + carry; carry = yTile[i]; store yTile.
+- Continue to next tile.
+
+This works for any row length. The UB budget: we need two tiles: double buffer for x, mask, y. So we need 3 * 2 * tileLen * 4 = 24 * tileLen bytes. With UB_BUDGET_BYTES=192KB, tileLen <= 8192 elements (since 24*8192*4=786KB > 192KB). Actually 24*tileLen*4=96*tileLen. 192KB = 196608 bytes, so tileLen <= 196608/96 = 2048. So tileLen limited to 2048. That's fine.
+
+Thus, we will use tileLen = 2048 (or align down from max). For rowLen = 32768, we'll have 16 tiles per row. The running sum is kept in a scalar variable (register). This is correct.
+
+We also need to handle the mask: the mask is a bool in the Python code, but in the kernel we treat it as float. To simplify, we can pass mask as float (0.0 or 1.0) from the Python binding. The project_json should accept mask as float. The host tiling will need totalLength, rowLen, tileLen, blockDim, and maybe no need for dim attribute. We'll keep dim attribute for infer shape.
+
+The tiling data: totalLength, rowLen, tileLen, blockDim.
+
+The host operator: compute rowLen from shape dimension (dim). Use attrs to get dim, compute the size of that dimension. For simplicity, we assume dim is last dimension? Actually from the model, dim=1 on a 2D tensor (batch, seq). So we can compute rowLen = shape[dim]. We'll get shape from context.
+
+The kernel: each block processes one row. The rows are assigned based on blockIdx. Since blockDim = number of blocks used (set to min(rows, 24) in tiling), each block handles rows at stride = blockDim. But careful: if blockDim > rows, some blocks are idle. We'll assign row index = blockIdx and process if rowIdx < numRows. Then after processing that row, we skip to next row with stride = blockNum (which is context block dim? Actually we set blockDim in tiling but in kernel we use GetBlockNum(). We'll use GetBlockNum() as the stride.
+
+Simplify: each block processes one row. blockDim = numRows (capped at 24). Then each block gets exactly one row (blockIdx). Use if (blockIdx >= numRows) return.
+
+Then for each row, loop tiles.
+
+We'll code accordingly.
+
+Now, we need to produce the six strings. Let's write them.
+
+Note: The python_bind_src must use the correct operator name. The op name is MaskedCumsumCustom, so the aclnn call is aclnnMaskedCumsumCustom. But we need to ensure that the operator is registered with that name. In host_operator_src, we use the class MaskedCumsumCustom with OP_ADD.
+
+In python_bind_src, we use EXEC_NPU_CMD(aclnnMaskedCumsumCustom, ...). The signature: maybe aclnnMaskedCumsumCustom(x, mask, dim, result). We'll pass dim as an attribute? The aclnn API likely expects the attribute as an extra parameter. But in the example, the aclnnLeakyReluCustom had only self, negative_slope, result. So the attribute is passed directly. So we can do similar: aclnnMaskedCumsumCustom(self, mask, dim, result). We'll include dim as an int argument.
+
+We need to ensure the operator definition in host_operator_src matches.
+
+Also, the model_src should call the function with the correct signature: masked_cumsum_custom(x, mask, dim).
+
+Now, let's write the code.
+
+We'll follow the exact format of the example, replacing with our kernel.
+
+I'll generate each block.
+
+Important: In the txt bundle, the keys are exactly: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src. The blocks must be separate.
+
+I'll output the code as a single Python string with triple quotes.
+
+Now, write the answer.

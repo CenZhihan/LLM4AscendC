@@ -32,7 +32,7 @@
 - 相邻两轮 `build_attempt_error_bundle`（`compiled` / `correctness` / `failure_stage` / `symptom_anchor` / `root_cause_anchor` / 分层 `correctness_info` / **02-build·06-eval log tail**）；
 - 相邻两轮 operator txt 的 **unified diff（截断）**。
 
-`eval_operator` 失败时 `correctness_info` 为分层文本（`=== root_cause ===` / `=== symptom ===`），避免仅保留 CPack 尾日志。Review 须以 **root_cause** 为 trigger 优先；输出须为单句 `When ... do not ...; instead ...`（拒绝 CoT 污染稿）。若与客观 `transition` 矛盾则丢弃本条。
+`eval_operator` 失败时 `correctness_info` 为分层文本（`=== root_cause ===` / `=== symptom ===`），避免仅保留 CPack 尾日志。Review 须以 **root_cause** 为 trigger 优先；输出须为单句 `When ... do not ...; instead ...`（拒绝 CoT 污染稿）。**When 子句必须写明适用场景**（阶段、函数/文件、失败类型），避免仅复述错误字面、却未说明在何处适用的建议；后处理 `_has_scenario_scope` 对含上下文相关 host API（如 GetInputShape/Shape*）却未标明 where 的句子拒收。Prompt 以通用原则为主，Shape 仅作简短正反例。若与客观 `transition` 矛盾则丢弃本条。
 
 ---
 
@@ -92,7 +92,7 @@
 - `inbox/<run_slug>/mem_<uuid>.jsonl`：子进程**仅**写入**单行**的独立文件（避免多进程争用同一文件）。
 - `inbox/<run_slug>/merged/`：已成功合并入 canonical 的收件副本（便于审计）。
 
-**并行写入策略**：子进程不直接 append canonical；写入 inbox 后调用 `merge_run_inbox`（`fcntl` 独占锁写 canonical，再移动收件文件）。整批实验结束时主进程再执行一次 merge，收敛遗留文件。`run_slug` 由 `run_dir` 相对仓库根路径规范化得到，使同一 output run 共用同一 inbox 桶。
+**并行写入策略**：子进程不直接 append canonical；写入 inbox 后调用 `merge_run_inbox`（`fcntl` 独占锁写 canonical，再移动收件文件）。整批实验结束时主进程再执行一次 merge，收敛遗留文件。`run_slug` 由 `run_dir` 相对仓库根路径规范化得到，使同一 output run 共用同一 inbox 桶。多轮 **续跑**（`--continue-attempt`）在同一 `run_dir` 下追加 `attempt(N+1)..M`，不新开 run，记忆 inbox 仍按该 `run_slug` 合并。
 
 **检索**：从 canonical 尾部窗口生成 **manifest 短行**（`id`、op、category、`tool_mode`、`tier`、锚点、摘要；**不按**当前 run 的 `tool_mode`/`eval_mode` 预筛），选条 LLM 返回 `memory_ids`，再按 id 从尾部窗口取全文片段注入（窗口外旧 id 可能暂不可见，可调 `max_records`）。
 

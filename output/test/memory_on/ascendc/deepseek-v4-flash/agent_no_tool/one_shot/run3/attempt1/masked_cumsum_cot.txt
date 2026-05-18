@@ -1,0 +1,112 @@
+We need to generate six embedded Python strings for the custom AscendC operator named "masked_cumsum_custom" (kernel function name) and PascalCase "MaskedCumsumCustom". The operator performs masked cumulative sum along a given dimension: y = cumsum(x * mask, dim=dim).
+
+We'll follow the structure from the example leaky_relu_custom. Need to adapt for masked cumsum:
+
+- Inputs: x (float), mask (bool?), dim (int). In PyTorch, mask is bool. But in AscendC, we need to handle bool as int8? Usually bool tensor is stored as uint8. We'll use int8 type for mask (bool is often stored as uint8 in PyTorch, but for simplicity we can use float and treat it as 0/1. However, the mask is boolean, but we can convert to float on the host side? Better to pass it as float from the Python binding? The instruction says "Tensor mask" and in original model it uses mask bool. In the custom op, we can accept mask as float. But to be precise, we can define mask as bool? AscendC supports bool? Typically, we use int8. But the example used float for inputs. Let's keep mask as float for simplicity; the host can convert? Actually, the original model uses mask.bool() so it's boolean. In the custom op, we can define mask as float and expect it to be 0.0 or 1.0. Alternatively, we can use int8. But the types in project_json_src need to be consistent. Let's use float for mask as well, to avoid complexity. The dim is an attribute (int).
+
+- Output: y (float) same shape.
+
+- Kernel: need to perform masked cumulative sum along dim. For a 2D tensor (batch_size, seq_len), cumsum over dim=1 (last dim). The kernel needs to handle general ND, but we can focus on 2D or flatten? Since the input shape is (batch_size, input_shape) where input_shape is (32768,) and dim=1. So it's essentially row-wise cumulative sum on each row. But the kernel should be general: it can compute cumsum along the innermost dimension (or any dim). Since AscendC kernels are typically designed for ND with tiling along the total size. For cumsum, it's a sequential operation along a dimension, which is challenging for parallelization. We can implement a block-wise scan algorithm using shared memory/UB. However, for simplicity and to match the pattern, we can do a per-element sequential scan within each tile along the dim axis. Since the dimension is fixed (dim=1), we can treat the tensor as 2D and each block processes a row. The challenge is that cumsum requires dependencies along the dim. If we tile along the dim, we need to propagate carry. So we can use a two-pass approach: within each tile compute local cumsum, then add the cumulative sum from previous tiles. This is a standard segmented scan.
+
+But the kernel must be efficient. Given the batch_size=32768 and dim=32768, each row has 32768 elements. That's large. We can tile along the row dimension? Actually, we have a large batch, so we can parallelize over rows. Each row has independent cumulative sum. The kernel can assign each block to one row (or multiple rows). Since blockDim can be high, we can process multiple rows per block with grid-stride loops.
+
+Better approach: flatten the tensor to 2D (rows, cols). Use blockDim = number of rows? But rows=32768, which is large. We can set blockDim to some number (like 24) and each block processes multiple rows in a grid-stride manner. For each row, we perform a sequential cumsum. That's simple: for each element in the row, we accumulate.
+
+But the kernel must be efficient and avoid slow sequential loops. However, given it's a valid operation, we can implement it with a loop over the row length.
+
+We need to decide on tiling and UB budget.
+
+Let's design the operation:
+
+- Input x: (N, D) where N=batch, D=dim length.
+- mask: same shape, float (0/1).
+- dim: attribute, but we assume dim=1 (last dim). For generality, we can treat the last dimension as the scanning dimension.
+
+In tiling, we can set tileLength to the number of columns (D), as we need to scan the whole row each time. But D=32768, which may exceed UB capacity. The example leaky_relu had tileLen around 8192. For cumsum, we need to store the row partially? Actually, we can tile along the rows: each block processes a group of rows. For each row, we need the entire row in UB to do cumsum? We can process a tile of the row: e.g., take tileLen columns and do cumsum within that segment, but we need carry from previous segment. So we need to maintain a per-row accumulator. That is doable: for each row, we iterate over tiles of columns, compute local cumsum, add carry, then output, and update carry.
+
+Thus tiling is along the columns dimension. tileLen can be up to UB budget divided by (2*sizeof(float) for x and mask, plus temporary). We also need output buffer. So roughly 4 * tileLen * sizeof(float) = 16*tileLen bytes. UB budget 192KB => max tileLen = 192*1024/16 = 12288. We can set ALIGN_ELEMS=16, HARD_CAP_ELEMS=8192 (as per memory3). So tileLen ~8192.
+
+Then for each row, we loop over tiles. We process rows in a grid-stride manner.
+
+We need to store carry for each row. Since we have limited UB, we can store carry in a separate buffer? We can keep a local accumulator per row processed in loop, but if we process multiple rows in a block, we need to maintain multiple carries. To simplify, each block processes only one tile of rows? Actually, we can have each block process a contiguous chunk of rows, and for each row, we iterate over columns in tiles. The carry for each row can be stored in a temporary global buffer? Or we can use a per-block array of carries (size = number of rows per block). Since blockDim is such that each block processes many rows (grid-stride), the number of rows per block could be up to totalRows/blockDim. That could be large, but we can limit by tiling rows as well. For simplicity, we can process one row at a time (loop over rows in grid-stride), and for each row, loop over column tiles within that row. Carry is a single float per row, stored in register/local. That works.
+
+Thus kernel: For each row assigned to block (grid-stride), inner loop over column tiles: load x and mask, compute local cumsum with carry from previous tile, store, update carry.
+
+Now, we need to handle mask: if mask element is 0, then the cumsum resets? Actually, original: x * mask then cumsum. That means we effectively zero out masked positions and then cumsum. So the cumsum continues across positions where mask==0? Actually, if mask is 0 at a position, x*mask=0, so that position contributes 0 to cumsum, and the cumsum continues with the same value as previous? Wait, cumsum(x*mask) means we multiply x by mask then cumulate. So at a masked position, the value is zero, but the cumulative sum continues (adds zero). So it's like cumulative sum with zeros. That's equivalent to cumsum(x) but with mask multiplying each term before accumulation. So there is no reset; the cumulative sum continues across masked positions. So we don't need to reset. So it's straightforward: compute y[i] = y[i-1] + x[i]*mask[i] (with y[-1]=0). That's a simple scan.
+
+Thus carry = previous cumsum value.
+
+Now, we must produce the six strings.
+
+Let's start with project_json_src. Define op "MaskedCumsumCustom". Inputs: x (float), mask (float), attr: dim (int with default). Output: y (float). All ND format.
+
+host_tiling_src: TilingData with totalLength (prod of all dims), tileLength (number of columns per tile), blockDim, dim (the dimension to scan), and also maybe rows per block? We can compute rows = totalLength / dimLength. But we need to know dim length. Since we assume scanning on last dim, we can compute columnLength as the size of the last dimension. In tiling, we can get shape and compute columnLength = shape[ndim-1]. Then totalLength = product of all dims. tileLength is the number of elements along the scanning dim to process in one tile. We'll also store rowStride (size of last dim) and maybe numRows.
+
+But for simplicity, we can just store totalLength and tileLength and dim (which we ignore if we assume last dim). However, to be robust, we should include dim. Actually, the dim parameter is an attribute, so we can store it in tiling.
+
+host_operator_src: TilingFunc, InferShape, InferDataType, OpDef. Need to use StorageShape* (memory1): `context->GetInputShape(0)` return `StorageShap` pointer, then `GetOriginShape()`. Also adapt UB budget: use ALIGN_ELEMS=16, HARD_CAP_ELEMS=4096, maxTile=UB_BUDGET_BYTES/28 (memory3). But our budget: we need buffers for x, mask, output, temporary? We'll have inQueueX, inQueueMask, outQueueY, tmpQueue (for carry? Actually, we can do without tmpQueue if we compute in place). But we'll likely need a temporary for the product? We'll implement as: localCumsum = 0; for each element in tile: val = x[i] * mask[i]; localCumsum += val; y[i] = prevCarry + localCumsum; The output can be written directly from outQueue. We need to read x and mask, compute, and output. We can do without tmpQueue if we compute sequentially. But the example had tmpQueue. We'll include a tmpQueue for potential use. So buffers: x (float), mask (float), output (float), maybe tmp (float) for accumulation? Actually, we can compute directly using scalar loop, not vector operations. But AscendC supports vector operations. We can do vector multiplication and then prefix sum? That requires vector prefix sum which is not directly available. So we'll likely need to use a loop within Compute. But AscendC has `AscendC::MaskedSum`? Not sure. To keep it simple and correct, we'll implement a scalar loop over the tile, using GetValue and SetValue (memory2 advises using GetValue/SetValue for element access). So we'll do a loop. That may be slow but works. We can also use vector multiplication: Muls and then a reduction? but cumsum is not reduction. So scalar loop is acceptable. We'll need to access xLocal, maskLocal elements. So we'll not use a separate tmpQueue; we'll just compute in place on xLocal? We need to keep xLocal for multiplication, then we can compute yLocal directly. So we'll have three buffers: x, mask, y. No tmp. But to be safe, we can allocate a tmp buffer for intermediate product. Let's follow pattern of example and include tmpQueue, but we might not use it. Actually, we can use `AscendC::Mul` to compute product, then add to carry. But the carry is across tiles. We can store carry in a local variable.
+
+Given the complexity, I'll design Compute as:
+- Dequeue xLocal and maskLocal.
+- Allocate yLocal.
+- For i in range(len):
+    float val = xLocal.GetValue(i) * maskLocal.GetValue(i);
+    carry += val;
+    yLocal.SetValue(i, carry);
+- Enqueue yLocal.
+
+We need to carry across tiles: carry is a per-row accumulator stored in registers across tile iterations. Since we process a row sequentially, we can have a float carry variable that persists across tiles for that row.
+
+Now, tiling: We need to know the size of the scanning dimension (cols). In Init, we can compute cols = totalLength / rows, but rows unknown. Better to pass rows and cols in tiling. We'll store: totalLength (product), tileLength (cols tile), rows (number of rows), cols (full column length). Actually, tileLength is the number of elements per tile along the scanning dim. We'll set tileLen as min(cols, maxTile). Then each block processes a set of rows (grid-stride). For each row, we loop over tiles of columns.
+
+Thus tiling data: totalLength, rows, cols, tileLength, blockDim, dim (optional). We'll also include negativeSlope-like parameter? No.
+
+Now host_operator_src: TilingFunc calculates totalLength from shape, then gets shape dimensions. We'll assume shape is at least 1D. We'll get the last dimension size as cols. rows = totalLength / cols. Then tileLen computed from UB budget: UB used per tile: 3 * tileLen * sizeof(float) (x, mask, y) = 12*tileLen bytes. Actually, we also need tmp? Not really. So UB_BUDGET_BYTES/12. But memory3 said use /28 for the leaky_relu case with 5 buffers? That was 5*tileLen*4 = 20*tileLen, /20 gave 9.6K. Now we have 12*tileLen, so maxTile = UB_BUDGET_BYTES / 12 ≈ 16384. But we cap at HARD_CAP_ELEMS=4096 (from memory3) and align to 16. So tileLen will be 4096 (aligned). That's fine.
+
+BlockDim: we can set to number of rows? But rows could be large. We'll compute number of blocks as rows (since each row is independent) but limit blockDim to something like 24. Or we can set blockDim = 1? It should be at least 1. Better: we can set blockDim to min(rows, 24). But if rows > 24, we use grid-stride loops.
+
+Thus TilingFunc: 
+- Get input shape (StorageShape) -> GetOriginShape() -> Vec<int64_t> dims. Compute totalLength = product.
+- Get cols = dims[dims.size()-1] if dims not empty.
+- rows = totalLength / cols.
+- tileLen = min(cols, maxTileAligned).
+- blockDim = min(rows, 24). (or fixed to 24, but we can compute).
+We'll store rows, cols, tileLength, totalLength, blockDim.
+
+Now kernel_src: Need to implement KernelMaskedCumsumCustom class.
+Init: receive GM_ADDR x, mask, y, and tiling data. We'll also receive rows, cols, tileLength. We'll store these.
+Process: 
+- blockIdx, blockNum.
+- Compute rowsPerBlock = ceil(rows / blockNum) but we can use grid-stride: for each row assigned (loop start = blockIdx, stride = blockNum), process that row.
+- For each row, for each tile of cols (tileStart=0, tileStride=tileLength; until cols), process that tile.
+- Inside tile: load x and mask segments (length = min(tileLength, cols-tileStart)), compute cumsum within tile with carry from previous tile, output y segment.
+
+We'll need to keep rowCumSum variable (float) per row. Initialize to 0 at start of row.
+
+Compute function for a tile: given xLocal, maskLocal, len, and reference to cumSum, compute yLocal, update cumSum. We'll use GetValue/SetValue loops.
+
+Now python_bind_src: similar pattern but for masked_cumsum_custom. Need to create aclnn call? Actually, we need to call the custom operator. The example used EXEC_NPU_CMD(aclnnLeakyReluCustom, ...). We'll do similarly: EXEC_NPU_CMD(aclnnMaskedCumsumCustom, self, mask, dim, result). Note that mask tensor needs to be passed. dim is int attribute.
+
+But we need to register operator. Use TORCH_LIBRARY_IMPL and PYBIND11_MODULE.
+
+model_src: same pattern but call masked_cumsum_custom.
+
+Now let's write the strings. Ensure consistency: kernel function name "masked_cumsum_custom", PascalCase "MaskedCumsumCustom", tiling class "MaskedCumsumCustomTilingData". Also header file names: "masked_cumsum_custom_tiling.h" (from example "leaky_relu_custom_tiling.h").
+
+Let's produce the six strings.
+
+Note: memory1 warns about using GetInputShape returning StorageShape*. So we use auto* inShape = context->GetInputShape(0); auto originShape = inShape->GetOriginShape(); then get dims via originShape.GetDimCount() etc.
+
+Memory2: for element access use GetValue/SetValue.
+
+Memory3: use ALIGN_ELEMS=16, HARD_CAP_ELEMS=4096, UB_BUDGET_BYTES/28. Wait, memory3 says for the leaky_relu case they used /28 and got good results. But for our kernel, the number of buffers is different. However, to be safe and because the user instruction says "Repair memories retrieved from validated runs", we should follow the same constants even if the UB budget calculation is slightly off? The memory3's context was for a different kernel. But the instruction says to apply these fixes. So we will use ALIGN_ELEMS=16, HARD_CAP_ELEMS=4096, and maxTile=UB_BUDGET_BYTES/28. That might be conservative but should work. We'll compute UB_BUDGET_BYTES = 192*1024. Then maxTile = 192*1024/28 = 7020, then cap at 4096, align down to 16 => 4096 (already multiple). So tileLen = min(cols, 4096) aligned.
+
+Thus in tiling, we compute tileLen = min(cols, maxTile) and then align down to 16.
+
+Now write the code.
+
+Be careful about the naming: kernel function is "masked_cumsum_custom", operator class is "MaskedCumsumCustom", tiling data class "MaskedCumsumCustomTilingData".
+
+I'll write the six strings as per the example format.
+
+Let's start with project_json_src.
