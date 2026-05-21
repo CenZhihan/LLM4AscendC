@@ -285,6 +285,12 @@ def run_multi_attempt_for_op(
     seed_previous_code: str = "",
     seed_repair_context_path: str = "",
     prior_attempts: Optional[Dict[str, Any]] = None,
+    memory_backend: str = "local",
+    memory_url: str = "http://127.0.0.1:8420",
+    memory_session_prefix: str = "llm4ascend",
+    memory_recall_limit: int = 5,
+    memory_timeout: float = 5.0,
+    memory_keep_local_repair_context: bool = True,
 ) -> Dict[str, Any]:
     if max_attempts < 2:
         raise ValueError("max_attempts must be >= 2")
@@ -306,6 +312,19 @@ def run_multi_attempt_for_op(
     previous_attempt_code = seed_previous_code
     previous_repair_context_path = seed_repair_context_path
 
+    from generator.agent.memory import create_memory_backend
+
+    memory = create_memory_backend(
+        backend=memory_backend,
+        run_dir=run_dir,
+        op=op,
+        url=memory_url,
+        session_prefix=memory_session_prefix,
+        recall_limit=memory_recall_limit,
+        timeout=memory_timeout,
+        keep_local_repair_context=memory_keep_local_repair_context,
+    )
+
     for attempt_id in range(start_attempt_id, max_attempts + 1):
         attempt_dir = run_dir / f"attempt{attempt_id}"
         outcome = AttemptOutcome(
@@ -326,11 +345,27 @@ def run_multi_attempt_for_op(
             saved_prev_for_memory = previous_attempt_code
             repair_logs_raw = ""
             if attempt_id >= 2:
-                if not previous_repair_context_path:
-                    raise RuntimeError(f"attempt{attempt_id} missing previous repair context")
-                repair_logs_raw = pathlib.Path(previous_repair_context_path).read_text(
-                    encoding="utf-8", errors="replace"
+                query_parts = [f"Operator: {op}", f"Category: {category}"]
+                if previous_repair_context_path:
+                    try:
+                        snippet = pathlib.Path(previous_repair_context_path).read_text(
+                            encoding="utf-8", errors="replace"
+                        )[:800]
+                        query_parts.append(f"Error snippet: {snippet}")
+                    except Exception:
+                        pass
+                recall_result = memory.recall(
+                    query="\n".join(query_parts),
+                    session_key=f"{memory_session_prefix}-{op}",
+                    metadata={
+                        "attempt_id": attempt_id,
+                        "previous_repair_context_path": previous_repair_context_path,
+                        "op": op,
+                        "category": category,
+                    },
+                    limit=memory_recall_limit,
                 )
+                repair_logs_raw = recall_result.text
             retrieved_repair_memories = ""
             retrieved_repair_memories_applied: List[Dict[str, Any]] = []
             repair_memory_selection: Optional[Dict[str, Any]] = None
@@ -422,8 +457,22 @@ def run_multi_attempt_for_op(
                 max_log_lines=max_log_lines,
             )
             repair_path = attempt_dir / f"{op}_repair_context.txt"
-            _write_text(repair_path, repair_text)
             outcome.repair_context_path = str(repair_path)
+
+            memory.write(
+                session_key=f"{memory_session_prefix}-{op}",
+                user_content=repair_text,
+                assistant_content=gen["result"].generated_code or "",
+                metadata={
+                    "attempt_id": attempt_id,
+                    "op": op,
+                    "category": category,
+                    "compiled": outcome.compiled,
+                    "correctness": outcome.correctness,
+                    "correctness_info": outcome.correctness_info,
+                    "repair_text": repair_text,
+                },
+            )
 
             if use_repair_memory:
                 try:
@@ -479,6 +528,11 @@ def run_multi_attempt_for_op(
 
     if op_summary["final_status"] == "unknown":
         op_summary["final_status"] = f"failed_after_attempt{max_attempts}"
+    op_summary["memory_backend"] = memory_backend
+    try:
+        memory.close()
+    except Exception:
+        pass
     return op_summary
 
 
@@ -506,6 +560,12 @@ def _run_single_op_job(
     seed_previous_code: str = "",
     seed_repair_context_path: str = "",
     prior_attempts: Optional[Dict[str, Any]] = None,
+    memory_backend: str = "local",
+    memory_url: str = "http://127.0.0.1:8420",
+    memory_session_prefix: str = "llm4ascend",
+    memory_recall_limit: int = 5,
+    memory_timeout: float = 5.0,
+    memory_keep_local_repair_context: bool = True,
 ) -> Dict[str, Any]:
     _apply_parallel_opp_env_if_needed(op_slot=op_slot, parallel_ops=parallel_ops)
     device_id = op_slot % eval_npu
@@ -532,6 +592,12 @@ def _run_single_op_job(
         seed_previous_code=seed_previous_code,
         seed_repair_context_path=seed_repair_context_path,
         prior_attempts=prior_attempts,
+        memory_backend=memory_backend,
+        memory_url=memory_url,
+        memory_session_prefix=memory_session_prefix,
+        memory_recall_limit=memory_recall_limit,
+        memory_timeout=memory_timeout,
+        memory_keep_local_repair_context=memory_keep_local_repair_context,
     )
 
 
@@ -609,6 +675,12 @@ def _continue_single_op_worker(
         seed_previous_code=seed_code,
         seed_repair_context_path=str(ent.get("seed_repair_context_path") or ""),
         prior_attempts=ent.get("prior_attempts") or {},
+        memory_backend=args_dict.get("memory_backend", "local"),
+        memory_url=args_dict.get("memory_url", "http://127.0.0.1:8420"),
+        memory_session_prefix=args_dict.get("memory_session_prefix", "llm4ascend"),
+        memory_recall_limit=args_dict.get("memory_recall_limit", 5),
+        memory_timeout=args_dict.get("memory_timeout", 5.0),
+        memory_keep_local_repair_context=args_dict.get("memory_keep_local_repair_context", True),
     )
     merged = merge_op_summary(
         ent.get("prior_op_summary") or {},
@@ -716,6 +788,12 @@ def _run_continue_session(
             seed_previous_code=seed_code,
             seed_repair_context_path=seed_repair,
             prior_attempts=ent.prior_attempts,
+            memory_backend=args.memory_backend,
+            memory_url=args.memory_url,
+            memory_session_prefix=args.memory_session_prefix,
+            memory_recall_limit=args.memory_recall_limit,
+            memory_timeout=args.memory_timeout,
+            memory_keep_local_repair_context=args.memory_keep_local_repair_context,
         )
         return merge_op_summary(
             ent.prior_op_summary,
@@ -747,6 +825,12 @@ def _run_continue_session(
             "eval_npu": args.eval_npu,
             "parallel_ops": args.parallel_ops,
             "use_repair_memory": args.use_repair_memory,
+            "memory_backend": args.memory_backend,
+            "memory_url": args.memory_url,
+            "memory_session_prefix": args.memory_session_prefix,
+            "memory_recall_limit": args.memory_recall_limit,
+            "memory_timeout": args.memory_timeout,
+            "memory_keep_local_repair_context": args.memory_keep_local_repair_context,
         }
         memory_root_str = str(memory_root) if memory_root else ""
         continue_entities = [e for e in plan.entities if e.action == "continue"]
@@ -982,6 +1066,48 @@ def main() -> int:
         default="",
         help="Existing run directory to continue from (required with --continue-attempt).",
     )
+    parser.add_argument(
+        "--memory-backend",
+        choices=["off", "local", "tencentdb"],
+        default="local",
+        help="Memory backend: off=none, local=file-based repair context (default), tencentdb=TencentDB Agent Memory Gateway.",
+    )
+    parser.add_argument(
+        "--memory-url",
+        type=str,
+        default="http://127.0.0.1:8420",
+        help="TencentDB Agent Memory Gateway base URL (used when --memory-backend=tencentdb).",
+    )
+    parser.add_argument(
+        "--memory-session-prefix",
+        type=str,
+        default="llm4ascend",
+        help="Session key prefix for TencentDB capture/recall.",
+    )
+    parser.add_argument(
+        "--memory-recall-limit",
+        type=int,
+        default=5,
+        help="Max number of memories to recall from external backend.",
+    )
+    parser.add_argument(
+        "--memory-timeout",
+        type=float,
+        default=5.0,
+        help="HTTP timeout in seconds for TencentDB Gateway calls.",
+    )
+    parser.add_argument(
+        "--memory-keep-local-repair-context",
+        action="store_true",
+        default=True,
+        help="When using tencentdb backend, also keep local attemptN/<op>_repair_context.txt as exact evidence.",
+    )
+    parser.add_argument(
+        "--no-memory-keep-local-repair-context",
+        action="store_false",
+        dest="memory_keep_local_repair_context",
+        help="Disable local repair context when using tencentdb backend.",
+    )
     args = parser.parse_args()
     if args.continue_attempt and not (args.continue_from or "").strip():
         raise ValueError("--continue-from is required when --continue-attempt is set")
@@ -1126,6 +1252,12 @@ def main() -> int:
         "operator_keys": resolved_ops,
         "ops": {},
         "use_repair_memory": args.use_repair_memory,
+        "memory_backend": args.memory_backend,
+        "memory_url": args.memory_url,
+        "memory_session_prefix": args.memory_session_prefix,
+        "memory_recall_limit": args.memory_recall_limit,
+        "memory_timeout": args.memory_timeout,
+        "memory_keep_local_repair_context": args.memory_keep_local_repair_context,
     }
 
     if args.parallel_ops == 1:
@@ -1151,6 +1283,12 @@ def main() -> int:
                 ascend_search_version_filter=ascend_vf,
                 run_slug=memory_run_slug,
                 use_repair_memory=args.use_repair_memory,
+                memory_backend=args.memory_backend,
+                memory_url=args.memory_url,
+                memory_session_prefix=args.memory_session_prefix,
+                memory_recall_limit=args.memory_recall_limit,
+                memory_timeout=args.memory_timeout,
+                memory_keep_local_repair_context=args.memory_keep_local_repair_context,
             )
             results.append({"op": op, "summary": summary})
     else:
@@ -1179,6 +1317,12 @@ def main() -> int:
                     ascend_search_version_filter=ascend_vf,
                     run_slug=memory_run_slug,
                     use_repair_memory=args.use_repair_memory,
+                    memory_backend=args.memory_backend,
+                    memory_url=args.memory_url,
+                    memory_session_prefix=args.memory_session_prefix,
+                    memory_recall_limit=args.memory_recall_limit,
+                    memory_timeout=args.memory_timeout,
+                    memory_keep_local_repair_context=args.memory_keep_local_repair_context,
                 )
                 fut_to_op[fut] = op
             for fut in concurrent.futures.as_completed(fut_to_op):

@@ -664,6 +664,58 @@ python generator/scripts/render_repair_memory_manifest.py
 
 - **设计说明与示例 prompt 快照**：[`docs/repair_memory_design.md`](docs/repair_memory_design.md)（含 §8 维护流程）、[`generator/agent/_example_prompts_memory/`](generator/agent/_example_prompts_memory/)（Review / 选条 / inject 的英文 message 实录，已与 `root`/`symptom`/`log_excerpt` 实现对齐）。
 
+#### 3.7.2 统一记忆后端（memory backend）
+
+`run_agent_multi_rounds.py` 从 `v0.x` 起支持通过 **`--memory-backend`** 选择不同的记忆后端，流程编排脚本只依赖统一抽象接口，不直接耦合具体实现。
+
+| 后端 | 参数值 | 说明 |
+|------|--------|------|
+| `local`（默认） | `--memory-backend local` | 保留历史行为：每轮将 `repair_context.txt` 写入 `attemptN/<op>_repair_context.txt`，下一轮直接读取上一轮的精确错误上下文。 |
+| `off` | `--memory-backend off` | 禁用一切记忆读写； attempt ≥ 2 时不再注入上一轮修复上下文（用于基线/ablation）。 |
+| `tencentdb` | `--memory-backend tencentdb` | 调用 **TencentDB Agent Memory Gateway**（REST），在保留本地 `repair_context.txt` 作为精确证据的同时，额外进行跨 run / 跨 op 的长期记忆 `recall` / `capture`。 |
+
+**相关参数**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--memory-backend` | `local` | 后端类型：`off` / `local` / `tencentdb` |
+| `--memory-url` | `http://127.0.0.1:8420` | TencentDB Gateway 地址 |
+| `--memory-session-prefix` | `llm4ascend` | session_key 前缀（最终 key 为 `<prefix>-<op>`） |
+| `--memory-recall-limit` | `5` | 单次 recall 返回条数上限 |
+| `--memory-timeout` | `5.0` | Gateway HTTP 调用超时（秒） |
+| `--memory-keep-local-repair-context` | 默认开启 | 使用 `tencentdb` 时仍保留本地 `repair_context.txt` |
+| `--no-memory-keep-local-repair-context` | — | 禁用上述本地保留 |
+
+**使用示例**
+
+```bash
+# A. 默认行为：仅本地 repair context（与历史行为一致）
+python3 generator/scripts/run_agent_multi_rounds.py \
+  --categories test_set \
+  --memory-backend local
+
+# B. 禁用记忆（attempt2+ 不再看到上一轮错误）
+python3 generator/scripts/run_agent_multi_rounds.py \
+  --categories test_set \
+  --memory-backend off
+
+# C. 接入 TencentDB Agent Memory（本地精确上下文 + 长期记忆召回）
+python3 generator/scripts/run_agent_multi_rounds.py \
+  --categories test_set \
+  --memory-backend tencentdb \
+  --memory-url http://127.0.0.1:8420 \
+  --memory-session-prefix llm4ascend-lxbr \
+  --memory-keep-local-repair-context
+```
+
+当 `--memory-backend=tencentdb` 时，脚本会在 **每轮评测后** 调用 `POST /capture` 将修复文本与生成的代码摘要写入记忆；在 **下一轮生成前** 调用 `POST /recall` 召回历史经验，并与本地 `repair_context.txt` 合并后注入 Agent prompt。若 Gateway 健康检查失败，会自动降级到 `local` 后端并打印 `[WARN]` 提示。
+
+**实现位置**：
+- 抽象接口 & 工厂：`generator/agent/memory/`（`base.py` / `factory.py` / `types.py`）
+- 本地后端：`generator/agent/memory/local_repair.py`
+- TencentDB 后端：`generator/agent/memory/tencentdb.py`
+- 接入点：`generator/scripts/run_agent_multi_rounds.py`
+
 ### 3.6 配置与依赖
 
 | 文件 | 作用 |
