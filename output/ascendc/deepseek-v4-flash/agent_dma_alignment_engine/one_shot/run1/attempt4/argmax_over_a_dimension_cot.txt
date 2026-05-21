@@ -1,0 +1,65 @@
+We need to fix the kernel_src based on the error logs. The errors are:
+
+1. `blockIdx_` undeclared: Use `AscendC::GetBlockIdx()` instead.
+2. `inputBase_ = (__gm__ float*)x;` no viable overload: Should use `SetGlobalBuffer` method on GlobalTensor.
+3. `outputBase_` similar issue.
+4. `inQueueMaxIdxs_.AllocTensor<float>()` assigned to `LocalTensor<int64_t>`: cannot convert. Need separate queues for int64 and float.
+5. `AscendC::Mul(idxLocal, 0.0f, tileCols);` wrong arguments: Should use `AscendC::Muls` with a scalar, or use `AscendC::SetValue` (correct api is `AscendC::SetValue` but it's a method on LocalTensor? Actually AscendC::SetValue is a function. Might need `AscendC::SetVal` or using `AscendC::Muls` with 0. 
+6. `AscendC::Select` calls wrong signature: Need to use correct Select overload: `Select(dst, src0, src1, selMask, len)`? Actually from error, we see candidate: `Select(const LocalTensor<T>& dst, const LocalTensor<U>& selMask, ...)` So the correct signature for masked select is: `Select(dst, src0, src1, selMask, len)`? Let's check AscendC API. Typically: `Select(dst, src0, src1, mask, len)` where mask is uint8. But the error says candidate with `const LocalTensor<T>& dst, const LocalTensor<U>& selMask, ...`. The 4th argument should be mask. We used `idxTemp_` as mask, but also need src0 and src1. The given call `AscendC::Select(maxVals, idxTemp_, tLocal, maxVals, tileCols);` has 5 arguments: dst, mask, src1, src0? Not matching. Need to use proper API.
+
+Simpler approach: Instead of implementing complex kernel with select, we can use a simpler algorithm: For each column tile, we compute argmax by comparing each row's value to the current max. Use `AscendC::Compare` to get mask, then use `AscendC::Sel` which is `Select` with mask. The correct signature: `Select(dst, src0, src1, mask, len)` where mask is uint8. So `Select(maxVals, tLocal, maxVals, mask, tileCols)` would select tLocal where mask=1 else maxVals.
+
+We need to rewrite kernel_src properly.
+
+Also, the tiling data and init need to pass `tileLen` from tiling data. In previous kernel, we hardcoded `tileLen_ = 2048` but we should use the value from tiling. Actually we computed tileLen in tiling but didn't pass it to kernel. We need to add `tileLen` to tiling data. Currently tiling has `totalBatches, rowLen, colLen, blockDim, dim`. Add `tileLen`. Then in Init, use that.
+
+Let's redesign kernel:
+
+- Each block handles a specific (batch, colTile) as before.
+- We'll use two main buffers: one for max values (float) and one for indices (int64). We'll allocate them using TQue with VECIN.
+- We'll also need a temporary float buffer for loading the next row's tile (or reuse one of the queues).
+- For simplicity, we can use a single double-buffered queue for max values and indices? Actually we need to keep current max values and indices across rows. So we allocate them once in Init and reuse. We'll just allocate them as local tensors using `AllocTensor` from a queue that is initialized with enough space. Since we only need one buffer each, we can initialize two queues with BUFFER_NUM=1 for simplicity, or use separate queues for each.
+
+Better: Use `pipe_.InitBuffer(inQueueMaxVals_, 1, tileLen * sizeof(float));` and then allocate once. Then we can use that tensor throughout the process. But careful: queue management with EnQue/DeQue is for streaming. For persistent state, we can just use the buffer directly without queue. But typical pattern is to use queues for double buffering. Since we only process one tile per block, we can just allocate local tensors directly via `AscendC::LocalTensor<float> maxVals = pipe_.AllocLocalTensor<float>(tileLen);` Actually pipe has `AllocLocalTensor` method? Usually we use `TQue::AllocTensor` after popping from queue. But we can also use `AscendC::LocalTensor<float> maxVals = inQueueMaxVals_.AllocTensor<float>();` and never enqueue/dequeue it. That is allowed because AllocTensor just gets a buffer from the preallocated pool. It's okay to not use queue for static data.
+
+We'll do:
+
+```
+pipe_.InitBuffer(inQueueMaxVals_, 1, tileLen * sizeof(float));
+pipe_.InitBuffer(inQueueMaxIdxs_, 1, tileLen * sizeof(int64_t));
+pipe_.InitBuffer(inQueueTmp_, 1, tileLen * sizeof(float)); // for loading new row data
+```
+
+Then in Process:
+```
+auto maxVals = inQueueMaxVals_.AllocTensor<float>();
+auto maxIdxs = inQueueMaxIdxs_.AllocTensor<int64_t>();
+auto tmpRow = inQueueTmp_.AllocTensor<float>();
+// ... use them, no need to FreeTensor? Actually we should free later.
+```
+
+But we must free after use to allow reallocation if needed. Since it's one tile, we can free at end.
+
+Now for comparison: Use `AscendC::Compare(mask, tmpRow, maxVals, CMPMODE::GT, len);` where mask is uint8 local tensor. Then `AscendC::Select(maxVals, tmpRow, maxVals, mask, len);` and `AscendC::Select(maxIdxs, r_vals, maxIdxs, mask, len);` where r_vals is a local int64 tensor filled with current row index r. For filling row index, we can use `AscendC::Muls` or `AscendC::BroadcastVar` with scalar. Simpler: Use `AscendC::Muls(idxLocal, 0.0f, tileCols);` is wrong; for int64, we need `AscendC::Muls` requires dst and src both same type? `Muls` works on float only? Actually `Muls` is for float. For int64, we can use `AscendC::Add` with scalar? There is no direct set to constant. We can use `AscendC::Muls` on float and then cast? Or we can initialize with `AscendC::SetValue`? `SetValue` is a function that sets all elements to a scalar: `AscendC::SetValue(maxIdxs, static_cast<int64_t>(r), len);` Yes, `AscendC::SetValue(dst, scalar, len)` works for any type (int64). So we can use that.
+
+We also need a mask buffer. Allocate it similarly.
+
+We'll need to compute global indices for reading data. The input layout is [batch, row, col] with rowLen rows and colLen columns. For each block, we have batch = batchStart, colStart. For row r, we read at offset: batch*rowLen*colLen + r*colLen + colStart. Then copy tileLen elements to tmpRow.
+
+Similarly, output: write out maxIdxs at offset batch*colLen + colStart.
+
+Also, we need to handle variable tile end (tileLenActual). Set tileLen from tiling data.
+
+Now, fix the tiling data to include tileLen.
+
+Let's rewrite kernel_src accordingly. Also fix host_operator_src to compute tileLen and pass it. In host_operator_src, we already compute tileLen but didn't set it in tiling; we need to add set_tileLen and field in tiling data.
+
+Also, in kernel init, we need to receive tileLen and store it.
+
+Now, check errors from log: There is also an error about `"not enough arguments for format string"` during opc_tool. That may be due to the kernel compilation failing earlier; once kernel compiles, that error may disappear.
+
+We'll produce corrected code for all six strings.
+
+Important: Keep naming consistent with previous attempt (ArgmaxOverADimensionCustom). Keep contracts.
+
+Now, write the corrected solution.

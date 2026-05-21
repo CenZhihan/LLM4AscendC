@@ -1,0 +1,60 @@
+We need to fix the previous attempt's kernel and tiling. The error shows "vector core execution abnormal" with CCU instruction address check errors across cores. This suggests a memory access violation or misaligned access in the kernel.
+
+Key issues from previous kernel:
+1. The kernel's `Process()` method has a grid-stride loop that prefectches next tile before computing current. But the prefectch (CopyIn for next tile) is called BEFORE Compute for current tile, which can cause queue overflow and data corruption because the buffers only have BUFFER_NUM=2 per queue. When prefetching next tile while current tile's x/mask still in queues, it might allocate tensors that exceed buffer capacity (since both x and mask need separate queues but each queue has BUFFER_NUM=2). Actually, each queue is independent: inQueueX_ has 2 slots, inQueueMask_ has 2 slots, outQueueY_ has 2 slots. The prefetch logic: It calls CopyIn(nextBase, nextLen) which allocates a tensor for x and mask each and enqueues them. Then immediately after, it calls CopyIn(base, curLen) again for the current tile. That would allocate two more tensors, making total 4 tensors in each input queue? Wait: The code is:
+
+```c
+while (true) {
+  uint32_t curLen = totalLen_ - base;
+  if (curLen > tileLen_) curLen = tileLen_;
+
+  // Prefetch next tile early if available
+  uint32_t nextBase = base + blockNum * tileLen_;
+  uint32_t nextLen = 0;
+  if (nextBase < totalLen_) {
+    nextLen = totalLen_ - nextBase;
+    if (nextLen > tileLen_) nextLen = tileLen_;
+    CopyIn(nextBase, nextLen);   // <-- allocates and enqueues x and mask for next tile
+  }
+
+  CopyIn(base, curLen);          // <-- allocates and enqueues x and mask for current tile
+  Compute(curLen);               // <-- dequeues x and mask for current tile, computes, enqueues y
+  CopyOut(base, curLen);         // <-- dequeues y and copies out
+
+  if (nextLen == 0) break;
+  base = nextBase;
+  curLen = nextLen;
+}
+```
+
+But note that `Compute` dequeues the tensors that were enqueued by the immediately preceding `CopyIn(base, curLen)`. However, if next tile was prefetched, its tensors remain in the queues until later iterations. Since each queue has capacity 2, and we have at most one extra enqueued (the next tile) plus the current tile enqueued, total 2 enqueues per queue. That's okay because BUFFER_NUM=2. But after Compute, the current tile's tensors are freed (xLocal is enqueued to outQueueY_, maskLocal freed). So next iteration, prefetch again would enqueue another next, and then current. That would exceed the capacity? Let's trace:
+
+Iteration 0:
+- Prefetch tile1: enqueue x1, mask1.
+- Enqueue current tile0: enqueue x0, mask0. Now each input queue has 2 elements (x1 and x0, mask1 and mask0). OK.
+- Compute: dequeues x0, mask0, computes, enqueues y0. Now input queues have x1, mask1. OK.
+- CopyOut: dequeues y0, copies out, frees. Now output queue has 0.
+
+Iteration 1 (base = nextBase = tile1):
+- Prefetch tile2: enqueue x2, mask2. Now input queues have x1, x2 and mask1, mask2. Still 2 each. OK.
+- Enqueue current tile1: enqueue x1? Wait, x1 already in queue from prefetch. Actually, after iteration 0, x1 and mask1 are still in queues. Then we call CopyIn(base, curLen) where base is tile1, which will allocate new tensors and enqueue again. But that would duplicate tile1 data: we have already enqueued tile1 in iteration 0 prefetch, now we enqueue tile1 again? That's wrong: the prefetch already loaded tile1. The logic should not prefetch the next tile AND then load the current tile; it should only load the current tile if not already prefetched. The typical pattern is: load first tile, then loop: compute current, prefetch next, copy out current, advance. But here the prefetch is done before loading the current tile each iteration, leading to double load of the same tile. This causes the bug: we enqueue tile1 twice, overflowing the buffer (since capacity is 2, but we try to enqueue a third tensor when tile2 and tile1 already occupy both slots). The buffer allocation would fail or corrupt memory, causing vector core exception.
+
+So the fix: change the loop to a standard prefetch pattern: load first tile before loop, then in loop: compute current, prefetch next, copy out current, advance. That avoids double enqueue and ensures buffer usage stays within BUFFER_NUM.
+
+Additionally, the kernel does not handle the dim parameter; it assumes the data is flattened and accumulates over the whole contiguous tile. But the original operation is `torch.cumsum(x * mask, dim=dim)`. The cumsum is along a specific dimension, not over entire flattened tensor. The tiling code tries to consider inner size but the kernel doesn't use it. So the kernel must handle per-dimension accumulation. The simplest approach is to have the tiling pass the inner size (number of elements along the cumsum dimension) and the number of rows (other dims product). Then in kernel, for each row of length `innerSize`, perform a serial cumulative sum. That will be correct. The tile length should be a multiple of inner size to avoid partial rows.
+
+So we need to modify the tiling to compute and pass innerSize and maybe rowDimProd (or just innerSize and totalRows). The tiling data should include: totalLength, tileLength (must be multiple of innerSize), innerSize. The blockDim can be set based on number of rows.
+
+Then kernel: for each tile (contiguous elements), treat it as a 2D array of [numRows, innerSize] where numRows = tileLen / innerSize. For each row, do in-place cumulative sum.
+
+Also note: the mask input is bool in PyTorch, but we convert to float in model_src. The operator expects float mask. That's fine.
+
+Now fix the kernel and tiling accordingly.
+
+We'll keep the existing project_json and python_bind mostly same, but need to add the dim attribute handling in tiling/kernel.
+
+Let's rewrite host_tiling, host_operator, kernel source with minimal changes.
+
+Also ensure host_operator's InferShape and InferDataType are correct.
+
+Now produce the corrected code.

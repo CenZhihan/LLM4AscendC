@@ -1,0 +1,137 @@
+We need to produce six Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src for the softmax operator. The kernel name is softmax_custom, PascalCase SoftmaxCustom. The model performs softmax along dim=1. Input shape is (batch_size, num_features) with batch_size=4096, dim=393216. The dtype policy engine suggests using float32 I/O and accumulation. We need to implement a numerically stable softmax: compute max, subtract, exp, sum, divide. Since it's along dim=1, we need to reduce over the last dimension. For a 2D tensor, we can treat each row independently. The kernel should handle tiling properly, using UB budget. We'll produce the six strings.
+
+We need to ensure the kernel is efficient: handle large rows (393216 elements) by tiling within a row? Or we can process each row in tiles? Since the reduction is along dim=1 (columns), each row is independent. We can have blockDim equal to number of rows? But rows=4096, that's too many blocks. Maybe we can distribute rows across blocks. Each block processes multiple rows? Or we can use grid-stride loops over rows. The total length is batch_size * dim = 4096 * 393216 = ~1.6B elements, which is huge. Need to carefully tile.
+
+Better approach: each block handles a subset of rows. Within each row, we need to compute max, then exp and sum. That requires two passes over the row (can be done in one pass if we do two stages: first compute max, then second compute exp and sum, then third divide). We can store intermediate values in UB. The row length is 393216, which may not fit in UB all at once. So we need to tile the row as well. So we have two levels of tiling: block-level (rows) and tile-level (within row). The tiling data should include row length (numFeatures) and batch size, and tile length for within-row tiling.
+
+We'll follow the pattern from the leaky_relu example but adapt. The host tiling will compute blockDim based on number of rows, and tileLength for within-row processing.
+
+We need to decide UB budget: for softmax, we need input, output, and temporary buffers for max, sum, maybe exp values. Typical: 3 buffers (input, output, tmp) each of tileLen. Plus maybe a scalar for max, sum. So we can set UB_BUDGET_BYTES = 192KB. For float32, each element 4 bytes. So max elements = 192*1024/4 = 49152 per buffer. But we need multiple buffers, so tileLen = 49152 / (number of buffers). For safety, we can use 2 buffers (input and output) and one tmp, but we need to pipeline. Actually we can use double buffering for input and output, plus intermediate for max/sum. Let's assume we need 4 buffers: inQueueX (2), outQueueY (2), tmpQueue (1) for max, sum, exp? Actually we can reuse. We'll follow similar pattern: inQueueX (2), outQueueY (2), tmpQueue (1). So total 5 tiles * tileLen floats. tileLen = UB_BUDGET_BYTES / (5*4) = 192*1024 / 20 = 9830.4, align down to 8192? We can use ALIGN_ELEMS = 1024 or 2048. We'll set tileLen to maybe 8192.
+
+But note the row length is 393216, which is 48 * 8192. So we can tile the row into 48 tiles.
+
+BlockDim: we can set it to number of rows, but cap at 24 as in leaky_relu? 4096 rows is too many. We can set blockDim to maybe 24 or 32, and each block processes multiple rows in a grid-stride loop. The tiling can set blockDim = min(24, numRows). Then each block handles rows with stride blockDim.
+
+We'll implement the kernel as:
+
+- Get blockIdx and blockNum.
+- For each row index = blockIdx, rowIdx < batchSize, rowIdx += blockNum:
+    - Process the row:
+        - First compute max across all tiles of the row:
+            - For each tile in row:
+                - Copy tile to local, compute max (using ReduceMax).
+            - Keep global max across tiles (using scalar variable).
+        - Second pass: compute exp(x - max) and sum:
+            - For each tile:
+                - Load tile, subtract max, compute exp (using Exp), accumulate sum (using ReduceAdd).
+        - Third pass: divide each tile by sum and write output.
+
+We can combine first and second passes? Not easily because we need max before computing exp. So two passes.
+
+We need to be careful about using correct Ascend C intrinsics: DataCopy, Muls, Sub, Exp, Add, ReduceMax, ReduceAdd. We'll use vector functions.
+
+We'll also need to handle the case where tile length may not cover the whole row; the last tile may be partial.
+
+We'll use the same buffer management: three queues (inQueueX, outQueueY, tmpQueue). But we might need more temporary for max/sum across tiles. We can use pipe.InitBuffer(tmpQueue, 1, tileLen * sizeof(float)) for intermediate exp values or sum? Actually we can compute sum in a local variable and not store all exp. But for division, we need the exp values? We need to write exp(x-max)/sum to output. So we need to compute exp for each tile and then divide by sum. So we need to store the exp values temporarily before dividing. That means we need to either compute exp twice (once for sum, once for output) or store them. Better to store them: we can store exp in a local buffer (tmpQueue) and then divide. So we need at least three buffers: input, output, exp. But we can reuse input buffer? We can overwrite input with exp? No, we need the original input for max. So we can do:
+
+- First pass: for each tile, copy input to local (inQueueX), compute max across tile, accumulate global max, then free input.
+- Second pass: for each tile, copy input again (since we freed it), but we need it again. So we need to load it again from GM. That's okay because we have double buffering. We can pipeline two passes: while first pass is computing max, second pass can't start until max is known. Simpler: do two separate loops over the row. For each tile, we load from GM, compute, and then write to output. We need to avoid double loading? Actually we can load once, compute max, then after max known, we can reuse the same loaded data to compute exp? But max is across tiles, so we need max from all tiles before any exp. So we need to either store all input tiles or load twice. Given the tile size is small (8192 floats = 32KB), loading twice is fine.
+
+We'll implement as:
+
+- For each row, first loop over tiles to compute rowMax:
+    - For each tile offset:
+        - CopyIn tile to xLocal (from inQueueX)
+        - Compute tileMax using ReduceMax (or we can use vector max and reduce)
+        - Update global rowMax
+        - Free tile
+- Second loop over tiles to compute sumExp:
+    - For each tile offset:
+        - CopyIn tile to xLocal
+        - Compute xLocal = exp(xLocal - rowMax) (use sub and exp)
+        - Compute tileSum using ReduceAdd
+        - Update global sumExp
+        - Store exp values in yLocal? Wait, we need to output exp/sum later. We can either store exp in a separate buffer (tmpQueue) and then in third loop divide, or combine. Since we have the exp values in xLocal (after overwriting), we can write them to output but with division needed. So we can do third loop: while computing sum, also store exp in output buffer? Then after sum known, do another pass to divide? That would be three passes. Alternatively, we can compute exp and sum, then immediately divide and write output in the same tile, but we need the global sum from all tiles. So we cannot divide until after sum is known. So we need to either store the exp values (maybe in GM? but that would be extra write). Better to store them in UB (tmpQueue) for the duration of the row. Since we have only one row per block at a time, we can allocate a large temporary buffer covering the whole row? That would be too large (393216*4 = 1.5MB > UB). So we must tile the division as well. So we can do:
+
+    - Second pass: for each tile, compute exp(x - rowMax) and store in a temporary local buffer (tmpQueue). Also accumulate sum.
+    - After second pass, sumExp is known.
+    - Third pass: for each tile, load from tmpQueue (the stored exp), divide by sumExp, copy to output.
+
+But tmpQueue is only one tile size, so we can only hold one tile of exp at a time. So during third pass, we need to reload the exp values. They are stored in the temporary buffer that we overwrite each tile. So we need to recalc? We can recalc exp again in third pass. That's fine: third pass: load input again, compute exp, divide by sum, output. That means three passes of loading input. That's okay because it's simple and each tile is small.
+
+Simplify: We can do:
+
+1. Compute rowMax (first pass over tiles)
+2. Compute sumExp (second pass over tiles: load input, compute exp, accumulate sum, discard)
+3. Write output (third pass over tiles: load input, compute exp, divide by sum, write)
+
+That's three passes, each loading input from GM. That's acceptable for large rows. We can pipeline with double buffering.
+
+We need to manage queues properly. Since each pass is a separate loop, we can reuse the queues. We'll implement three methods: ComputeMax, ComputeSum, ComputeOutput. Each will use inQueueX for input, and possibly outQueueY for output in third pass. We'll use tmpQueue for scalar reduction? Actually we can use vector reduction intrinsics: AscendC::ReduceMax and AscendC::ReduceAdd which reduce a local tensor to a scalar. We'll store the scalar results in registers (float). For tile max, we can use AscendC::LocalTensor<float> and then AscendC::ReduceMax returns a scalar.
+
+Now, let's write the code.
+
+Host tiling: We need to define TilingData with totalLength (batch * dim), batchSize, numFeatures, tileLength, blockDim. But we only need row length (numFeatures), number of rows (batchSize), and tileLength for within-row processing. totalLength is batch*numFeatures, but we can compute from shape. We'll store batchSize, numFeatures, tileLength, blockDim.
+
+UB budget calculation: We need to consider the buffers. For each tile we need input and output buffers (double buffered) and maybe temporary for exp? But we are not storing exp; we compute on the fly. The temporary queue might be used for reduction results? We can allocate a small buffer for reduction? Actually we can use scalar registers. So we need at least 2 * tileLen for inQueueX and 2 * tileLen for outQueueY. Plus maybe one tile for tmpQueue. So total 5 * tileLen floats. Same as leaky_relu. We'll use similar UB_BUDGET_BYTES = 192*1024, ALIGN_ELEMS = 1024, HARD_CAP_ELEMS = 32768. tileLen = UB_BUDGET_BYTES / (5*4) = 9830, align down to 9216? Or 8192. We'll use 8192 as it's power of 2 and aligns well. We'll compute from UB_BUDGET_BYTES / (5*4) and then align down to multiple of ALIGN_ELEMS (1024) and not exceed HARD_CAP_ELEMS. Also ensure tileLen <= numFeatures.
+
+BlockDim: number of rows/tiles? We can set blockDim = min(numRows, 24) or compute based on total rows. Since rows=4096, we can set blockDim = 24 (max) and each block processes rows with stride blockDim. That's fine.
+
+Now, write the kernel. We'll use __aicore__ functions.
+
+We'll name the kernel class KernelSoftmaxCustom.
+
+Implementation details:
+
+- Get row count: batchSize, numFeatures.
+- BlockIdx, blockNum.
+- For rowIdx = blockIdx; rowIdx < batchSize; rowIdx += blockNum:
+    - Set base = rowIdx * numFeatures.
+    - ProcessRow(base, numFeatures, tileLen).
+
+In ProcessRow:
+    - Compute rowMax = -inf initially.
+    - for offset = 0; offset < numFeatures; offset += tileLen:
+        - curLen = min(tileLen, numFeatures - offset)
+        - CopyIn(base+offset, curLen)
+        - Compute tileMax using ReduceMax
+        - rowMax = max(rowMax, tileMax)
+    - Compute sumExp = 0.0f
+    - for offset = 0; offset < numFeatures; offset += tileLen:
+        - curLen = min(tileLen, numFeatures - offset)
+        - CopyIn(base+offset, curLen)
+        - Subtract rowMax (Sub)
+        - Compute Exp (Exp)
+        - Accumulate sumExp via ReduceAdd
+        - (discard the local tensor)
+    - for offset = 0; offset < numFeatures; offset += tileLen:
+        - curLen = min(tileLen, numFeatures - offset)
+        - CopyIn(base+offset, curLen)
+        - Subtract rowMax
+        - Exp
+        - Divide by sumExp (Div)
+        - CopyOut(base+offset, curLen)
+
+But we need to be careful: in the second pass, we don't write output; we just compute sum. In the third pass we compute output. However, we are using the same buffers; we need to ensure completion of previous operations. Since we use double buffering, we need to call CopyIn and then compute, then free/que. We'll write helper functions.
+
+We also need to handle the case where tileLen may be 0 or row length 0.
+
+Now, write the kernel code.
+
+We also need to include "kernel_operator.h".
+
+Now, produce the six strings.
+
+Let's write them.
+
+Note: The example includes host_tiling_src with a tiling data definition and TilingFunc. We'll adapt.
+
+For project_json_src: softmax_custom takes input tensor of float, output tensor of float. No attrs needed (dim=1 is fixed? The original uses dim=1, but we can assume the kernel always reduces along the last dimension (dim=1 for 2D). We could add an attribute for dim, but to keep simple, we assume dim=1. The operator will be SoftmaxCustom with input x and output y.
+
+For host_operator_src: we need to include tiling, infer shape, and operator definition. Use PascalCase SoftmaxCustom.
+
+For python_bind_src: we need to create a function that calls the NPU kernel. Use aclnnSoftmaxCustom? Actually the example uses EXEC_NPU_CMD with aclnnLeakyReluCustom. We need to follow same pattern: we need to generate the aclnn API call. The convention is aclnn<OpName>. So we'll have aclnnSoftmaxCustom. The implementation will call EXEC_NPU_CMD.
+
+For model_src: import custom_ops_lib and use softmax_custom function.
+
+Now, write all.

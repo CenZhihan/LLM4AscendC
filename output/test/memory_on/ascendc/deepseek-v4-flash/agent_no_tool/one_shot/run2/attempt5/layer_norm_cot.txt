@@ -1,0 +1,90 @@
+We need to generate the six Python strings for the layer_norm_custom kernel. The previous attempt failed because the generated code was incomplete (cut off). We need to provide a complete set of strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+We must follow the pattern from the leaky_relu example, adapting for LayerNorm. The kernel name is "layer_norm_custom", PascalCase "LayerNormCustom". The original model uses nn.LayerNorm with normalized_shape tuple. The custom kernel should take a 2D input? Actually the original input is (batch_size, features, dim1, dim2) and normalized_shape is (features, dim1, dim2). So the input is 4D, but LayerNorm normalizes the last N dimensions. The custom kernel could be designed to handle arbitrary shapes but for simplicity we can treat it as a 2D operation where the last dimensions are flattened. We'll implement a kernel that computes mean and variance along the last axis (the normalized shape), then normalizes.
+
+We need to define tiling data: totalLength, tileLength, blockDim, and the normalized shape parameters (maybe normalized_size and epsilon). But we also need to pass the actual shape info. Since the tiling data is fixed at compile time, we could pass normalized_size and epsilon as attributes. The original nn.LayerNorm has eps=1e-5 by default, and elementwise_affine=False (no learnable params). So we just compute (x - mean) / sqrt(var + eps).
+
+We'll design the kernel to handle a 2D view: each row is a sample of size normalized_shape (product of dimensions). The tiling will split along the batch dimension (first axis) across blocks. The inner loop will process tiles of the flattened normalized shape.
+
+Important: The input can be any shape, but the operator's input_desc can be ND float tensor. We'll infer the normalized shape from the attribute? Or we need to pass normalized_shape as an attribute? The original model passes normalized_shape as init input, but the forward only takes x. The custom operator should have attributes for normalized_shape (list of ints) and eps (float). In the project_json, we can define attr "normalized_shape" as list of ints, and "eps" as float. The host operator must parse these and set tiling accordingly.
+
+In the leaky_relu example, the attrs were used in tiling: negative_slope. Here we need normalized_shape dimensions and epsilon.
+
+But the tiling data structure: we need to store totalLength (total elements), tileLength (per block tile size for the inner loop), blockDim, normalizedSize (product of normalized_shape), epsilon. Also we might need the stride (outer dimensions) but we can compute it as totalLength / normalizedSize. Actually we can compute the batch size (number of independent normalizations) as totalLength / normalizedSize.
+
+We'll assume the input is contiguous ND, and we treat it as a 2D matrix: [N, D] where N = totalLength / D, D = product(normalized_shape). Then each block processes a range of rows. Inside each row, we need to compute mean and variance across D elements. Since D might be large, we tile within the row.
+
+The UB budget: we need to allocate buffers for x, y, and temporary space for mean and variance computation. We'll use a two-pass approach: first compute sum and sum of squares, then compute mean and variance, then normalize. To minimize UB usage, we can do a single pass with Welford's online algorithm, but that is complex. Simpler: two passes: first compute sum and sum of squares using vector reductions, then compute mean and variance, then normalize. However, we need to store the data for second pass. Alternatively, we can compute mean and variance in one pass using DataCopy and then reduce. But that requires multiple buffers.
+
+Given the complexity, we might instead use a single pass where we compute mean first (sum), then variance (sum of squared differences), but that requires two passes over data. Since we cannot store all data in UB, we need to tile the row: for each row, we can process chunks, accumulate sum and sum of squares, then after processing all chunks, compute mean and variance, then we need to process the data again to normalize. But the data is in global memory, so we can read it again. That's okay: we can process each row twice: first pass to compute mean and variance, second pass to normalize. But that doubles memory traffic. Alternatively, we can buffer the entire row in UB? Only if D is small. For large D, we need to tile.
+
+We can design the kernel to handle a 1D vector of length D per row. We'll have two phases: Phase 1: for each block, iterate over its assigned rows, and for each row, iterate over tiles of the row to compute sum and sum of squares. Then after all tiles, compute mean and variance. Then Phase 2: for each row, iterate over tiles again and write normalized output.
+
+That requires storing the mean and variance for each row, which we can keep in UB per block if we have enough UB. The number of rows processed per block is small. We can allocate an array of mean and variance for the number of rows this block handles. But that's variable. Simpler: we can compute mean and variance per row and then immediately normalize row by row using two passes per row. That way we don't need to keep many results.
+
+Implementation plan:
+- For each block, determine its assigned rows (using grid-stride loop over rows).
+- For each row:
+   1. Compute sum and sum of squares by iterating over all tiles of the row (using DataCopy and vector operations).
+   2. Compute mean = sum / D, variance = sumSq/D - mean*mean, then invStd = rsqrt(variance + eps).
+   3. Second pass: iterate over tiles again to compute y = (x - mean) * invStd.
+
+This is straightforward but reads each row twice from global memory. We can optimize by using a larger tile size to reduce iterations, but still two passes.
+
+Alternatively, we could use a single pass online algorithm but it's more complex. For correctness, two passes is fine.
+
+We need to define tiling data: totalLength, tileLength (tile size within a row), blockDim, dim (normalized_shape product), eps.
+
+The UB budget calculation: For each tile, we need buffers for x, y, and temporary for sum and sum of squares. We can reuse buffers across passes. For first pass, we need x buffer and two accumulators (sum and sumSq) which can be scalar registers? But vector operations work on tensors; we need to accumulate. We can use a local tensor for partial sum and sumSq, then add them after each tile. We'll allocate three buffers: xLocal, sumLocal (1 element) and sumSqLocal (1 element). But sumLocal and sumSqLocal are small (1 float each). However, vector additions operate on tensors; we can reduce to scalar using ReduceAdd. We'll allocate a small tensor of length 1. Better: we can use AscendC's vector reduce operations: ReduceAdd, etc. Alternatively, we can maintain the accumulators in register variables, but the vector unit works on LocalTensor. We can allocate a single-element tensor for sum and sumSq. We'll use AscendC::Muls, AscendC::Add, etc.
+
+For simplicity, we'll do per-tile: compute sumTile = reducesum(xTile), sumSqTile = reducesum(xTile*xTile). Then add to global sum and sumSq. But reducesum returns a scalar. We can use AscendC::ReduceSum. However, the documentation suggests using AscendC::VecReduceSum. But to keep it simple, we can compute sum by iterating? That would be slow. We'll use AscendC::VecReduceSum.
+
+Given the complexity, and the fact that the previous attempt failed due to missing code, we need to produce a complete, plausible implementation. The evaluator will compile and run it. We must ensure the kernel compiles and runs correctly.
+
+Alternatively, we could design a simpler kernel that only handles a specific shape (like 2D) and uses a single pass by storing the entire row in UB if D is small. But we don't know D. We could set a maximum tile size for the row dimension and loop within row. The two-pass approach is general.
+
+Let's outline the kernel:
+
+- KernelLa yerNormCustom (PascalCase) class.
+- Init: receive totalLength, tileLength, blockDim, dim (normalized size), eps.
+- Process: for each row assigned to block,
+   - compute meanVariance for that row.
+   - normalize the row.
+
+We'll use TQue for input and output. We'll have two queues: one for input data, one for output. But for the two-pass approach, we need to read data twice: once for mean/variance, once for norm. We could read from GM directly each time without queuing? We can use DataCopy from GM to local, compute, then discard. For the second pass, we again read from GM to local, compute, write to GM. That's fine.
+
+We'll allocate a local tensor for x data (tile size). For the first pass, we accumulate sum and sumSq into local 1-element tensors using ReduceAdd. After each tile, we update global sum and sumSq (stored in local registers as float). Actually, we can just use float variables in UB? In kernel, we can declare float variables as part of class? But they are stored in register, not in UB. For thread safety, using local tensor is safer.
+
+We can use AscendC::LocalTensor<float> sumLocal, sumSqLocal, each of length 1. We will add tile sum to these accumulators.
+
+We need to compute reducesum of a tile. AscendC provides VecReduceSum which outputs a scalar to a local tensor of length 1. We'll use that.
+
+Let's code.
+
+Tiling data structure:
+
+BEGIN_TILING_DATA_DEF(LayerNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint32_t, normalizedSize); // product of normalized_shape
+  TILING_DATA_FIELD_DEF(float, epsilon);
+END_TILING_DATA_DEF;
+
+We need to compute normalizedSize from the attributes and pass it to tiling.
+
+In host operator, we parse attributes: normalized_shape (list of ints) and eps (float, default 1e-5). We compute product.
+
+Now, the project_json_src: define input_desc: x (ND float), output_desc: y (ND float), attr: normalized_shape (list of ints, param_type optional, default_value? We can leave empty), eps (float, default 1e-5). The normalized_shape is required for the operator, but for forward-only we infer from input shape? In the original model, normalized_shape is given at init, but the operator should know it. We'll make it an attribute.
+
+Now, the python_bind_src: we need to call the custom operator via EXEC_NPU_CMD. The function name should match: aclnnLayerNormCustom. We'll implement a thin wrapper that takes tensor x and returns tensor y. The operator will have attributes: normalized_shape (list of ints) and eps. We'll pass them.
+
+We also need to handle the case where the input has more than 2 dimensions; the operator should flatten the last normalized_shape dimensions. The host operator's infer shape should just copy shape.
+
+Now, write the code.
+
+We'll produce the six strings.
+
+Note: The kernel_src must include necessary headers and use the correct namespace.
+
+Let's start writing.

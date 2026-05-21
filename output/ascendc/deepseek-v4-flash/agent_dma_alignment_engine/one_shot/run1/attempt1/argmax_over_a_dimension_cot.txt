@@ -1,0 +1,166 @@
+We need to produce the full Ascend C kernel / host / project artifacts for the argmax over dimension custom kernel.
+
+Given the example structure for LeakyReLU, we need to produce similar six strings but for argmax over dimension.
+
+We have retrieved DMA alignment info suggesting usage of DataCopyPad for non-aligned GM->UB, and DataCopy for aligned. For argmax, we need to load float32 tiles, compute argmax (find max index) along a given dimension, and output int64 indices (since PyTorch returns long). The input shape is (batch_size, dim1, dim2) = (128, 4096, 4095), dim=1 => output shape (128, 4095) with int64.
+
+We need to design tiling strategy that handles the reduction. The UB budget is 192KB. We'll need to load a portion of the dimension along which we reduce. Since dim=1 (size 4096) and we need to compare across that dimension, we can tile along the other dimensions. Approach: For each output element (batch, dim2), we need to find the argmax over dim1. We can process multiple output elements in parallel.
+
+Allocate UB for source tile: shape (tileDim1, tileDim2) of float32, plus workspace for reduction. But we need to do reduction along dim1: find max and argmax. We can load a chunk of rows (dim1 slices) and perform sequential compare.
+
+Simpler: For each output position (b, d2), we process all 4096 values along dim1. We can load a block of dim1 values for a batch of d2 elements. The total elements in input is 128*4096*4095 ~ 2.1e9, too large for UB. We need to tile over batch and dim2.
+
+We'll produce kernel code accordingly.
+
+We must follow the pattern: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+Kernel name: argmax_over_a_dimension_custom, PascalCase: ArgmaxOverADimensionCustom.
+
+Output dtype: int64, input float32. The dim attribute is passed as attr.
+
+In the example, the model uses dim=1, but we need to support any dim (passed in init). In kernel, we need to handle the reduction dimension.
+
+Given the complexity, we'll design for dim=1 case (as in example), but we can generalize by passing dim as attribute.
+
+For simplicity, we'll assume dim=1 (row argmax). We'll also need to handle ND format with shape (batch, rows, cols). Output shape (batch, cols). For other dims, similar logic applies but index calculation changes.
+
+We'll produce a kernel that does: for each (b, c), find argmax over r=0..R-1. We'll tile over batch and col to fit in UB.
+
+Tiling: Use UB: we can load a tile of shape (tileBatch, tileCols) of values and compare across rows. But we need to compare across rows sequentially. Better: iterate over rows, keep current max and argmax for each (b,c) in tile.
+
+So we'll have local tensors for: current max values (float32), current indices (int64), and also source row. We'll process row by row.
+
+Total UB needed: For tile of size N = tileBatch * tileCols, we need: 
+- cur_max_f32: N * 4 bytes
+- cur_idx_i64: N * 8 bytes
+- row_val_f32: N * 4 bytes (temporary for loading one row's chunk)
+Total ~16N bytes. For 192KB UB, N max = 192*1024/16 = 12288. So we can process up to ~12k elements per tile. With output size 128*4095=524k, many tiles.
+
+We'll also need space for DataCopyPad if not aligned. Input rows have 4095 cols, not 32B aligned (4095*4=16380, not multiple of 32). So we need DataCopyPad as per DMA alignment warnings. For output, indices size 4095*8=32760, also not 32B aligned? 32760/32=1023.75, not multiple, so need DataCopyPad for output as well. The retrieved context suggests DataCopyPad for non-aligned moves.
+
+We'll implement using DataCopyPad for GM->UB and UB->GM. For UB->UB moves for compare, we can use DataCopy (since aligned internally).
+
+We'll need to use Pad: when loading a row of 4095 floats, we need to pad to next 32B (4096 floats). So we'll allocate padSize 4 bytes? Actually for DataCopyPad, we set padSize as the number of elements to pad. Since 16380 bytes / 4 = 4095 elements, need pad 1 element to reach 4096 (16384 bytes). So padSize=1. Similarly for output: 32760 bytes / 8 = 4095 int64, need pad 1 element to 4096 (32768 bytes). So padSize=1. We'll adjust tiling to account for padded sizes.
+
+We'll also have to initialize indices to 0 and max to -inf (or first row). We'll do first row then compare.
+
+Now, generate all six strings.
+
+Let's write them carefully.
+
+Project json: op name ArgmaxOverADimensionCustom, input float, output int64, attr dim (int, optional default 1? The example dim=1, but we can make default 1). Actually dim is provided in init and passed to forward, so it's a model parameter, not an operator attribute? In the example, the model has dim as init param and forward just uses torch.argmax(x, dim=self.dim). So we need to pass dim as attribute to the custom op. In the LeakyReLU example, negative_slope was attr. Similarly here dim should be attr.
+
+So project_json_src: op with input x (float), output y (int64), attr dim (int, optional default 1).
+
+host_tiling_src: define TilingData with fields: totalElements (input size), outputSize, tileBatch, tileCols, blockDim, dim. Also maybe padded versions.
+
+We'll need to compute tiling: given input shape (B, R, C), dim=1, output size = B*C. We'll tile over B and C to fit tileBatch * tileCols <= maxTileElems per tile. Use UB budget.
+
+Let's define UB_BUDGET_BYTES = 192*1024, per element bytes for tile = 4 (cur_max) + 8 (cur_idx) + 4 (row_temp) = 16, plus overhead. So maxTileElems = 192*1024/16 = 12288. Align down to 32? Actually row_temp alignment requires 32B per row? We'll align tileCols to 32 (since each row loaded via DataCopyPad needs to be 32B aligned? Actually DataCopyPad expects aligned destination, but we can allocate padded. For simplicity, we'll set tileCols = min(C, 4095) but then pad to next multiple of 8 (since int64). To avoid complexity, we can set tileCols = min(C, 4096) if C is 4095, use 4096 with pad? But then output indices would be 4096 per tile, but we only need 4095. We'll deal with pad later. But we can also set tileCols = 4095 (unaligned) and handle with DataCopyPad. The DMA engine suggests DataCopyPad for unaligned. So we'll use DataCopyPad with padSize.
+
+We'll set tileCols = C (4095) but then allocate padded size of 4096. Similarly for max/idx we allocate tileBatch * tileCols, but each row we load is 4095 elements with pad1.
+
+Thus tiling: tileBatch = maxTileElems / tileCols. maxTileElems = 12288, tileCols = 4095 => tileBatch ~ 3. So we'll process 3 batches per tile? Actually tileBatch could be 3, but then tileBatch*tileCols = 12285, fits. But we also need to consider that each row is processed individually, so we can process 3 output positions per batch. We'll compute tileBatch = floor(maxTileElems / tileCols) = 12288 / 4095 = 3 (floor). So we'll process 3 rows of output at a time.
+
+Alternatively, we could tile over dimension 1? But dim=1 is reduction direction, so we need all rows to compute one output. So we cannot tile over dim1 for a single output. So tiling over batch and col is correct.
+
+Host tiling: compute blockDim as number of tiles. Input B=128, C=4095, tileBatch=3, tileCols=4095 => total tiles = ceil(B/tileBatch) * ceil(C/tileCols). Since C is exactly tileCols (4095), only one tile in col dimension. So total tiles = ceil(128/3) = 43. BlockDim = min(43, max cores?) We'll set blockDim = number of tiles capped at 24 (as example). We'll also set blockDim equal to number of tiles (since each tile can be processed independently) but can be larger than cores? Actually blockDim is number of AICore to use. We'll set blockDim = min(numTiles, 24) or something. We'll follow pattern.
+
+Kernel code: implement grid stride over tiles. Each block processes one or more tiles. Use double buffering for loading rows? Since we need to compare row by row, we can load one row at a time (from GM to UB), then compare to current max/idx, then load next row. We can use single buffer for row, and double buffer for max/idx? Simpler: use single buffer for row load, and local tensors for max and idx.
+
+We'll implement: 
+- For each output tile (batch range, col range), we process each row r from 0 to R-1:
+   - Load row slice for that tile's col range using DataCopyPad (with pad).
+   - For first row: copy row values to max, set indices=0.
+   - For subsequent rows: compare with max, update max and indices where row >= max (strict > for first occurrence? Usually argmax returns first max. We'll use > to keep first).
+- After processing all rows, we have max and indices for that tile. Then write indices to GM using DataCopyPad (with pad to align).
+
+We need to handle the fact that row loading contiguously in GM: for each batch b, row r, the data is at offset = (b*R*C + r*C + colStart) * sizeof(float). But we are loading a slice of cols for that row across batches? Actually we want for a set of batches, we load each row's slice for the selected col range. Since GM layout is [batch][row][col], to get the col slice for multiple batches efficiently, we could load consecutive rows for different batches? That would be non-contiguous. Better: for each batch in the tile, we process the rows sequentially. Since the tile of output positions corresponds to specific batch indices and col indices. The row access will be strided across batches. To optimize DMA, we could load a 2D tile: for a given batch set and col set, we could load all rows for those batches in one contiguous block? No, because rows for different batches are separated by R*C elements. So it's not contiguous. So we need to load each row slice separately.
+
+Given that, we'll process one batch at a time within a tile? That might be simpler: tile over batch only? But then we would need to load full col dimension for each batch. That's 4095 floats per row, which is okay (16380 bytes, unaligned). We can process one batch per tile, and for each batch we iterate over rows. That way, for each batch, we load rows one by one, which are contiguous in GM (since rows are consecutive within a batch). So tile could be one batch. Then tileBatch=1, tileCols=4095. Then we can process each batch separately. This is simpler.
+
+So tiling: for each batch (0 to B-1), we process all rows. We'll have blockDim = B (128) if many cores, but we can distribute tiles across blocks using grid stride. We'll set blockDim = 16 or something, and have each block process multiple batches.
+
+Given B=128, we can set blockDim=16, each block processes 8 batches. Tile size per batch: we need to store current max (4095 floats), current idx (4095 int64), and row buffer (4095 floats). Total 3*4095*4? Actually int64 is 8 bytes, so: 4095*4 + 4095*8 + 4095*4 = 16*4095 = 65520 bytes, plus overhead. That's within 192KB. So we can process one batch per tile.
+
+But the DMA alignment warnings: row load of 4095 floats (16380 bytes) not 32B aligned (16380 mod 32 = 28). So need DataCopyPad with pad 1. Similarly output indices 4095*8=32760 not 32B aligned (32760 mod 32 = 24). So need pad. We'll handle.
+
+Thus host tiling: totalBatches = B, tileLenBatch = 1? Actually we can set tileBatch = 1, so each tile processes one batch. Then numTiles = B = 128. BlockDim = min(numTiles, 24) = 24. Or we can set blockDim = 24, and each block processes multiple tiles via grid stride.
+
+Better: use grid stride as in LeakyReLU example: each block starts at blockIdx * tileLen, uses stride blockNum * tileLen. Here tileLen = 1 batch. So totalBatches = 128, blockNum=24, stride=24, each block processes ceil(128/24) batches.
+
+Let's implement that.
+
+Now write the six strings.
+
+We'll need to carefully craft the kernel code with DataCopyPad.
+
+DataCopyPad signature: DataCopyPad(dst, src, srcLen, padSize) where padSize is number of elements to pad? According to docs, padSize is number of elements to pad at end? In CANN 8.3, DataCopyPad for GM->UB: DataCopyPad(LocalTensor, GlobalTensor, size, padSize) where size is number of elements in src, padSize is number of elements to append to reach alignment. So for loading 4095 floats, we set size=4095, padSize=1. The destination local tensor must have capacity for 4096 floats.
+
+Similarly for output: we have 4095 int64, set size=4095, padSize=1, destination local tensor capacity 4096.
+
+We'll use the same for row buffer: allocate 4096 floats, load with size 4095, padSize 1.
+
+Now for max and indices: we need to initialize max with first row after loading, and indices to 0. Then for subsequent rows, compare and update.
+
+We'll use vector Max and Compare functions? There's no direct argmax vector instruction. We'll implement using loops or using Max and Compare with selection. We can use: 
+- maxLocal = rowLocal (first row)
+- idxLocal = 0 (int64)
+- For each subsequent row: 
+   - Compare: selectLocal = (rowLocal > maxLocal) ? (rowLocal > maxLocal) -> we can use Compare and Sel to create mask.
+   - But there's no direct element-wise 3-way. We can use:
+        AutoCompare: Cmp (compare) and then select. AscendC has Compare and Select with Masks.
+   Simpler: use loops? But loops are not efficient. We can use:
+        cv::LocalTensor<uint8_t> mask = ...; 
+        AscendC::Compare(mask, rowLocal, maxLocal, CMPMODE::GT, tileCols); 
+        AscendC::Select(maxLocal, rowLocal, maxLocal, mask, SEL_MODE::VSEL_CONDITIONAL, tileCols);
+        For indices: we need to set idxLocal to r where mask true. Since idxLocal is int64, we can do: vector assign constant r, then Select: idxLocal = Select(row indices, old idx, mask). But we need to generate a tensor of the current row index (r). That's a scalar broadcast for each row. We can use a local tensor filled with r (float? int64). We can create a LocalTensor<int64> idxInc filled with r, then Select.
+
+   So for each row:
+      - CMP(mask, rowLocal, maxLocal, GT, tileCols) (mask is uint8_t)
+      - Select(maxLocal, rowLocal, maxLocal, mask, SEL_MODE::VSEL_CONDITIONAL, tileCols)
+      - For indices: we need a tensor of current row index (int64). We can use Dt to fill with scalar? There's Duplicate: Duplicate(idxInc, static_cast<int64_t>(r), tileCols). Then Select(idxLocal, idxInc, idxLocal, mask, ...)
+
+   But note: we must ensure that mask type is correct. Compare returns mask of type uint8_t for per-element? Actually Compare returns a mask tensor of dtype uint8_t? In AscendC, Compare(CmpMask, src0, src1, cmpMode, len) where CmpMask is LocalTensor<uint8_t>. Then use Select with mask.
+
+   We'll implement accordingly.
+
+Now, need to handle the case where the last row may have pad elements? We should not include pad in comparison because pad values are undefined. So we only compare among the actual 4095 elements. The pad elements are at the end; we should ignore them. Since maxLocal and idxLocal are initialized from first row which also has pad, but we can avoid by only comparing up to tileCols (4095) not padded length. The DataCopyPad loads 4095 elements and pads 1, but the pad element is at index 4095. So our vector operations on length tileCols (4095) will only affect first 4095 elements, leaving the pad untouched. That's fine. Similarly, when writing output, we write only 4095 elements (pad is ignored). DataCopyPad will copy 4095 elements and pad 1, but the extra will be written to GM, but it's beyond the output tensor? We need to ensure that we don't write out of bounds. Since the output tensor size is exactly 4095 indices per batch, writing an extra 1 element would corrupt memory. So we must use DataCopy with size=4095 and padSize=1? Actually DataCopyPad is used to align the transfer. The destination must have capacity for padded size, but the actual number of bytes written to GM is aligned to 32B? The documentation: DataCopyPad writes the entire padded size to GM, including pad. So we cannot write extra pad to GM. Therefore we cannot use DataCopyPad for output if the output tensor is not aligned and we don't want to write pad. Instead, we should use DataCopy and manually ensure alignment by reading/writing from aligned offset. For output, we can allocate UB buffer of padded size, then perform DataCopy from UB to GM with size 4095? But DataCopy requires both source and destination to be 32B aligned and size multiple of 32B. Since 4095*8=32760 is not multiple of 32, we cannot use DataCopy directly. So we must use DataCopyPad for output as well, but we must ensure that the extra pad written does not exceed the allocated GM memory. The output tensor shape is (B, 4095) int64, so total bytes = 128*4095*8 = 4,190,720 bytes. Not aligned to 32 either. However, the GM memory is allocated by the framework with alignment to 32B or more? Typically tensors are aligned to 32B. So writing an extra 8 bytes (1 int64) beyond the valid tensor may still be within allocated memory if the allocation is aligned. But it's dangerous. Better to handle differently: we can pad the output tensor to multiple of 32 by adjusting the shape? Not possible. Alternatively, we can use DataCopy with a smaller, aligned size: we can process the output in chunks of 4 (since 4 int64 = 32B), but 4095 not divisible by 4 (4095 mod 4 = 3). So we still have tail. So the canonical approach is to use DataCopyPad and accept that the last pad element will be written but we have allocated enough memory. Typically, AscendC kernels pad the tensor silently by allocating extra space. In the given example of LeakyReLU, they used DataCopy for aligned sizes. For non-aligned, they might use DataCopyPad. In the retrieved context, for argmax reduction tile alignment with 16380 bytes, they suggested DataCopyPad. So we'll use DataCopyPad for both input and output. For output, we need to ensure that the GM buffer has capacity for the padded element. Since the output tensor is created by the framework, it might have padding. To be safe, we can allocate an extra element in the output tensor? Not possible from kernel. Typically the kernel is expected to handle alignment internally by working with padded UB buffers and then using DataCopyPad which writes padded data to GM. If the GM tensor has no extra space, this could cause out-of-bounds. However, many AscendC examples use DataCopyPad for non-aligned writes and rely on the framework to provide sufficient alignment (32B). Since 4095*8 = 32760 bytes, modulo 32 = 24, so the tensor's size is not a multiple of 32, but the underlying memory allocation might be rounded up to 32B boundary. So writing 32 more bytes might overflow if the next tensor is immediately adjacent. A common practice is to pad the local buffer to 32B and then use DataCopy with an aligned size by truncating the last elements? Actually another approach: for writing, we can use DataCopyPad with padSize such that the total transfer size is a multiple of 32. For output of 4095 int64, we need padSize = (32 - (4095*8 % 32))/8 = (32 - 24)/8 = 1. So transfer 4096 elements. The GM buffer must have at least 4096 * 8 bytes allocated. Since the output tensor is defined to have 4095 elements, the framework may allocate exactly 4095*8 bytes, which is not enough. This is a problem. To resolve, we can adjust the output shape to be padded? Or we can use a different strategy: we can write the output in two parts: aligned blocks of 32B (4 int64) and a tail using DataCopyPad for the tail. Given that 4095 = 4*1023 + 3, we can write 1023 chunks of 4 int64 using DataCopy (since 4*8=32B aligned), and then write the last 3 int64 using DataCopyPad with padSize=1 to make it 32B. This avoids over-allocation. That is a more robust approach. We'll implement that.
+
+Similarly for input: we can load rows in chunks of 8 floats (32B) using DataCopy for aligned chunks, and tail using DataCopyPad. But we need to load the entire row to compare across all columns. Loading chunk by chunk would complicate the comparison because we need to compare across all columns simultaneously. It's easier to load the entire row (4095 floats) into a padded UB buffer (4096 floats) using DataCopyPad, which writes 4096 floats. This requires the input GM to have at least 4096*4 bytes per row. The input tensor is (128,4096,4095) so each row has 4095 floats, but the tensor's stride across rows is 4095, not padded. So reading beyond row end would read into next row's data, causing errors. So we cannot use DataCopyPad for the whole row unless the row stride is padded. Therefore we must load the row in aligned chunks. This is the same issue: the input is not padded. So we need to load the 4095 floats using multiple DataCopy for aligned blocks (8 floats each) and a final DataCopyPad for the tail (last 7 floats? Actually 4095 mod 8 = 7). But then our comparison would be done on the fly across chunks. We could accumulate max/idx per column element over chunks, but we need to compare across the entire row. We can maintain a global max and idx per column, and for each chunk we update. That works: we process the row in chunks of 8 floats (aligned), load using DataCopy, then compare with current max, and update. This avoids the need for a padded row buffer. However, we need to handle the last chunk which may be unaligned. For the last chunk of 7 floats, we can load using DataCopyPad with padSize=1 (to make 8 floats). Then compare only the first 7 elements (ignore pad). This is fine.
+
+But the row is contiguous in GM, so chunk loading with offsets is fine. We'll implement row processing in chunks of 8 floats. This means we need to loop over columns in chunks. However, our max and idx tensors are of size tileCols = 4095. We could keep them as is, and update them chunk-wise. We'll need to address the specific col range for each chunk. For simplicity, we can store max and idx as full per output position (batch, col). Since we are processing a single batch, max and idx have 4095 elements. When loading row chunk, we get a local tensor of 8 floats. We need to compare against the corresponding 8 elements of max. So we can slice maxLocal and idxLocal by offset.
+
+Thus implementation:
+- For each batch in tile:
+   - Initialize an empty max tensors? Better to process first row completely before loop? Or we can initialize max with -inf and idx with 0, then process all rows. For -inf, we can use a large negative number: -FLT_MAX. But to avoid floating point issues, we can process first row separately to set initial max/idx. We'll do that.
+
+Procedure per batch:
+- For each col chunk (0 to C-1, step 8):
+  - Load first row's chunk (aligned if possible, else DataCopyPad) into rowChunk.
+  - Set initial maxChunk = rowChunk (copy), idxChunk = 0 (fill with zero vector).
+  - Store to global max/idx buffers at appropriate offsets.
+- Then for remaining rows (r=1 to R-1):
+  - For each col chunk:
+     - Load the row's chunk.
+     - Compare with corresponding max chunk: update max and idx where greater.
+  - End chunks.
+- After all rows, write out the final idx for this batch.
+
+But storing intermediate results for each chunk into a global UB buffer (max and idx full tensors) requires allocating maxLocal and idxLocal of size 4095 each (16*4095=65520 bytes). That's fine.
+
+To avoid repeated indexing, we can allocate maxLocal and idxLocal as LocalTensor<float> and LocalTensor<int64_t> of length 4095. Then for each chunk, we access sub-tensors using offset.
+
+Vector operations expect contiguous tensors, so we can use Offset + length.
+
+Implementation details in kernel code.
+
+Now, host tiling: we need to pass total length, batch size, row size, col size, dim? We'll pass just rowLen and colLen and totalBatches. Since dim is fixed per kernel instance (passed as attr), we can compute in kernel.
+
+We'll simplify by assuming dim=1. In host tiling, we set tileBatch = 1 (one batch per tile). totalBatches = B. Then each block processes multiple batches via grid stride.
+
+In kernel, we need to know B, R, C. We'll get them from tiling data: totalBatches, rowLen, colLen.
+
+Now, write the code.
+
+Let's produce the six strings.

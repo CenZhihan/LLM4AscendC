@@ -42,6 +42,8 @@ from .security_check import security_check_node
 from .kb_shell_search import kb_shell_search_node
 from .ascend_search import ascend_search_node
 from .ascend_fetch import ascend_fetch_node
+from .dma_alignment_engine import dma_alignment_engine_node
+from .dtype_policy_engine import dtype_policy_engine_node
 from .registered_tool import registered_tool_dispatch_node, tool_dispatch_node
 from .answer import answer_node
 
@@ -67,6 +69,8 @@ __all__ = [
     'kb_shell_search_node',
     'ascend_search_node',
     'ascend_fetch_node',
+    'dma_alignment_engine_node',
+    'dtype_policy_engine_node',
     'registered_tool_dispatch_node',
     'tool_dispatch_node',
     'answer_node',

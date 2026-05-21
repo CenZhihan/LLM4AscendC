@@ -1,0 +1,225 @@
+We need to fix the masked_cumsum_custom kernel. The error is "vector core execution is abnormal" with CCU instruction address check errors across many cores. This suggests memory access issues, likely out-of-bounds or misaligned access. The kernel does per-row cumulative sum with a inner loop using GetValue/SetValue which might be inefficient and could cause issues if not aligned. Also the tiling and stride logic may be flawed.
+
+From repair memories:
+- Memory 2: When vector core exception occurs, use ALIGN_ELEMS=16, HARD_CAP_ELEMS=4096, and maxTile=UB_BUDGET_BYTES/28. But that was for a different op (Tanh?). However the error here is also vector core exception. 
+- The current code uses ALIGN_ELEMS=2048 and UB_BUDGET=256*1024, and maxTile = UB_BUDGET/(2*sizeof(float)) = 32768, which is huge. That might cause UB overflow. 
+- Also the kernel uses a grid-stride over rows but not proper tiling for the cumsum operation. The inner loop using scalar element access might be the cause of CCU errors because it's not vectorized and might be trying to access out-of-bounds.
+
+We need to rewrite the kernel to use vectorized cumulative sum. Ascend has a `Cumsum` operation. We should use AscendC's built-in cumulative sum API if available, but typically custom kernel needs to implement it. However we can use `AscendC::Cumsum` or implement with vector operations.
+
+Given the time, a simpler approach: Instead of doing row-by-row cumsum in kernel, we can do the multiplication and then a prefix sum using vectorized operations. But the per-row prefix sum is inherently sequential per row. However we can use `AscendC::Vec::Cumsum` which is available in AscendC libraries? Actually AscendC provides `AscendC::Cumsum` for tensor along given axis. So we should use that.
+
+But we need to handle the mask multiplication first, then cumsum along dimension. Since the cumsum dimension is the last dimension (dim=1 for 1D input? Actually input shape is (batch_size, dim) with dim=1, so it's like 2D with shape (32768, 32768)? Wait from original model: batch_size=32768, input_shape=(32768,), dim=1. So input is 2D: (32768, 32768)? Actually input_shape=(32768,) means one-dimensional, but batch_size=32768, so total shape is (32768, 32768) i.e., 2D. dim=1 means cumsum along the second dimension (the inner one). So each row has innerSize=32768.
+
+The kernel should: load a tile of rows, multiply by mask, then compute prefix sum per row. Using scalar loops is slow and error-prone. We should use AscendC's `Cumsum` helper. Actually AscendC has `AscendC::Cumsum` that works on local tensors. Let's check: In kernel_operator.h, there is `AscendC::Cumsum` function. So we can use that.
+
+But we need to ensure tiling works correctly. The current tiling calculates tileLen as rowsPerBlock * innerSize, but the grid stride is over rows. However the kernel's Process uses rowStride = blockNum * (tileLen/innerSize). This assumes each block handles multiple rows per tile, but the grid stride may cause overlapping or gaps? Let's analyze: rowBase = blockIdx * (tileLen/innerSize). So each block starts at a different set of rows. Then rowStride = blockNum * rowsPerTile. So it skips by total rows processed by all blocks. This is like a cyclic distribution. That should be fine.
+
+But the main issue is the scalar loop inside Compute. The CCU errors indicate instruction address check error, which could be due to misaligned accesses or out-of-bounds. The scalar GetValue/SetValue might not be safe for vector execution. We need to use vector loads/stores.
+
+Better approach: Use `AscendC::Cumsum` which is vectorized. Also we need to allocate a temporary buffer for the mask multiplication? Actually we can do element-wise multiply then cumulative sum. The cumulative sum operation in AscendC might require the input to be in a local tensor and output to another. We can do:
+
+1. Load x and mask.
+2. Element-wise multiply: `AscendC::Mul(xLocal, xLocal, maskLocal, len);`
+3. Then for each row, we need to perform exclusive or inclusive cumulative sum. AscendC's `Cumsum` is inclusive prefix sum along the last dimension. Since our tile contains contiguous rows, we can reshape the tensor as 2D (rows, innerSize) and apply Cumsum along axis=1. But AscendC's Cumsum might work on a 1D tensor? Actually it works on any shape and axis. We can set shape with `SetShape` or pass dimensions. However simpler: we can split the tile into rows and call Cumsum for each row individually using a loop but using vector operations.
+
+But the real problem is we are using a grid-stride pattern that may cause each block to process multiple rows, but the tile size may be larger than one row. That's fine.
+
+Given the error and repair memories, I suspect the UB overflow due to large tile size. The tiling uses UB_BUDGET_BYTES = 256*1024, and maxTile = 256*1024 / (2*sizeof(float)) = 32768 floats. That's 128KB for each of x and mask buffers, total 256KB, exactly the UB budget. But we also need output buffer and temporary for cumulative sum, which might exceed. The kernel uses inQueueX_, inQueueMask_, outQueueY_ each with tileLen floats, plus temporary for cumsum? The current kernel does not allocate a temporary buffer for cumsum; it modifies xLocal in-place, which is fine. But total UB usage: 3 * tileLen * 4 bytes = 3*32768*4 = 393216 bytes = 384KB, which exceeds 256KB UB budget. That's the problem! The error is vector core exception due to UB overflow.
+
+Thus we need to reduce tile size. According to memory 2, use ALIGN_ELEMS=16, HARD_CAP_ELEMS=4096, and maxTile = UB_BUDGET_BYTES/28. But that was for a different op using 28 bytes per element. For our op we use 3 floats per element (x, mask, y) = 12 bytes. But we also need temporary for cumsum? Actually if we use in-place, we only have 3 buffers. So bytes per element = 12. UB_BUDGET_BYTES=256KB, so maxTile = 256*1024 / 12 = 21845, rounded down. But we also need to align.
+
+But also the kernel prefetches next tile while computing current? The current code does not double-buffer properly; it only prefetches after computing current. That's fine, but we need to ensure not to exceed UB. The current kernel uses BUFFER_NUM=2, so it enqueues multiple tiles? Actually it enqueues one tile at a time. The double buffering is not used effectively because it only enqueues next after dequeuing current. So total UB usage at any time is 3 * tileLen floats (x, mask, y). So we should set tileLen such that 3*tileLen*4 <= UB_BUDGET_BYTES.
+
+Let's compute: 256KB / (3*4) = 256*1024 / 12 = 21845.33. So maxTile = 21844 aligned to something. But also we need to consider that mask is float but original mask is bool. In python bind we convert to float. So mask tensor is float. Good.
+
+But also the cumulative sum algorithm might need a temporary buffer if using vectorized cumsum. But we can do in-place cumsum using AscendC::Cumsum which might require extra workspace? Possibly not. However to be safe, we should reduce tile size.
+
+Let's fix the tiling: set maxTile = UB_BUDGET_BYTES / (3 * sizeof(float)) = 256*1024 / 12 = 21845, then align down to ALIGN_ELEMS=16, and cap at HARD_CAP_ELEMS=4096? That memory suggests HARD_CAP_ELEMS=4096. But 4096 is too small for large rows? The innerSize is 32768, so tileLen should be at least innerSize to process one row at a time. If we cap at 4096, we can't process a full row because innerSize=32768. That would require processing a row in multiple tiles, which complicates cumsum across tile boundaries. So we need tileLen to be a multiple of innerSize to avoid breaking rows. That's why the current tiling ensures tileLen is multiple of innerSize. So tileLen must be at least innerSize and a multiple thereof. But innerSize could be 32768, which is too large for UB. Then we need to process one row per tile? That would mean tileLen = innerSize = 32768, which is > 4096 and > 21845. So it's impossible to fit one row in UB. Therefore the design must handle partial rows? But cumulative sum across tile boundary within a row is difficult. The original PyTorch op is torch.cumsum(x*mask, dim=dim). This is a full reduction along the dimension. To implement efficiently, we might need to use a different approach: each block handles a row completely? But rows are independent, so each block can process one row at a time, but the row length is innerSize=32768, which fits in 128KB (x and mask both 128KB each = 256KB total, plus output 128KB = 384KB, exceeding UB). So we cannot fit a full row simultaneously. Hence we need to process a row in chunks and accumulate partial sums across chunks. That's complex.
+
+But note: The original model input shape: batch_size=32768, input_shape=(32768,). That's 2D tensor of shape (32768, 32768), which is huge. But typical usage might be smaller? The error occurs even with this shape. We need to produce a kernel that works for arbitrary shapes. The current tiling assumes rows are large, but UB cannot hold entire row. So we need to redesign.
+
+Given the complexity and time, a simpler fix: change the tiling to use a much smaller tile size that fits in UB, and process each tile independently? But cumsum along the dimension requires continuity across tiles. That won't work.
+
+Maybe the best approach is to not implement cumsum at all, but let the kernel just do element-wise multiplication and then use a separate cumsum op? But the requirement is to replace the entire operation. The user instruction says to replace the model, so we need a single kernel that does both.
+
+Given the difficulty, perhaps we can use Ascend's built-in Cumsum operator? But we are writing a custom kernel, so we must implement in AscendC. 
+
+Alternatively, we can use a different algorithm: For each row, we can compute prefix sum using vectorized scan that works in blocks. That would require temporary buffers and multiple passes. But that's beyond minimal fix.
+
+The error is vector core exception due to UB overflow. Let's apply the repair memory: set ALIGN_ELEMS=16, HARD_CAP_ELEMS=4096, and maxTile = UB_BUDGET_BYTES/28 (but that formula was for a different per-element count). Our per-element bytes = 12, so maxTile = 256*1024/12 = 21845, but we cap to 4096. However innerSize may be larger than 4096, so we need to process partial rows and carry over the cumsum. That requires storing the previous sum per row. That's doable with a small buffer for row accumulators. But the kernel currently doesn't handle that.
+
+But maybe the test shape is small? The error log shows the kernel was compiled and ran on 32 blocks, and the error was vector core exception. The input size is large. The correct solution likely involves implementing a two-pass approach or using AscendC's built-in `Cumsum` which might handle large dims internally. Actually, AscendC's `Cumsum` function works on local tensors and can handle large dimensions by doing the operation in multiple passes? Not sure.
+
+Given time constraints, a minimal fix: reduce tile size to fit in UB, and change the cumsum to use AscendC's `Cumsum` API which might be optimized. But we need to include the proper header and usage.
+
+Let's look at AscendC documentation: The function `Cumsum` is in `kernel_operator.h`. It takes a local tensor, output tensor, and axis. So we can do:
+
+```
+AscendC::Cumsum(xLocal, yLocal, axis, len, ...); // but need to handle shape
+```
+
+But we need to restructure the tile to be 2D. Actually, we can treat the tile as a 2D tensor with shape (numRows, innerSize) and then call Cumsum along axis=1. However, the tile may not be a full number of rows? It should be a multiple of innerSize, so it's exactly numRows full rows. So we can use `AscendC::SetShape` to set the shape and then call Cumsum.
+
+Thus we can replace the scalar loop with a call to AscendC::Cumsum. That should be vectorized and avoid CCU errors.
+
+But we still need to fix the UB overflow. With tileLen capped to 4096, but innerSize could be larger, we can't process a full row. So we need to ensure that tileLen is a multiple of innerSize, but if innerSize > HARD_CAP_ELEMS, then tileLen would be at least innerSize, exceeding cap. So we must set HARD_CAP_ELEMS high enough to accommodate a full row. Since innerSize could be up to the total length (if input is 1D), but for 2D with dim=1, innerSize is the second dimension. In the test case, innerSize=32768. That's less than 21845? No, it's larger. So we need to allow tileLen up to innerSize, which may exceed 4096. So we should increase HARD_CAP_ELEMS to something like 65536 or more, but the UB budget may not allow that. However if UB budget is 256KB and we have 3 buffers, max element count is 21845. So innerSize=32768 cannot fit entirely in UB. Therefore we must handle partial rows. That means the kernel needs to process a row in multiple tiles and accumulate the prefix sum across tiles. This is a significant change.
+
+Given that the original error was vector core exception due to UB overflow, and the previous attempt used huge tile size, the immediate fix is to constrain tile size properly. But we also need to handle cumsum correctly. Perhaps the simple approach is to reduce tile size to fit UB and for cumsum, we can process each tile independently but then the result is wrong because cumsum within a tile only includes local prefix, not global. So that's not correct.
+
+Given the complexity, I think the best is to provide a minimal fix that avoids out-of-bounds and UB overflow, and ensure the cumsum is correct. Since the previous attempt used a scalar loop that likely caused the CCU errors, using AscendC's Cumsum might fix the vector instruction issue. Also we need to adjust tiling to ensure tile size fits in UB. Let's set maxTile = UB_BUDGET_BYTES / (3 * sizeof(float)) = 21845, and without cap, but ensure alignment to innerSize may cause it to exceed? Actually we can set tileLen = maxTile but then round down to multiple of innerSize. If innerSize > maxTile, then tileLen would become 0 or innerSize? This is problematic. We might need to handle that by making tileLen = maxTile and then processing partial rows with carry. But that's complex.
+
+Maybe we can change the tiling to treat each row independently with multiple tiles per row, and use a small per-row accumulator. But given time, I'll adopt a simpler approach: Let each block handle a single row at a time, but process the row in multiple iterations (tiles). For each tile within a row, we compute partial prefix sum and carry forward the cumulative sum from previous tile. This requires a small buffer for the carry values (one per block). That's doable.
+
+But the above might be too many changes. Let's look at the error again: The error occurs across many cores with CCU instruction address check error. This could be due to misaligned data copy or scalar accesses. Using AscendC::Cumsum might resolve the vectorization issue.
+
+Given the constraints, I'll provide a corrected version that:
+- Fixes UB budget: set maxTile = UB_BUDGET_BYTES / (3 * sizeof(float)) = 21845, align to 16, and cap at HARD_CAP_ELEMS=65536 (allow one row).
+- Use AscendC::Cumsum for the cumulative sum.
+- Keep the tiling logic similar but ensure tileLen is at least innerSize and multiple thereof. If innerSize > maxTile, then we cannot fit one row; but in that case we'll just set tileLen = maxTile and later handle partial rows? But the kernel will then have incomplete rows. For now, we assume the input shapes are such that innerSize fits in UB. The test case has innerSize=32768, which is >21845, so it won't fit. But maybe the test case is not actually run? The error log shows runs with that shape. So we must handle it.
+
+Given the difficulty, I'll propose a simpler but still effective fix: Change the tiling to set tileLen = UB_BUDGET_BYTES / (3 * sizeof(float)) = 21845, and set innerSize to tileLen (i.e., treat each tile as flat). Then the cumsum will be done on the whole tile, which is incorrect if the tile spans multiple rows. But then the kernel would only work if the input is 1D? The original model has dim=1 which is the second dimension. But if we treat the tile as flat, the cumulative sum across rows will be wrong. So that's not acceptable.
+
+Given the time, I'll output the repaired code that fixes the UB overflow by reducing tile size and using AscendC::Cumsum, but I'll also add a note that for large innerSize the kernel may not be correct. However the user expects a working solution. The error logs show vector core exception; fixing UB overflow and using proper vector instructions should at least make it compile and run without crashing, even if correctness might be off? But the correctness test fails. The previous attempt had compiled but failed with vector core exception. So we need to fix the runtime error first.
+
+Based on repair memory 2, we should use ALIGN_ELEMS=16, HARD_CAP_ELEMS=65536 (or 4096? but we need larger), and maxTile = UB_BUDGET_BYTES/28? That formula was for 28 bytes per element, but for us it's 12. So we can compute accordingly.
+
+I'll set:
+UB_BUDGET_BYTES = 192 * 1024 (from the leakage example, conservative) or 256*1024? The previous used 256KB, but memory 2 uses 192KB? Actually memory 2 doesn't specify UB budget, it says UB_BUDGET_BYTES/28. That implies 28 bytes per element. For us, 3 floats = 12 bytes, so UB_BUDGET_BYTES/12 would give max elements. But to be safe, use 192KB and set maxTile = 192*1024/12 = 16384. Align to 16, cap at 16384 (or less). innerSize may be larger; we'll set tileLen = maxTile if totalLength < maxTile else maxTile, but then we need to ensure it's a multiple of innerSize? If innerSize > maxTile, we can't align to innerSize. In that case, we set tileLen = maxTile and let the kernel process that, but the cumsum will be wrong. So we need to handle large innerSize separately.
+
+Given the original user code is for a specific model with batch_size=32768, shape=(32768,), dim=1. So innerSize=32768, which is large. So we must handle it. The kernel must process a row in multiple tiles. To do that, we need to maintain carry-over sums across tiles for each row. That means we need an array of carry sums of size blockDim? Actually each block processes multiple rows? With grid stride, each block may process multiple rows. We can maintain a local array of carry sums for each active row in the tile. That's complicated.
+
+Alternatively, we can restructure the kernel to let each block process one row at a time (not grid stride). Since there are many rows, we can use block index to pick a row. That simplifies: each block processes one entire row, but the row length may exceed UB. So we need to process the row in chunks and maintain a running sum within the block. That is feasible: for each block, we iterate over the row in tiles, updating the cumsum.
+
+Let's redesign:
+- totalRows = totalLength / innerSize
+- blockDim = number of blocks, each block handles one or more rows (cyclic).
+- For each row assigned to the block (via grid stride), we process that row in tiles of size tileLen (which is a multiple of some min size). We'll have a carry scalar that holds the cumulative sum so far for the current row. At the start of a row, carry=0. For each tile of the row:
+   1. Load x and mask for the tile segment.
+   2. Multiply: x_seg = x_seg * mask_seg.
+   3. For each element in the segment, add carry and then update carry? Actually we need prefix sum within segment and then carry forward the last sum. So we can compute prefix sum in place using Cumsum on segment, then add carry to each element, and set carry to the last element of the segment after addition.
+   4. Store the segment.
+
+This requires tileLen to be small enough to fit in UB. We'll set tileLen = UB_BUDGET_BYTES / (3 * sizeof(float)) = 16384 if UB budget=192KB. That's less than innerSize=32768, so we'll need 2 tiles per row.
+
+Thus we need to modify the kernel to handle per-row tiling. This is a significant change but manageable.
+
+Let's implement this approach in the kernel and adjust tiling accordingly. The tiling should provide tileLen (max elements per tile), innerSize (row length), and totalLength. The kernel's Process will iterate over rows assigned to this block, and for each row, iterate over segments.
+
+We need to ensure that the mask is float (from python bind). Good.
+
+Given the length of the answer, I'll provide the updated code.
+
+Changes:
+- host_tiling_src: add carry = 0? no, tiling only needs totalLength, tileLen, innerSize, blockDim.
+- kernel_src: implement row-wise processing with per-segment cumsum using AscendC::Cumsum on the segment, then add carry, update carry.
+- Use AscendC::Cumsum. Need to include appropriate headers (already included).
+- Adjust UB budget to 192KB (conservative from leaky relu example) and compute maxTile = 192*1024 / 12 = 16384, align to 16, no cap? Let's set HARD_CAP_ELEMS=65536 but we will clamp tileLen to maxTile anyway.
+
+But we also need to ensure that the cumsum segment operation is correct: AscendC::Cumsum computes prefix sum on the segment. Then we add the carry (previous row sum) to each element. Then carry becomes the last element. This works.
+
+Let's write the kernel.
+
+Also note: The cumsum function might require a shape. For a 1D segment, we can just call Cumsum on the tensor with len=segmentLen and axis=0. In AscendC, Cumsum works on 1D tensor if axis=0. So we can treat each segment as a 1D tensor.
+
+Now, the tiling: tileLen should be a divisor of innerSize? Not necessarily, but for simplicity, we can set tileLen to a value that fits UB and then process the row in chunks. The last chunk may be smaller.
+
+Also need to handle the case where tileLen >= innerSize: then just one tile per row.
+
+We'll also need a temporary buffer for the cumulative sum result? We can do in-place: after multiplication, compute Cumsum on the same buffer (xLocal). Then add carry. The carry is a float scalar.
+
+We need to store carry per row. Since we process rows sequentially within a block, we can keep a local variable `rowCarry` for the current row. That's fine.
+
+Now, about the prefetching: For simplicity, we can process one tile per row per iteration without double-buffering between rows. But we can still double-buffer within a tile? Actually we are using BUFFER_NUM=2, which allows us to load next segment while computing current. But since we need to maintain carry across segments, we must compute sequentially. However we can still overlap load of next segment with compute of current segment? That would require two separate buffers for x and mask. We can use the double buffering pattern similar to leaky_relu: prefetch next tile while computing current. But careful: The carry update depends on the current segment's last element. To compute next segment, we need the carry from current. So we can compute current, then while copying out, we can load next. The current code did that but only for the next tile of the same row? Actually it was doing grid stride across rows, not per-row segments. We'll adapt.
+
+Given complexity, I'll simplify: Process each row fully before moving to next row. Within a row, process segments sequentially without overlapping. That may be slower but correct. Then we can use a single buffer or double buffer for loading. Let's keep it simple: for each segment, we allocate, load, compute, store, free. This uses UB only for the segment size. We'll still use BUFFER_NUM=1? Actually we can still use double buffering to overlap load and compute? Not necessary.
+
+But to keep code changes minimal, I'll keep the existing double-buffer structure but adapt it for per-row segment iteration. Since we need to process multiple segments per row, we'll need to reset the queue for each segment. That's tricky. Given time, I'll implement a simpler single-buffer version: allocate one local tensor for x, one for mask, compute, store, free. That avoids queue complexity.
+
+The repair memory 3 mentions adding a temporary queue for operations. We'll add tmpQueue_ if needed for Cumsum? Possibly not needed.
+
+Let's write the new kernel.
+
+First, update tiling to compute innerSize from shape dim. Keep as before.
+
+Set UB_BUDGET_BYTES = 192*1024, ALIGN_ELEMS=16, HARD_CAP_ELEMS=65536. maxTile = UB_BUDGET_BYTES / (3*sizeof(float)) = 16384. If totalLength < 16384, use totalLength. Ensure tileLen is at least ALIGN_ELEMS and aligned. No need to align to innerSize because we handle partial rows.
+
+We'll add a field `tileLen` for segment size.
+
+Now the kernel:
+
+```
+class KernelMaskedCumsum {
+    ...
+    void Init(GM_ADDR x, GM_ADDR mask, GM_ADDR y, uint32_t totalLength, uint32_t tileLength, uint32_t innerSize) {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+        innerSize_ = innerSize;
+        xGm_.SetGlobalBuffer(x, totalLen_);
+        maskGm_.SetGlobalBuffer(mask, totalLen_);
+        yGm_.SetGlobalBuffer(y, totalLen_);
+        pipe_.InitBuffer(inX_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inMask_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outY_, 1, tileLen_ * sizeof(float));
+    }
+
+    void Process() {
+        uint32_t totalRows = totalLen_ / innerSize_;
+        uint32_t rowsPerBlock = (totalRows + blockNum - 1) / blockNum;
+        uint32_t rowStart = blockIdx * rowsPerBlock;
+        uint32_t rowEnd = min(rowStart + rowsPerBlock, totalRows);
+
+        for (uint32_t row = rowStart; row < rowEnd; ++row) {
+            uint32_t rowOffset = row * innerSize_;
+            float carry = 0.0f;
+            uint32_t remaining = innerSize_;
+            uint32_t segStart = 0;
+            while (remaining > 0) {
+                uint32_t segLen = min(remaining, tileLen_);
+                // Load x and mask
+                AscendC::LocalTensor<float> xLocal = inX_.AllocTensor<float>();
+                AscendC::LocalTensor<float> maskLocal = inMask_.AllocTensor<float>();
+                AscendC::DataCopy(xLocal, xGm_[rowOffset + segStart], segLen);
+                AscendC::DataCopy(maskLocal, maskGm_[rowOffset + segStart], segLen);
+                // Multiply
+                AscendC::Mul(xLocal, xLocal, maskLocal, segLen);
+                inMask_.FreeTensor(maskLocal);
+                // Cumsum on segment
+                AscendC::Cumsum(xLocal, xLocal, 0, segLen); // in-place cumsum
+                // Add carry to each element
+                AscendC::BroadcastAddScalar(xLocal, xLocal, carry, segLen);
+                // Update carry with last element
+                carry = xLocal.GetValue(segLen - 1);
+                // Store
+                AscendC::DataCopy(yGm_[rowOffset + segStart], xLocal, segLen);
+                inX_.FreeTensor(xLocal);
+                remaining -= segLen;
+                segStart += segLen;
+            }
+        }
+    }
+```
+
+But we need to be careful: `AscendC::Cumsum` signature? It might be `Cumsum(LocalTensor<T>& dst, const LocalTensor<T>& src, int32_t axis, int32_t len)`. So we can use it.
+
+Also `BroadcastAddScalar` might not exist; we can use `AscendC::Adds` (add scalar) or `AscendC::Vec::Adds`. Actually AscendC has `AscendC::Adds(yLocal, xLocal, scalar, len)`. So we can do `AscendC::Adds(xLocal, xLocal, carry, segLen);`.
+
+But need to ensure carry is a float.
+
+Also we need to include the proper namespace? Already `using namespace AscendC;` from kernel_operator.h? We'll keep the `AscendC::` prefix.
+
+Now, the tiling: We need to set tileLen such that it's aligned to some boundary? We'll use ALIGN_ELEMS=16, and ensure tileLen is multiple of 16. Also ensure at least 16.
+
+We also need to adjust the host_operator_src to pass innerSize. The tiling data already has innerSize. Good.
+
+We should also remove the old grid stride and row-based stride; now we use block assignment based on rows.
+
+But we need to maintain the original blockDim calculation? We'll keep as before: blockDim = min(24, totalRows) maybe, but we already compute rowsPerBlock. The tiling should set blockDim to number of blocks, which we compute as CeilDiv(totalRows, rowsPerBlock). We'll keep the previous logic but now it's used to assign rows to blocks.
+
+Now, let's rewrite the entire code.
+
+We need to output the six strings. I'll output them with appropriate indentation and quotes.
+
+Also fix the python_bind_src: it currently uses `mask.float()`. That's fine.
+
+Now produce the final answer.

@@ -24,6 +24,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.common.env import EnvConfig, build_subprocess_env, load_env_config, shell_prefix  # noqa: E402
+from tools.common.error_extract import (  # noqa: E402
+    build_layered_errors_from_log_text,
+    extract_core_error,
+    read_log_tail_text,
+)
 from tools.common.fingerprint import compute_fingerprint, read_fingerprint, write_fingerprint  # noqa: E402
 from tools.common.runner import now_tag, run_cmd  # noqa: E402
 from tools.txt_operator import materialize_operator_from_txt  # noqa: E402
@@ -50,48 +55,46 @@ class OperatorSpec:
     pybind: dict
 
 
-def _read_tail(path: pathlib.Path, max_lines: int = 80) -> str:
+FAILURE_LOG_TAIL_LINES = 220
+
+
+def _read_tail(path: pathlib.Path, max_lines: int = FAILURE_LOG_TAIL_LINES) -> str:
     if not path.exists():
         return ""
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        raw = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
-    tail = lines[-max_lines:] if len(lines) > max_lines else lines
-    return "\n".join(tail)
+    return read_log_tail_text(raw, max_lines)
 
 
-def _extract_core_error(text: str) -> str:
-    """
-    Heuristic: pick the last traceback / error-looking lines.
-    Keep it short and high-signal for humans.
-    """
-    if not text:
-        return ""
-    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return ""
+def _failure_correctness_info(
+    *,
+    logs_dir: pathlib.Path,
+    logs: dict[str, str],
+    exc: BaseException,
+) -> str:
+    """Layered root_cause + symptom from build/eval logs (aligned with repair-memory pipeline)."""
+    for key in ["02-build", "06-eval", "01-msopgen", "03-install-run"]:
+        latest = sorted(logs_dir.glob(f"*-{key}.log"))
+        if latest:
+            logs[key] = str(latest[-1])
 
-    key_markers = (
-        "Traceback (most recent call last):",
-        "RuntimeError:",
-        "ImportError:",
-        "ModuleNotFoundError:",
-        "CalledProcessError:",
-        "CMake Error",
-        "error:",
-        "ERROR",
-        "ERR",
-        "No such file or directory",
-        "not found",
-        "failed",
-    )
-    idxs: list[int] = [i for i, ln in enumerate(lines) if any(m in ln for m in key_markers)]
-    if not idxs:
-        return "\n".join(lines[-20:])
-    start = max(0, idxs[-1] - 6)
-    end = min(len(lines), idxs[-1] + 8)
-    return "\n".join(lines[start:end])
+    log_text = ""
+    for key in ["02-build", "06-eval"]:
+        p = (logs.get(key) or "").strip()
+        if p:
+            log_text = _read_tail(pathlib.Path(p), FAILURE_LOG_TAIL_LINES)
+            if log_text:
+                break
+    if not log_text:
+        newest_logs = sorted(logs_dir.glob("*.log"))
+        if newest_logs:
+            log_text = _read_tail(newest_logs[-1], FAILURE_LOG_TAIL_LINES)
+
+    exc_fallback = f"{type(exc).__name__}: {exc}"
+    _, _, formatted = build_layered_errors_from_log_text(log_text, exc_fallback=exc_fallback)
+    return formatted or exc_fallback
 
 
 def write_result_json(
@@ -144,7 +147,7 @@ def _write_txt_materialize_failure_json(
     art_dir = art_root / op_key
     art_dir.mkdir(parents=True, exist_ok=True)
     tb_text = traceback.format_exc()
-    core = _extract_core_error(tb_text)
+    core = extract_core_error(tb_text)
     correctness_info = core or f"{type(exc).__name__}: {exc}"
     out_path = write_result_json(
         art_dir=art_dir,
@@ -572,16 +575,13 @@ def _execute_pipeline(op_dir: pathlib.Path, *, art_root: pathlib.Path, mode: str
         compiled_ok = compiled_ok if compiled_ok is not None else False
         correctness_ok = correctness_ok if correctness_ok is not None else False
 
-        newest_logs = sorted(logs_dir.glob("*.log"))
-        newest = newest_logs[-1] if newest_logs else None
-        tail = _read_tail(newest) if newest else ""
-        core = _extract_core_error(tail)
-        correctness_info = core or f"{type(e).__name__}: {e}"
+        correctness_info = _failure_correctness_info(logs_dir=logs_dir, logs=logs, exc=e)
 
-        for k in ["01-msopgen", "02-build", "03-install-run", "04-pybind-build", "05-pybind-install", "06-eval"]:
-            latest = sorted(logs_dir.glob(f"*-{k}.log"))
-            if latest:
-                logs[k] = str(latest[-1])
+        for k in ["04-pybind-build", "05-pybind-install"]:
+            if k not in logs:
+                latest = sorted(logs_dir.glob(f"*-{k}.log"))
+                if latest:
+                    logs[k] = str(latest[-1])
 
         out_path = write_result_json(
             art_dir=art_dir,

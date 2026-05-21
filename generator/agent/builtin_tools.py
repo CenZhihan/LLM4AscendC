@@ -18,6 +18,8 @@ from .nodes import (
     code_rag_node,
     code_search_snippet_node,
     code_style_node,
+    dma_alignment_engine_node,
+    dtype_policy_engine_node,
     env_check_api_node,
     env_check_env_node,
     env_check_npu_node,
@@ -273,6 +275,57 @@ def _meta() -> Dict[str, Dict[str, Any]]:
                 "in `query`, only the **first** is fetched."
             ),
         },
+        "dtype_policy_engine": {
+            "display_name": "Dtype / accumulation policy",
+            "description": (
+                "Advisory only (CANN 8.3.rc baseline): suggests accumulation dtype, per-stage cast strategy, "
+                "and PyTorch-alignment modes. Does not replace `api_lookup` or compile/eval."
+            ),
+            "parameter_docs": (
+                "Structured `args` optional: "
+                "`target_precision_mode` in "
+                "[match_pytorch, fp32_accum_fp16_io, fp32_accum_bf16_io, strict_signature, integer_exact]; "
+                "`op_family` in [elementwise, matmul_like, reduce, conv_like, norm_like, mixed, unknown]; "
+                "`io_dtypes` e.g. {\"io\":\"float16\"} or {\"inputs\":[\"half\"],\"output\":\"half\"}; "
+                "optional `stages` hint list."
+            ),
+            "examples": [
+                '{"tool":"dtype_policy_engine","query":"matmul fp16 I/O on NPU","args":{"op_family":"matmul_like","target_precision_mode":"match_pytorch","io_dtypes":{"io":"float16"}}}',
+                '{"tool":"dtype_policy_engine","query":"strict dtypes","args":{"target_precision_mode":"strict_signature","io_dtypes":{"output":"float32"}}}',
+            ],
+            "usage_guidance": (
+                "Put a short operator intent in `query` (e.g. matmul FP16 I/O, reduce over K). Put structured knobs "
+                "in `args`: `target_precision_mode`, `op_family`, and `io_dtypes` when known from the MKB reference "
+                "or task spec; optional `stages` hints per stage. Prefer this **after** rough I/O dtypes are fixed. "
+                "Use `api_lookup` / `api_constraint` in other rounds for **concrete API symbols and per-call "
+                "constraints** — this tool only advises **operator-level** accumulation and cast staging (CANN 8.3.rc "
+                "baseline, advisory)."
+            ),
+        },
+        "dma_alignment_engine": {
+            "display_name": "DMA alignment policy",
+            "description": (
+                "Advisory only: checks transfer extents/offsets for 32B-style GM↔UB alignment, suggests "
+                "AscendC::DataCopy vs DataCopyPad, and flags Compare 256B extent rules (CANN 8.3.rc / kb102 patterns)."
+            ),
+            "parameter_docs": (
+                "`args.transfers`: array of objects with `direction` (gm_to_ub, ub_to_gm, ub_to_ub, l1_to_ub, ...), "
+                "`dtype`, `elem_count` or `byte_length`, optional `gm_offset_bytes`, `prefer_api` "
+                "[auto|DataCopy|DataCopyPad], `involves_api` (e.g. Compare). Optional `chip` (default DAV_2201)."
+            ),
+            "examples": [
+                '{"tool":"dma_alignment_engine","query":"GM to UB tail tile","args":{"transfers":[{"direction":"gm_to_ub","dtype":"float16","elem_count":7,"gm_offset_bytes":0}]}}',
+                '{"tool":"dma_alignment_engine","query":"compare alignment","args":{"transfers":[{"direction":"ub_to_ub","dtype":"float32","elem_count":64,"involves_api":"Compare"}]}}',
+            ],
+            "usage_guidance": (
+                "Put a short scenario in `query` (e.g. GM→UB tail tile, UB→GM write). Put **all transfer geometry** "
+                "in `args.transfers`: each item should include `direction`, `dtype`, and `elem_count` or `byte_length`, "
+                "plus optional `gm_offset_bytes`, `prefer_api`, and `involves_api` (e.g. Compare) when relevant. "
+                "Without `transfers`, alignment checks are mostly generic. Pair with `api_constraint` when you already "
+                "have one API + exact `count`/`dtype` for that call site; this tool is for **multi-transfer** DMA "
+                "alignment and DataCopy vs DataCopyPad suggestions (kb102-style patterns, advisory)."
+            ),
+        },
     }
 
 
@@ -339,6 +392,10 @@ def _handler_for(
             )
         if name == "ascend_fetch":
             return ascend_fetch_node(state, ascend_fetch_retriever)
+        if name == "dtype_policy_engine":
+            return dtype_policy_engine_node(state)
+        if name == "dma_alignment_engine":
+            return dma_alignment_engine_node(state)
         raise KeyError(name)
 
     return h

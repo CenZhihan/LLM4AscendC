@@ -92,6 +92,9 @@ def _extract_user_question(state: GeneratorAgentState) -> str:
 
     attempt_id = int(state.get("attempt_id") or 1)
     if attempt_id <= 1:
+        mem = (state.get("retrieved_repair_memories") or "").strip()
+        if mem:
+            return f"{base}\n\nRetrieved repair memories (verified cross-run fixes):\n{mem}"
         return base
 
     repair_logs = (state.get("repair_error_logs_raw") or "").strip()
@@ -110,6 +113,9 @@ def _extract_user_question(state: GeneratorAgentState) -> str:
             "Previous attempt generated code preview (for routing context only):\n"
             f"{preview}"
         )
+    mem = (state.get("retrieved_repair_memories") or "").strip()
+    if mem:
+        sections.append("Retrieved repair memories (verified cross-run fixes):\n" + mem)
     return "\n\n".join(sections)
 
 
@@ -159,6 +165,8 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
     ascend_fetch_results = state.get("ascend_fetch_results", [])
     ascend_allowed_urls = state.get("ascend_search_allowed_urls", [])
     reg_results = state.get("registered_tool_results", [])
+    dtype_policy_results = state.get("dtype_policy_engine_results", [])
+    dma_align_results = state.get("dma_alignment_engine_results", [])
 
     existing = ""
     if kb_results:
@@ -217,6 +225,10 @@ def _summarize_existing_results(state: GeneratorAgentState) -> str:
         )
     if reg_results:
         existing += "Registered tool results (excerpt):\n" + "\n".join(reg_results[:2]) + "\n\n"
+    if dtype_policy_results:
+        existing += "Dtype policy engine (excerpt):\n" + "\n".join(dtype_policy_results[:1]) + "\n\n"
+    if dma_align_results:
+        existing += "DMA alignment engine (excerpt):\n" + "\n".join(dma_align_results[:1]) + "\n\n"
     return existing
 
 

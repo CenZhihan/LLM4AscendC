@@ -1,0 +1,216 @@
+# 多轮修复记忆机制设计（第一阶段）
+
+**目标**：在 AscendC 算子智能体多轮生成—评测—修复流程中，把「跨轮可验证的改进」沉淀为可检索经验，并在后续 attempt 中注入上下文，减少同类 API / 构建错误反复出现。
+
+**范围**：仅做**修复型记忆**（记录「如何变好」）；不做「规避型」泛化负面清单（留待后续）。与现有多轮脚本逻辑对齐：每轮有评测结果（`compiled` / `correctness`）、修复用错误摘要、以及相邻两轮代码可比。
+
+---
+
+## 1. 记忆载体与单条结构
+
+**载体**：以 **JSON Lines（`.jsonl`）** 为主存——便于校验字段、追加写入、后续换 embedding 检索而不推翻格式。若需人类可读展示，可由同目录脚本渲染为 Markdown，**不以大段 Markdown 为唯一真源**。
+
+**单条记忆（证据包 + 叙述）必填要素**：
+
+
+| 要素     | 说明                                                                                   |
+| ------ | ------------------------------------------------------------------------------------ |
+| 标识与版本  | `memory_id`、`schema_version`，便于演进与去重。                                                |
+| 实验上下文  | `op`、`category`、`tool_mode`、`strategy`、`eval_mode` 等随条记录；**manifest 不再按 tool_mode/eval_mode 预筛**，选条时由 `query_text` 提供当前配置供模型判断相关性。                  |
+| 分层标签   | `tier`：`A` 或 `B`；`confidence`：`high`（仅 A）/ `medium`（B）。                              |
+| 状态转移   | 上轮与本轮的 `compiled` / `correctness` 对比（机器可读、不可由 LLM 改写）。                               |
+| 失败阶段   | `failure_stage_before` / `failure_stage_after`：由评测产物中的阶段信息（如构建链各阶段、数值评测阶段）规则映射得到粗标签。 |
+| 错误锚点（表象） | `symptom_anchor_before` / `symptom_anchor_after`：流水线末段失败（CPack、INSTALL、opbuild、txt 缺块等）；`error_anchors_*` 与之相同，兼容旧条。 |
+| 根因锚点   | `root_cause_anchor_before` / `root_cause_anchor_after`：从 **02-build / 06-eval 日志 tail（默认 220 行）** 优先抽取的编译/API 错误（如 C++ `error:`、kernel 编译失败）；旧条可为空，manifest/inject 回退 `error_anchors_*`。 |
+| 代码侧证据  | 可选：代码摘要或 hash，用于否定「无实质改动却写记忆」。                                                       |
+| 证据引用   | 相对路径或 run 内定位：相邻两轮产物、结果 JSON、修复上下文文件等。                                               |
+| 自然语言经验 | **English** conditional: **When** [trigger] **do not** [bad] **; instead** [good]; no absolutes.            |
+
+
+**Review 模型职责**：在**规则已判定可写**之后，仅生成/润色 **`natural_language`（英文一句）**；输入与下一轮修代码 agent **同源**：
+
+- 相邻两轮 `build_attempt_error_bundle`（`compiled` / `correctness` / `failure_stage` / `symptom_anchor` / `root_cause_anchor` / 分层 `correctness_info` / **02-build·06-eval log tail**）；
+- 相邻两轮 operator txt 的 **unified diff（截断）**。
+
+`eval_operator` 失败时 `correctness_info` 为分层文本（`=== root_cause ===` / `=== symptom ===`），避免仅保留 CPack 尾日志。Review 须以 **root_cause** 为 trigger 优先；输出须为单句 `When ... do not ...; instead ...`（拒绝 CoT 污染稿）。**When 子句必须写明适用场景**（阶段、函数/文件、失败类型），避免仅复述错误字面、却未说明在何处适用的建议；后处理 `_has_scenario_scope` 对含上下文相关 host API（如 GetInputShape/Shape*）却未标明 where 的句子拒收。Prompt 以通用原则为主，Shape 仅作简短正反例。若与客观 `transition` 矛盾则丢弃本条。
+
+---
+
+## 2. 写入时机与门槛
+
+**挂接位置（逻辑）**：第 `k` 轮评测结束、已持久化本轮结果与修复上下文之后；**开始第 `k+1` 轮生成之前**。此时同时具备第 `k-1` 轮与第 `k` 轮的错误与代码，便于对比（`k = 1` 无上一轮，一般不写跨轮记忆，见下）。**Review 调用前**由 `code_diff.format_attempt_code_diff` 对相邻两轮完整 txt 产物做 **unified diff**（长度有上限），与评测信号摘要一并送入总结模型。
+
+**总否定（任一满足则不写入主库）**：
+
+- 本轮无可靠评测状态（生成失败、评测链路未产出有效 `compiled`/`correctness`、纯基础设施类失败如网关/超时且无稳定构建锚点）。
+- 与上一轮相比**无实质代码变更**。
+- Review 输出不满足模板或与客观转移不一致。
+
+**Tier A（`confidence = high`，优先沉淀）**——`k ≥ 2`，且满足其一：
+
+- `compiled`：非成功 → 成功。
+- 在已可编译前提下，`correctness`：未通过 → 通过。
+
+**Tier B（`confidence = medium`，条件更严）**——`k ≥ 2`，整体仍未通过（例如数值仍未过），且**不满足** Tier A，但**同时**满足：
+
+- **阶段推进**：`failure_stage_before` 与 `failure_stage_after` 不同，且符合预先约定的「向更可诊断/更浅层失败推进」白名单（实现时固定表，避免主观）。
+- **锚点变化**：规范化后的前后锚点不相同（排除仅换行、路径前缀等伪变化）。
+- **代码变更**：前后代码摘要或 hash 不同。
+
+**不写**：仅日志措辞变化、客观状态与阶段均未改善、或无法凑齐证据包字段。
+
+---
+
+## 3. 利用时机与方式
+
+**时机**：**每一次**即将开始新一轮生成调用**之前**（含 `attempt = 1` 与 `attempt ≥ 2`）。
+
+- 首轮：查询可依赖 `op`、`category`、`tool_mode` 等（`query_text` 中仍会带上 `tool_mode`/`eval_mode` 供选条模型参考）；无上一轮错误文本时偏「类级」经验。
+- 次轮及以后：查询以**当前将注入的修复摘要**（错误锚点、阶段、`correctness_info` 片段）为主，提高相关性。
+
+**方式**：从全局 `.jsonl` 的 **尾部窗口**（默认最多约 500 条）生成 manifest 短行；**不再**按 `tool_mode` / `eval_mode` 与当前 run 做硬过滤，以便跨工具配置复用（选条模型结合 `query_text` 自行判断是否适用）。以固定区块拼入生成侧上下文（与现有修复提示并列），每条展示宜短：层级、转移一行、条件式经验、关键锚点。
+
+**降权或不注入**：`tier = B` 且与当前错误锚点重叠过低；或 schema 版本过旧。
+
+---
+
+## 4. 工程注意（简要）
+
+- **并行多算子**：全局追加需**并发安全**（文件锁、或每进程写临时队列再合并）。
+- **记忆库位置**：默认在仓库根目录下的 **`repair_memory/`**（与代码包 `generator/repair_memory/` 区分）；与单次 `run_dir` 解耦，便于跨实验复用；条目中仍保留 `tool_mode`/`eval_mode` 等元数据供展示与选条模型参考，**manifest 不再按二者硬过滤**。旧路径 `artifacts/repair_memory/` 已废弃，请迁移数据或设置 `LLM4ASCENDC_REPAIR_MEMORY_ROOT`。
+- **演进**：字段带 `schema_version`；后续可将「检索 LLM」替换为 embedding + 向量库，不改变 Tier 与否定门槛定义。
+
+---
+
+## 6. 实现落地（与 Claude manifest 思路对齐）
+
+**代码位置**：`generator/repair_memory/`（`schema`、`tier_gate`、`failure_stage`、`anchors`、`error_signals`、`inbox`、`merge`、`manifest`、`inject`、`select`、`review_llm`、`pipeline`）；分层抽取纯函数在 `tools/common/error_extract.py`；多轮挂接在 `generator/scripts/run_agent_multi_rounds.py` 与 `generator/scripts/run_agent_cuda_agent_multi_rounds.py`；Agent 状态字段 `retrieved_repair_memories` / `eval_mode` 在 `generator/agent/agent_state.py`、`agent_runner.py`，注入在 `nodes/choose_tool.py` 与 `nodes/answer.py`。
+
+**存储布局**（默认根目录 `<REPO_ROOT>/repair_memory/`，可用环境变量覆盖）：
+
+- `canonical/repair_memories.jsonl`：合并后的真源（每行一条完整 JSON）。
+- `inbox/<run_slug>/mem_<uuid>.jsonl`：子进程**仅**写入**单行**的独立文件（避免多进程争用同一文件）。
+- `inbox/<run_slug>/merged/`：已成功合并入 canonical 的收件副本（便于审计）。
+
+**并行写入策略**：子进程不直接 append canonical；写入 inbox 后调用 `merge_run_inbox`（`fcntl` 独占锁写 canonical，再移动收件文件）。整批实验结束时主进程再执行一次 merge，收敛遗留文件。`run_slug` 由 `run_dir` 相对仓库根路径规范化得到，使同一 output run 共用同一 inbox 桶。多轮 **续跑**（`--continue-attempt`）在同一 `run_dir` 下追加 `attempt(N+1)..M`，不新开 run，记忆 inbox 仍按该 `run_slug` 合并。
+
+**检索**：从 canonical 尾部窗口生成 **manifest 短行**（`id`、op、category、`tool_mode`、`tier`、锚点、摘要；**不按**当前 run 的 `tool_mode`/`eval_mode` 预筛），选条 LLM 返回 `memory_ids`，再按 id 从尾部窗口取全文片段注入（窗口外旧 id 可能暂不可见，可调 `max_records`）。
+
+**环境变量**：
+
+- `LLM4ASCENDC_REPAIR_MEMORY=0`：关闭写入与检索注入。
+- `LLM4ASCENDC_REPAIR_MEMORY_ROOT`：覆盖记忆根目录。
+
+**工具脚本**：`generator/scripts/render_repair_memory_manifest.py` 从 canonical 单向生成 `repair_memory_manifest.txt`（调试/展示）。
+
+**Agent report**：每轮生成结束后，`{op}_report.json` 中增加 **`repair_memories_applied`** 数组：与选条顺序一致，每条含 `memory_id`、`tier`、`natural_language`（及 `transition`、锚点等），便于分析检索是否命中、记忆是否被实际注入。
+
+**平台说明**：合并依赖 Linux `fcntl`；非 Linux 环境合并为 no-op（inbox 仍会累积，可拷贝至 Linux 再合并）。
+
+---
+
+## 5. 小结
+
+
+| 维度  | 要点                                                                     |
+| --- | ---------------------------------------------------------------------- |
+| 形式  | JSONL 单条 = 证据包 + 条件式自然语言；Markdown 仅作展示可选。                              |
+| 写入  | 仅修复型；Tier A/B 由规则判定；Review 在日志摘要之外可见 **相邻两轮 txt 的 unified diff（有上限）**，便于写出针对具体改动的条件句。 |
+| 利用  | 每轮生成前检索 n 条注入；manifest **跨 tool_mode/eval_mode** 复用；控制长度。 |
+
+
+*文档版本：与「第一阶段：修复型 + Tier A/B」讨论一致，实现细节以代码落地为准。*
+
+---
+
+## 7. 附录：形态说明、Prompt 实录与选条机制
+
+以下与目录 **`generator/agent/_example_prompts_memory/`** 中的示例文件一一对应，便于答辩或给学长展示时直接打开 txt / json。
+
+##### 1. 单条记忆在 canonical 里长什么样？
+
+每条在 **`repair_memory/canonical/repair_memories.jsonl`** 中占一行，为 **一条完整 JSON 对象**（证据字段 + 一条 **英文**条件式 `natural_language`：`When ... do not ...; instead ...`）。字段含义见正文第 1 节表格。
+
+**示例（已排版，便于阅读；真源为单行 JSONL）**：见同目录 **`example_one_memory_record.json`**（从真实 run 抽取的 hardsigmoid Tier A 记录结构）。
+
+##### 2. 给「选条」LLM 看的「摘要」长什么样？
+
+**不是**把整段 `natural_language` 原样塞进 manifest：实现上由 **`generator/repair_memory/manifest.py::build_manifest_lines`** 为每条记忆生成 **一行**，形如：
+
+`id=<uuid>\top=<op>\tcategory=<cat>\ttool_mode=<tm>\ttier=<A|B>\troot=<root_cause_anchor_after 约120字>\tsymptom=<symptom_anchor_after>\tsummary=<natural_language 单行截断约160字>>`
+
+多条 manifest 用换行拼接成 `manifest_text`。**多行示例**：**`example_manifest_lines.txt`**。
+
+##### 3. 总结记忆（Review LLM）的完整 prompt
+
+写入前由 **`generator/repair_memory/review_llm.py::generate_repair_natural_language`** 调用：一条 **system** + 一条 **user**（英文指令；含 Tier、`Previous/Current attempt signals`、以及可选 **unified diff**；各信号块最长约 6000 字符，diff 默认最长约 12000 字符）。
+
+**完整实录（占位内容；请以仓库内最新代码为准）**：**`review_memory_llm_messages_example.txt`**。
+
+##### 4. 选条 LLM 的完整 prompt
+
+由 **`generator/repair_memory/select.py::select_repair_memories`**（及兼容包装 **`select_memory_ids`**）调用：一条 **system**（要求只返回 `{"memory_ids":[...], "selection_rationale":"..."}`）+ 一条 **user**（`Select up to N memory ids and explain your choice.` + `=== Manifest ===` + `=== Current query ===`）。**`selection_rationale`** 为必填短文本：若选了 id 则说明与当前 **`repair_context`** 的对应关系；若 **`memory_ids` 为空**则说明为何不注入。
+
+**完整实录**：**`select_memory_ids_llm_messages_example.txt`**。
+
+##### 5. 选条机制是什么？（结合选条 prompt）
+
+1. **入口**：多轮脚本在 **`attempt_id >= 2`** 且开启 **`--use-repair-memory`** 时，在生成前调用 **`build_retrieval_block_for_attempt`**（`inject.py`）。
+2. **Manifest**：从 **`repair_memory/canonical/repair_memories.jsonl` 尾部窗口** 读入记录，**仅按 `schema_version` 过滤** 后打成 **每行一条的短 manifest**（见上文第 2 点）；**不再**按当前 run 的 `tool_mode`/`eval_mode` 预筛，以便其它工具配置下沉淀的经验也可进入候选；文件 mtime/size 变化会刷新缓存，避免重复读盘解析。
+3. **Query**：由当前 **`op` / `category` / `tool_mode` / `eval_mode` / `attempt_id`** 与 **上一轮修复用原始日志**（`repair_error_logs_raw` 截断）拼成 **`query_text`**。
+4. **选条**：与主 agent 一致使用 **streaming** ``chat.completions``（``generator/repair_memory/llm_util.py::chat_completion_stream_content_reasoning``），累积 **``delta.content``**；若仍为空再拼 **``delta.reasoning_content``**。解析时用 **``JSONDecoder.raw_decode``** 扫描所有合法 ``{...}``：若第一个 ``memory_ids`` JSON 前仅有空白，则取 **第一个**（与 system 要求「回复首字符即 ``{``」一致）；否则取 **最后一个**（长 CoT 后再给 JSON 的情形）。``max_tokens`` 默认 **4096**。若流式异常或双空，再 **非流式** 回退一次并 ``assistant_message_text``。
+5. **取全文**：用返回的 id 在尾部窗口的完整记录里 **按 id 查表**；找不到的 id 记入 **`memory_ids_dropped`**，成功加载的 id 记入 **`memory_ids_resolved`**。
+6. **注入**：将命中记录的 **`natural_language` + tier + transition + root_cause_anchor_after + symptom_anchor_after** 格式化为 **`format_injection_block`** 文本，写入 agent state 的 **`retrieved_repair_memories`**，供 **工具路由（choose_tool）** 与 **最终写代码（answer）** 两段 user 文本拼接使用。
+7. **报告**：同一轮写入 **`{op}_report.json`** 的 **`repair_memory_selection`** 字段（含 **`raw_model_output`**（过长截断）、**`selection_rationale`**、**`parse_ok`/`parse_error`**、**`memory_ids`/`memory_ids_resolved`/`memory_ids_dropped`**），与已有的 **`repair_memories_applied`**（实际注入条目的结构化摘要）并列，便于对照分析选条 agent 的决策。
+
+##### 6. 融入检索记忆后的「算子生成」完整 prompt（写代码阶段）
+
+最终 AscendC 产物主要由 **`generator/agent/nodes/answer.py::answer_node`** 在 **`attempt_id > 1`** 时拼接：**system** 固定为 `You are a helpful assistant.`，**user** 内含「修复约束 + `Original user instruction`（即 `base_prompt`）+ 上一轮日志 + 上一轮全文代码 + 工具检索块 + **`Retrieved repair memories`** 块」。
+
+**完整结构实录（含占位符说明）**：**`answer_node_generation_with_memories_example.txt`**。
+
+> 说明：**首轮 attempt1** 若已有检索块，记忆会以较短模板出现在 user 中；**工具编排轮**中记忆通过 **`choose_tool.py::_extract_user_question`** 拼进 `Task specification`，与 answer 阶段为 **不同 API 调用**，展示材料可按需两段都保留。
+
+##### 7. 本附录文件清单
+
+| 文件 | 用途 |
+| --- | --- |
+| `example_one_memory_record.json` | 单条 canonical 记忆（排版 JSON） |
+| `example_manifest_lines.txt` | 选条 LLM 所见的 manifest 行示例 |
+| `review_memory_llm_messages_example.txt` | Review LLM messages 实录 |
+| `select_memory_ids_llm_messages_example.txt` | 选条 LLM messages 实录 |
+| `answer_node_generation_with_memories_example.txt` | 写代码 LLM messages 实录（含记忆块） |
+
+---
+
+## 8. 记忆库维护（canonical 清洗与去重）
+
+独立脚本 **`generator/scripts/maintain_repair_memory.py`**，对 **`repair_memory/canonical/repair_memories.jsonl`** 做两阶段维护（**不**改写或凝练保留条目的 `natural_language`）：
+
+| 阶段 | 机制 | 说明 |
+| --- | --- | --- |
+| Phase 1 清洗 | 固定规则 | `validate_record` 失败、NL 不满足 Review 模板（CoT 等）、仅 CPack/INSTALL 表象且无具体 API 细节的泛泛条 → 从 canonical **删除** |
+| Phase 2 分桶 | 规则 | 按 txt 缺块 / CPack / opbuild / 507035 / Shape API / compile / pybind 等粗分类 |
+| Phase 3 去重 | 桶内 LLM | 对同桶 ≥2 条调用模型输出 `{"drop_ids":[...], "rationale":"..."}`；冗余才删，**不同修复点可都保留**；解析失败则跳过该桶 |
+
+**默认 `--dry-run`**：只写 **`maintenance_reports/report_<timestamp>.json`**，不改 canonical。审阅后加 **`--apply`**：备份 `repair_memories.jsonl.bak` → 重写 canonical（保持顺序）→ 删除条 **追加** 到 **`archive/removed_memories.jsonl`**（含 `phase` / `reason` / 完整 `record`，便于排查误删）。
+
+```bash
+# 预览（推荐先跑）
+python generator/scripts/maintain_repair_memory.py --model <your-model>
+
+# 仅规则清洗、不调 LLM
+python generator/scripts/maintain_repair_memory.py --skip-dedup --dry-run
+
+# 确认报告后写回
+python generator/scripts/maintain_repair_memory.py --model <your-model> --apply
+
+# 按已审阅的报告精确删除（不再调 LLM；避免重跑报告不一致）
+python generator/scripts/maintain_repair_memory.py \
+  --apply-report repair_memory/maintenance_reports/report_20260516T124738Z.json --apply
+
+# 若报告生成后又 append 了新记忆，用默认 remove_list 只删报告里的 id，新条会保留
+# 若 canonical 自报告后未变，也可用 --apply-report-mode kept_ids
+```
+
+实现细节见 **`generator/repair_memory/maintenance.py`**；单测 **`generator/repair_memory/tests/test_maintenance.py`**。

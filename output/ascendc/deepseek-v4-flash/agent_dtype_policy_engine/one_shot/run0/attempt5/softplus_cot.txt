@@ -1,0 +1,227 @@
+We need to fix the softplus kernel. The error shows output mismatch: many values are 0.0 or 20.0 instead of the correct softplus values. The kernel appears to have issues with the mask/select logic and the threshold computation. Also, the output shows many zeros and many 20.0 values, which suggests either the threshold comparison is wrong or the log/exp computation is incorrect.
+
+Let's analyze the kernel_src from the previous attempt:
+
+- It computes `log(1 + exp(beta * x))`.
+- Then if beta != 1, it multiplies by 1/beta.
+- Then it builds mask: `x > threshold`. Then selects: if mask, output x, else output the log result.
+
+But the reference softplus in PyTorch: `softplus(x, beta=1, threshold=20)` is `1/beta * log(1 + exp(beta*x))` for values below threshold, and `x` for values above threshold? Actually, PyTorch's softplus: `softplus(x) = log(1 + exp(x))`. With beta and threshold: `softplus(x, beta, threshold) = 1/beta * log(1 + exp(beta*x))` for `beta*x < threshold`? Wait, the threshold is applied to the input after scaling? Let's check PyTorch documentation: `torch.nn.functional.softplus(x, beta=1, threshold=20)` returns `log(1 + exp(beta*x)) / beta` if `beta*x < threshold`, otherwise returns `x` (or maybe `x`? Actually the threshold is on the output? No, it's on the input after scaling. I recall that for efficiency, if `beta*x > threshold`, softplus approximates `x` (since `log(1+exp(beta*x)) ≈ beta*x` for large values, then dividing by beta gives x). So the condition is: if `beta * x > threshold`, then output x (the linear approximation). Else compute the full formula.
+
+The previous kernel did: if `x > threshold`, output x. But it should be if `beta * x > threshold`. Also, the threshold comparison should be done before the division by beta.
+
+In the kernel, they did `AscendC::Muls(expLocal, xLocal, beta_, len)` first, then exp, then log, then if beta != 1, they divide by beta. Then they compare `xLocal > thresholdTensor` (not `beta*x > threshold`). So the mask is wrong.
+
+Also, the use of `threshold` attribute in the op definition is present but in the kernel it's not multiplied by beta. The correct logic:
+
+```
+// Compute t = beta * x
+// If t > threshold:
+//   y = x  (since log(1+exp(t))/beta ≈ t/beta = x)
+// Else:
+//   y = log(1+exp(t)) / beta
+```
+
+But we can keep it simple: compute log1p(exp(t)) / beta, then mask where t > threshold, replace with x.
+
+However, we also see many zeros and 20.0 values. The zeros could be from the log(1+exp(beta*x)) evaluating to something that gets masked incorrectly? Or maybe the `Log` or `Exp` functions have issues with large values? But the values 20.0 appear exactly where the reference has smaller values (like 0.7238, 0.7125, etc.). That suggests the mask is selecting x when it shouldn't, and x is near 20? Actually 20.0 is the threshold value. Possibly the mask condition `x > threshold` is true for many elements, and those elements get output as x, which could be large (like 20.0). But the reference doesn't have 20.0. So the mask is incorrectly applied.
+
+Also the zeros: maybe when `x` is negative, the log computation might produce something that after selection gives 0? But zeros appear in places where reference has ~0.8 etc. So likely the mask is causing many elements to be replaced with x when they shouldn't, and many elements to be replaced with 0 when they shouldn't. Possibly the `Select` operation is misused? Or the `maskLocal` values might be inverted? Let's check AscendC select documentation. Typically, `Select` with a mask chooses from the first tensor where mask is true (or false)? In AscendC, `Select` with `VSEL_TENSOR_TENSOR_MODE` and a mask tensor: the mask is a tensor of floats, where 0.0 selects from the second tensor, non-zero selects from the first? Actually, common convention: mask=0 selects second operand, mask!=0 selects first. The kernel uses `Select(yLocal, xLocal, logLocal, maskLocal, ...)`. So where mask is non-zero (i.e., true for `x > threshold`), it selects xLocal. That seems correct: if x > threshold, output x. But the condition should be `beta*x > threshold`. Let's fix that.
+
+Additionally, the `tmpQueue_` is used for 3 tensors: exp, log, mask. But they also allocate `thresholdTensor` inside Compute, which is fine. However, they free `expLocal` early, then allocate `thresholdTensor`. That's okay.
+
+But the main issue is the mask condition and possibly the computation of log1p(exp(t)). Also, note that for large negative beta*x, exp(t) underflows to 0, so log(1+0)=0. That would cause y=0 for negative inputs? But softplus should be >0 for negative inputs (e.g., log1p(exp(-100)) ≈ 0? Actually exp(-100) is very small, log(1+small) ≈ small, but not zero. However, floating point precision: log(1+exp(-100)) might be 0.0 if exp(-100) underflows to 0? On AscendC, float32 exp(-100) is about 3.7e-44, which is denormalized? Might be flushed to zero. That could explain zeros for negative inputs? But the reference outputs are around 0.8 for some negative-looking entries (e.g., -1 would give softplus ~0.313). The zeros appear in many places, not just strongly negative. So probably the mask is causing the zeros.
+
+Let's look at the error output: first row: reference [1.1773, 1.1666, 0.8036, ...] new output [1.1773, 1.1666, 0.0000, ...]. The first two elements match, third is zero. So for some elements the computation is correct, for others it's wrong. This suggests a tiling or indexing issue, not just math. Possibly the `Select` operation uses the mask incorrectly, or the `Compute` function has a data hazard because they are reusing the same tmpQueue tensors but the allocation order might be wrong? They do:
+
+```
+AscendC::LocalTensor<float> expLocal = tmpQueue_.AllocTensor<float>();
+AscendC::LocalTensor<float> logLocal = tmpQueue_.AllocTensor<float>();
+AscendC::LocalTensor<float> maskLocal = tmpQueue_.AllocTensor<float>();
+...
+tmpQueue_.FreeTensor(expLocal);
+... then allocate thresholdTensor ...
+tmpQueue_.FreeTensor(thresholdTensor);
+...
+tmpQueue_.FreeTensor(maskLocal);
+tmpQueue_.FreeTensor(logLocal);
+```
+
+But they have `tmpQueue_` with 3 tensors. They allocate 3 at the start: expLocal, logLocal, maskLocal. That uses all 3 slots. Then they free expLocal and allocate thresholdTensor, which reuses the freed slot. Then free thresholdTensor. Then free maskLocal and logLocal. That seems okay.
+
+But maybe the issue is that the `Select` operation modifies the mask tensor? Or maybe the `Muls` after the Log is not correct? They did `if (beta_ != 1.0f) { AscendC::Muls(logLocal, logLocal, 1.0f / beta_, len); }`. That's fine.
+
+Another possibility: the `Compare` operation returns a mask where each element is 0.0 or 1.0? In AscendC, Compare typically returns a tensor of uint8 or int8? But they are storing into a float tensor. That's fine, but the mask values might be 0.0 or 1.0. The Select should work.
+
+But the output shows many zeros and 20.0. 20.0 is the threshold. If the mask is incorrect, many elements might be selecting x, and if those x are around 20, they appear as 20. But also many zeros: if x is negative and the mask selects logLocal, but logLocal might be zero due to underflow? That could happen.
+
+Let's test with a simple fix: correct the mask condition to compare `beta * x` with threshold. Also ensure that for large negative x, the softplus returns a small positive number, not zero. In AscendC, we can use `Log1p`? There is no direct Log1p. We can compute `log(1+exp(t))` but for t small, 1+exp(t) may lose precision. Better to use a branch? But for now, let's fix the mask.
+
+Also, the `project_json_src` includes beta and threshold attributes. The `host_operator_src` passes beta and threshold to tiling. The `kernel_src` receives them. That's fine.
+
+But we also see that the error shows "Reference output: tensor([[1.1773, 1.1666, 0.8036, ...]])" and "New output: tensor([[ 1.1773,  1.1666,  0.0000,  ...]])". The first two elements match, third is zero. That pattern suggests that the tile processing might be off-by-one or stride issue? Perhaps the `strideElems = blockNum * tileLen_` causes some blocks to process overlapping regions? Actually, it's grid-stride: each block processes base = blockIdx * tileLen_ and then strides by blockNum * tileLen_. That should be correct.
+
+But looking at the output, the first two elements match, then many zeros then later many 20.0. Could be that for some tiles the computation is skipped? Or the `Select` is inverted? If the mask is 0 for correct condition, then it selects logLocal which might be wrong. But zeros suggest logLocal is zero.
+
+Let's check the log computation: `log(1+exp(beta*x))`. For x near 0, beta=1, exp(0)=1, log(2)=0.693, which is positive. The reference has 0.8036 for third element. So the log result should be ~0.8. But we get 0.0. So maybe the `Exp` or `Log` functions are not working? Or maybe the `Muls` before exp is not happening? Could be a missing `SetFlag` for vector intrinsics? No.
+
+Another possibility: The `CopyIn` and `CopyOut` use `AscendC::DataCopy` with len as number of elements? Wait, in AscendC, DataCopy expects number of elements? Actually, the signature: `DataCopy(dst, src, len)` where len is number of elements? In the leaky_relu kernel example, they used `len` directly. In the previous leaky_relu kernel, they used `tileLen_ * sizeof(float)` in pipe buffer initialization but then in DataCopy they passed `len` (number of elements). So that's correct.
+
+But in this kernel, they do `pipe_.InitBuffer(tmpQueue_, 3, tileLen_ * sizeof(float));` That's fine. All data moves are by element count.
+
+Maybe the issue is that the `tmpQueue_` with 3 buffers is not sufficient because they need more? Actually they allocate 3: exp, log, mask. Then free exp, allocate threshold, free threshold, free mask, free log. That's okay.
+
+Let's try a simpler approach: remove the threshold mask entirely and just compute softplus for all elements to see if the math is correct. But the instruction is to replace PyTorch's softplus which uses threshold optimization. However, for correctness, we should implement the same logic. The PyTorch softplus with beta=1, threshold=20 is: `if beta*x > threshold: y = x; else: y = log(1 + exp(beta*x)) / beta`. So we must include the mask.
+
+But given the errors, maybe the issue is that `beta` is always 1.0 in the test? The model uses `F.softplus(x)` without specifying beta/threshold. So defaults are beta=1, threshold=20. So mask condition reduces to `x > 20`. That should rarely be true because the inputs are random floats in [0,1) multiplied by 4096? Actually `torch.rand(batch_size, dim)` gives uniform [0,1). So x values are between 0 and 1. No x is >20. So the mask should never select x. That means the many 20.0 values are not coming from mask. They must be coming from some other error. The zeros also.
+
+Wait, the input is `torch.rand(batch_size, dim)` which is [0,1). So all x between 0 and 1. Then softplus output should be between 0.693 and 0.693? Actually softplus(0)=ln2≈0.693, softplus(0.5)=ln(1+exp(0.5))≈0.974, softplus(1)=ln(1+exp(1))≈1.313. So outputs should be between ~0.693 and ~1.313. The reference output shows values around 0.7 to 1.2, consistent. The new output shows many zeros and many 20.0. So something is drastically wrong.
+
+20.0 is the threshold. Perhaps the kernel is reading uninitialized memory or incorrect tiling causing out-of-bounds? The fact that many elements are exactly 20.0 suggests that the threshold constant is being written as output. Could be that the mask selects x (which is 20?) but x is never 20. So maybe the threshold is being used as the output directly? Or the log computation is giving 20? No.
+
+Another clue: the error log says "New output: tensor([[ 1.1773,  1.1666,  0.0000,  ...]])". The first two elements match exactly. So for those positions, the computation is correct. Then many zeros and then many 20.0. This pattern is typical of a tile size mismatch: if the tile length is not aligned properly, or the DataCopy lengths are wrong, then only the first few elements are correct and the rest are garbage.
+
+In the previous leaky_relu example, the kernel used `DataCopy(xLocal, xGm_[gmOffset], len);` where `len` is the number of elements. That should be fine.
+
+But note: in the kernel, they allocate `pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));` The buffer size is in bytes. Then in `CopyIn`, they `inQueueX_.AllocTensor<float>()` which gives a tensor of size `tileLen_` elements (since the buffer was allocated with `tileLen_ * sizeof(float)` bytes). So the tensor can hold `tileLen_` floats. Then `DataCopy(xLocal, xGm_[gmOffset], len);` where `len` is `curLen` which is `min(tileLen_, remaining)`. That's correct.
+
+But in `Compute`, they do operations with `len` which is the actual number of elements in this tile. That's fine.
+
+So why the first two elements correct? Could be that the first tile is processed correctly but subsequent tiles are corrupted? But the output shows first two elements correct, then third is zero. That suggests that within the first tile, some elements are correct, some are not. Maybe the `strideElems` calculation causes overlapping or gaps? Let's check the grid-stride loop. They have `strideElems = blockNum * tileLen_`. For blockIdx=0, base=0, curLen = min(tileLen_, totalLen). Then they copy in, compute, copy out. Then nextBase = 0 + strideElems. If totalLen > strideElems, they copy next tile. This should be fine.
+
+But what if `tileLen_` is not a multiple of ALIGN_ELEMS? They align down, so it is. But the totalLength is 4096*393216 = 1,610,612,736, which is large. tileLen_ might be UB_BUDGET_BYTES/28 = 192*1024/28 ≈ 7018? Actually 192*1024=196608, /28≈7021. Align down to 2048 gives 6144? 7021/2048=3.43, floor=3, *2048=6144. But HARD_CAP_ELEMS=32768, so tileLen_ could be 6144. That is a reasonable tile size.
+
+But the output shows only first two elements correct then zeros. That might be an issue with the `DataCopy` or the queue system. Could it be that the `tmpQueue_` is interfering because they allocate too many tensors? In `Compute`, they allocate 3 tensors initially. That's within the 3 slots. Then they free exp and allocate threshold. That's fine. But note: after they free exp, they allocate threshold. Then they free threshold. Then they free mask and log. However, the order of freeing might cause issues if the queue expects LIFO? In AscendC, `FreeTensor` should free the tensor but the order may not matter as long as the references are correct. However, the `TQue` for VECCALC is a fixed-size pool. When they free exp, the slot becomes available. Then allocate threshold, which takes that slot. Then free threshold. Then free mask and log. That should work.
+
+But maybe the `Select` operation requires that the mask tensor be of type uint8 or int8? In AscendC, `Compare` returns a tensor of type `int8` or `uint8` by default? It might return a tensor of same type as inputs with values 0 or 1. The `Select` operation can accept a float mask where 0.0 selects from one, non-zero from other. That should work.
+
+Given the complexity, perhaps the simplest fix is to rewrite the kernel with a simpler approach: use `Log1p`? There is no built-in log1p. But we can use the identity: `log(1+exp(t)) = max(0, t) + log(1+exp(-|t|))` which is more stable. That might help avoid underflow for negative t. But the main issue is the mask.
+
+Maybe the mask condition should compare `beta*x` with threshold, not just `x`. Also, we need to handle the case where `beta*x > threshold` by outputting `x` (not `beta*x`). Yes.
+
+Let's make minimal targeted changes:
+
+1. In `kernel_src`, change the mask computation to use `t = beta * x` (the scaled value) and compare with threshold.
+2. Ensure that when mask is true, we output `x` (not `t/beta`). That's already the case.
+3. Also, to avoid issues with underflow, we can use a more stable softplus implementation: compute `abs_t = Abs(t)`, then `y = Max(0, t) + Log(1 + Exp(-abs_t))`. But that requires more operations. However, for float32, exp(-700) underflows to 0, so log(1+0)=0, which is fine because for large negative t, softplus≈0. For large positive t, if we use the formula `max(0,t) + log(1+exp(-t))`, the log term is negligible. So it's stable. Let's adopt that.
+
+But maybe the immediate issue is the mask condition. Let's fix that first and see if it resolves the zeros.
+
+Also, the kernel currently uses `AscendC::Duplicate(thresholdTensor, threshold_, len);` which creates a tensor filled with threshold. Then `Compare`. That's fine.
+
+But note: the error output shows many 20.0 values. Could it be that the `Compare` function returns a mask where elements with x>threshold are set to 1.0, and then `Select` picks x. But x is not 20. However, if the thresholdTensor is used incorrectly, maybe the mask is inverted? If mask is 0 where x>threshold, then Select would output logLocal for those elements, and output x for others? That would give zeros for some and correct for others? Not sure.
+
+Let's test a theory: maybe the `Select` interprets the mask differently: in AscendC, `Select` with `SELMODE::VSEL_TENSOR_TENSOR_MODE` selects from first tensor where mask is non-zero, else from second. That's what we assume. So if mask is 1 (> threshold), we get x. If mask is 0, we get logResult. So for x in [0,1), mask is 0, so we should get logResult. But we get zeros. That implies logResult is zero for some elements. That could be due to underflow if x is negative? But x is in [0,1). So exp(beta*x) is between 1 and 2.718, log(1+exp) is between log2≈0.693 and log(1+2.718)=log(3.718)≈1.313. So not zero.
+
+Unless the `Exp` function is not working? But the first two elements match, so Exp works for those. The third element zero suggests maybe the third element's x is such that something goes wrong? It could be that the tile boundary falls in the middle of the tensor and the indices are off. For example, if tileLen_ is 6144, then the first block processes indices 0-6144. The first two elements are at indices 0 and 1, which are correctly processed. The third element at index 2 is also within that tile. So if the tile processing is correct for indices 0 and 1, it should be correct for index 2. Unless the `DataCopy` has a bug: they copy `len` elements from global to local. But the local tensor is of size tileLen_. If len is less than tileLen_ (which it is for the last tile), it's fine. For the first tile, len = tileLen_ because totalLen is huge. So all elements in the tile are copied. Then Compute processes all `len` elements. Then CopyOut copies `len` elements back. So indices 0 and 1 should be computed together with index 2. So why would only index 0 and 1 be correct and index 2 be zero? That suggests maybe the `Compute` function has a bug that only affects certain elements? Unlikely.
+
+Maybe the `tmpQueue_` allocation/free is causing some memory corruption. Let's examine the Compute function more carefully:
+
+```
+AscendC::LocalTensor<float> expLocal = tmpQueue_.AllocTensor<float>();
+AscendC::LocalTensor<float> logLocal = tmpQueue_.AllocTensor<float>();
+AscendC::LocalTensor<float> maskLocal = tmpQueue_.AllocTensor<float>();
+
+AscendC::Muls(expLocal, xLocal, beta_, len);
+AscendC::Exp(expLocal, expLocal, len);
+AscendC::Adds(expLocal, expLocal, 1.0f, len);
+AscendC::Log(logLocal, expLocal, len);
+if (beta_ != 1.0f) {
+    AscendC::Muls(logLocal, logLocal, 1.0f / beta_, len);
+}
+
+tmpQueue_.FreeTensor(expLocal);  // <-- free expLocal
+
+// Build mask: x > threshold
+AscendC::LocalTensor<float> thresholdTensor = tmpQueue_.AllocTensor<float>(); // reuses freed slot
+AscendC::Duplicate(thresholdTensor, threshold_, len);
+AscendC::Compare(maskLocal, xLocal, thresholdTensor, AscendC::CMPMODE::GT, len);
+tmpQueue_.FreeTensor(thresholdTensor);
+
+// Select: y = mask ? x : logResult
+AscendC::Select(yLocal, xLocal, logLocal, maskLocal,
+                AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, len);
+
+tmpQueue_.FreeTensor(maskLocal);
+tmpQueue_.FreeTensor(logLocal);
+```
+
+Potential issue: After `tmpQueue_.FreeTensor(expLocal)`, the memory is freed but the `expLocal` tensor is no longer valid. However, they have already used `expLocal` for the log computation. That's fine. Then they allocate `thresholdTensor` and use it. Then they free it. Then they use `maskLocal` and `logLocal`. That's okay.
+
+But note: `logLocal` was allocated from `tmpQueue_` as well. When they free `expLocal`, the slot is returned. Then they allocate `thresholdTensor`. That's fine. However, the `tmpQueue_` was initialized with 3 slots. They allocate 3 at once: exp, log, mask. So the pool has 3 slots occupied. Freeing exp frees one slot. Then allocate thresholdTensor uses that freed slot. Then free thresholdTensor returns that slot. Then later they free mask and log returns two more slots. No problem.
+
+But what if the `tmpQueue_`'s internal state gets confused because the allocation and free are not LIFO? I'm not sure. In many AscendC examples, they allocate multiple tensors from the same queue and free them in reverse order (LIFO). If they free in non-LIFO order, it might cause issues. Let's check typical patterns: Usually they allocate in order, use them, then free in reverse order (last allocated first freed). Here the order:
+- Allocate exp, log, mask
+- Free exp (not last)
+- Allocate threshold (reuses exp slot)
+- Free threshold
+- Free mask (second allocated? Actually mask was allocated third)
+- Free log (second? Actually log was allocated second)
+
+That's not LIFO. This might cause memory corruption in the queue manager. The AscendC `TQue` for VECCALC might require LIFO order because it's a stack-based deque? I recall that for `TQue<TPosition::VECCALC, N>`, it's a calculator queue that does expect LIFO order for free. Many examples use `FreeTensor` in reverse order of allocation. So this could be the bug.
+
+Let's correct the Compute to allocate all needed tensors at once (including the threshold) or free in LIFO order. We can allocate 4 tensors: exp, log, mask, threshold. But that would require tmpQueue_ with 4 slots. Or we can compute the mask first using a separate approach. Simpler: change the number of tmpQueue buffers to 4 and allocate all four at the start, then free in reverse order. But we can also avoid using a separate threshold tensor by using a scalar broadcast: `AscendC::Compare(maskLocal, xLocal, threshold_, AscendC::CMPMODE::GT, len);` where `threshold_` is a scalar float. Yes, AscendC's Compare can take a scalar as second operand? The signature `Compare(dst, src, scalar, cmpMode, len)` is overloaded? In AscendC, there is `Compare(dst, src, scalar, cmpMode, len)` where scalar is a float. So we can avoid allocating thresholdTensor. That reduces the number of tensors needed.
+
+Let's use scalar compare. Also, we need to compare `beta*x` with threshold, not `x`. So we can compute `t = Muls(x, beta)` into a temporary (or reuse expLocal after using it for log? Actually after log, we have logLocal. We can compute `t` into expLocal before the log step? But we need exp for log. Sequence:
+
+1. Copy x into expLocal (or use xLocal directly? but xLocal is needed later for mask and for final selection).
+2. Compute t = beta * x into expLocal.
+3. Compute exp(t) in place? Actually we need exp(t) for log. So we can do:
+   - t = beta * x (store in expLocal)
+   - exp_t = exp(t) (store in expLocal)
+   - log1p_exp = log(1 + exp_t) (store in logLocal)
+   - if beta != 1: multiply logLocal by 1/beta.
+4. Then compare t > threshold using scalar threshold_ (store mask in maskLocal).
+5. Select: if mask, output x, else output logLocal.
+
+We need xLocal still for the selection. So we must keep xLocal until after select. So we can't reuse xLocal. So we need a separate tensor for t. We can use the freed slot after we free something else. But to keep it simple, let's increase tmpQueue to 4 slots and allocate all tensors at the start, then free in reverse order. That ensures LIFO.
+
+Let's modify:
+- Change `tmpQueue_` to `AscendC::TQue<AscendC::TPosition::VECCALC, 4> tmpQueue_;` and in Init: `pipe_.InitBuffer(tmpQueue_, 4, tileLen_ * sizeof(float));`
+
+- In Compute:
+   - Allocate: xLocal? Actually xLocal is from inQueueX. Then allocate from tmpQueue: tLocal, expLocal, logLocal, maskLocal. That's 4.
+   - Compute t = beta * x into tLocal.
+   - Exp into expLocal using tLocal.
+   - Add 1, Log into logLocal.
+   - If beta != 1, scale logLocal.
+   - Compare t > threshold scalar, result in maskLocal.
+   - Select y from x or logLocal based on maskLocal.
+   - Free in reverse order: maskLocal, logLocal, expLocal, tLocal.
+   - Then free xLocal and enqueue yLocal.
+
+But we also need to keep xLocal for selection. We can use xLocal directly in Select.
+
+Alternatively, we can keep the original 3-slot approach but reorder allocations/frees to be LIFO. Let's do that instead to minimize changes. We'll restructure Compute to avoid free not LIFO.
+
+We can allocate expLocal, logLocal, maskLocal. Then compute log into logLocal (using expLocal as scratch). Then after log is done, we can use expLocal (which is free after freeing? But we need it for the mask? Actually we need a tensor for t for the compare. We can compute t = beta*x into expLocal after we are done with it for exp? But we need exp for log. After we have logLocal, we can reuse expLocal for t. But we must free expLocal first? Or we can still use expLocal without freeing if we haven't freed it. The issue is that we allocated expLocal but we haven't freed it; we can still use it as a scratch tensor. So we can compute t into expLocal after the log step. That avoids a separate allocation. So:
+
+1. Allocate expLocal, logLocal, maskLocal.
+2. Compute t = beta * x into expLocal.
+3. Exp(expLocal, expLocal, len) -> exp(t) in expLocal.
+4. Adds(expLocal, 1.0) -> 1+exp in expLocal.
+5. Log(logLocal, expLocal, len) -> log in logLocal.
+6. (Optionally scale logLocal)
+7. Now we have logLocal ready. We can now compute mask using a scalar compare: but we need t (beta*x) again. We can recompute t into expLocal (since we no longer need the exp value). So Muls(expLocal, xLocal, beta_, len) again.
+8. AscendC::Compare(maskLocal, expLocal, threshold_, AscendC::CMPMODE::GT, len); // scalar compare with threshold_.
+9. Select(yLocal, xLocal, logLocal, maskLocal, ...)
+10. Free in reverse order: maskLocal, logLocal, expLocal? Actually order: allocate exp, log, mask. So free mask, log, exp.
+11. Then free xLocal, enqueue yLocal.
+
+This uses only 3 tmpQueue slots, and free in LIFO order (mask, log, exp). That should be safe.
+
+Let's implement this fix. Also correct the mask condition to compare `beta*x` with threshold, not just `x`. Also, we need to pass `threshold` from tiling data.
+
+Now, also in the host_operator_src, the attribute indexing: they used `attrs->GetAttrPointer<float>(0)` for beta and `(1)` for threshold. That's correct.
+
+In kernel_src, Init receives `float beta, float threshold`. Good.
+
+Now, let's update the kernel_src accordingly. We'll also adjust the comment in host_operator_src about UB model (now uses 3 tmp tensors, but originally 3, now still 3, so okay).
+
+Let's produce the corrected kernel_src.
+
+Also, ensure that the python_bind_src's lambda/function names match: `aclnnSoftplusCustom` should be generated from the build. In the build log, they generated `aclnn_softplus_custom.h`. So the function name should be `aclnnSoftplusCustom`. That's fine.
+
+Now, produce the final answer with the six strings corrected. We'll only change the kernel_src, and possibly adjust the host_operator_src if needed for clarity, but minimal changes.
+
+Let's write the corrected kernel_src.

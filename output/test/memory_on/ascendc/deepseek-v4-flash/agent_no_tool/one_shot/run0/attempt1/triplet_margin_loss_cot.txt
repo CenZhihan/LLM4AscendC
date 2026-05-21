@@ -1,0 +1,231 @@
+We need to generate six embedded Python strings for the custom AscendC operator named "triplet_margin_loss_custom" (PascalCase: TripletMarginLossCustom). The original model uses F.triplet_margin_loss with anchor, positive, negative, and margin (scalar from tensor). The custom operator should implement triplet margin loss.
+
+First, understand triplet margin loss: L = max(d(anchor, positive) - d(anchor, negative) + margin, 0) where d is distance (typically p=2 norm). In PyTorch, F.triplet_margin_loss computes pairwise distances, then loss = mean of clamp(d_ap - d_an + margin, min=0). But for efficiency we can implement directly.
+
+The kernel will take four tensors: anchor, positive, negative, and a scalar margin (maybe as float attr). Output is a scalar loss (mean). But typical AscendC kernel outputs a tensor, but we can output a scalar (1-element tensor). However, the model_src expects to call the custom op and get a tensor. We'll output a 1-element tensor.
+
+We need to design tiling: process pairs batch-dim wise. For each pair (i), compute squared Euclidean distance? Or actual Euclidean? Usually it's Euclidean distance squared or actual? F.triplet_margin_loss uses p=2 (Euclidean) by default. Implementation: d = sqrt(sum((x-y)^2)). But sqrt is expensive. We could use squared distances? The loss is max(d_ap - d_an + margin, 0). If we use squared distances, the margin would need scaling. Since the original uses actual Euclidean distance, we should implement sqrt to be correct.
+
+However, sqrt on AscendC might be heavy. But we can use AscendC::Sqrt. We'll implement per pair.
+
+Given inputs: anchor (n,d), positive (n,d), negative (n,d), margin (float). Output: scalar (1-element tensor).
+
+Tiling: we can process batches in tiles. For each tile (blockDim blocks), compute partial sums, then reduce across blocks? Or we can have kernel compute all pairs and then do a global reduction? Single core might be simpler but for large n, need multi-core. We'll use all cores to compute partial sums, then atomic add? But atomic float add not supported? We can use a reduction kernel or just output sum and then divide by n in Python? Better to output scalar loss.
+
+Simpler: use one block per pair? Not feasible.
+
+Alternative: use tiling to compute sums of losses in each block, store in a partial sum array, then host does final mean. But model expects function returning scalar. So kernel can output a 1-element tensor with mean loss.
+
+We can implement with two-stage: first kernel computes per-element losses? Too complex.
+
+Better to implement a simple single-block kernel (blockDim=1) that processes all pairs in a loop, computing distances and accumulating loss, then divide by n. But for large n, UB may overflow? We need tiling within block.
+
+But to follow pattern, we use multi-block with grid-stride. Each block processes a subset of pairs, computes its partial sum, and then we need a reduction. We can use a shared workspace across blocks? Or we can use two kernel calls: one to compute per-block partial sums, then another to sum them. But the example only has one kernel.
+
+Maybe we can use a single kernel that computes total sum using atomic operations? AscendC supports AtomicAdd for float? Not sure. Safer: use a single block (blockDim=1) and process all pairs sequentially, but use double buffer to pipeline data movement. For typical sizes (n=32, d=128), it's fine. We can set blockDim=1 and process all in one block.
+
+But we need to follow tiling pattern: compute tileLen based on UB budget. For each tile, we process a number of pairs? Actually, we need to load anchor, positive, negative for each pair. That's 3*d elements per pair. So per pair floats = 3*d. For d=128, that's 384 floats. For n=32, total 12288 floats. UB budget 192KB = 49152 floats. So tileLen could be number of pairs we process per iteration.
+
+We'll set tileLen as number of pairs processed per loop. We'll compute totalPairs = n. Then for each block, we process pairs from its start index.
+
+Simpler: Use double buffering for three input tensors and compute distances.
+
+Implementation plan:
+
+- Kernel inputs: anchor, positive, negative, output scalar (y), workspace (not needed), tiling data (totalPairs, tileLen, blockDim, margin).
+- Each block: for its chunk of pairs, load each pair's vectors, compute d_ap = sqrt(sum((a-p)^2)), d_an = sqrt(sum((a-n)^2)), compute loss = max(d_ap - d_an + margin, 0). Accumulate to local sum. After all its pairs, store partial sum to workspace (array of blockDim floats). Then synchronize? But we need a second kernel? Or we can have host do reduction? Model expects single call.
+
+Better: Use single block (blockDim=1) and process all pairs sequentially. This avoids reduction. For n=32, it's fine. For larger n, we might need multi-block but let's assume moderate.
+
+So in tiling, set blockDim=1. tileLen = number of pairs per iteration (maybe all pairs or smaller loops to manage UB). We'll process pairs in batches of tileLen, but for n=32, one batch is fine. We'll set tileLen = n.
+
+Kernel: As each block processes all pairs? If blockDim=1, then only block0 works. Others skip. Use grid-stride with blockNum=blockDim (1). So block0 processes from index 0 to totalPairs-1 with stride tileLen (which is all pairs if tileLen >= totalPairs). Compute sum, then write to output y (1 element). Then we get mean loss.
+
+We must ensure correctness: F.triplet_margin_loss computes mean of losses (if reduction='mean' default). So we sum and divide by n.
+
+We also need to handle padding? Not needed.
+
+Now, generate the six strings.
+
+project_json_src: define operator with inputs: anchor (float, ND), positive, negative, output: loss (float, ND, shape [1]). Attribute: margin (float, default 0.0? but original has margin tensor, we'll take scalar attr). Actually original passes margin as tensor scalar; in op we want float attribute. The model in get_inputs gives margin tensor; our custom binding will extract scalar and pass as attr. So in project_json, attr "margin" float optional default 0.0.
+
+host_tiling_src: TilingData with fields: totalPairs (uint32_t), tileLen (uint32_t), blockDim (uint32_t), margin (float). We'll set blockDim=1. tileLen = min(totalPairs, some max from UB). Compute max pairs per tile: UB budget / bytes_per_pair. bytes per pair = 3*d*sizeof(float) (anchor,pos,neg) + tmp for distances? We also need to compute distances, so we need local buffers. We'll allocate three local vectors of size d for anchor,pos,neg, and two for squared differences and one for sum. So maybe 6*d floats. So bytes per pair = 6*d*4 = 24*d. For d=128, 3072 bytes. UB budget 192KB = 196608 bytes. So max pairs = 196608/3072 = 64. So tileLen 32 for safety. We'll use AlignDown(UB_BUDGET_BYTES / (24*d), 16) or similar. But d is known at compile time? No, d is dynamic. We can compute in tiling using input shape. Input shape of anchor is (n,d). So we can get d from shape. Compute perPairBytes = 24 * d. Then maxTile = UB_BUDGET_BYTES / perPairBytes; align down.
+
+We'll set tileLen = min(maxTile, totalPairs). blockDim = 1.
+
+host_operator_src: standard pattern with InferShape, InferDataType, Register op. Tiling function computes tileLen as described. Set blockDim=1. Use workspace? Not needed.
+
+kernel_src: Implement kernel. Use double buffering for three input pipes? But we have three inputs; can reuse buffer: load anchor, positive, negative per pair. We can have two sets of buffers for double buffering. We'll create a class with Init, Process.
+
+We'll use local tensors for anchor, pos, neg of size d. Then compute squared differences: subtract, square, sum, sqrt. Use AscendC::Sub, Mul, etc. We'll need a temporary for square and sum. Use vector instructions.
+
+To compute sqrt: AscendC::Sqrt.
+
+Then accumulate loss.
+
+We'll use TQue for each input? Or just load directly. Since we process pairs sequentially, we can enque each pair's data.
+
+We'll use pipe with buffer for 2 pairs (double buffering) for each input? But we have three inputs; we can use 3 queues for loading, each with BUFFER_NUM=2. Then compute on dequeued tensors.
+
+Alternatively, simpler: load all pairs for this tile in one go? That would require large buffer. Better to loop per pair.
+
+For each pair, we need to load its three vectors from global to local. We can use DataCopy. Then compute.
+
+We'll use two sets of local tensors for double buffering: while computing one pair, prefetch next pair.
+
+Implementation outline:
+
+class KernelTripletMarginLossCustom {
+public:
+    __aicore__ inline void Init(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR y, uint32_t totalPairs, uint32_t tileLen, float margin, uint32_t d) {
+        totalPairs_ = totalPairs;
+        tileLen_ = tileLen;
+        margin_ = margin;
+        d_ = d;
+        anchorGm_.SetGlobalBuffer((__gm__ float*)anchor);
+        positiveGm_.SetGlobalBuffer((__gm__ float*)positive);
+        negativeGm_.SetGlobalBuffer((__gm__ float*)negative);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, 1);
+        // Init pipes: each input queue with 2 buffers of d floats
+        pipe_.InitBuffer(inAnchorQ_, BUFFER_NUM, d_ * sizeof(float));
+        pipe_.InitBuffer(inPositiveQ_, BUFFER_NUM, d_ * sizeof(float));
+        pipe_.InitBuffer(inNegativeQ_, BUFFER_NUM, d_ * sizeof(float));
+        pipe_.InitBuffer(tmpQ_, 1, d_ * sizeof(float)); // for squares, diff
+        pipe_.InitBuffer(tmpSumQ_, 1, sizeof(float));   // but we can use scalar
+    }
+    __aicore__ inline void Process() {
+        if (totalPairs_ == 0) return;
+        uint32_t blockNum = GetBlockNum();
+        uint32_t blockIdx = GetBlockIdx();
+        // Only block 0 does work if blockDim=1. Use grid-stride.
+        // For simplicity, we process all pairs in block0.
+        if (blockIdx != 0) return;
+        float sum_loss = 0.0f;
+        uint32_t start = 0;
+        while (start < totalPairs_) {
+            uint32_t batch = min(tileLen_, totalPairs_ - start);
+            // Prefetch first pair
+            LoadPair(start, d_);
+            if (batch > 1) LoadPair(start+1, d_);
+            for (uint32_t i = 0; i < batch; i++) {
+                // Compute on current pair (from queue)
+                float loss = ComputePair(d_);
+                sum_loss += loss;
+                // Free current pair's buffers
+                FreeBuffers();
+                // Prefetch next pair
+                uint32_t next = start + i + 2;
+                if (next < start + batch) {
+                    LoadPair(next, d_);
+                }
+            }
+            start += batch;
+        }
+        float mean = sum_loss / totalPairs_;
+        // Write mean to output
+        AscendC::LocalTensor<float> outLocal = outYQ_.AllocTensor<float>();
+        outLocal.SetValue(0, mean);
+        AscendC::DataCopy(yGm_, outLocal, 1);
+        outYQ_.FreeTensor(outLocal);
+    }
+private:
+    // ... implementation of LoadPair, ComputePair, FreeBuffers
+};
+
+But we need to handle double buffering: we have pairs of buffers. We'll index which buffer is current. Simpler: use single buffer for each input and don't double buffer, just sequential load/compute. For n=32, it's fine. We can just load each pair, compute, and free. No need for double buffering. That simplifies.
+
+We'll use a queued approach: each pair we allocate from queue, enque, then deque, compute, free. That's fine.
+
+We need a queue for each input: anchor, positive, negative. Each with BUFFER_NUM=2. We'll use them circularly.
+
+But to avoid complexity, we can use a single buffer per input and reuse. Use pipe with single buffer, but then we cannot prefetch while computing. For small n, it's fine.
+
+We'll use a single buffer per input: TQue with 1 buffer. Then for each pair, allocate, copy, compute, free. That's simple.
+
+But we need to ensure we don't exceed UB budget? With d=128, each buffer 128 floats = 512 bytes. Three buffers = 1536 bytes. Plus temp for computation: we can reuse one temp buffer for diffs and squares. So total ~2KB, well within UB.
+
+Thus kernel simpler:
+
+Init: allocate queue for each input with 1 buffer of d floats, and a temp queue for computation (1 buffer of d floats). Also a scalar queue for sum? We'll keep sum in register.
+
+Process: loop over pairs from start (block0). For each pair index i, load anchor_i, positive_i, negative_i into local tensors from global by offset i*d. Compute distances. Compute loss. Accumulate. After loop, compute mean and write output.
+
+We need to store global tensor for each input, and for each pair compute base offset = i * d.
+
+Implement LoadPair: all local tensors from queues, DataCopy from global at offset.
+
+ComputePair: take local tensors, compute d_ap and d_an, then loss.
+
+We'll write loss accumulation in scalar variable.
+
+At end, copy mean to output.
+
+We'll need a small pipe for output.
+
+Given that we use single buffer per input, we need to free after each pair.
+
+Actually, we can avoid queues entirely and just use LocalTensor directly with DataCopy from global. But then we need to manage local memory reuse. Using queues is safer.
+
+We'll define inQueueAnchor, inQueuePos, inQueueNeg each with BUFFER_NUM=2 for double buffering, but we can still use single buffer if we want. Let's use single buffer for simplicity (BUFFER_NUM=1). But then we cannot double buffer; we load, compute, free. That's fine.
+
+But the pattern in example used double buffering. We can still implement double buffering for better performance, but for correctness single is okay.
+
+We'll use BUFFER_NUM=2 to follow pattern, but we'll use them as ping-pong.
+
+Implementation details: For each pair, we allocate from anchor queue, copy, enque, then deque. However, with BUFFER_NUM=2, we can have two pending loads. We'll implement a standard double buffering loop with a prefetch for next pair.
+
+But given time, we can implement simpler sequential loop without double buffering, as it's correct.
+
+Let's produce the code.
+
+We need to compute squared Euclidean distance: for two vectors a and b, sum((a-b)^2). Use AscendC::Sub, AscendC::Mul, AscendC::ReduceSum? AscendC does not have direct reduce sum? We can use a loop or vector accumulation. But we have vector instructions: we can compute diff, square, then use AscendC::Adds to accumulate? Actually, we can compute diff, square, then use AscendC::VecSum? There is no direct reduce. We can compute sum using a local scalar variable and loop over elements with DataCopy? Better: Use AscendC::ReduceSum? I recall there is AscendC::ReduceAdd in later versions? But we can compute dot product using MAC? Simpler: compute squared differences as a vector, then use AscendC::Sum? Not available. We can implement element-wise and then use a for loop to accumulate in a local register. But that's inefficient. Alternatively, we can compute the squared distance as dot product of (a-b) with itself: sum_{j} (a_j - b_j)^2. We can compute using vector multiply and then reduce with a vector of ones? Or use AscendC::VecMul? We can compute diff, then sq, then use AscendC::ReduceSum with a vector of ones. But AscendC API: AscendC::ReduceSum(localTensor, len, lane) returns scalar. That exists? Yes, AscendC::ReduceSum is available in some versions. We'll assume it's available. Or we can use AscendC::ReduceMax? Not.
+
+Alternatively, we can compute using a sequence: Sub, then Mul, then use a loop using MaskedReduce? I think we can use AscendC::ReduceSum as part of vector instructions. In the example, they used Mins, Muls, Add. No reduction. So they avoided reduction. For our case, we need sum. We can use a block reduction within the same core: compute partial sums in local, then accumulate across lanes? But each block processes one pair sequentially, so we can manually loop over vector elements using a small loop? For d=128, we can unroll.
+
+Simplest: use AscendC::VecCompute with a custom lambda? Not.
+
+We can use AscendC::MAC (multiply-accumulate) to compute dot product? But we want sum of squares.
+
+Given the complexity, maybe we can implement triplet margin loss using squared distances (i.e., L = max(d_ap^2 - d_an^2 + margin, 0))? But that would change the loss function. Not acceptable.
+
+We must match original.
+
+Maybe we can use AscendC::Sqrt only for final distances, but we need to sum squares first. We can compute sum of squares using a scalar reduction: load vector, compute squares, then use a for loop from 0 to d-1, accumulating in register. Since d is at most 8192 maybe, but for d=128 it's fine. Use a do { sum += sqLocal(i); } while. That is 128 iterations, fine.
+
+We'll do that.
+
+Alternatively, use AscendC::VecReduceAdd? Not sure if supported.
+
+I'll implement manual scalar reduction.
+
+We'll have a temp tensor for squared values. Then loop to accumulate.
+
+Implementation details in kernel:
+
+Compute squared distance between two vectors a and b:
+- Sub: diff = a - b (vector)
+- Mul: sq = diff * diff (vector)
+- LocalTensor<float> sqLocal; then float sum = 0; for (int j=0; j<d; j++) sum += sqLocal(j);
+- Then sqrt = sqrt(sum).
+
+We can reuse the same temp tensor for diff and sq.
+
+Now, let's write code.
+
+We'll need to pass dimension d to kernel. We can get from shape in tiling, store in tiling data. Add d to TilingData.
+
+Tiling fields: totalPairs, tileLen, blockDim, margin, d.
+
+In kernel, we receive d from tiling.
+
+Now produce strings.
+
+One more thing: In python_bind_src, we need to include pybind11 with arguments: anchor, positive, negative, margin (float). The model now passes margin as tensor; we need to extract scalar. In binding, we'll convert tensor to float.
+
+Also in model_src, the ModelNew's forward will call custom_ops_lib.triplet_margin_loss_custom(anchor, positive, negative, margin). We'll implement that.
+
+Now generate all six strings.
+
+We'll write them as multiline f-strings? The example uses triple-quoted strings. We'll output directly.
+
+Let's produce the answer.

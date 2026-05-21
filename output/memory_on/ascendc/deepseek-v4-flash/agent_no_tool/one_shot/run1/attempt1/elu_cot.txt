@@ -1,0 +1,91 @@
+We need to generate the six strings for the ELU custom operator. ELU: f(x) = alpha * (exp(x) - 1) for x < 0, f(x) = x for x >= 0. Need to implement custom kernel. Kernel name: elu_custom (PascalCase: EluCustom). Follow the pattern from leaky_relu example.
+
+First, project_json_src: define op "EluCustom", input x, output y, attr alpha (float, default maybe 1.0). Use ND format, float.
+
+Host tiling similar, but tiling data includes totalLength, tileLength, blockDim, alpha.
+
+Host operator: implement TilingFunc, InferShape, InferDataType, register op. Use appropriate UB budget calculation. For ELU, we need to compute exp(x) for negative x. Might need more temporary buffers. In the kernel, we need to compute exp for x<0 and then alpha*(exp(x)-1). Could use AscendC intrinsic functions. Keep simple: compute mask, compute exp for all but then apply mask? Better: use a conditional approach. But simplest: compute y = x; for each element, if x<0, compute exp(x) and then alpha*(exp-1). In vectorization, we can use vector operations with masks. Alternatively, we can compute exp on all, then add, but that's wasteful for positive. However, for simplicity, we can do: compute min(x,0) to zero out positive, then compute exp on neg part, etc. But exp is not directly vectorized? AscendC has Exp intrinsic. Let's design kernel.
+
+We need to ensure tiling and buffer sizes accommodate temporary tensors. For ELU, we need: x local, y local, and maybe one temp for exp? Actually, we can do: 
+- Load x.
+- Compute mask: let negMask = (x < 0) ? 1.0 : 0.0. But we can use Select or compare.
+- Compute exp_x = Exp(x). But exp(x) is expensive; we only need for negative. However, AscendC might have vectorized operations. We could compute:
+  - tmp1 = Mins(x, 0) // clamp positive to 0, leaving negative values unchanged?
+  Actually, Mins(x, 0) gives min(x,0) = x for x<0, 0 for x>=0. Then we can compute exp of that minus one? But exp(min(x,0)) = exp(negative values) but also exp(0)=1 for positive. Then subtract 1, multiply by alpha, and add back positive part. Another approach: use conditional assignment. But we need to avoid branching.
+
+Better: use formula: y = x + (alpha*(exp(x)-1) - x) * (x < 0). That is, compute delta = alpha*(exp(x)-1) - x, then y = x + delta * (x<0). This way we compute exp on all elements (both positive and negative) and then correct. But exp on positive large numbers can overflow? Not too large because ELU is used on typical input range. However, for large positive, exp(x) is huge, causing overflow. So we need to handle that. For positive x, exp(x) is not needed; we want y=x. So we want to avoid computing exp on positive. Better: use mask to only compute exp on negative region.
+
+In vector processing, we can use a vector conditional: for each element, if x<0, compute exp, else keep x. AscendC provides vector conditional operations? We can use Select to choose between two vectors. But we need to compute exp only where needed. We can compute exp of x, then clamp? Not good.
+
+Simpler: use LeakyRelu-like approach but with exp. We can compute tmp = min(x,0) to get negative part (x_neg), then compute exp_x_neg = Exp(x_neg) - 1 (since for positive, x_neg=0, exp(0)-1=0). Then y = x + alpha * (exp_x_neg). But wait: for x>=0, x_neg=0, exp(0)-1=0, so y = x. For x<0, x_neg=x, exp(x)-1, y = x + alpha*(exp(x)-1). But the formula is: y = alpha*(exp(x)-1) for x<0, not x + alpha*(exp(x)-1). So that's wrong. We need to replace x with alpha*(exp(x)-1) for negative. So we can compute y = x + (alpha*(exp(x)-1) - x) * (x<0). Alternatively, compute y = Select( x>=0, x, alpha*(exp(x)-1) ). But that's a conditional assignment.
+
+Given AscendC capabilities, we can implement using vector operations with a mask. Let's design kernel:
+- Load x.
+- Compute mask = (x < 0) as float (1.0 or 0.0). Use Compare with zero and convert.
+- Compute exp_x = Exp(x) for all? Not good. Instead, we can compute exp only for negative portion but we can't branch per element.
+
+Alternative: compute exp on the whole vector, but then clip positive values to avoid overflow? That is complex.
+
+Maybe we can compute: 
+- tmp1 = Mins(x, 0)  // negative part
+- tmp2 = Maxs(x, 0)  // positive part (though we don't need exp)
+- tmp3 = Exp(tmp1)   // exp on negative part, for positive part tmp1=0, exp(0)=1
+- tmp4 = tmp3 - 1.0  // exp-1
+- tmp5 = alpha * tmp4
+- result = tmp5 + tmp2   // because for positive, tmp5=alpha*(1-1)=0, result = x; for negative, tmp2=0, result=alpha*(exp(x)-1). That works! Because for negative, tmp1=x, tmp3=exp(x), tmp4=exp(x)-1, tmp5=alpha*(exp(x)-1), result = that + 0 = correct. For positive, tmp1=0, tmp3=1, tmp4=0, tmp5=0, result = 0 + x = x. This is perfect! And no overflow issue because positive part is not exp'd. Only exp on negative values which are <=0, so exp(x) <=1, safe. So we need two temps: one for mins, one for maxs, one for exp result, etc. Let's count buffers: xLocal, yLocal, t1 (mins), t2 (maxs), t3 (exp result), t4 (exp-1), t5 (alpha*...). That's many temps. But we can reuse: after computing mins and maxs, we can free mins? But AscendC queues manage memory. In the compute function, we can allocate multiple local tensors within the same queue? In leaky_relu example, they used tmpQueue for one temporary. For ELU, we need more temps. We can allocate them from a single temp queue? Or use pipe_.AllocTensor in the compute function. But we need to be careful with memory.
+
+Given UB budget, we can allocate multiple tiles. Example: for tileLen, we need 5 * tileLen floats? Possibly manageable. Let's design compute function:
+  - Dequeue xLocal.
+  - Allocate yLocal.
+  - Allocate t1 (for mins), t2 (for maxs), t3 (for exp), t4 (for exp-1), t5 (for alpha*...). That's 5 temps besides xLocal and yLocal. But we can reuse: after computing mins and maxs, we might not need both simultaneously. Actually, we need mins to compute exp, and we keep it? But after we compute exp, we can reuse mins for other things? Simpler: allocate three temps: tExp, tTemp1, tTemp2. Steps:
+    tTemp1 = Mins(xLocal, 0.0)  // negative part
+    tTemp2 = Maxs(xLocal, 0.0)  // positive part
+    tExp = Exp(tTemp1)           // exp on negative part (including zeros)
+    // now tTemp1 is no longer needed? We can reuse tTemp1 for (exp-1) if we do:
+    // tTemp1 = Sub(tExp, 1.0) but that would overwrite tTemp1. However, we also need tTemp2 later. So we need both tTemp1 and tExp? Actually, after we compute tExp, we can compute tTemp1 = Sub(tExp, 1.0) -> tTemp1 now holds exp-1. But we still have tTemp2 for positive part. Then compute tTemp1 = Mul(tTemp1, alpha). Then result = Add(tTemp2, tTemp1). So only need three temps: one for negative part (which becomes exp-1 after exp), one for positive part, one for exp calculation (which we can directly put into the negative part's variable after computing exp? But exp needs a target. We'll use:
+    tNeg = Mins(xLocal, 0.0); // tNeg holds negative part
+    tPos = Maxs(xLocal, 0.0); // tPos holds positive part
+    tTemp = Exp(tNeg); // tTemp holds exp(neg)
+    tNeg = Sub(tTemp, 1.0); // reuse tNeg for (exp-1)
+    tNeg = Mul(tNeg, alpha); // tNeg = alpha*(exp-1)
+    yLocal = Add(tPos, tNeg); // y = pos + alpha*(exp(neg)-1)
+    Then free tPos, tNeg, tTemp, but note tNeg and tTemp are separate? Actually, we allocated three temps: t1, t2, t3. We'll use:
+      t1 = Mins(xLocal, 0)
+      t2 = Maxs(xLocal, 0)
+      t3 = Exp(t1) // t3 now exp
+      t1 = Sub(t3, 1.0) // t1 reuse for exp-1
+      t1 = Mul(t1, alpha) // t1 alpha*(exp-1)
+      yLocal = Add(t2, t1) // result
+    Then free t2, t1, t3? But t3 not needed after sub. We can free t3 after use, but careful with queue order. In queue-based memory, we allocate tensors from the same queue? In leaky_relu, they had separate queues for in, out, and one temp. For multiple temps, we can allocate multiple tensors from the same temp queue if we ensure correct order. But easier: we can have multiple separate queues? Or we can use a single temp queue and allocate multiple tensors. The code in leaky_relu allocated only one temp tensor. For ELU, we need at least two temps? Actually, we need three: for mins, maxs, and exp intermediate. But we can reuse mins after exp, but we still need maxs separately. So we need at least two temps simultaneously: one for maxs, one for exp-mins chain. We can allocate two temps from tmpQueue? We can allocate two tensors from the same queue? Typically, each TQue is a queue of tensors; allocating two tensors from the same queue would work if we free them in order. But in the compute, we will allocate all needed tensors sequentially from the same queue. For example:
+
+    auto t1 = tmpQueue.AllocTensor<float>(); // for mins
+    auto t2 = tmpQueue.AllocTensor<float>(); // for maxs
+    auto t3 = tmpQueue.AllocTensor<float>(); // for exp
+    // then use, and free in reverse order? Actually, we must free in LIFO order? The queue is a queue, so we need to free in the order they were allocated? Typically, AscendC allows allocating multiple tensors from the same queue, and you can free them in any order as long as you have a handle. It's not strictly LIFO? The documentation suggests that you should free tensors in the reverse order of allocation to avoid fragmentation. But for simplicity, we can allocate them in order and free them later. Since we will free all at the end, order might not matter if we free them after use. We'll allocate all three, then use them, then free all at end. That should be fine.
+
+    Alternatively, we can reuse two temp buffers. For instance, we can compute mins and maxs, then compute exp into mins, then subtract, then multiply, then add. That would require only two temps: one for mins (reused) and one for maxs. But we need an intermediate for exp result before subtracting. Actually, we can do: t1 = Mins; tExp = Exp(t1); then we can do t1 = Sub(tExp, 1.0); this overwrites t1 with exp-1, but we still have t2 (maxs). So we need only two temps: t1 and t2. Steps:
+        auto t1 = tmpQueue.AllocTensor<float>(); // used initially for mins, then reused
+        auto t2 = tmpQueue.AllocTensor<float>(); // used for maxs
+        Mins(t1, xLocal, 0.0f, len);
+        Maxs(t2, xLocal, 0.0f, len);
+        auto tExp = tmpQueue.AllocTensor<float>(); // third temp for exp result
+        Exp(tExp, t1, len); // t1 is still mins, we need to keep it? Actually, after Exp, we can reuse t1 for sub. But we need tExp to hold exp result. So we need three temps. We could do: after computing tExp, we can do Sub(t1, tExp, 1.0f, len). That would overwrite t1 with exp-1. So we still have t2 for maxs. That's fine. Then we free tExp. Then Mul(t1, t1, alpha, len). Then Add(yLocal, t2, t1, len). Then free t1 and t2. So only three temps, but we allocate and free tExp in between. That is okay. So we need three temps from the same queue: t1, t2, tExp. We'll allocate all three? Actually, we can allocate t1 and t2 first, then after computing mins and maxs, allocate tExp. Then compute exp into tExp, then compute sub using t1 and tExp into t1 (so t1 becomes exp-1), then free tExp, then mul into t1, then add into yLocal, then free t1 and t2. This requires dynamic allocation/deallocation within compute. In AscendC, we can allocate tensors from the queue at any time, and free them. We'll follow that.
+
+    To keep it simple, we can stick with three temps allocated from the start, then free them later. That is fine.
+
+Given the UB budget, we need to recalc tileLen for ELU. The kernel will have:
+  - one vector queue for input (x), 2 tiles (ping-pong)
+  - one vector queue for output (y), 2 tiles
+  - one temp queue for three temps? Actually, we will allocate temps from a single temp queue. The temp queue needs to hold up to 3 tensors of tileLen each. But we might be able to reuse one buffer for multiple steps, so the maximum simultaneous usage is: we have t1 (mins), t2 (maxs), and t3 (exp) simultaneously for a short period. That's 3 * tileLen floats. So the temp queue should have capacity for at least 3 tiles. In the tiling, we need to budget UB bytes for: inQueueX: 2 tiles, outQueueY: 2 tiles, tmpQueue: 3 tiles = total 7 * tileLen floats. Bytes = 28 * tileLen. So UB_BUDGET should be divided by 28. In leaky_relu example, they used 5 tiles (2+2+1). Now for ELU, we need 7 tiles. So adjust UB_BUDGET_BYTES and the factor.
+
+But we can also reduce by reusing more. Actually, in leaky_relu, they used one temp. For ELU, we could use only 2 temps if we are careful, but it's safer to use 3. We'll set the tiling accordingly.
+
+Now, generate the six strings.
+
+Note: In kernel_src, we need to implement the compute with appropriate AscendC vector intrinsics. Use AscendC::Exp, AscendC::Mins, AscendC::Maxs, etc.
+
+Also, note that in the kernel, we have to handle tiling and grid-stride like leaky_relu. The kernel function name is elu_custom.
+
+We'll follow the same structure as leaky_relu but with ELU.
+
+Now, produce final answer with all six strings. Ensure naming consistency.

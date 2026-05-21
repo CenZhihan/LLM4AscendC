@@ -97,6 +97,8 @@ def _format_retrieved_content(state: GeneratorAgentState) -> str:
     ascend_search_results = state.get("ascend_search_results", [])
     ascend_fetch_results = state.get("ascend_fetch_results", [])
     registered_tool_results = state.get("registered_tool_results", [])
+    dtype_policy_engine_results = state.get("dtype_policy_engine_results", [])
+    dma_alignment_engine_results = state.get("dma_alignment_engine_results", [])
 
     parts: list = []
 
@@ -162,6 +164,12 @@ def _format_retrieved_content(state: GeneratorAgentState) -> str:
     if registered_tool_results:
         parts.append("[Registered tools]\n" + "\n\n".join(registered_tool_results[:6]))
 
+    if dtype_policy_engine_results:
+        parts.append("[Dtype policy engine]\n" + "\n\n".join(dtype_policy_engine_results[:4]))
+
+    if dma_alignment_engine_results:
+        parts.append("[DMA alignment engine]\n" + "\n\n".join(dma_alignment_engine_results[:4]))
+
     return "\n\n".join(parts) if parts else ""
 
 
@@ -189,6 +197,7 @@ def answer_node(
     attempt_id = int(state.get("attempt_id") or 1)
     repair_logs = (state.get("repair_error_logs_raw") or "").strip()
     previous_code = (state.get("previous_attempt_code") or "").strip()
+    mem = (state.get("retrieved_repair_memories") or "").strip()
 
     # Format retrieved content
     ref_text = _format_retrieved_content(state)
@@ -198,6 +207,7 @@ def answer_node(
         retrieved_block = ref_text if ref_text else "(no tool results in this attempt)"
         logs_block = repair_logs if repair_logs else "(no prior error logs provided)"
         previous_code_block = previous_code if previous_code else "(no previous code provided)"
+        mem_suffix = f"\n\nRetrieved repair memories (verified cross-run fixes):\n{mem}\n\n" if mem else ""
         user_prompt = (
             "You are an expert Ascend C kernel engineer.\n"
             "This is a repair attempt. Fix the previous attempt with minimal and targeted changes.\n\n"
@@ -209,9 +219,11 @@ def answer_node(
             f"Previous attempt error logs (raw text):\n{logs_block}\n\n"
             f"Previous attempt full generated code:\n{previous_code_block}\n\n"
             f"Retrieved context from current attempt tools:\n{retrieved_block}\n\n"
+            f"{mem_suffix}"
             "Generate the complete corrected solution as instructed (code only where the task demands code)."
         )
     elif ref_text:
+        mem_suffix = f"\n\nRetrieved repair memories (verified cross-run fixes):\n{mem}\n\n" if mem else ""
         user_prompt = (
             "You are an expert Ascend C kernel engineer. The following blocks are retrieval results "
             "and tool outputs gathered for the user task.\n"
@@ -221,13 +233,16 @@ def answer_node(
             "override fuzzy analogies from code snippets. Use code_search_snippet mainly for structure when it does not conflict with those rules.\n\n"
             f"Retrieved context:\n{ref_text}\n\n"
             f"Original user instruction:\n{base_prompt}\n\n"
+            f"{mem_suffix}"
             "Generate the complete solution as instructed (code only where the task demands code)."
         )
     else:
+        mem_suffix = f"\n\nRetrieved repair memories (verified cross-run fixes):\n{mem}\n" if mem else ""
         user_prompt = (
             "You are an expert Ascend C kernel engineer.\n"
             "Generate the complete Ascend C artifacts requested below.\n\n"
             f"User instruction:\n{base_prompt}"
+            f"{mem_suffix}"
         )
 
     messages = [

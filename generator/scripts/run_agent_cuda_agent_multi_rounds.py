@@ -19,7 +19,7 @@ import subprocess
 import sys
 import traceback
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -71,6 +71,29 @@ def _artifact_group_rel_from_txt_path(txt_path: pathlib.Path) -> Optional[pathli
     if str(rel_parent) in ("", "."):
         return None
     return rel_parent
+
+
+def _apply_parallel_opp_env_if_needed(*, op_slot: int, parallel_ops: int) -> None:
+    """
+    Isolate custom OPP install roots when --parallel-ops > 1 (align with eval_operator --workers).
+    See run_agent_multi_rounds._apply_parallel_opp_env_if_needed.
+    """
+    if parallel_ops <= 1:
+        return
+    from tools.common.env import load_env_config
+
+    cfg = load_env_config()
+    if not cfg.ascend_custom_opp_path:
+        return
+    base = pathlib.Path(cfg.ascend_custom_opp_path)
+    bucket = op_slot % parallel_ops
+    isolated = base / f"_parallel_w{bucket}"
+    isolated.mkdir(parents=True, exist_ok=True)
+    os.environ["LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH"] = str(isolated)
+    print(
+        f"[ALLOC] LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH={isolated} "
+        f"(slot={op_slot} mod parallel_ops={parallel_ops} -> bucket={bucket})"
+    )
 
 
 def _cuda_agent_eval_result_json_path(txt_path: pathlib.Path, op_key: str) -> pathlib.Path:
@@ -155,33 +178,6 @@ def _extract_eval_core(payload: Dict[str, Any], op: str) -> Dict[str, Any]:
     }
 
 
-def _select_error_logs(logs: Dict[str, str]) -> List[str]:
-    preferred = ["02-build", "06-eval"]
-    selected: List[str] = []
-    for key in preferred:
-        value = (logs.get(key) or "").strip()
-        if value:
-            selected.append(value)
-    if selected:
-        return selected
-
-    fallback_order = ["01-msopgen", "03-install-run", "04-pybind-build", "05-pybind-install"]
-    for key in fallback_order:
-        value = (logs.get(key) or "").strip()
-        if value:
-            selected.append(value)
-    return selected
-
-
-def _tail_lines(raw: str, max_lines: int) -> str:
-    if max_lines <= 0:
-        return raw
-    lines = raw.splitlines()
-    if len(lines) <= max_lines:
-        return raw
-    return "\n".join(lines[-max_lines:])
-
-
 def _build_repair_error_context(
     *,
     op: str,
@@ -189,29 +185,13 @@ def _build_repair_error_context(
     selected_logs: List[str],
     max_log_lines: int,
 ) -> str:
-    core = _extract_eval_core(result_payload, op)
-    sections: List[str] = []
-    sections.append(f"=== attempt1 eval summary for {op} ===")
-    sections.append(f"compiled: {core['compiled']}")
-    sections.append(f"correctness: {core['correctness']}")
-    sections.append("")
-    if core["correctness_info"]:
-        sections.append("=== correctness_info (raw text) ===")
-        sections.append(core["correctness_info"])
-        sections.append("")
-    for p in selected_logs:
-        path = pathlib.Path(p)
-        try:
-            raw = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            sections.append(f"=== log read failed: {p} ({exc}) ===")
-            sections.append("")
-            continue
-        trimmed = _tail_lines(raw, max_lines=max_log_lines)
-        sections.append(f"=== log file: {p} (tail {max_log_lines} lines) ===")
-        sections.append(trimmed)
-        sections.append("")
-    return "\n".join(sections).strip() + "\n"
+    from generator.repair_memory.error_signals import (
+        build_attempt_error_bundle,
+        format_repair_error_context,
+    )
+
+    bundle = build_attempt_error_bundle(result_payload, op, max_log_lines=max_log_lines)
+    return format_repair_error_context(op=op, bundle=bundle, attempt_label="prior attempt")
 
 
 def _save_generation_outputs(
@@ -249,6 +229,10 @@ def _generate_one_cuda_attempt(
     repair_error_logs_raw: str = "",
     previous_attempt_code: str = "",
     ascend_search_version_filter: Optional[str] = None,
+    retrieved_repair_memories: str = "",
+    retrieved_repair_memories_applied: Optional[List[Dict[str, Any]]] = None,
+    repair_memory_selection: Optional[Dict[str, Any]] = None,
+    eval_mode: str = "full",
 ) -> Dict[str, Any]:
     from generator.agent.agent_runner import KernelGenerationTask, generate_kernel_with_agent
 
@@ -268,6 +252,10 @@ def _generate_one_cuda_attempt(
         repair_error_logs_raw=repair_error_logs_raw,
         previous_attempt_code=previous_attempt_code,
         ascend_search_version_filter=ascend_search_version_filter,
+        retrieved_repair_memories=retrieved_repair_memories,
+        retrieved_repair_memories_applied=retrieved_repair_memories_applied,
+        repair_memory_selection=repair_memory_selection,
+        eval_mode=eval_mode,
     )
     paths = _save_generation_outputs(
         out_dir=out_dir,
@@ -307,23 +295,36 @@ def run_multi_attempt_for_cuda_row(
     eval_workers: int,
     eval_npu: int,
     ascend_search_version_filter: Optional[str] = None,
+    run_slug: str = "",
+    memory_root: Optional[pathlib.Path] = None,
+    use_repair_memory: bool = False,
+    start_attempt_id: int = 1,
+    seed_previous_code: str = "",
+    seed_repair_context_path: str = "",
+    prior_attempts: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if max_attempts < 2:
         raise ValueError("max_attempts must be >= 2")
+    if start_attempt_id < 1 or start_attempt_id > max_attempts:
+        raise ValueError(f"start_attempt_id must be in [1, {max_attempts}], got {start_attempt_id}")
+    if not (run_slug or "").strip():
+        from generator.repair_memory.paths import run_slug_from_run_dir
+
+        run_slug = run_slug_from_run_dir(run_dir) if use_repair_memory else ""
     op_summary: Dict[str, Any] = {
         "op_key": op_key,
         "row_index": row_index,
         "category": category,
-        "attempts": {},
+        "attempts": dict(prior_attempts or {}),
         "fixed_in_attempt2": False,
         "fixed_on_attempt": None,
         "max_attempts": max_attempts,
         "final_status": "unknown",
     }
-    previous_attempt_code = ""
-    previous_repair_context_path = ""
+    previous_attempt_code = seed_previous_code
+    previous_repair_context_path = seed_repair_context_path
 
-    for attempt_id in range(1, max_attempts + 1):
+    for attempt_id in range(start_attempt_id, max_attempts + 1):
         attempt_dir = run_dir / f"attempt{attempt_id}"
         outcome = AttemptOutcome(
             attempt_id=attempt_id,
@@ -340,6 +341,7 @@ def run_multi_attempt_for_cuda_row(
             repair_context_path="",
         )
         try:
+            saved_prev_for_memory = previous_attempt_code
             repair_logs_raw = ""
             if attempt_id >= 2:
                 if not previous_repair_context_path:
@@ -347,6 +349,41 @@ def run_multi_attempt_for_cuda_row(
                 repair_logs_raw = pathlib.Path(previous_repair_context_path).read_text(
                     encoding="utf-8", errors="replace"
                 )
+            retrieved_repair_memories = ""
+            retrieved_repair_memories_applied: List[Dict[str, Any]] = []
+            repair_memory_selection: Optional[Dict[str, Any]] = None
+            if use_repair_memory:
+                try:
+                    from generator.repair_memory import build_retrieval_block_for_attempt
+
+                    (
+                        retrieved_repair_memories,
+                        retrieved_repair_memories_applied,
+                        repair_memory_selection,
+                    ) = build_retrieval_block_for_attempt(
+                        llm_config=llm_config,
+                        op=op_key,
+                        category=category,
+                        tool_mode=tool_mode,
+                        eval_mode=eval_mode,
+                        repair_error_logs_raw=repair_logs_raw,
+                        attempt_id=attempt_id,
+                        memory_root=memory_root,
+                    )
+                except Exception as e:
+                    retrieved_repair_memories = ""
+                    retrieved_repair_memories_applied = []
+                    repair_memory_selection = {
+                        "memory_ids": [],
+                        "memory_ids_resolved": [],
+                        "memory_ids_dropped": [],
+                        "selection_rationale": (
+                            f"build_retrieval_block_for_attempt raised: {e!s}"
+                        ),
+                        "raw_model_output": "",
+                        "parse_ok": False,
+                        "parse_error": repr(e),
+                    }
             gen = _generate_one_cuda_attempt(
                 op_key=op_key,
                 row_index=row_index,
@@ -360,6 +397,10 @@ def run_multi_attempt_for_cuda_row(
                 repair_error_logs_raw=repair_logs_raw,
                 previous_attempt_code=previous_attempt_code,
                 ascend_search_version_filter=ascend_search_version_filter,
+                retrieved_repair_memories=retrieved_repair_memories,
+                retrieved_repair_memories_applied=retrieved_repair_memories_applied,
+                repair_memory_selection=repair_memory_selection,
+                eval_mode=eval_mode,
             )
             outcome.generated = True
             outcome.txt_path = str(gen["txt_path"])
@@ -392,7 +433,9 @@ def run_multi_attempt_for_cuda_row(
             outcome.compiled = core["compiled"]
             outcome.correctness = core["correctness"]
             outcome.correctness_info = core["correctness_info"]
-            outcome.selected_log_paths = _select_error_logs(core["logs"])
+            from generator.repair_memory.error_signals import select_error_log_paths
+
+            outcome.selected_log_paths = select_error_log_paths(core["logs"])
 
             repair_text = _build_repair_error_context(
                 op=op_key,
@@ -403,6 +446,31 @@ def run_multi_attempt_for_cuda_row(
             repair_path = attempt_dir / f"{op_key}_repair_context.txt"
             _write_text(repair_path, repair_text)
             outcome.repair_context_path = str(repair_path)
+
+            if use_repair_memory:
+                try:
+                    from generator.repair_memory import maybe_write_repair_memory_after_eval
+
+                    maybe_write_repair_memory_after_eval(
+                        op=op_key,
+                        category=category,
+                        strategy=strategy,
+                        tool_mode=tool_mode,
+                        eval_mode=eval_mode,
+                        attempt_id=attempt_id,
+                        run_dir=run_dir,
+                        run_slug=run_slug,
+                        llm_config=llm_config,
+                        op_summary_attempts=dict(op_summary.get("attempts") or {}),
+                        curr_outcome=outcome.__dict__,
+                        curr_payload=payload,
+                        prev_code=saved_prev_for_memory,
+                        curr_code=gen["result"].generated_code or "",
+                        memory_root=memory_root,
+                        max_log_lines=max_log_lines,
+                    )
+                except Exception:
+                    pass
 
             previous_attempt_code = gen["result"].generated_code
             previous_repair_context_path = str(repair_path)
@@ -453,8 +521,17 @@ def _run_single_cuda_agent_job(
     eval_workers: int,
     eval_npu: int,
     op_slot: int,
+    parallel_ops: int,
     ascend_search_version_filter: Optional[str] = None,
+    run_slug: str = "",
+    memory_root: Optional[pathlib.Path] = None,
+    use_repair_memory: bool = False,
+    start_attempt_id: int = 1,
+    seed_previous_code: str = "",
+    seed_repair_context_path: str = "",
+    prior_attempts: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    _apply_parallel_opp_env_if_needed(op_slot=op_slot, parallel_ops=parallel_ops)
     device_id = op_slot % eval_npu
     os.environ["ASCEND_VISIBLE_DEVICES"] = str(device_id)
     print(f"[ALLOC] op_key={op_key} slot={op_slot} ASCEND_VISIBLE_DEVICES={device_id} (eval_npu={eval_npu})")
@@ -476,15 +553,33 @@ def _run_single_cuda_agent_job(
         eval_workers=eval_workers,
         eval_npu=eval_npu,
         ascend_search_version_filter=ascend_search_version_filter,
+        run_slug=run_slug,
+        memory_root=memory_root,
+        use_repair_memory=use_repair_memory,
+        start_attempt_id=start_attempt_id,
+        seed_previous_code=seed_previous_code,
+        seed_repair_context_path=seed_repair_context_path,
+        prior_attempts=prior_attempts,
     )
 
 
 def _default_cuda_agent_run_dir(
-    *, model_slug: str, tool_mode: str, strategy: str, run: int, test: bool
+    *,
+    model_slug: str,
+    tool_mode: str,
+    strategy: str,
+    run: int,
+    test: bool,
+    use_repair_memory: bool = False,
 ) -> pathlib.Path:
     from generator.agent.agent_config import parse_tool_mode, tool_mode_to_string
 
-    out_root = pathlib.Path("output/test/cuda_agent_ops_6k" if test else "output/cuda_agent_ops_6k")
+    if use_repair_memory:
+        out_root = pathlib.Path(
+            "output/test/memory_on/cuda_agent_ops_6k" if test else "output/memory_on/cuda_agent_ops_6k"
+        )
+    else:
+        out_root = pathlib.Path("output/test/cuda_agent_ops_6k" if test else "output/cuda_agent_ops_6k")
     return (
         out_root
         / model_slug
@@ -502,6 +597,322 @@ def _all_ops_summary_filename(max_attempts: int) -> str:
     return f"attempts{max_attempts}_summary_all_rows.json"
 
 
+def _continue_single_cuda_worker(
+    ent_dict: Dict[str, Any],
+    *,
+    args_dict: Dict[str, Any],
+    out_run_dir_str: str,
+    dataset_path_str: str,
+    llm_config: Dict[str, Any],
+    ascend_vf: Optional[str],
+    memory_run_slug: str,
+    memory_root_str: str,
+    continued_from_abs: str,
+    continue_session_at: str,
+    new_max_attempts: int,
+    op_slot: int,
+) -> Tuple[str, Dict[str, Any]]:
+    from generator.scripts.multi_round_continue import merge_op_summary
+    from tools.cuda_agent_eval.dataset_snapshot import load_dataset_row
+
+    out_run_dir = pathlib.Path(out_run_dir_str)
+    dataset_path = pathlib.Path(dataset_path_str)
+    memory_root = pathlib.Path(memory_root_str) if memory_root_str else None
+    row_index = int(ent_dict["row_index"])
+    row = load_dataset_row(dataset_path, row_index)
+    seed_code = ""
+    if ent_dict.get("seed_txt_path"):
+        seed_code = pathlib.Path(ent_dict["seed_txt_path"]).read_text(encoding="utf-8", errors="replace")
+    new_partial = _run_single_cuda_agent_job(
+        op_key=ent_dict["entity_key"],
+        row_index=row_index,
+        row=row,
+        dataset_path=dataset_path,
+        strategy=args_dict["strategy"],
+        tool_mode=args_dict["tool_mode"],
+        llm_config=llm_config,
+        run_dir=out_run_dir,
+        eval_mode=args_dict["eval_mode"],
+        clean_policy=args_dict["clean_policy"],
+        max_log_lines=args_dict["max_log_lines"],
+        max_attempts=new_max_attempts,
+        eval_workers=args_dict["eval_workers"],
+        eval_npu=args_dict["eval_npu"],
+        op_slot=op_slot,
+        parallel_ops=args_dict["parallel_ops"],
+        ascend_search_version_filter=ascend_vf,
+        run_slug=memory_run_slug,
+        memory_root=memory_root,
+        use_repair_memory=args_dict["use_repair_memory"],
+        start_attempt_id=int(ent_dict["last_attempt_id"]) + 1,
+        seed_previous_code=seed_code,
+        seed_repair_context_path=str(ent_dict.get("seed_repair_context_path") or ""),
+        prior_attempts=ent_dict.get("prior_attempts") or {},
+    )
+    merged = merge_op_summary(
+        ent_dict.get("prior_op_summary") or {},
+        new_partial,
+        new_max_attempts=new_max_attempts,
+        continued_from_abs=continued_from_abs,
+        source_last_attempt=int(ent_dict["last_attempt_id"]),
+        continue_session_at=continue_session_at,
+        ran_new_attempts=True,
+    )
+    return ent_dict["entity_key"], merged
+
+
+def _run_continue_session_cuda(
+    *,
+    args: argparse.Namespace,
+    out_run_dir: pathlib.Path,
+    dataset_path: pathlib.Path,
+    llm_config: Dict[str, Any],
+    resolved_model: str,
+    ascend_vf: Optional[str],
+    memory_run_slug: str,
+    memory_root: Optional[pathlib.Path],
+) -> int:
+    from generator.scripts.multi_round_continue import (
+        OpContinueState,
+        aggregate_summary_filename,
+        build_continue_plan,
+        merge_op_summary,
+        per_entity_summary_filename,
+        utc_now_iso,
+        write_continue_report,
+    )
+    from tools.cuda_agent_eval.dataset_snapshot import load_dataset_row
+
+    continue_session_at = utc_now_iso()
+    row_keys_filter: Optional[List[str]] = None
+    if getattr(args, "row_keys", None):
+        row_keys_filter = list(args.row_keys)
+    elif args.indices is not None:
+        from tools.cuda_agent_eval.constants import suggested_op_key_ca6k
+
+        row_keys_filter = [suggested_op_key_ca6k(int(i)) for i in args.indices]
+
+    try:
+        plan = build_continue_plan(
+            run_dir=out_run_dir,
+            new_max_attempts=args.max_attempts,
+            kind="cuda",
+            ops_filter=row_keys_filter,
+            max_log_lines=args.max_log_lines,
+        )
+    except (ValueError, FileNotFoundError) as e:
+        print(f"[ERROR] {e}")
+        return 2
+
+    to_run = [e for e in plan.entities if e.action == "continue"]
+    if not to_run:
+        print("[ERROR] No rows to continue.")
+        return 2
+
+    entity_results: Dict[str, Dict[str, Any]] = {}
+    merged_summaries: Dict[str, Dict[str, Any]] = {}
+    order_index = {e.entity_key: i for i, e in enumerate(plan.entities)}
+
+    def _process_entity(ent: OpContinueState, op_slot: int) -> Dict[str, Any]:
+        if ent.action != "continue":
+            return merge_op_summary(
+                ent.prior_op_summary,
+                {},
+                new_max_attempts=args.max_attempts,
+                continued_from_abs=plan.continued_from_abs,
+                source_last_attempt=ent.last_attempt_id,
+                continue_session_at=continue_session_at,
+                ran_new_attempts=False,
+            )
+        if ent.row_index is None:
+            raise RuntimeError(f"row_index missing for {ent.entity_key}")
+        row = load_dataset_row(dataset_path, ent.row_index)
+        seed_code = ent.seed_txt_path.read_text(encoding="utf-8", errors="replace") if ent.seed_txt_path else ""
+        print(
+            f"[RUN] op_key={ent.entity_key} row_index={ent.row_index} "
+            f"continue attempt{ent.last_attempt_id + 1}..{args.max_attempts}"
+        )
+        new_partial = _run_single_cuda_agent_job(
+            op_key=ent.entity_key,
+            row_index=ent.row_index,
+            row=row,
+            dataset_path=dataset_path,
+            strategy=args.strategy,
+            tool_mode=args.tool_mode,
+            llm_config=llm_config,
+            run_dir=out_run_dir,
+            eval_mode=args.eval_mode,
+            clean_policy=args.clean_policy,
+            max_log_lines=args.max_log_lines,
+            max_attempts=args.max_attempts,
+            eval_workers=args.eval_workers,
+            eval_npu=args.eval_npu,
+            op_slot=op_slot,
+            parallel_ops=args.parallel_ops,
+            ascend_search_version_filter=ascend_vf,
+            run_slug=memory_run_slug,
+            memory_root=memory_root,
+            use_repair_memory=args.use_repair_memory,
+            start_attempt_id=ent.last_attempt_id + 1,
+            seed_previous_code=seed_code,
+            seed_repair_context_path=str(ent.seed_repair_context_path or ""),
+            prior_attempts=ent.prior_attempts,
+        )
+        return merge_op_summary(
+            ent.prior_op_summary,
+            new_partial,
+            new_max_attempts=args.max_attempts,
+            continued_from_abs=plan.continued_from_abs,
+            source_last_attempt=ent.last_attempt_id,
+            continue_session_at=continue_session_at,
+            ran_new_attempts=True,
+        )
+
+    if args.parallel_ops == 1:
+        slot = 0
+        for ent in plan.entities:
+            merged = _process_entity(ent, slot)
+            merged_summaries[ent.entity_key] = merged
+            entity_results[ent.entity_key] = merged
+            if ent.action == "continue":
+                slot += 1
+    else:
+        args_dict = {
+            "strategy": args.strategy,
+            "tool_mode": args.tool_mode,
+            "eval_mode": args.eval_mode,
+            "clean_policy": args.clean_policy,
+            "max_log_lines": args.max_log_lines,
+            "eval_workers": args.eval_workers,
+            "eval_npu": args.eval_npu,
+            "parallel_ops": args.parallel_ops,
+            "use_repair_memory": args.use_repair_memory,
+        }
+        memory_root_str = str(memory_root) if memory_root else ""
+        continue_entities = [e for e in plan.entities if e.action == "continue"]
+        slot_map = {e.entity_key: i for i, e in enumerate(continue_entities)}
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.parallel_ops) as ex:
+            fut_to_key = {}
+            for ent in plan.entities:
+                if ent.action != "continue":
+                    merged_summaries[ent.entity_key] = _process_entity(ent, 0)
+                    entity_results[ent.entity_key] = merged_summaries[ent.entity_key]
+                    continue
+                ent_dict = {
+                    "entity_key": ent.entity_key,
+                    "row_index": ent.row_index,
+                    "last_attempt_id": ent.last_attempt_id,
+                    "seed_txt_path": str(ent.seed_txt_path) if ent.seed_txt_path else "",
+                    "seed_repair_context_path": str(ent.seed_repair_context_path or ""),
+                    "prior_attempts": ent.prior_attempts,
+                    "prior_op_summary": ent.prior_op_summary,
+                }
+                fut = ex.submit(
+                    _continue_single_cuda_worker,
+                    ent_dict,
+                    args_dict=args_dict,
+                    out_run_dir_str=str(out_run_dir),
+                    dataset_path_str=str(dataset_path),
+                    llm_config=llm_config,
+                    ascend_vf=ascend_vf,
+                    memory_run_slug=memory_run_slug,
+                    memory_root_str=memory_root_str,
+                    continued_from_abs=plan.continued_from_abs,
+                    continue_session_at=continue_session_at,
+                    new_max_attempts=args.max_attempts,
+                    op_slot=slot_map[ent.entity_key],
+                )
+                fut_to_key[fut] = ent.entity_key
+            for fut in concurrent.futures.as_completed(fut_to_key):
+                key = fut_to_key[fut]
+                try:
+                    _, merged = fut.result()
+                    merged_summaries[key] = merged
+                except Exception:
+                    ent = next(e for e in plan.entities if e.entity_key == key)
+                    merged_summaries[key] = merge_op_summary(
+                        ent.prior_op_summary,
+                        {
+                            "op_key": key,
+                            "final_status": "op_level_parallel_runtime_failed",
+                            "error": traceback.format_exc(),
+                        },
+                        new_max_attempts=args.max_attempts,
+                        continued_from_abs=plan.continued_from_abs,
+                        source_last_attempt=ent.last_attempt_id,
+                        continue_session_at=continue_session_at,
+                        ran_new_attempts=True,
+                    )
+                entity_results[key] = merged_summaries[key]
+
+    prior_agg = plan.previous_aggregate
+    resolved_indices = []
+    for ent in plan.entities:
+        ri = merged_summaries[ent.entity_key].get("row_index") or ent.row_index
+        if ri is not None:
+            resolved_indices.append(int(ri))
+
+    all_summaries: Dict[str, Any] = {
+        "kind": "cuda_agent_ops_6k_multi_round",
+        "model": resolved_model,
+        "dataset_path": str(dataset_path),
+        "tool_mode": args.tool_mode,
+        "ascend_search_version_filter": ascend_vf,
+        "strategy": args.strategy,
+        "eval_mode": args.eval_mode,
+        "clean_policy": args.clean_policy,
+        "max_attempts": args.max_attempts,
+        "parallel_ops": args.parallel_ops,
+        "eval_workers": args.eval_workers,
+        "eval_npu": args.eval_npu,
+        "run_dir": str(out_run_dir),
+        "resolved_indices": resolved_indices,
+        "op_counts_filter": prior_agg.get("op_counts_filter"),
+        "rows": {},
+        "use_repair_memory": args.use_repair_memory,
+    }
+
+    report_path = write_continue_report(
+        run_dir=out_run_dir,
+        plan=plan,
+        continue_session_at=continue_session_at,
+        model=resolved_model,
+        use_repair_memory=args.use_repair_memory,
+        entity_results=entity_results,
+    )
+    all_summaries["continue"] = {
+        "enabled": True,
+        "continued_from": plan.continued_from_abs,
+        "previous_max_attempts": plan.previous_max_attempts,
+        "new_max_attempts": args.max_attempts,
+        "continue_report": report_path.name,
+    }
+
+    for ent in sorted(plan.entities, key=lambda e: order_index.get(e.entity_key, 10**9)):
+        summary = merged_summaries[ent.entity_key]
+        all_summaries["rows"][ent.entity_key] = summary
+        per_path = out_run_dir / per_entity_summary_filename(ent.entity_key, args.max_attempts)
+        _write_json(per_path, summary)
+        print(f"[WROTE] {per_path}")
+
+    agg = out_run_dir / aggregate_summary_filename("cuda", args.max_attempts)
+    _write_json(agg, all_summaries)
+    print(f"[WROTE] {agg}")
+    print(f"[WROTE] {report_path}")
+
+    if args.use_repair_memory:
+        try:
+            from generator.repair_memory import merge_run_inbox
+            from generator.repair_memory.paths import get_memory_root
+
+            merged_n = merge_run_inbox(get_memory_root(), memory_run_slug)
+            if merged_n:
+                print(f"[REPAIR_MEMORY] final merge: appended {merged_n} record(s) (run_slug={memory_run_slug})")
+        except Exception as exc:
+            print(f"[REPAIR_MEMORY] final merge skipped: {exc}")
+    return 0
+
+
 def main() -> int:
     from generator.agent.agent_config import get_llm_config_compatible, model_slug_for_path
     from generator.cuda_agent_dataset_selection import resolve_row_indices
@@ -516,7 +927,7 @@ def main() -> int:
             "artifacts (LLM4ASCENDC_CUDA_AGENT_ART_ROOT), OPP path (LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH)."
         ),
     )
-    sel = parser.add_mutually_exclusive_group(required=True)
+    sel = parser.add_mutually_exclusive_group(required=False)
     sel.add_argument(
         "--indices",
         nargs="+",
@@ -587,7 +998,37 @@ def main() -> int:
         metavar="SUBSTRING",
         help="Ascend docs version substring filter for ascend_search + ascend_fetch.",
     )
+    parser.add_argument(
+        "--use-repair-memory",
+        action="store_true",
+        help=(
+            "Enable cross-attempt repair memory; default output under output/memory_on/cuda_agent_ops_6k/... "
+            "(with --test: output/test/memory_on/cuda_agent_ops_6k/...). Omit for legacy behavior without memory."
+        ),
+    )
+    parser.add_argument(
+        "--continue-attempt",
+        action="store_true",
+        help="Continue multi-round repair in an existing run directory (append attemptN+1..max).",
+    )
+    parser.add_argument(
+        "--continue-from",
+        type=str,
+        default="",
+        help="Existing run directory to continue from (required with --continue-attempt).",
+    )
+    parser.add_argument(
+        "--row-keys",
+        nargs="+",
+        default=None,
+        metavar="KEY",
+        help="In continue mode: subset of ca6k row keys (e.g. ca6k_00055).",
+    )
     args = parser.parse_args()
+    if args.continue_attempt and not (args.continue_from or "").strip():
+        raise ValueError("--continue-from is required when --continue-attempt is set")
+    if (args.continue_from or "").strip() and not args.continue_attempt:
+        raise ValueError("--continue-attempt is required when --continue-from is set")
 
     if args.max_attempts < 2:
         raise ValueError("--max-attempts must be >= 2")
@@ -609,32 +1050,6 @@ def main() -> int:
     if not dataset_path.is_file():
         raise FileNotFoundError(dataset_path)
 
-    range_pair: Optional[tuple[int, int]] = None
-    use_all = False
-    indices_arg: Optional[list[int]] = None
-    if args.indices is not None:
-        indices_arg = list(args.indices)
-    elif args.range is not None:
-        range_pair = (int(args.range[0]), int(args.range[1]))
-    else:
-        use_all = bool(args.all)
-
-    try:
-        resolved_indices = resolve_row_indices(
-            dataset_path,
-            indices=indices_arg,
-            range_pair=range_pair,
-            use_all=use_all,
-            op_counts=list(args.op_counts) if args.op_counts is not None else None,
-        )
-    except ValueError as e:
-        print(f"[ERROR] {e}")
-        raise SystemExit(2) from e
-
-    if not resolved_indices:
-        print("[ERROR] No rows to run after filters (--indices/--range/--all and optional --op-counts).")
-        raise SystemExit(2)
-
     llm_config = get_llm_config_compatible(cli_model=args.model)
     resolved_model = llm_config["model"]
     model_slug = model_slug_for_path(resolved_model)
@@ -649,18 +1064,87 @@ def main() -> int:
                 f"ascend_search={has_ascend_search(_tm)}, ascend_fetch={has_ascend_fetch(_tm)}."
             )
 
-    out_run_dir = (
-        pathlib.Path(args.out_dir)
-        if args.out_dir
-        else _default_cuda_agent_run_dir(
-            model_slug=model_slug,
-            tool_mode=args.tool_mode,
-            strategy=args.strategy,
-            run=args.run,
-            test=args.test,
+    if args.continue_attempt:
+        out_run_dir = pathlib.Path(args.continue_from).resolve()
+        if not out_run_dir.is_dir():
+            raise ValueError(f"--continue-from is not a directory: {out_run_dir}")
+        if args.out_dir:
+            out_explicit = pathlib.Path(args.out_dir).resolve()
+            if out_explicit != out_run_dir:
+                raise ValueError(
+                    f"--out-dir ({out_explicit}) must match --continue-from ({out_run_dir}) in continue mode"
+                )
+        print(
+            f"[INFO] Continue mode: run_dir={out_run_dir} "
+            "(ignoring --run, --range, --all; optional --indices/--row-keys filter)"
         )
-    )
-    out_run_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        range_pair: Optional[tuple[int, int]] = None
+        use_all = False
+        indices_arg: Optional[list[int]] = None
+        if args.indices is not None:
+            indices_arg = list(args.indices)
+        elif args.range is not None:
+            range_pair = (int(args.range[0]), int(args.range[1]))
+        elif args.all:
+            use_all = True
+        else:
+            raise ValueError("Exactly one of --indices, --range, or --all is required (unless --continue-attempt)")
+
+        try:
+            resolved_indices = resolve_row_indices(
+                dataset_path,
+                indices=indices_arg,
+                range_pair=range_pair,
+                use_all=use_all,
+                op_counts=list(args.op_counts) if args.op_counts is not None else None,
+            )
+        except ValueError as e:
+            print(f"[ERROR] {e}")
+            raise SystemExit(2) from e
+
+        if not resolved_indices:
+            print("[ERROR] No rows to run after filters (--indices/--range/--all and optional --op-counts).")
+            raise SystemExit(2)
+
+        out_run_dir = (
+            pathlib.Path(args.out_dir)
+            if args.out_dir
+            else _default_cuda_agent_run_dir(
+                model_slug=model_slug,
+                tool_mode=args.tool_mode,
+                strategy=args.strategy,
+                run=args.run,
+                test=args.test,
+                use_repair_memory=args.use_repair_memory,
+            )
+        )
+        out_run_dir.mkdir(parents=True, exist_ok=True)
+    if args.use_repair_memory and args.out_dir and not args.continue_attempt:
+        p = str(out_run_dir.resolve()).replace("\\", "/")
+        if "memory_on" not in p:
+            print(
+                "[WARN] With --use-repair-memory, prefer run_dir under a path containing memory_on "
+                "(default when --out-dir is unset); "
+                f"current run_dir={out_run_dir}"
+            )
+
+    from generator.repair_memory.paths import get_memory_root, run_slug_from_run_dir
+
+    memory_run_slug = run_slug_from_run_dir(out_run_dir) if args.use_repair_memory else ""
+    memory_root: Optional[pathlib.Path] = get_memory_root() if args.use_repair_memory else None
+
+    if args.continue_attempt:
+        return _run_continue_session_cuda(
+            args=args,
+            out_run_dir=out_run_dir,
+            dataset_path=dataset_path,
+            llm_config=llm_config,
+            resolved_model=resolved_model,
+            ascend_vf=ascend_vf,
+            memory_run_slug=memory_run_slug,
+            memory_root=memory_root,
+        )
 
     print(f"[INFO] Rows to run ({len(resolved_indices)}); dataset={dataset_path}")
     if len(resolved_indices) <= 40:
@@ -689,6 +1173,7 @@ def main() -> int:
         "resolved_indices": resolved_indices,
         "op_counts_filter": list(args.op_counts) if args.op_counts is not None else None,
         "rows": {},
+        "use_repair_memory": args.use_repair_memory,
     }
 
     if args.parallel_ops == 1:
@@ -712,7 +1197,10 @@ def main() -> int:
                 eval_workers=args.eval_workers,
                 eval_npu=args.eval_npu,
                 op_slot=op_slot,
+                parallel_ops=args.parallel_ops,
                 ascend_search_version_filter=ascend_vf,
+                run_slug=memory_run_slug,
+                use_repair_memory=args.use_repair_memory,
             )
             results.append({"op_key": op_key, "row_index": row_index, "summary": summary})
     else:
@@ -741,7 +1229,10 @@ def main() -> int:
                     eval_workers=args.eval_workers,
                     eval_npu=args.eval_npu,
                     op_slot=op_slot,
+                    parallel_ops=args.parallel_ops,
                     ascend_search_version_filter=ascend_vf,
+                    run_slug=memory_run_slug,
+                    use_repair_memory=args.use_repair_memory,
                 )
                 fut_to_key[fut] = (op_key, row_index)
             for fut in concurrent.futures.as_completed(fut_to_key):
@@ -775,6 +1266,16 @@ def main() -> int:
     agg = out_run_dir / _all_ops_summary_filename(args.max_attempts)
     _write_json(agg, all_summaries)
     print(f"[WROTE] {agg}")
+    if args.use_repair_memory:
+        try:
+            from generator.repair_memory import merge_run_inbox
+            from generator.repair_memory.paths import get_memory_root
+
+            merged_n = merge_run_inbox(get_memory_root(), memory_run_slug)
+            if merged_n:
+                print(f"[REPAIR_MEMORY] final merge: appended {merged_n} record(s) (run_slug={memory_run_slug})")
+        except Exception as exc:
+            print(f"[REPAIR_MEMORY] final merge skipped: {exc}")
     return 0
 
 

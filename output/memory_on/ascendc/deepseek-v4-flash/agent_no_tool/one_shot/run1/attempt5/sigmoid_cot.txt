@@ -1,0 +1,240 @@
+We need to diagnose the output mismatch. The kernel computes sigmoid using exp and reciprocal. The reference output is from PyTorch's sigmoid (which is 1/(1+exp(-x))). The kernel output shows values that are close but not exactly matching. The mismatch suggests numerical precision issues: maybe the kernel uses float32, and PyTorch also uses float32, but the kernel's approach might have small rounding differences. However, the error log shows that the build succeeded, but correctness failed.
+
+Looking at the kernel code: 
+- Compute: mul -1 (Muls with -1.0f), Exp, Adds 1.0f, Reciprocal.
+- This should compute y = 1/(1+exp(-x)). But note: the reciprocal operation might have precision limitations. Also, the order: Muls -> Exp -> Adds -> Reciprocal. That's standard.
+
+But wait: The reference output uses torch.sigmoid. The new output is on device 'npu:0'. The values differ in the 3rd-4th decimal places, sometimes 5th. This could be due to the AscendC reciprocal implementation being slightly less accurate than PyTorch's. However, the problem says "prioritize resolving the concrete errors shown in logs." The error is output mismatch. The logs suggest that the build and run succeeded, but the output didn't match exactly.
+
+Possible causes:
+1. The kernel uses float precision, but reference is double? The warning: "Device do not support double dtype now, dtype cast replace with float." This warning suggests that the reference or the input might be double, but the device cast to float. The reference output tensor is printed without device, maybe it's on CPU and computed in double? Actually, the reference output is from model's forward (torch.sigmoid) which by default uses float32 if input is float. The input x is created with torch.rand, which defaults to float32. So the reference should be float32. The warning about double might be from something else.
+
+2. The kernel might have a bug in the algorithm: The formula for sigmoid is 1/(1+exp(-x)). That's correct.
+
+3. Potential numeric issue: The reciprocal of (1+exp(-x)) might be less accurate. But we can improve by using a more stable approach: compute sigmoid as exp(x)/(1+exp(x)) for positive x to avoid overflow? Not needed.
+
+4. The tile/grid-stride loop: Is the logic correct? It prefetches next tile while computing current. That should be fine.
+
+5. The CopyIn and CopyOut use DataCopy with len in elements? DataCopy expects count in number of elements? In AscendC, DataCopy with LocalTensor and GlobalTensor, the third parameter is the number of elements to copy. Yes, "len" is number of floats. That's correct.
+
+6. The queue management: In CopyIn, we allocate a tensor, copy, enqueue. In Compute, we dequeue x, allocate y, compute, enqueue y. In CopyOut, dequeue y, copy to gm, free. That's correct.
+
+7. The tiling: totalLength is the number of elements (since shape size). The tileLength is set to maxTile (UB budget / 20) aligned to 2048. That should work.
+
+8. The block dim is set to numTiles, clamped between 8 and 24. That seems okay.
+
+The main suspect is the reciprocal operation's precision. But the error magnitude is around 0.0005 to 0.001. That might be acceptable for a custom kernel? But the test requires exact match? The eval script probably uses allclose with default tolerance 1e-8? Not sure.
+
+Alternatively, there might be a bug: in kernel, the process uses CopyIn before while loop, then inside while, it computes and copies out, then prefetches next. But the nextLength might be computed incorrectly when base+strideElems is exactly totalLen? The condition: if (nextBase < totalLen_) then prefetch. That's fine. But after computing and copying out, if nextLen ==0, break. That's correct.
+
+But consider: if base + strideElems < totalLen_ but base + strideElems + tileLen_ might exceed totalLen_, we cap to totalLen_ - nextBase. That's fine.
+
+Could there be an off-by-one? Let's test with simple numbers: totalLen=1000, tileLen=256, blockNum=8, blockIdx=0. strideElems=2048. base=0, curLen=256. NextBase=2048 > totalLen, so nextLen=0. So only one tile processed. That's fine for block 0. But block 0 should process indices 0-255. Block 1 processes 256-511, etc. But wait: strideElems = blockNum * tileLen = 8*256=2048. So each block processes one tile only. That's because the grid stride is tile-based: block 0 processes tiles at offsets 0, 2048, 4096,... but totalLen=1000, so only first tile. That's fine. But block 1: base=256, curLen=256, nextBase=2304 > totalLen, so only one tile. So each block processes exactly one tile. However, total length 1000, tileLen=256, numTiles=4. But blockDim=8. So 8 blocks each process one tile, but only 4 tiles needed. So some blocks (block 4-7) will have base >= totalLen and early return. That's fine.
+
+Now, check the grid stride logic: "Tile-granularity grid-stride to improve load balance." Actually, each block processes tiles spaced by blockNum*tileLen elements. That means block i processes tiles at offsets i*tileLen, i*tileLen+strideElems, etc. For small totalLen relative to strideElems, each block only processes one tile. That's fine. But is there a chance that a tile is partially processed? No.
+
+The algorithm seems correct.
+
+Maybe the issue is that the kernel doesn't handle the case where tileLen is not a multiple of ALIGN_ELEMS? But we align down. Should be fine.
+
+Another possibility: The reciprocal function might have a different behavior for special values (e.g., 0, overflow). But for typical random values, it should be fine.
+
+Given the small differences, it might be a validation tolerance issue. However, the task says "Fix the previous attempt with minimal and targeted changes." The error log shows output mismatch. We need to make the output match exactly within floating point precision.
+
+One way to improve accuracy is to use a different algorithm: compute sigmoid using the formula: 0.5 * (1 + tanh(x/2)). That might be more stable and potentially match PyTorch's implementation? But PyTorch's sigmoid is 1/(1+exp(-x)) using its own exp and div. That should be similar.
+
+Alternatively, we can use the built-in AscendC Sigmoid operation if available, but we are implementing custom.
+
+Maybe the issue is that the reciprocal and exp operations have limited precision on AscendC compared to CPU. But we can increase the precision by using double? But device doesn't support double.
+
+Given that the error is consistent and small, it might be acceptable. But the eval says FAIL. Perhaps we need to ensure that the kernel uses a more accurate implementation: for example, use the formula y = exp(x) / (1 + exp(x)) for x >= 0, and y = 1/(1+exp(-x)) for x < 0 to avoid overflow and improve accuracy. But the error magnitude suggests it's not an overflow issue.
+
+Let's look at the specific values: For first element: ref=0.6919, new=0.6914. Difference ~0.0005. That's about 0.07% relative error. For sigmoid, the derivative is small. Could be due to the reciprocal being slightly off.
+
+Maybe we can use a better algorithm: instead of Reciprocal, use Div with scalar 1.0f? But that's same.
+
+Or we can compute y = 1.0f / (1.0f + AscendC::Exp(-x, len)). But that's what we have.
+
+Wait: In the Compute function, we use Muls with -1.0f, then Exp, then Adds with 1.0f, then Reciprocal. However, the Adds operation: "Adds(tLocal, tLocal, 1.0f, len)" adds a scalar to each element. That's correct.
+
+Potential bug: The Muls with -1.0f might be better as "AscendC::Mul(tLocal, xLocal, -1.0f, len)" but Muls is scalar multiplication. That's fine.
+
+Maybe the issue is that the queue sizes: We used tmpQueue_ of 1 tile, but we allocate and free inside Compute. That's fine.
+
+Given the error logs, the build succeeded, the kernel ran, but output mismatch. The most likely root cause is numerical precision of the reciprocal operation on AscendC. However, we can try to replace the reciprocal with a division: y = 1.0f / (1.0f + exp(-x)). But that is the same. Or we can compute using the formula: y = exp(x) / (1 + exp(x)) and select based on sign to avoid saturation. But that adds complexity.
+
+Alternatively, we might try to use the AscendC intrinsic "Sigmoid" if available? But that defeats the purpose.
+
+Another thought: The DataCopy copies floats. The tiling uses tileLength in floats. That's fine.
+
+Maybe the kernel's Process loop has a flaw: After CopyOut, the outQueueY's tensor is freed, but we didn't check if we are overwriting the next tile's data? Actually, the grid stride ensures each block writes to disjoint output regions. So no data race.
+
+What about the workspace and tiling GM_ADDR parameters? The kernel function signature: "extern "C" __global__ __aicore__ void sigmoid_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)". That's standard.
+
+Let's re-examine the host operator source: The Init takes totalLength and tileLength. That's correct.
+
+Now, the error: "Reference output: tensor([[0.6919, ...]], New output: tensor([[0.6914, ...]], device='npu:0')". The reference is on CPU, new on NPU. The small differences could be due to different floating point rounding.
+
+But perhaps the issue is that the kernel uses a different order of operations leading to slightly different rounding. For example, computing -x then exp then add 1 then reciprocal may produce different results than torch's built-in sigmoid which might use a more optimized algorithm.
+
+To match exactly, we could try to use the same algorithm as PyTorch's sigmoid, which is typically 1/(1+exp(-x)). But on NPU, the exp and reciprocal implementations might not produce bit-exact results.
+
+Given the situation, the minimal targeted change might be to adjust the algorithm to use a more numerically stable approach: compute sigmoid by splitting into two cases: for x >= 0, use exp(-x) to avoid overflow, and for x < 0, use exp(x) to avoid underflow? Actually, the standard stable approach is:
+  if x >= 0: y = 1 / (1 + exp(-x))
+  else: y = exp(x) / (1 + exp(x))
+
+But that's more code. However, it can help precision.
+
+Alternatively, we could try to use the AscendC built-in "Sigmoid" function if available? But the task is to write a custom kernel, not use built-in.
+
+Maybe the error is due to the fact that the kernel uses the same buffer for tLocal in a way that interferes with the pipeline? But we free after use.
+
+Another possibility: The tmpQueue_ is declared with BUFFER_NUM=2? Actually, it's 1. So it's fine.
+
+Given that the differences are small and consistent, I suspect the eval script might use torch.allclose with default rtol=1e-5, atol=1e-8, and the error may be within that? But it reports FAIL. So likely the difference exceeds tolerance.
+
+Let's check some values: 0.6919 vs 0.6914, difference 0.0005, relative ~0.07%. That might fail allclose if rtol is 1e-5 (0.001%)? Actually 1e-5 = 0.001%, so 0.07% is much larger. So it fails.
+
+We need to improve accuracy. Perhaps the reciprocal implementation on AscendC is less accurate. We could implement our own reciprocal using Newton-Raphson? That's overkill.
+
+But maybe the issue is not precision but a bug: The Compute function uses Muls with -1.0f, but the variable is float, so -1.0f is fine. However, the Adds uses 1.0f, also fine.
+
+Wait: The Adds signature: AscendC::Adds(LocalTensor dst, LocalTensor src, const float scalar, const int32_t len). That's correct.
+
+After Adds, we have tLocal = 1.0f + exp(-x). Then Reciprocal computes 1/(...). That should be correct.
+
+Maybe the problem is that the exp function on AscendC returns slightly different results than CPU. But can we improve by using a different formula? For example, use the identity: sigmoid(x) = 0.5 + 0.5 * tanh(x/2). That might be more stable and potentially more accurate if tanh is implemented with better precision. Let's try that.
+
+Compute:
+  t = x * 0.5f
+  t = tanh(t)
+  y = 0.5f + 0.5f * t
+
+That requires tanh, which is available in AscendC (Tanh). That might yield better match to PyTorch's sigmoid? PyTorch's sigmoid is typically exp-based, but tanh implementation might be different.
+
+Alternatively, we can keep the current algorithm but increase precision by using double? Not possible.
+
+Given the time, I'll propose to change the compute to use the tanh-based formula. It's a minimal change in the kernel_src. Also, we need to ensure we have buffer for tanh? We already have tLocal. That's fine.
+
+So, modify kernel_src Compute to:
+  // t = x * 0.5f
+  AscendC::Muls(tLocal, xLocal, 0.5f, len);
+  // t = tanh(t)
+  AscendC::Tanh(tLocal, tLocal, len);
+  // y = 0.5f + 0.5f * t
+  AscendC::Muls(yLocal, tLocal, 0.5f, len);
+  AscendC::Adds(yLocal, yLocal, 0.5f, len);
+
+That should be more accurate? Maybe not, but it's worth a try.
+
+Actually, PyTorch's tanh is also an approximation. This might not match exactly.
+
+Another approach: Use the polynomial approximation for sigmoid? Too complex.
+
+Maybe the error is due to the fact that the kernel uses a different order of operations, but we can reorder to match typical implementation: compute exp(-x), then add 1, then divide. We already do that.
+
+Let's check if there's a bug in how we handle the tensor sizes: The queue buffers are allocated with tileLen_ * sizeof(float) bytes. The DataCopy transfers len floats. That should be fine.
+
+What about alignment? The DataCopy might require that the address is 32-byte aligned. The buffers from TPipe should be aligned. The global memory address from tensor should be aligned. Might not be an issue.
+
+Given the error log, the build succeeded and the output is close but not exact. The most likely reason is that the AscendC exp and reciprocal implementations have limited precision and produce slightly different results from CPU. To fix, we could try to use a more accurate approximation: compute using two steps of Newton-Raphson for reciprocal if we suspect reciprocal is inaccurate. But that's complex.
+
+Alternatively, we can compute y = 1.0f / (1.0f + AscendC::Exp(AscendC::Mul(xLocal, -1.0f, len), len), len) in a single line? No.
+
+Maybe we can use built-in Sigmod operation from AscendC? But that's not custom.
+
+Given the instruction "Prioritize resolving the concrete errors shown in logs" and "Keep naming/contracts consistent", I think the most direct fix is to ensure the kernel's output matches by using a more stable algorithm. I'll change to tanh-based. Also, we need to include the necessary header? Already includes kernel_operator.h which has Tanh.
+
+But also, we must ensure that the tanh function is available and that we have enough temporary space (one tile), which we do.
+
+Let's also double-check the tiling: We don't pass blockDim to kernel, but blockDim is used in host_operator_src to set context->SetBlockDim. That's fine.
+
+In the kernel, we use GetBlockNum() which is the blockDim set by runtime.
+
+Now, one more thing: In the grid-stride loop, we call CopyIn for next block before computing current. But we also have the initial CopyIn before the loop. In the loop, after copying next, we compute and copy out, then if nextLen=0 break. That's correct. However, note that we have two copies of the data in the queues: the initial and the prefetched. But we only dequeue one per iteration. That's fine.
+
+But there is a potential issue: The loop may cause the queue to have two entries at the same time? Actually, we only dequeue x after Compute, and after Compute we free x tensor and enqueue y. Then in the next iteration, we dequeue the next x. So the queues should not overflow because we have BUFFER_NUM=2, and we only have at most 2 entries in inQueueX (the initial and the prefetched) at the same time. That's okay.
+
+The outQueueY: we enqueue y after compute, and dequeue after copyout. We have two buffer slots, so at most two enqueues before dequeue. That's fine.
+
+So the algorithm should work.
+
+Given the error is output mismatch, and the values are close, I suspect the tolerance is strict. To improve, we can try to use double for intermediate calculations? But the device does not support double. So we need to ensure we use the exact same order of operations as PyTorch. But we cannot.
+
+Alternatively, we can adjust the evaluation tolerance? Not in our control.
+
+Maybe the issue is that the kernel uses the wrong formula: Actually, sigmoid is 1/(1+exp(-x)), but our order is: -x, exp, +1, reciprocal. That's correct.
+
+Wait: In the compute, we used Muls with -1.0f, then Exp on tLocal. That computes exp(-x). Then Adds with 1.0f gives 1+exp(-x). Then Reciprocal gives 1/(1+exp(-x)). That's correct.
+
+Maybe the bug is that we are overwriting tLocal incorrectly? Let's trace:
+  tLocal = Muls(xLocal, -1.0f) -> t now is -x.
+  tLocal = Exp(tLocal) -> t now is exp(-x).
+  tLocal = Adds(tLocal, 1.0f) -> t now is 1+exp(-x).
+  yLocal = Reciprocal(tLocal) -> y = 1/(1+exp(-x)).
+That's correct.
+
+Now, what about the difference? Could it be that the Reciprocal operation on AscendC uses a fast approximation with limited precision? Possibly. To improve, we can use a custom reciprocal with Newton-Raphson: given b, compute 1/b by iterative r_{n+1} = r_n * (2 - b * r_n). But that requires multiple steps and extra buffer.
+
+Given the time, I'll propose to change to tanh-based formula. That may or may not match better. But we need to provide a fix.
+
+Another possibility: The mismatch is due to the kernel not handling the case where tileLen is not a multiple of something? But the data copy should work.
+
+I'll also check the host operator: The python bind uses "aclnnSigmoidCustom" which is generated by the build system from the op name. That should be correct.
+
+Maybe the issue is that the kernel doesn't use the negative slope or any attribute, so that's fine.
+
+I think the most likely root cause is that the AscendC exp and reciprocal functions have lower precision. To mitigate, we can use a different approach: compute sigmoid as 0.5 * (1 + tanh(x/2)). The AscendC tanh might be more accurate? I'm not sure.
+
+Alternatively, we can use a lookup table in UB? No.
+
+Given the constraints, I'll make a minimal change: In the kernel_src Compute, change to use tanh-based formula. Also, we need to remove the negativeSlope-related code from Init if present? Actually, in the previous attempt, Init does not have negativeSlope parameter. That's correct. But in the kernel_src, we have no negativeSlope. So we keep as is.
+
+But wait: The kernel_src in the previous attempt has no negativeSlope, but the Init signature is (x, y, totalLength, tileLength). That's fine.
+
+I suggest modifying kernel_src Compute function to:
+
+```cpp
+    __aicore__ inline void Compute(uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+        AscendC::LocalTensor<float> tLocal = tmpQueue_.AllocTensor<float>();
+
+        // y = 0.5 * (1 + tanh(x/2))
+        AscendC::Muls(tLocal, xLocal, 0.5f, len);
+        AscendC::Tanh(tLocal, tLocal, len);
+        AscendC::Muls(yLocal, tLocal, 0.5f, len);
+        AscendC::Adds(yLocal, yLocal, 0.5f, len);
+
+        tmpQueue_.FreeTensor(tLocal);
+        outQueueY_.EnQue<float>(yLocal);
+        inQueueX_.FreeTensor(xLocal);
+    }
+```
+
+This is a minimal change. It replaces the three operations (Mul negative, Exp, Add, Reciprocal) with two Mul/tanh operations and an add. That might have different numerical behavior, possibly closer to PyTorch's tanh? Not sure.
+
+But we need to ensure that this formula is mathematically equivalent. Yes, tanh(x/2) = (exp(x)-1)/(exp(x)+1), so 0.5*(1+tanh(x/2)) = 0.5*(1 + (exp(x)-1)/(exp(x)+1)) = 0.5*( (exp(x)+1 + exp(x)-1)/(exp(x)+1) ) = 0.5*(2*exp(x)/(exp(x)+1)) = exp(x)/(1+exp(x)) = sigmoid(x). So it's correct.
+
+Now, we should also remove the unused imports? Not needed.
+
+The rest of the files are fine.
+
+But wait: The error logs also show a warning about double dtype. That's not directly fixable.
+
+I'll also check if there's any issue with the host_operator_src: It uses SigmoidCustom as op name, consistent. No negative slope attribute needed.
+
+The python_bind_src uses aclnnSigmoidCustom, which should be generated.
+
+Given the eval failed due to output mismatch, my hypothesis is that the tanh-based implementation might be more accurate on AscendC. However, I have no evidence. But it's a minimal targeted change.
+
+Alternatively, we could simply double the UB budget to allow larger tiles? No, that wouldn't change precision.
+
+I'll proceed with changing kernel_src Compute to tanh-based. Also, I will update the comment.
+
+No other changes needed.
+
+Now, produce the final answer: six Python strings embedded in the response. The code should be identical to the previous attempt except for the kernel_src Compute function.
+
+Let's write the complete solution.

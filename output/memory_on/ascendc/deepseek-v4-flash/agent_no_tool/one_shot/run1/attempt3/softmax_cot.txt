@@ -1,0 +1,71 @@
+We need to fix the kernel_src and possibly other files based on the error logs. The main errors are:
+
+1. `ReduceMax` requires 4 arguments; in kernel_src we used `AscendC::ReduceMax(scalar, xVec, curLen);` but it needs 4 args. According to AscendC API, `ReduceMax` can be called with 4 args: dst, src, count, and a mask or repeat? Let's check typical signature: `ReduceMax(const LocalTensor<T>& dst, const LocalTensor<T>& src, const uint32_t calCount, const uint32_t origCount = 0)`. Or there may be overloads. The error says "requires 4 arguments" but we gave 3. So add a 4th argument, perhaps 0 for full reduction.
+
+2. `Sub` and `Div` have mismatched arguments: we used `AscendC::Sub(tmp, xVec, newMax, curLen);` but Sub expects dst, src0, src1, count? Actually the error says candidate template ignored: could not match 'LocalTensor<T>' against 'float'. So `Sub` with a scalar second argument? Actually we passed `newMax` which is a float, but the function expects a LocalTensor for src1. So we need to use `Sub` with two LocalTensors or use `Subs` (scalar version). Similarly for `Div` with `rowSum` scalar. Use `Subs` and `Divs` for scalar operations.
+
+3. `ReduceSum` also requires 4 arguments.
+
+4. `Exp` requires 3 arguments: dst, src, count. We used `AscendC::Exp(tmp, tmp, curLen);` which should be correct? But error says "no matching function for call to 'Exp' ... requires 3 arguments, but 1 was provided" that's for line `float expDiff = AscendC::Exp(rowMax - newMax);`. That is a scalar exp, which doesn't exist as a standalone function. We need to compute scalar exp using a small local tensor or use a scalar lambda? Better to avoid scalar exp; we can recompute using vector exp on a 1-element tensor.
+
+5. Also `ReduceMax` returning a float via indexing: `float chunkMax = scalar(0);` That is okay but the reduce call needs proper arguments.
+
+Overall, the kernel algorithm attempted online softmax but with too many scalar operations that are not supported in AscendC (no scalar math functions). Need to rewrite using vector operations only. A simpler approach: use a two-pass softmax entirely in vector registers without scalar reductions per chunk. Instead, we can use a per-chunk prefix-style or use a single tile for a row if row fits. Given rowLength up to 393216, tileLength will be much smaller (like 8192). So we need to do multi-chunk softmax. But we can do a simplified version: for each row, we can do two passes over the chunks using vector operations, but the max and sum are accumulated across chunks using scalar results from partial reductions. That's the problem: scalar operations are not directly available. However, we can use 1-element local tensors and use vector functions with repeat count 1. For example, to get max of a chunk, we do ReduceMax on a 1-element buffer? Actually we need to compute max of a vector, then store in a 1-element tensor, then load that as a float. That's okay. The issue is with scalar exp and arithmetic. We can do those operations on 1-element tensors as well: e.g., allocate a 1-element tensor, assign scalar values via SetValue? But AscendC doesn't have direct scalar assignment; we need to use DataCopy from a global memory scalar? Or we can use `AscendC::SetLocalTensorVal`? There is `AscendC::SetScalarTensorVal` maybe. Alternatively, we can avoid the scalar accumulation by doing the softmax in a single pass using a technique that doesn't combine scalars: we can compute exp(x - max) for each chunk, then sum them, but we need the global max first. A simpler approach: compute the global max in a first pass using vector max that reduces across chunks using a temporary buffer. But that still requires exchanging scalar values across chunks. Given the difficulty, maybe a workaround is to restrict tileLen to be equal to rowLength (if rowLength <= UB budget) and process each row in one tile. That would avoid multi-chunk complexity. Check UB budget: 192KB, 16*? rowLength = 393216 floats = 1.5MB, too large. So row doesn't fit.
+
+Another approach: use a different algorithm: for each row, we can compute max and sum using an atomic-like reduction across chunks? Not possible in this environment.
+
+Maybe we can use the built-in `Softmax` operator? But the task is to write custom kernel.
+
+Given the complexity, we need to fix the current code's API usage. Let's modify kernel_src:
+
+- Replace `AscendC::ReduceMax(scalar, xVec, curLen)` with `AscendC::ReduceMax(scalar, xVec, curLen, 0)` (add 4th arg).
+- Replace `AscendC::ReduceSum(scalar, tmp, curLen)` with `AscendC::ReduceSum(scalar, tmp, curLen, 0)`.
+- Replace scalar `Sub` and `Div` with `Subs` and `Divs` (or use `Sub` with a local tensor of 1 element). For vector-sub with scalar, we can use `Subs`: `AscendC::Subs(dst, src, scalar, count)`. Similarly `Divs`.
+- For scalar exp, we can allocate a 1-element LocalTensor, copy the scalar value into it using `AscendC::SetLocalTensorVal`? Actually we can do: create a small temporary tensor of 1 element, assign the scalar via `SetValue`? There is `AscendC::SetLocalTensorVal` (only for scalar type). Or we can use `AscendC::Exp` on that 1-element tensor. But we need to set its value. In AscendC, to set a local tensor element, we can use `localTensor.SetValue(0, value)` for scalar, but that's not available? There is `SetValue` method. Actually `LocalTensor` has `SetValue` in some versions? Typically we can do: `LocalTensor<float> oneElem = ...; oneElem(0) = rowMax;` but that's not allowed in device code? In many kernels, they use `localTensor(0) = ...` for scalar assignment, but that requires scalar indexing which may be allowed. The error log didn't complain about that usage. So we can use `scalar(0) = rowMax;` to assign a value. So for scalar exp, we can allocate a 1-element tensor, set its value, compute Exp on it, then read the result.
+
+Thus revise:
+
+```
+// Before: float expDiff = AscendC::Exp(rowMax - newMax); // invalid
+// Instead:
+AscendC::LocalTensor<float> scalarDiff = scalarQueue_.AllocTensor<float>();
+scalarDiff(0) = rowMax - newMax;
+AscendC::Exp(scalarDiff, scalarDiff, 1);  // compute exp on 1 element
+float expDiff = scalarDiff(0);
+scalarQueue_.FreeTensor(scalarDiff);
+```
+
+But note: scalarQueue_ is VECCALC with size 2, we already use it for chunk max and sum. We may need more. Better to allocate temporary 1-element tensors on the fly using `AllocTensor` from a dedicated queue. We can add a small queue for scalars. Or we can reuse the same scalar tensor by reassigning.
+
+Also, after computing chunkMax, we do `scalarQueue_.FreeTensor(scalar)`; then later allocate again. That's fine.
+
+But we need to ensure that `scalar(0) = ...` is valid. In many AscendC examples, they use `SetLocalTensorVal` or direct assignment. The error log earlier didn't show error for that line, so it's likely allowed.
+
+Now, for `Sub` and `Div` with scalar, use `Subs` and `Divs`:
+
+- For `AscendC::Sub(tmp, xVec, newMax, curLen);` -> `AscendC::Subs(tmp, xVec, newMax, curLen);`
+- For `AscendC::Div(yLocal, yLocal, rowSum, curLen);` -> `AscendC::Divs(yLocal, yLocal, rowSum, curLen);`
+
+Check if `Subs` and `Divs` exist. They do in AscendC: `Subs(dst, src, scalar, count)`, `Divs(dst, src, scalar, count)`.
+
+Also for `AscendC::Sub(yLocal, xVec, rowMax, curLen);` in phase 2 -> use `Subs`.
+
+Now, the `ReduceMax` and `ReduceSum` need a 4th arg: the `origCount`? The error said requires 4 arguments, so add `0` as last argument. But check actual signature: `ReduceMax(const LocalTensor<T>& dst, const LocalTensor<T>& src, const uint32_t calCount, const uint32_t origCount = 0)`. So pass `0`.
+
+Similarly for `ReduceSum`.
+
+Also, the `Exp` call with 3 arguments is correct: `AscendC::Exp(tmp, tmp, curLen);` That's fine.
+
+One more issue: The `scalarQueue_` is defined as `TQue<..., 2>`. We allocate and free tensors from it multiple times. That should be okay but ensure we don't exceed 2. Currently we allocate scalar for chunk max, then free, then allocate for sum, then free. That uses only 1 at a time. For the scalarDiff, we can allocate another from same queue but need to ensure we don't exceed 2. That's fine.
+
+Now, also need to fix the compilation error about `config` directory not found. That is likely a build system issue not related to our code; but the error log shows that the kernel compilation failed so the binary wasn't generated, leading to missing config. So fixing the kernel compilation should resolve.
+
+Let's rewrite the kernel_src with these fixes. Also ensure we include the correct headers.
+
+Let's produce the corrected six strings. We'll keep everything else the same except kernel_src.
+
+Also note: In the original attempt, the kernel function name is `softmax_custom`, matching the provided name.
+
+We'll also adjust the host_tiling_src and host_operator_src if needed? They seemed fine except maybe the tiling data uses rowLength, and the kernel uses it. That's okay.
+
+Now produce the final answer with all six strings.

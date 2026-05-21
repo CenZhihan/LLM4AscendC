@@ -3,7 +3,7 @@ Agent state definition for LangGraph-based kernel generation agent.
 
 Defines GeneratorAgentState that integrates KB, WEB, and Code RAG retrieval results.
 """
-from typing import Annotated, List, Dict, Any
+from typing import Annotated, Any, Dict, List, Optional
 
 try:
     from typing import NotRequired
@@ -82,6 +82,8 @@ class GeneratorAgentState(MessagesState):
     ascend_fetch_results: Annotated[List[str], _add_list]
     ascend_search_allowed_urls: Annotated[List[str], _add_list]
     registered_tool_results: Annotated[List[str], _add_list]
+    dtype_policy_engine_results: Annotated[List[str], _add_list]
+    dma_alignment_engine_results: Annotated[List[str], _add_list]
 
     # Structured env check results (for programmatic access)
     env_check_env_result: NotRequired[Dict[str, Any]]    # Environment overview
@@ -102,6 +104,8 @@ class GeneratorAgentState(MessagesState):
     security_check_result: NotRequired[Dict[str, Any]]   # Security pattern check
     ascend_search_result: NotRequired[Dict[str, Any]]    # Ascend online docs search
     ascend_fetch_result: NotRequired[Dict[str, Any]]     # Ascend online docs fetch
+    dtype_policy_engine_result: NotRequired[Dict[str, Any]]  # dtype / accumulation advisory
+    dma_alignment_engine_result: NotRequired[Dict[str, Any]]  # DMA alignment advisory
 
     # Tool call logging
     tool_calls_log: Annotated[List[Dict[str, Any]], _add_tool_calls]
@@ -126,6 +130,10 @@ class GeneratorAgentState(MessagesState):
     attempt_id: NotRequired[int]             # Attempt index, e.g., 1 or 2
     repair_error_logs_raw: NotRequired[str]  # Raw error context for repair attempt
     previous_attempt_code: NotRequired[str]  # Full previous attempt code for repair attempt
+    retrieved_repair_memories: NotRequired[str]  # Injected cross-run repair memory (natural language)
+    retrieved_repair_memories_applied: NotRequired[List[Dict[str, Any]]]  # Structured rows for report
+    repair_memory_selection: NotRequired[Dict[str, Any]]  # Selection LLM debug (ids, rationale, parse)
+    eval_mode: NotRequired[str]  # e.g. full — used for memory filtering only
 
 
 def create_initial_state(
@@ -137,6 +145,10 @@ def create_initial_state(
     attempt_id: int = 1,
     repair_error_logs_raw: str = "",
     previous_attempt_code: str = "",
+    retrieved_repair_memories: str = "",
+    retrieved_repair_memories_applied: Optional[List[Dict[str, Any]]] = None,
+    repair_memory_selection: Optional[Dict[str, Any]] = None,
+    eval_mode: str = "full",
 ) -> Dict[str, Any]:
     """
     Create initial state for agent invocation.
@@ -153,7 +165,7 @@ def create_initial_state(
     """
     from langchain_core.messages import HumanMessage
 
-    return {
+    state: Dict[str, Any] = {
         "messages": [HumanMessage(content=base_prompt)],
         "op_name": op_name,
         "category": category,
@@ -163,6 +175,9 @@ def create_initial_state(
         "attempt_id": attempt_id,
         "repair_error_logs_raw": repair_error_logs_raw,
         "previous_attempt_code": previous_attempt_code,
+        "retrieved_repair_memories": retrieved_repair_memories or "",
+        "retrieved_repair_memories_applied": list(retrieved_repair_memories_applied or []),
+        "eval_mode": eval_mode or "full",
         "kb_results": [],
         "web_results": [],
         "code_rag_results": [],
@@ -183,7 +198,12 @@ def create_initial_state(
         "ascend_fetch_results": [],
         "ascend_search_allowed_urls": [],
         "registered_tool_results": [],
+        "dtype_policy_engine_results": [],
+        "dma_alignment_engine_results": [],
         "tool_calls_log": [],
         "tool_choice_reasoning_log": [],
         "query_round_count": 0,
     }
+    if repair_memory_selection is not None:
+        state["repair_memory_selection"] = dict(repair_memory_selection)
+    return state

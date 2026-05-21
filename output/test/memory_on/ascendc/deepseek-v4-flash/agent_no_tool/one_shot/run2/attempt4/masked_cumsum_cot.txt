@@ -1,0 +1,56 @@
+We need to fix the previous attempt. The error logs indicate that the generated code was incomplete: the txt bundle was missing 'kernel_src' and 'python_bind_src' blocks. The previous attempt's kernel_src and python_bind_src were cut off mid-code. Also the overall structure likely missing those blocks entirely due to truncation.
+
+The task is to generate six embedded Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src. All must be complete.
+
+We must follow the pattern from the successful leaky_relu example but adapted for masked_cumsum_custom with float x, bool mask, int dim. The dim is an attribute.
+
+Key points from the example:
+- project_json_src: op name PascalCase (MaskedCumsumCustom), input x (float), mask (bool), output y (float), attr dim (int, default 1).
+- host_tiling_src: TilingData class with fields for totalElements, rowLength, totalRows, blockDim, dim. Use same namespace optiling.
+- host_operator_src: TilingFunc, InferShape, InferDataType, OpDef class. Must use MaskedCumsumCustom. Must include includes for tiling header and op_def_registry. Must set blockDim appropriately. Must handle dim attribute.
+- kernel_src: Kernel class, use AscendC operations for masked cumsum. Since dim is last dimension (we can assume last dim for simplicity, but store dim in tiling), we need to implement prefix sum per row with mask. Use local tensors for x, mask, y. Use BUFFER_NUM=2, pipe, queues. The example for LeakyReLU used grid-stride loops. For cumsum, we can process one row at a time per block (grid stride over rows). Use DataCopy for loading x and mask (mask as bool, but we need to cast to float for arithmetic). Use AscendC vector functions: for each row, do a prefix sum with mask: we can use AscendC::Cumsum? There is no direct cumsum, but we can implement iterative addition: loop over elements with dependency. However, AscendC may have a VecCumax or something? Actually, for efficiency, we can use a single pass: load row, convert mask to float (0 or 1), multiply x by mask to get masked_x, then compute cumulative sum by sequential addition. But vectorization may be tricky due to dependency. However, we can use AscendC's vec_reduce_add? No, cumsum is not a reduction. For simplicity and correctness, we can implement a iterative loop per element using scalar operations within local tensor? But that would be slow. Alternative: we can precompute prefix sum using the vector unit by doing a tree-based scan? But that's complex. Since the original PyTorch implementation uses torch.cumsum, the custom kernel must produce same result. We can use AscendC's built-in VecCumSum? I think there is an intrinsic: AscendC::CumSum(src, dst, len). Let's check: In AscendC programming guide, there is `CumSum` function that computes cumulative sum of input tensor. Yes, AscendC supports `CumSum(LocalTensor<D> src, LocalTensor<D> dst, int32_t length)`. So we can use that! Then just multiply by mask after? But cumsum includes all elements, we need masked cumsum: we need to apply mask before cumsum (set non-masked to 0) or after? Actually, cumsum(x*mask, dim) = cumsum of masked x. So we can compute masked_x = x * mask (mask as 0/1 float), then compute cumsum of masked_x. That works.
+
+So kernel algorithm per row:
+1. Load x row (float)
+2. Load mask row (bool)
+3. Convert mask to float (0.0f or 1.0f) using Cast? Or use Muls? For bool to float, we can use AscendC::Cast with type conversion? Since mask is bool (8-bit), we can load as int8 and then convert? Simpler: we can load mask as float by using DataCopy with type conversion? AscendC::DataCopy only works on same type? Actually, DataCopy requires same dtype. We can load mask as int8 local tensor, then use Cast to float. Or we can use an alternative: since mask is bool, we can treat it as int8 and multiply with x using Multiply? But Muls expects float. So we need conversion. We'll use AscendC::Cast to convert bool to float. Or we can store an additional local tensor for mask as float after casting. That's fine.
+
+4. Multiply x by mask_float to get masked_x.
+5. Compute CumSum on masked_x to get y_row.
+6. Store y_row.
+
+We need to handle tiling: rowLength may be larger than UB budget. So we need to split row into tiles if rowLength > maxTile. But that complicates cumsum because cumsum across tiles depends on previous tile's last value. So we can process each tile sequentially: for each tile, compute cumulative sum within tile but add offset from previous tile's last value. That is more complex. To keep simpler, we can set tileLen to rowLength (so each tile is whole row) if rowLength fits in UB. The UB budget estimate: we need x row (float), mask row (bool), y row (float), plus temporary mask_float row (float). That's 4 * rowLength * sizeof(float?) Actually mask is bool: 1 byte each, so about 4*rowLength*4 (float) + rowLength*1 ≈ 17 * rowLength bytes. With UB_BUDGET 192KB, rowLength up to ~11K floats. But the input shape is (32768, 32768) => rowLength = 32768, which is too large for single tile. So we must tile. So we need to implement tiled cumsum across tiles. For each tile, we compute cumsum on the tile data, but we need to carry forward the previous tile's last cumsum value as an offset. This requires a scalar offset per row. We can store offset in a scalar register and apply to next tile. Since we process row by row, we can have a per-row offset variable that accumulates.
+
+Thus we need to handle tiling within a row. We'll have a loop over tiles within each row. For each tile, we load x and mask sub-tile, compute masked_x, compute cumsum on that tile's masked_x (starting from zero), then add the offset to all elements, then output, then update offset with the last element of the tile's cumsum (which includes offset). This is standard segmented cumulative sum.
+
+We also need to consider block distribution: each block processes rows in grid stride. For tiling within row, we need pipe to allocate buffers of tileLen, not full row. So Init should set tileLen from tiling data. We'll add tileLen to tiling.
+
+Thus modify tiling: include tileLength field. Compute tileLength from UB budget: we have 4 float buffers (x, masked_x, y, temp?) Actually we need: x_tile, mask_tile (bool), mask_float_tile (float), y_tile (float). That's 3 float tiles + 1 bool tile. Bool tile can be loaded as int8 and cast. But we can allocate a local tensor for mask as float directly? To avoid extra copy, we can load mask as int8, cast to float into a local tensor, then multiply. So we need: x_que, mask_que (int8), y_que, and a temp float for mask conversion. So 3 float tiles + 1 int8 tile. Budget: tileLen * (3*4 + 1) = 13 * tileLen bytes. With UB_BUDGET 192KB, tileLen max ~ 15100. But we also have limit ALIGN_ELEMS 2048 and HARD_CAP_ELEMS 32768. We'll compute tileLen = min(rowLength, budget calculation) aligned. We'll also need a scalar offset per row; we can store in a register.
+
+Now, for the kernel implementation:
+
+We need to use AscendC::CumSum. But CumSum may not exist? According to AscendC API, there is `CumSum(LocalTensor<T> src, LocalTensor<T> dst, const int32_t len)` where len is the number of elements. This computes inclusive cumulative sum. That is exactly what we need.
+
+Now, ensure we handle the mask correctly: mask is bool, so we can load into LocalTensor<int8_t> and then cast to float using AscendC::Cast. Alternatively, we can use AscendC::Select? No, simpler to cast.
+
+Also, we need to handle the case where rowLength is not a multiple of tileLen. We'll process min(tileLen, remaining) in last tile.
+
+Now, write the kernel_src completely, with proper class, init, process method.
+
+For python_bind_src: It should include a function that calls the custom operator. Use EXEC_NPU_CMD with aclnnMaskedCumsumCustom. The name should be masked_cumsum_custom for the torch binding. We'll follow pattern.
+
+Also model_src: import custom_ops_lib, define ModelNew with forward calling custom_ops_lib.masked_cumsum_custom.
+
+We must ensure all six blocks are present and correctly formatted.
+
+Also note: In the previous attempt, host_operator_src had a line: `#include "masked_cumsum_custom_tiling.h"` which is generated from host_tiling_src. That's correct.
+
+Now, let's write the complete solution.
+
+I'll produce the six strings.
+
+Note: The user wants just the code, no extra text. So output the Python code with the six strings.
+
+I'll structure it as a Python variable assignment or just the strings? The original showed each as a multi-line string, then later they are used together. We'll output each as a raw string with triple quotes.
+
+Make sure there are no missing blocks.

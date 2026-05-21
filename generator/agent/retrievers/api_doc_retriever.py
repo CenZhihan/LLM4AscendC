@@ -10,29 +10,36 @@ same API documentation source:
 2. check_constraints() — Alignment, blockCount, platform constraints
 3. find_alternatives() — Alternative APIs when primary is unavailable
 """
+
+import dataclasses
 import os
 import re
-import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from generator.agent.rules.cann83_constants import (
+    ALIGN_BYTES_COMPARE_BLOCK,
+    dtype_elem_bytes,
+)
 
 # ============================================================
 # Structured result types
 # ============================================================
 
+
 @dataclass
 class ApiSignatureResult:
     """Result of API signature lookup."""
+
     api_name: str
-    signature: str                          # Full function signature
-    supported_dtypes: List[str]             # ["half", "float", ...]
-    repeat_times_limit: Optional[int]       # 255 or None
-    params: List[dict]                      # [{name, type, direction}, ...]
-    example_call: str                       # Example usage
-    source_doc: str                         # Source document path
-    details: str                            # Human-readable summary
+    signature: str  # Full function signature
+    supported_dtypes: List[str]  # ["half", "float", ...]
+    repeat_times_limit: Optional[int]  # 255 or None
+    params: List[dict]  # [{name, type, direction}, ...]
+    example_call: str  # Example usage
+    source_doc: str  # Source document path
+    details: str  # Human-readable summary
     header_files: List[str] = field(default_factory=list)
     doc_metadata: List[dict] = field(default_factory=list)
     match_kind: str = "not_found"
@@ -43,11 +50,12 @@ class ApiSignatureResult:
 @dataclass
 class ApiConstraintResult:
     """Result of API constraint check."""
+
     api_name: str
-    constraints: List[dict]                 # [{type, description, severity}]
-    violations: List[str]                   # Current violations
-    suggestion: str                         # Fix suggestion
-    is_compliant: bool                      # Whether current call is compliant
+    constraints: List[dict]  # [{type, description, severity}]
+    violations: List[str]  # Current violations
+    suggestion: str  # Fix suggestion
+    is_compliant: bool  # Whether current call is compliant
     checked_context: Dict[str, object] = field(default_factory=dict)
     checks_performed: List[dict] = field(default_factory=list)
     unknowns: List[str] = field(default_factory=list)
@@ -58,10 +66,11 @@ class ApiConstraintResult:
 @dataclass
 class ApiAlternativeResult:
     """Result of API alternative lookup."""
+
     primary_api: str
-    alternatives: List[dict]                # [{api, steps, performance_impact, precision_impact}]
-    recommended: str                        # Recommended approach
-    reason: str                             # Why alternatives are needed
+    alternatives: List[dict]  # [{api, steps, performance_impact, precision_impact}]
+    recommended: str  # Recommended approach
+    reason: str  # Why alternatives are needed
 
 
 @dataclass
@@ -94,8 +103,18 @@ def _is_non_signature_line(line: str) -> bool:
 # ============================================================
 
 # Common dtype sets used across APIs
-_DTYPES_ALL = ["float", "float16", "half", "int8_t", "int16_t", "int32_t",
-               "uint8_t", "uint16_t", "uint32_t", "bfloat16_t"]
+_DTYPES_ALL = [
+    "float",
+    "float16",
+    "half",
+    "int8_t",
+    "int16_t",
+    "int32_t",
+    "uint8_t",
+    "uint16_t",
+    "uint32_t",
+    "bfloat16_t",
+]
 _DTYPES_FLOAT = ["float", "half", "bfloat16_t"]
 _DTYPES_FLOAT_HIGH = ["float", "half"]
 _DTYPES_INT = ["int8_t", "int16_t", "int32_t", "uint8_t", "uint16_t", "uint32_t"]
@@ -200,7 +219,6 @@ _API_KNOWLEDGE: Dict[str, dict] = {
         "source": "api-arithmetic.md",
         "constraints": [],
     },
-
     # ===== Unary Math =====
     "Exp": {
         "signature": "void Exp(LocalTensor<T>& dst, LocalTensor<T>& src, int32_t count)",
@@ -274,7 +292,6 @@ _API_KNOWLEDGE: Dict[str, dict] = {
             {"type": "alignment", "desc": "数据需 32 字节对齐", "severity": "warning"},
         ],
     },
-
     # ===== Data Movement =====
     "DataCopy": {
         "signature": "void DataCopy(LocalTensor<T>& dst, const GlobalTensor<T>& src, uint32_t count)",
@@ -288,7 +305,11 @@ _API_KNOWLEDGE: Dict[str, dict] = {
         "example": "DataCopy(localTensor, globalTensor, count)",
         "source": "api-datacopy.md",
         "constraints": [
-            {"type": "alignment", "desc": "GM->UB 时不建议使用 DataCopy，改用 DataCopyPad", "severity": "error"},
+            {
+                "type": "alignment",
+                "desc": "GM->UB 时不建议使用 DataCopy，改用 DataCopyPad",
+                "severity": "error",
+            },
         ],
     },
     "DataCopyPad": {
@@ -305,7 +326,6 @@ _API_KNOWLEDGE: Dict[str, dict] = {
         "source": "api-datacopy.md",
         "constraints": [],
     },
-
     # ===== Reduce =====
     "ReduceSum": {
         "signature": "void ReduceSum(LocalTensor<T>& dst, LocalTensor<T>& src, LocalTensor<T>& workspace, int32_t count)",
@@ -320,7 +340,11 @@ _API_KNOWLEDGE: Dict[str, dict] = {
         "example": "ReduceSum(dst, src, tmpBuf, count)",
         "source": "api-reduce.md",
         "constraints": [
-            {"type": "data_size", "desc": "dst 和 workspace 不能是同一 buffer", "severity": "error"},
+            {
+                "type": "data_size",
+                "desc": "dst 和 workspace 不能是同一 buffer",
+                "severity": "error",
+            },
         ],
     },
     "ReduceMax": {
@@ -336,10 +360,13 @@ _API_KNOWLEDGE: Dict[str, dict] = {
         "example": "ReduceMax(dst, src, tmpBuf, count)",
         "source": "api-reduce.md",
         "constraints": [
-            {"type": "data_size", "desc": "dst 和 workspace 不能是同一 buffer", "severity": "error"},
+            {
+                "type": "data_size",
+                "desc": "dst 和 workspace 不能是同一 buffer",
+                "severity": "error",
+            },
         ],
     },
-
     # ===== Compare =====
     "Compare": {
         "signature": "void Compare(LocalTensor<uint8_t>& dst, LocalTensor<T>& src0, LocalTensor<T>& src1, CMPMODE cmpMode, int32_t count)",
@@ -355,7 +382,11 @@ _API_KNOWLEDGE: Dict[str, dict] = {
         "example": "Compare(cmpLocal, srcLocal, maxLocal, CMPMODE::GT, A0_ALIGN)",
         "source": "api-restrictions.md",
         "constraints": [
-            {"type": "alignment", "desc": "count 个元素所占空间必须 256 字节对齐", "severity": "error"},
+            {
+                "type": "alignment",
+                "desc": "count 个元素所占空间必须 256 字节对齐",
+                "severity": "error",
+            },
         ],
     },
 }
@@ -423,6 +454,7 @@ _API_ALTERNATIVES: Dict[str, List[dict]] = {
 # Knowledge directory path
 # ============================================================
 
+
 def _get_knowledge_path() -> Optional[str]:
     """Get the Knowledge/api directory path."""
     this_dir = Path(__file__).parent
@@ -447,6 +479,7 @@ def _read_doc(filename: str) -> str:
 # Main retriever class
 # ============================================================
 
+
 class ApiDocRetriever:
     """
     API documentation retriever for Ascend C.
@@ -459,7 +492,9 @@ class ApiDocRetriever:
 
     def __init__(self, knowledge_path: Optional[str] = None):
         self._knowledge_path = knowledge_path or _get_knowledge_path()
-        self._include_root = Path(self._knowledge_path) / "include" if self._knowledge_path else None
+        self._include_root = (
+            Path(self._knowledge_path) / "include" if self._knowledge_path else None
+        )
 
     def known_api_names(self) -> List[str]:
         names = set(_API_KNOWLEDGE.keys())
@@ -477,7 +512,7 @@ class ApiDocRetriever:
         name = (api_name or "").strip()
         for prefix in ("AscendC::", "ascendc::"):
             if name.startswith(prefix):
-                name = name[len(prefix):]
+                name = name[len(prefix) :]
         if name in _API_ALIASES:
             name = _API_ALIASES[name]
         return name
@@ -518,8 +553,17 @@ class ApiDocRetriever:
             except OSError:
                 continue
             lines = text.splitlines()
-            title = next((line.lstrip("#").strip() for line in lines if line.strip().startswith("#")), path.name)
-            match_lines = [index + 1 for index, line in enumerate(lines) if pattern.search(line)]
+            title = next(
+                (
+                    line.lstrip("#").strip()
+                    for line in lines
+                    if line.strip().startswith("#")
+                ),
+                path.name,
+            )
+            match_lines = [
+                index + 1 for index, line in enumerate(lines) if pattern.search(line)
+            ]
 
             if not match_lines and path.name not in preferred:
                 continue
@@ -529,12 +573,14 @@ class ApiDocRetriever:
                 if key in seen:
                     continue
                 seen.add(key)
-                entries.append({
-                    "path": path.name,
-                    "title": title,
-                    "section": "",
-                    "excerpt": "",
-                })
+                entries.append(
+                    {
+                        "path": path.name,
+                        "title": title,
+                        "section": "",
+                        "excerpt": "",
+                    }
+                )
                 if len(entries) >= limit:
                     break
                 continue
@@ -546,12 +592,14 @@ class ApiDocRetriever:
                 if key in seen:
                     continue
                 seen.add(key)
-                entries.append({
-                    "path": path.name,
-                    "title": title,
-                    "section": section,
-                    "excerpt": excerpt[:240],
-                })
+                entries.append(
+                    {
+                        "path": path.name,
+                        "title": title,
+                        "section": section,
+                        "excerpt": excerpt[:240],
+                    }
+                )
                 if len(entries) >= limit:
                     break
             if len(entries) >= limit:
@@ -570,7 +618,9 @@ class ApiDocRetriever:
 
         header_files = set()
         matches: List[str] = []
-        fallback_pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(api_name.split('::')[-1])}(?![A-Za-z0-9_])")
+        fallback_pattern = re.compile(
+            rf"(?<![A-Za-z0-9_]){re.escape(api_name.split('::')[-1])}(?![A-Za-z0-9_])"
+        )
 
         for path in sorted(include_root.rglob("*")):
             if not path.is_file() or path.suffix.lower() not in {".h", ".hpp"}:
@@ -600,10 +650,14 @@ class ApiDocRetriever:
             if len(matches) >= 16:
                 break
 
-        signature = self._extract_header_signature(api_name, matches, include_root=include_root)
+        signature = self._extract_header_signature(
+            api_name, matches, include_root=include_root
+        )
         summary = ""
         if header_files:
-            summary = f"在本地 Knowledge/api/include 中找到 {len(header_files)} 个头文件匹配"
+            summary = (
+                f"在本地 Knowledge/api/include 中找到 {len(header_files)} 个头文件匹配"
+            )
         return _HeaderSearchResult(
             header_files=sorted(header_files),
             matches=matches,
@@ -635,18 +689,26 @@ class ApiDocRetriever:
             info = _API_KNOWLEDGE[name]
             if info.get("source"):
                 preferred_docs.append(info["source"])
-            doc_metadata = self._collect_doc_metadata(name, preferred_docs=preferred_docs)
+            doc_metadata = self._collect_doc_metadata(
+                name, preferred_docs=preferred_docs
+            )
             details_lines = [
                 f"API {name}: {info['signature']}",
                 f"支持数据类型: {', '.join(info['dtypes'])}",
                 f"repeatTimes 限制: {info.get('repeat_limit', 'N/A')}",
             ]
             if local_header_hit.header_files:
-                details_lines.append("头文件: " + ", ".join(local_header_hit.header_files[:4]))
+                details_lines.append(
+                    "头文件: " + ", ".join(local_header_hit.header_files[:4])
+                )
             if doc_metadata:
-                details_lines.append("文档元数据: " + "; ".join(
-                    f"{item['path']}|{item['section'] or item['title']}" for item in doc_metadata[:3]
-                ))
+                details_lines.append(
+                    "文档元数据: "
+                    + "; ".join(
+                        f"{item['path']}|{item['section'] or item['title']}"
+                        for item in doc_metadata[:3]
+                    )
+                )
             return ApiSignatureResult(
                 api_name=name,
                 signature=info["signature"],
@@ -670,9 +732,13 @@ class ApiDocRetriever:
                 details.append("匹配示例:")
                 details.extend(local_header_hit.matches[:3])
             if doc_metadata:
-                details.append("文档元数据: " + "; ".join(
-                    f"{item['path']}|{item['section'] or item['title']}" for item in doc_metadata[:3]
-                ))
+                details.append(
+                    "文档元数据: "
+                    + "; ".join(
+                        f"{item['path']}|{item['section'] or item['title']}"
+                        for item in doc_metadata[:3]
+                    )
+                )
             return ApiSignatureResult(
                 api_name=name,
                 signature=local_header_hit.signature,
@@ -684,7 +750,9 @@ class ApiDocRetriever:
                 details="\n".join(details),
                 header_files=local_header_hit.header_files,
                 doc_metadata=doc_metadata,
-                match_kind="header_decl" if local_header_hit.signature else "doc_excerpt",
+                match_kind="header_decl"
+                if local_header_hit.signature
+                else "doc_excerpt",
                 confidence="high" if local_header_hit.signature else "low",
                 is_actionable=bool(local_header_hit.signature),
             )
@@ -706,13 +774,13 @@ class ApiDocRetriever:
             example_call="",
             source_doc="",
             details=f"未找到 API '{api_name}' 的签名信息。\n"
-                    f"可能原因: API 名称不正确、或该 API 未在知识库中收录。\n"
-                    f"建议: 查阅 asc-devkit/docs/api/context/ 下的官方 API 文档。",
+            f"可能原因: API 名称不正确、或该 API 未在知识库中收录。\n"
+            f"建议: 查阅 asc-devkit/docs/api/context/ 下的官方 API 文档。",
             header_files=[],
             doc_metadata=[],
-                match_kind="not_found",
-                confidence="low",
-                is_actionable=False,
+            match_kind="not_found",
+            confidence="low",
+            is_actionable=False,
         )
 
     def _search_docs(self, api_name: str) -> Optional[ApiSignatureResult]:
@@ -777,8 +845,12 @@ class ApiDocRetriever:
         )
 
     @staticmethod
-    def _extract_header_signature(api_name: str, matches: List[str], include_root: Optional[Path] = None) -> str:
-        parts = [part for part in re.split(r"\s*::\s*", (api_name or "").strip()) if part]
+    def _extract_header_signature(
+        api_name: str, matches: List[str], include_root: Optional[Path] = None
+    ) -> str:
+        parts = [
+            part for part in re.split(r"\s*::\s*", (api_name or "").strip()) if part
+        ]
         if parts and parts[0].lower() == "ascendc":
             parts = parts[1:]
         if not parts:
@@ -789,7 +861,9 @@ class ApiDocRetriever:
             rf"\b(?:using|typedef|class|struct|enum(?:\s+class)?)\s+[^;={{}}]*\b{short}\b"
         )
         macro_re = re.compile(rf"^\s*#\s*define\s+{short}\b")
-        tail_call_re = re.compile(rf"(?<![A-Za-z0-9_]){short}(?![A-Za-z0-9_])\s*(?:<|\()")
+        tail_call_re = re.compile(
+            rf"(?<![A-Za-z0-9_]){short}(?![A-Za-z0-9_])\s*(?:<|\()"
+        )
         decl_cue_re = re.compile(
             r"\b(?:inline|constexpr|static|extern|virtual|friend|template|__aicore__|__host__|__device__|void|bool|char|short|int|long|float|double|size_t|uint\d+_t|int\d+_t)\b"
         )
@@ -805,7 +879,7 @@ class ApiDocRetriever:
             start = max(line_no - 1, 0)
             collected: List[str] = []
             found_open = False
-            for line in lines[start:start + 8]:
+            for line in lines[start : start + 8]:
                 if _is_non_signature_line(line):
                     if collected:
                         break
@@ -835,21 +909,38 @@ class ApiDocRetriever:
                 return code
             token_match = tail_call_re.search(code)
             if not token_match:
-                if include_root is not None and len(parts_match) >= 3 and parts_match[1].isdigit():
-                    multi_line_decl = read_declaration(parts_match[0], int(parts_match[1]))
+                if (
+                    include_root is not None
+                    and len(parts_match) >= 3
+                    and parts_match[1].isdigit()
+                ):
+                    multi_line_decl = read_declaration(
+                        parts_match[0], int(parts_match[1])
+                    )
                     if multi_line_decl:
                         return multi_line_decl
                 continue
-            prefix = code[:token_match.start()].rstrip()
+            prefix = code[: token_match.start()].rstrip()
             if prefix.endswith("::"):
                 qualifier = prefix[:-2].rstrip()
                 if decl_cue_re.search(qualifier) or " " in qualifier:
-                    if include_root is not None and len(parts_match) >= 3 and parts_match[1].isdigit():
-                        return read_declaration(parts_match[0], int(parts_match[1])) or code
+                    if (
+                        include_root is not None
+                        and len(parts_match) >= 3
+                        and parts_match[1].isdigit()
+                    ):
+                        return (
+                            read_declaration(parts_match[0], int(parts_match[1]))
+                            or code
+                        )
                     return code
                 continue
             if decl_cue_re.search(prefix) or re.search(r"[&*>]\s*$", prefix):
-                if include_root is not None and len(parts_match) >= 3 and parts_match[1].isdigit():
+                if (
+                    include_root is not None
+                    and len(parts_match) >= 3
+                    and parts_match[1].isdigit()
+                ):
                     return read_declaration(parts_match[0], int(parts_match[1])) or code
                 return code
         return ""
@@ -879,7 +970,7 @@ class ApiDocRetriever:
         name = api_name.strip()
         for prefix in ("AscendC::", "ascendc::"):
             if name.startswith(prefix):
-                name = name[len(prefix):]
+                name = name[len(prefix) :]
         if name in _API_ALIASES:
             name = _API_ALIASES[name]
 
@@ -913,33 +1004,76 @@ class ApiDocRetriever:
         # === Universal constraint checks ===
 
         # Check 1: repeatTimes <= 255
-        if "repeat_times" in checked_context:
-            repeat_times = int(checked_context.get("repeat_times", 0))
-            if repeat_times > 255:
-                constraints.append({
+        repeat_times = call_context.get("repeat_times", 0)
+        if repeat_times > 255:
+            constraints.append(
+                {
                     "type": "repeat_times",
                     "desc": "repeatTimes 为 uint8_t 时最大值 255",
                     "severity": "error",
-                })
-                violations.append(
-                    f"repeat_times = {repeat_times}，超过 uint8_t 最大值 255。"
-                    f"会导致溢出为 {repeat_times % 256}，计算结果错误。"
+                }
+            )
+            violations.append(
+                f"repeat_times = {repeat_times}，超过 uint8_t 最大值 255。"
+                f"会导致溢出为 {repeat_times % 256}，计算结果错误。"
+            )
+            suggestions.append(
+                "分批处理: 使用 while 循环，每次最多处理 255 个 repeat。"
+                "参考 api-repeat-limits.md 中的方案二。"
+            )
+
+        # Check 2: GM->UB alignment
+        is_gm_to_ub = call_context.get("is_gm_to_ub", False)
+        if is_gm_to_ub and name == "DataCopy":
+            constraints.append(
+                {
+                    "type": "alignment",
+                    "desc": "GM->UB 搬运应使用 DataCopyPad 而非 DataCopy",
+                    "severity": "error",
+                }
+            )
+            violations.append("DataCopy(GM->UB) 无法处理非对齐数据。")
+            suggestions.append("使用 DataCopyPad 替代 DataCopy 进行 GM->UB 数据搬运。")
+
+        # Check 3: Compare API 256B alignment
+        count = call_context.get("count", 0)
+        dtype = call_context.get("dtype", "float")
+        if name == "Compare" and count > 0:
+            elem_size = dtype_elem_bytes(str(dtype))
+            total_bytes = count * elem_size
+            if total_bytes % ALIGN_BYTES_COMPARE_BLOCK != 0:
+                constraints.append(
+                    {
+                        "type": "repeat_times",
+                        "desc": "repeatTimes 为 uint8_t 时最大值 255",
+                        "severity": "error",
+                    }
                 )
+                violations.append(
+                    f"count={count} * sizeof({dtype})={elem_size} = {total_bytes}B，"
+                    f"不是 {ALIGN_BYTES_COMPARE_BLOCK}B 的倍数。"
+                )
+                step = ALIGN_BYTES_COMPARE_BLOCK // elem_size
+                aligned_count = ((count + (step - 1)) // step) * step
                 suggestions.append(
                     "分批处理: 使用 while 循环，每次最多处理 255 个 repeat。"
                     "参考 api-repeat-limits.md 中的方案二。"
                 )
-                checks_performed.append({
-                    "name": "repeat_times_limit",
-                    "status": "fail",
-                    "detail": f"repeat_times={repeat_times}，超过 255。",
-                })
+                checks_performed.append(
+                    {
+                        "name": "repeat_times_limit",
+                        "status": "fail",
+                        "detail": f"repeat_times={repeat_times}，超过 255。",
+                    }
+                )
             else:
-                checks_performed.append({
-                    "name": "repeat_times_limit",
-                    "status": "pass",
-                    "detail": f"repeat_times={repeat_times}，未超过 255。",
-                })
+                checks_performed.append(
+                    {
+                        "name": "repeat_times_limit",
+                        "status": "pass",
+                        "detail": f"repeat_times={repeat_times}，未超过 255。",
+                    }
+                )
         else:
             unknowns.append("未提供 repeat_times，未校验 repeatTimes 的 uint8_t 上限。")
 
@@ -949,88 +1083,123 @@ class ApiDocRetriever:
                 is_gm_to_ub = bool(checked_context.get("is_gm_to_ub", False))
                 if is_gm_to_ub:
                     if require_context("count", "dtype"):
-                        dtype_bytes_map = {"float": 4, "float32": 4, "half": 2, "float16": 2,
-                                           "int32": 4, "int16": 2, "int8": 1, "uint8": 1, "bfloat16": 2}
+                        dtype_bytes_map = {
+                            "float": 4,
+                            "float32": 4,
+                            "half": 2,
+                            "float16": 2,
+                            "int32": 4,
+                            "int16": 2,
+                            "int8": 1,
+                            "uint8": 1,
+                            "bfloat16": 2,
+                        }
                         dtype_name = str(checked_context.get("dtype", "")).lower()
                         elem_size = dtype_bytes_map.get(dtype_name)
                         if elem_size is None:
                             missing_required_context = True
-                            unknowns.append(f"dtype={checked_context.get('dtype')} 未知，无法判断对齐。")
+                            unknowns.append(
+                                f"dtype={checked_context.get('dtype')} 未知，无法判断对齐。"
+                            )
                         else:
                             total_bytes = int(checked_context["count"]) * elem_size
                             if total_bytes % 32 != 0:
-                                constraints.append({
-                                    "type": "alignment",
-                                    "desc": "GM->UB 非 32B 对齐搬运应使用 DataCopyPad",
-                                    "severity": "error",
-                                })
+                                constraints.append(
+                                    {
+                                        "type": "alignment",
+                                        "desc": "GM->UB 非 32B 对齐搬运应使用 DataCopyPad",
+                                        "severity": "error",
+                                    }
+                                )
                                 violations.append(
                                     f"DataCopy(GM->UB) 搬运长度 {total_bytes}B 不是 32B 对齐。"
                                 )
-                                suggestions.append("使用 DataCopyPad 或 padding 对齐到 32B。")
-                                checks_performed.append({
-                                    "name": "gm_to_ub_alignment",
-                                    "status": "fail",
-                                    "detail": f"总字节数 {total_bytes}B，不满足 32B 对齐。",
-                                })
+                                suggestions.append(
+                                    "使用 DataCopyPad 或 padding 对齐到 32B。"
+                                )
+                                checks_performed.append(
+                                    {
+                                        "name": "gm_to_ub_alignment",
+                                        "status": "fail",
+                                        "detail": f"总字节数 {total_bytes}B，不满足 32B 对齐。",
+                                    }
+                                )
                             else:
-                                checks_performed.append({
-                                    "name": "gm_to_ub_alignment",
-                                    "status": "pass",
-                                    "detail": f"总字节数 {total_bytes}B，满足 32B 对齐。",
-                                })
+                                checks_performed.append(
+                                    {
+                                        "name": "gm_to_ub_alignment",
+                                        "status": "pass",
+                                        "detail": f"总字节数 {total_bytes}B，满足 32B 对齐。",
+                                    }
+                                )
                 else:
-                    checks_performed.append({
-                        "name": "gm_to_ub_alignment",
-                        "status": "pass",
-                        "detail": "当前上下文不是 GM->UB，未触发 DataCopyPad 替代规则。",
-                    })
+                    checks_performed.append(
+                        {
+                            "name": "gm_to_ub_alignment",
+                            "status": "pass",
+                            "detail": "当前上下文不是 GM->UB，未触发 DataCopyPad 替代规则。",
+                        }
+                    )
             else:
-                unknowns.append("未提供 is_gm_to_ub，无法判断 DataCopy 是否处于 GM->UB 场景。")
+                unknowns.append(
+                    "未提供 is_gm_to_ub，无法判断 DataCopy 是否处于 GM->UB 场景。"
+                )
                 missing_required_context = True
 
         if name == "DataCopyPad":
             if require_context("count", "dtype", "pad_size"):
-                checks_performed.append({
-                    "name": "datacopy_pad_context",
-                    "status": "pass",
-                    "detail": "已提供 count、dtype、pad_size，可进一步推导 padding 合法性。",
-                })
+                checks_performed.append(
+                    {
+                        "name": "datacopy_pad_context",
+                        "status": "pass",
+                        "detail": "已提供 count、dtype、pad_size，可进一步推导 padding 合法性。",
+                    }
+                )
 
         if name == "ReduceSum":
             have_alias = require_context("workspace_alias")
             have_workspace_size = require_context("workspace_size_bytes")
             if have_alias:
                 if bool(checked_context.get("workspace_alias")):
-                    violations.append("ReduceSum 的 dst 和 workspace 不能复用同一 buffer。")
+                    violations.append(
+                        "ReduceSum 的 dst 和 workspace 不能复用同一 buffer。"
+                    )
                     suggestions.append("为 ReduceSum 分配独立 workspace buffer。")
-                    checks_performed.append({
-                        "name": "reduce_workspace_alias",
-                        "status": "fail",
-                        "detail": "workspace_alias=True。",
-                    })
+                    checks_performed.append(
+                        {
+                            "name": "reduce_workspace_alias",
+                            "status": "fail",
+                            "detail": "workspace_alias=True。",
+                        }
+                    )
                 else:
-                    checks_performed.append({
-                        "name": "reduce_workspace_alias",
-                        "status": "pass",
-                        "detail": "workspace_alias=False。",
-                    })
+                    checks_performed.append(
+                        {
+                            "name": "reduce_workspace_alias",
+                            "status": "pass",
+                            "detail": "workspace_alias=False。",
+                        }
+                    )
             if have_workspace_size:
-                checks_performed.append({
-                    "name": "reduce_workspace_size",
-                    "status": "pass",
-                    "detail": f"workspace_size_bytes={checked_context.get('workspace_size_bytes')}",
-                })
+                checks_performed.append(
+                    {
+                        "name": "reduce_workspace_size",
+                        "status": "pass",
+                        "detail": f"workspace_size_bytes={checked_context.get('workspace_size_bytes')}",
+                    }
+                )
 
         if name == "Duplicate":
             have_count = require_context("count")
             have_repeat_times = require_context("repeat_times")
             if have_count and have_repeat_times:
-                checks_performed.append({
-                    "name": "duplicate_repeat_context",
-                    "status": "pass",
-                    "detail": f"count={checked_context.get('count')}, repeat_times={checked_context.get('repeat_times')}",
-                })
+                checks_performed.append(
+                    {
+                        "name": "duplicate_repeat_context",
+                        "status": "pass",
+                        "detail": f"count={checked_context.get('count')}, repeat_times={checked_context.get('repeat_times')}",
+                    }
+                )
             else:
                 require_context("mask")
 
@@ -1041,19 +1210,25 @@ class ApiDocRetriever:
                 src_dtype = str(checked_context.get("src_dtype", "")).lower()
                 dst_dtype = str(checked_context.get("dst_dtype", "")).lower()
                 if src_dtype not in supported or dst_dtype not in supported:
-                    violations.append(f"Cast 的 dtype 组合非法: {src_dtype} -> {dst_dtype}。")
+                    violations.append(
+                        f"Cast 的 dtype 组合非法: {src_dtype} -> {dst_dtype}。"
+                    )
                     suggestions.append("改用受支持的 Cast 源/目标 dtype 组合。")
-                    checks_performed.append({
-                        "name": "cast_dtype_pair",
-                        "status": "fail",
-                        "detail": f"src_dtype={src_dtype}, dst_dtype={dst_dtype}",
-                    })
+                    checks_performed.append(
+                        {
+                            "name": "cast_dtype_pair",
+                            "status": "fail",
+                            "detail": f"src_dtype={src_dtype}, dst_dtype={dst_dtype}",
+                        }
+                    )
                 else:
-                    checks_performed.append({
-                        "name": "cast_dtype_pair",
-                        "status": "pass",
-                        "detail": f"src_dtype={src_dtype}, dst_dtype={dst_dtype}",
-                    })
+                    checks_performed.append(
+                        {
+                            "name": "cast_dtype_pair",
+                            "status": "pass",
+                            "detail": f"src_dtype={src_dtype}, dst_dtype={dst_dtype}",
+                        }
+                    )
 
         # Check 3: Compare API 256B alignment
         count = checked_context.get("count")
@@ -1062,64 +1237,86 @@ class ApiDocRetriever:
             if count is None:
                 unknowns.append("未提供 count，未校验 Compare 的 256B 对齐约束。")
             if not dtype:
-                unknowns.append("未提供 dtype，未校验 Compare 的元素字节数和 256B 对齐约束。")
+                unknowns.append(
+                    "未提供 dtype，未校验 Compare 的元素字节数和 256B 对齐约束。"
+                )
             if count is not None and dtype:
-                dtype_bytes_map = {"float": 4, "float32": 4, "half": 2, "float16": 2,
-                                   "int32": 4, "int16": 2, "int8": 1, "uint8": 1}
+                dtype_bytes_map = {
+                    "float": 4,
+                    "float32": 4,
+                    "half": 2,
+                    "float16": 2,
+                    "int32": 4,
+                    "int16": 2,
+                    "int8": 1,
+                    "uint8": 1,
+                }
                 elem_size = dtype_bytes_map.get(dtype, 4)
                 total_bytes = int(count) * elem_size
                 if total_bytes % 256 != 0:
-                    constraints.append({
-                        "type": "alignment",
-                        "desc": "Compare API 的 count 个元素所占空间必须 256 字节对齐",
-                        "severity": "error",
-                    })
+                    constraints.append(
+                        {
+                            "type": "alignment",
+                            "desc": "Compare API 的 count 个元素所占空间必须 256 字节对齐",
+                            "severity": "error",
+                        }
+                    )
                     violations.append(
                         f"count={count} * sizeof({dtype})={elem_size} = {total_bytes}B，"
                         f"不是 256B 的倍数。"
                     )
-                    aligned_count = ((int(count) + (256 // elem_size - 1)) // (256 // elem_size)) * (256 // elem_size)
+                    aligned_count = (
+                        (int(count) + (256 // elem_size - 1)) // (256 // elem_size)
+                    ) * (256 // elem_size)
                     suggestions.append(
                         f"使用 padding 策略: 将 count 从 {count} 对齐到 {aligned_count}，"
                         f"多余的元素填充极值。"
                     )
-                    checks_performed.append({
-                        "name": "compare_256b_alignment",
-                        "status": "fail",
-                        "detail": f"总字节数 {total_bytes}B，不是 256B 的倍数。",
-                    })
+                    checks_performed.append(
+                        {
+                            "name": "compare_256b_alignment",
+                            "status": "fail",
+                            "detail": f"总字节数 {total_bytes}B，不是 256B 的倍数。",
+                        }
+                    )
                 else:
-                    checks_performed.append({
-                        "name": "compare_256b_alignment",
-                        "status": "pass",
-                        "detail": f"总字节数 {total_bytes}B，满足 256B 对齐。",
-                    })
+                    checks_performed.append(
+                        {
+                            "name": "compare_256b_alignment",
+                            "status": "pass",
+                            "detail": f"总字节数 {total_bytes}B，满足 256B 对齐。",
+                        }
+                    )
 
         # Check 4: UB capacity
         if "ub_usage_bytes" in checked_context:
             ub_usage = int(checked_context.get("ub_usage_bytes", 0))
             ub_capacity = int(checked_context.get("ub_capacity_bytes", 196608))
             if ub_usage > ub_capacity:
-                constraints.append({
-                    "type": "data_size",
-                    "desc": "UB Buffer 使用量不能超过 UB 容量",
-                    "severity": "error",
-                })
-                violations.append(
-                    f"UB 使用 {ub_usage}B 超过容量 {ub_capacity}B"
+                constraints.append(
+                    {
+                        "type": "data_size",
+                        "desc": "UB Buffer 使用量不能超过 UB 容量",
+                        "severity": "error",
+                    }
                 )
+                violations.append(f"UB 使用 {ub_usage}B 超过容量 {ub_capacity}B")
                 suggestions.append("减小 tile_size 或使用分批处理。")
-                checks_performed.append({
-                    "name": "ub_capacity",
-                    "status": "fail",
-                    "detail": f"UB 使用 {ub_usage}B，超过容量 {ub_capacity}B。",
-                })
+                checks_performed.append(
+                    {
+                        "name": "ub_capacity",
+                        "status": "fail",
+                        "detail": f"UB 使用 {ub_usage}B，超过容量 {ub_capacity}B。",
+                    }
+                )
             else:
-                checks_performed.append({
-                    "name": "ub_capacity",
-                    "status": "pass",
-                    "detail": f"UB 使用 {ub_usage}B，未超过容量 {ub_capacity}B。",
-                })
+                checks_performed.append(
+                    {
+                        "name": "ub_capacity",
+                        "status": "pass",
+                        "detail": f"UB 使用 {ub_usage}B，未超过容量 {ub_capacity}B。",
+                    }
+                )
         else:
             unknowns.append("未提供 ub_usage_bytes，未校验 UB 容量是否溢出。")
 
@@ -1172,7 +1369,7 @@ class ApiDocRetriever:
         name = api_name.strip()
         for prefix in ("AscendC::", "ascendc::"):
             if name.startswith(prefix):
-                name = name[len(prefix):]
+                name = name[len(prefix) :]
 
         alternatives: List[dict] = []
 
@@ -1180,12 +1377,14 @@ class ApiDocRetriever:
         for bl_name, bl_info in _API_BLACKLIST.items():
             bl_short = bl_name.split("::")[-1].split("(")[0]
             if name == bl_name or name == bl_short:
-                alternatives.append({
-                    "api": bl_info["alternative"],
-                    "steps": f"使用 {bl_info['alternative']} 替代 {bl_name}",
-                    "performance_impact": bl_info["perf_impact"],
-                    "precision_impact": bl_info["precision_impact"],
-                })
+                alternatives.append(
+                    {
+                        "api": bl_info["alternative"],
+                        "steps": f"使用 {bl_info['alternative']} 替代 {bl_name}",
+                        "performance_impact": bl_info["perf_impact"],
+                        "precision_impact": bl_info["precision_impact"],
+                    }
+                )
 
         # Check alternatives map
         if name in _API_ALTERNATIVES:

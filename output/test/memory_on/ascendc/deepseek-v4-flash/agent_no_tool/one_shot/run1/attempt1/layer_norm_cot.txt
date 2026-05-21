@@ -1,0 +1,131 @@
+We need to generate the six strings for the LayerNorm custom kernel. The original model uses nn.LayerNorm which applies normalization across the last dimensions. For the custom kernel, we need to define the operator, tiling, host operator, kernel code, Python bindings, and model code. The kernel name is layer_norm_custom (PascalCase: LayerNormCustom). We need to follow the structure of the leaky_relu example but adapt for layer norm.
+
+First, understand the computation: LayerNorm: y = (x - mean) / sqrt(var + eps) * gamma + beta. But in the PyTorch example, there is no explicit weight/bias? Actually nn.LayerNorm accepts normalized_shape and optionally weight and bias. Typically they are learned parameters. In the given model, it initializes with normalized_shape only (default affine=True), so there are weight and bias parameters. So the forward needs to handle those as inputs? The custom kernel should accept x, gamma, beta, and eps (default 1e-5). Also note the shape: normalized_shape is (features, dim1, dim2) meaning normalization over those dimensions. The input x is (batch_size, features, dim1, dim2). So we need to compute mean and var over the last three dimensions. In AscendC, we can use vector reduction.
+
+But we need to keep the kernel simple: the example leaky_relu had a single input and an attribute negative_slope. For LayerNorm, we have tensors x, gamma, beta, and an attribute eps. We need to define the input_desc accordingly.
+
+Also, the kernel should be efficient: use double buffers, tiling, etc. We'll follow a similar pattern.
+
+Let's design:
+
+- project_json_src: Operator "LayerNormCustom", inputs: x (float, ND), gamma (float, ND), beta (float, ND). Attributes: eps (float, default 1e-5). Output: y (float, ND).
+
+- host_tiling_src: TilingData with fields: totalLength (number of elements in x), tileLength, blockDim, eps. Also maybe the normalized dimensions? But we can compute mean/var over the last dimensions by knowing the shape. Alternatively, we can compute mean and variance per row (last three dimensions as one combined dimension). Since the input can have arbitrary batch dimension, we treat the last N dimensions as the normalization axis. In tiling, we need to know the row size (elements to normalize per sample) and the batch size. Typically, for layer norm, we process each batch element independently. So we can set totalLength = batch_size * row_size. But tiling must account for the row_size. We can pass row_size in tiling data. Alternatively, we can compute row_size from the shape in kernel. Generally, tiling is set before kernel launch, so we can compute row_size as product of normalized_shape. We'll add field rowSize.
+
+- host_operator_src: Register operator, infer shape, tiling. For tiling, we need to set blockDim and tileSize. Since layer norm involves computing mean and variance across row, we need to allocate buffers for sum and sumsq. Use vector operations.
+
+- kernel_src: Implement layer norm: for each block, process tiles of batch elements? Actually we can treat the data as a 2D grid: batch_size x row_size. Each block processes multiple rows? Typically, we parallelize over batch dimension. But AscendC is vectorized. We can have each block process a portion of the total elements, but mean/var need to be computed per row. So we need to handle row boundaries. Better to have each block handle a set of complete rows. We can split the batch dimension among blocks. Or we can use a block stride pattern where each block processes tiles that are multiples of row_size. To avoid cross-row dependencies, we need to ensure tiling aligns with row boundaries. In tiling, we can set tileLength as multiple of row_size. So each tile contains several complete rows. Then the kernel can compute local means and variances for each row within the tile.
+
+We'll design: totalLength = batch_size * row_size. tileLength is number of elements per tile, chosen as multiple of row_size. blockDim = number of blocks. Within a tile, we process rows sequentially using vector operations. We'll use double buffer for x and y, plus temporary buffers for sum, sumsq, etc. Since each row is independent, we can compute mean and variance in registers/local memory.
+
+Simplified approach: For each row in the tile:
+- Load the row into local tensor.
+- Compute sum using ReduceAdd? AscendC has functions like "Sum"? We can use AscendC::ReduceAdd for scalar sums. But we need to avoid cross-block communication. Actually each block can compute locally. For each row, we can compute sum and sum of squares using vector operations and then reduce to scalar. AscendC has "Reduction" API? We can use "Sum" on a local tensor? Or we can manually do a loop with accumulate? Better to use "ReduceAdd" function which sums elements of a local tensor into a scalar. Then compute mean = sum / rowSize, var = (sumsq/rowSize - mean*mean). Then normalize each element.
+
+But we need to be careful with precision. Also we need to handle gamma and beta scaling. Gamma and beta are per feature? Actually in layer norm, gamma and beta have shape (normalized_shape,) meaning one value per feature? Wait: normalized_shape is (features, dim1, dim2) so gamma and beta are also tensors of shape (features, dim1, dim2). So they are broadcast over batch. So for each row, gamma and beta are the same across batch? Actually they are per element in the normalized dimensions. So we need to apply gamma and beta element-wise after normalization. So we need to load gamma and beta tensors (global) and apply.
+
+But to simplify, we can treat gamma and beta as 1D tensors of length row_size. Actually they are reshaped to row_size. So the kernel can load gamma and beta from global memory. We'll include them in the input list.
+
+Thus, kernel needs to access x, gamma, beta, y. We also need epsilon.
+
+Implementation details:
+
+- Tiling: We'll compute rowSize from the shape. We'll set tileLength as a multiple of rowSize to keep alignment. We'll also set blockDim based on totalLength / tileLength.
+
+- Kernel: For each block, iterate over tiles in grid-stride manner. For each tile, copy in x, gamma, beta (note: gamma and beta are constant across batch? Actually they are the same for each row, so we can copy once per tile? But for first tile we copy gamma and beta, and reuse? Or we can load them from global each time. Since gamma and beta are small relative to tile, we can copy per row? But to save bandwidth, we can copy gamma and beta once and keep in local memory if tile is small. However, since tileLength is multiple of rowSize, we can treat gamma and beta as constant across rows. So we can load them once per tile into a local buffer and reuse for each row. Similarly, we need a temporary buffer for the row.
+
+We'll design:
+
+- Use double buffer for x (inQueueX), for y (outQueueY). Also a buffer for gamma (inQueueGamma) and beta (inQueueBeta) - but these are constant, so we can use a single buffer and reload if needed. Or we can load them once in Init? But gamma and beta are global tensors; we can read them directly in Compute? The issue is that they are shared across rows, so we can load them into a local tensor once per tile and then use for each row in that tile.
+
+Simpler: Process each row individually. For each row, we copy the row of x, gamma, beta (gamma and beta are the same for all rows, so we can copy them once and reuse). Since gamma and beta are size rowSize, they fit in the tile buffer. So in Process(), after copying a tile (multiple rows of x), we can also copy the entire gamma and beta into local tensors (if not already). Then for each row in the tile, compute normalization using those local copies.
+
+But careful: Gamma and beta are the same for all rows, so we can copy them once and keep them in a local buffer throughout the tile processing. We'll allocate a local tensor for gamma and beta in Init and copy them before the loop? However, the kernel is grid-stride; each block will process multiple tiles. We can copy gamma and beta once per kernel invocation? They are global and constant, so we can load them into a local buffer at the start of Process (outside loop). Then reuse for all rows and all tiles. That's efficient: we only need one copy of gamma and beta per block. We can allocate local tensors for gamma and beta in Init and copy them from global. Then in Compute, we use them.
+
+So: In Init, we set totalLen_, tileLen_, rowSize_, eps_, etc. We also set gammaGm_ and betaGm_ from input GM_ADDR (we need to pass gamma and beta pointers). The kernel signature should include GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y, and tiling. We'll modify the kernel extern "C" function accordingly.
+
+We also need to handle the case where gamma and beta are optional? In the model, they are always present because layers have affine=True. We'll assume required.
+
+Now, let's write the code.
+
+First, project_json_src: Op name "LayerNormCustom". Inputs: x (float, ND), gamma (float, ND), beta (float, ND). Output: y (float, ND). Attr: eps (float, default 1e-5).
+
+host_tiling_src: TilingData with fields: totalLength, tileLength, blockDim, eps, rowSize.
+
+host_operator_src: Similar to leaky_relu but with three inputs. Infer shape: output same as x. Tiling: compute rowSize from input shape. Since we have gamma and beta, their shape should be (rowSize,). We'll check that. Also compute totalLength = product of batch dims * rowSize. Then set tileLength as multiple of rowSize, blockDim.
+
+kernel_src: Implement KernelLayerNormCustom class. Methods: Init with pointers x, gamma, beta, y. Also set rowSize, eps. In Init, allocate buffers: inQueueX, outQueueY, tmpQueue for intermediate sum/sumsq? Actually we need buffers for sum and sumsq per row? We can compute sum using vector reduction functions. AscendC provides "Sum" which reduces a local tensor to a scalar? Actually "Sum" returns a scalar in a local scalar unit? Not sure. Alternatively, we can use "ReduceAdd" on a local tensor to produce a scalar in a scalar register. But the API: AscendC::ReduceAdd(localTensor, scalar, precision). We'll need a scalar variable of type "float" in local memory? Actually it returns the sum. We'll need to compute mean and var. We'll use temporary local tensors for the row and for gamma/beta copies.
+
+Simplify: For each row:
+- Copy row of x to xRow local tensor.
+- Compute sum of elements: use AscendC::Sum(xRow, len) -> returns AscendC::LocalScalar<float>? Actually there is AscendC::VectorOp::Sum? In AscendC, there is "Reduction" class. Or we can use "scl" functions. I'll assume we can use "AscendC::Sum(xRow, rowSize)" which reduces to a scalar in a variable. Let's assume it exists (might need to check documentation). Alternatively, we can manually loop with accumulate using vector add? But that's inefficient. I'll mimic the leaked_relu style but with more complex operations.
+
+Better to use "AscendC::ReduceAdd" on the local tensor to get sum, and also "AscendC::ReduceAddSq" to get sum of squares. Or we can compute sum and sum of squares by element-wise multiply and then Add. But there are vector instructions for such reductions. In typical AscendC examples, they use "AscendC::Sum" and "AscendC::Sumsq" actually. I'll use functions that reduce to scalar.
+
+Pseudo:
+
+AutoLocalTensor<float> xRow = ... 
+AutoLocalTensor<float> rowSum = ... (scalar)
+AutoLocalTensor<float> rowSumsq = ... (scalar)
+AscendC::Sum(rowSum, xRow, rowSize); // but Sum takes scalar output? Actually it's a scalar.
+AscendC::SumSq(rowSumsq, xRow, rowSize);
+float mean = rowSum / rowSize;
+float var = rowSumsq/rowSize - mean*mean;
+Then normalize: yRow[i] = (xRow[i] - mean) * rsqrt(var + eps) * gamma[i] + beta[i].
+
+We need rsqrt: AscendC::Rsqrt? There is "1.0/sqrt". We'll compute 1.0/sqrt(var+eps).
+
+We'll need temporary for gamma and beta copies. We'll copy them once at init into local tensors gammaLocal and betaLocal.
+
+So we need buffers: inQueueX, outQueueY, tmpQueue for xRow (maybe reuse), and also separate buffers for gamma/beta copies. Since gamma and beta are constant per block, we can allocate them as single buffers in pipe and load once.
+
+Now, write kernel code.
+
+Note: Need to include "kernel_operator.h" and use namespaces.
+
+We'll produce the six strings.
+
+Also ensure the kernel function name in kernel_src is exactly "layer_norm_custom" (matches Python interface). Interface: extern "C" __global__ __aicore__ void layer_norm_custom(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+
+We'll omit workspace for now (set 0). The model_src will use custom_ops_lib. We'll need to define the Python binding to call the custom op via aclnn. Similar to leaky_relu, we'll write python_bind_src with TORCH_LIBRARY_IMPL and PYBIND11 module.
+
+model_src: ModelNew that uses the custom kernel. The original model has hidden layers? Actually the original Model has a layer norm layer with normalized_shape. In the forward, it just calls self.ln(x). So the custom kernel should accept x, gamma, beta, epsilon? Actually the learned parameters are stored in the module. In the custom op, we need to pass gamma and beta as inputs. So the new model should have parameters gamma and beta (like the original). But the user instruction says "Replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels. Generate an optimized version named ModelNew". So we need to rewrite the model to use the custom op in forward. We'll create a Module that stores the weight and bias (gamma, beta) and uses the custom op. We'll also need to pass eps from nn.LayerNorm default (1e-5). The original model initializes with normalized_shape, so we can store that. In forward, we get x, then call the custom kernel.
+
+Thus model_src:
+
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, normalized_shape):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(normalized_shape))
+        self.bias = torch.nn.Parameter(torch.zeros(normalized_shape))
+        self.normalized_shape = normalized_shape
+        self.eps = 1e-5
+
+    def forward(self, x):
+        return custom_ops_lib.layer_norm_custom(x, self.weight, self.bias, self.eps)
+
+But note: The original model passes only x; the gamma and beta are from the module. So ModelNew should have those as parameters.
+
+Now, we need to write the six strings. We'll follow the style of the example, but adapted.
+
+Let's produce them one by one.
+
+Note: The example used "ascend910b". We'll keep that.
+
+Also, for tiling, we'll compute rowSize from input shape. In host_operator_src, we need to get normalized_shape from input x shape? Actually we expect x shape = (batch, ... normalized_shape). So the last ndims dimensions are the normalized shape. We can get that from the shape. We'll assume that the last dimension is the row? Actually we need product of all dimensions after the first? But it's easier to pass an attribute "normalized_shape" but the operator should infer from the input? Not necessary; we can compute from input shape and the fact that gamma/beta have shape equal to normalized_shape. So we can get rowSize from the total size of gamma shape. In tiling, we can get gamma shape.
+
+In host_operator_src: Input shapes: x (unknown batch), gamma (normalized_shape), beta. We'll assume gamma and beta are 1D? Actually they can be multi-dimensional but reshaped. We'll compute rowSize = product of gamma shape.
+
+We'll also need to ensure tiling works.
+
+Now write the code.
+
+I'll produce the output strings in the order: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+Make sure to include all necessary includes and syntax.
+
+Let's begin.

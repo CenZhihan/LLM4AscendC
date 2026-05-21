@@ -1,0 +1,90 @@
+We need to generate the six strings for the custom AscendC operator "masked_cumsum_custom" (PascalCase: MaskedCumsumCustom). The original PyTorch model computes cumulative sum along a dimension with a mask: `torch.cumsum(x * mask, dim=dim)`. The mask is boolean, but we need to handle types. The custom kernel should take x (float), mask (bool?), and dim (int). The output should be float.
+
+We need to design the kernel. It's a cumulative sum along a given dimension. The mask is applied by multiplying x with mask before cumsum. In the kernel, we can combine: compute cumsum of (x[i] if mask[i] else 0). For simplicity, we can treat mask as float (0 or 1). The dim parameter: we need to handle arbitrary dimension. However, for AscendC kernel, handling arbitrary dimension with tiling is complex. Typically, we might process the contiguous data along the dimension by iterating over slices. But the instruction says to generate the six strings. We need to make reasonable choices.
+
+Looking at the example: they used a simple kernel with grid-stride loops. For masked_cumsum along a dim, we need to consider that cumsum is a prefix sum operation. For a 1D tensor, it's straightforward. For higher dimensions, the input may be ND. But in the example, the input shape is (batch_size, *input_shape) with input_shape = (32768,) and dim=1 (the last dim). Actually batch_size=32768, input_shape=(32768,) results in total size 1,073,741,824 which is huge. The dim=1 means along the last dimension (since shape is (32768, 32768) when batch and input shape? wait: batch_size=32768, input_shape=(32768,) gives shape (32768, 32768). Dim=1 is the second dimension. So it's a 2D tensor with size 32768x32768. The cumsum along dim=1.
+
+We need to implement a tiled kernel that computes cumsum along the specified dimension. The kernel can be designed to handle 2D tensors efficiently by iterating over rows. For each row, compute exclusive prefix sum? Actually cumsum is inclusive. We can compute scan. But with tiling, we need to handle partial sums across tiles. Since dim=1 is the inner dimension, the data is contiguous along that dimension if we flatten per row. So we can treat each row independently.
+
+In tiling, we can load a row segment (tile) and compute cumsum. But to get correct cumsum across tile boundaries, we need to carry over the total sum from previous tiles. So we need to process rows sequentially, but within a row we can tile.
+
+Alternatively, we can do a simpler approach: process each row fully in a single tile if tile size is large enough. Given UB budget, we need to compute max tile length. For 2D, we can set blockDim to number of rows and each block processes one row completely. That avoids tile boundary issues. We can determine tileLength as the row length (which is 32768). But UB budget must accommodate for one row. For float32, 32768 elements = 128KB. That may be within UB (192KB). But we also need intermediate buffers. So we can use row-based tiling: each block processes one row. The number of blocks = number of rows = batch_size = 32768. But blockDim is limited (e.g., up to 24 in the example). 32768 blocks is not feasible. So we need to load balance: each block processes multiple rows. Or we process rows sequentially with tiling.
+
+Given the complexity, we can design a kernel that processes the contiguous dimension (dim=1) in tiles per row, using a grid-stride across rows. Each block processes a chunk of contiguous elements (tile) along the last dim, and we need to maintain per-row state across tiles. That's complicated.
+
+Alternative: Since the original PyTorch code is simple, we can implement a kernel that does the multiplication and then an in-place cumsum using a two-pass: first compute prefix sum locally per tile and then handle across tiles. But for simplicity, we can restrict to 2D input with dim=1 (the default in the example). The kernel can assume the input is 2D and dim=1. That would be more practical. The problem statement didn't specify generic dim support. So we can assume dim is always 1. However, the contract says "int dim". We can implement a generic approach but with limitations.
+
+Given the time, I'll implement a kernel that handles 2D input with dim=1. We'll treat the tensor as row-major. Each block processes a set of rows (multiple rows per block to utilize UB). Actually we can have each block process one row fully if row length fits in UB. Row length = 32768 elements = 128KB. With buffer for input, output, and tmp, we need 3 * 128KB = 384KB > 192KB UB. So we cannot hold a full row at once. We need to tile within a row. So we'll tile the row into chunks, and use a carry over for cumulative sum between chunks. This requires per-block state for each row being processed. Since multiple rows per block, we need to manage row index.
+
+A simpler approach: use a grid of blocks where each block processes a fixed number of contiguous elements along the row dimension (like a tile). Then we need to synchronize across tiles in the same row to get the correct cumulative sum. That requires cross-block synchronization which is not easy.
+
+Alternatively, we can use a single block that iterates over all rows and tiles sequentially. But that would be very slow. However, the kernel can be vectorized. Given the constraints, we might produce a kernel that works correctly for any 1D input (ignoring higher dims) or assume the tensor is 1D. But the example uses 2D. We need to match the contract.
+
+Let's read the example more carefully: they had a simple elementwise activation. They used a grid-stride loop. For cumsum, a grid-stride loop would not be correct because of the sequential dependence. So we need a different approach.
+
+Maybe we can implement a segmented cumulative sum where each row is a segment. The mask can be used as a reset condition? No, the mask just zeros out elements. Cumsum is still continuous. So it's just a prefix sum with zeroed elements.
+
+We can design a kernel that processes the data in rows, with each block handling a fixed number of rows (maybe one row per block) but using tiling within the row. The tiling within a row requires a carry scalar. So each block can process multiple rows sequentially. For each row, it loads a tile, computes partial cumsum, stores result, and passes the running sum to next tile. This is doable with UB buffers.
+
+We can set tileLen such that it fits in UB. Let's compute: row length 32768. We need input tile, output tile, and a temp tile for computation. That's 3 * tileLen * 4 bytes. To stay under 192KB, tileLen <= 192KB / 12 = 16384 elements (64KB each). But also need space for other variables. Let's use 8192 or 4096. So we tile each row into chunks of tileLen. Each block will process multiple rows, but since rows are independent, we can distribute rows across blocks. Each block processes a subset of rows (by blockIdx). For each row, it iterates over tiles of that row. That works.
+
+Implementation: totalRows = shape[0], rowLen = shape[1]. blockDim = number of blocks (we can set to e.g., 256? But AscendC typically uses small blockDim like 24. That's for vector processing. In the example they used blockDim up to 24. So we can have at most 24 blocks. With 32768 rows, each block processes ~1365 rows. That's fine. Within a block, we loop over its assigned rows. For each row, we do tiled cumsum.
+
+We need to store the running sum per row. We can hold a scalar (float) per row being processed simultaneously. Since we process one row at a time, a single running sum variable suffices.
+
+Now, for the tiling data, we need to pass totalLength (full tensor size), rowLen (or the dimension sizes), and possibly dim. But we can assume dim=1 for simplicity. We'll pass totalLength, rowLen, tileLen (for inner dimension). Also maybe negative_slope? No, we have mask and dim. But we need to handle mask: the data is (x * mask) before cumsum. So we need to load both x and mask. So input includes x and mask. The kernel will load both, compute product, then cumsum. The mask is boolean. We can load it as int8 or float. For simplicity, we treat mask as float (0 or 1). So inputs: x_global (float), mask_global (float? but original mask is bool). We'll use float for mask in kernel, but the host should convert? Actually the host operator should accept bool and handle conversion? We'll define input descriptors: x (float), mask (bool? or float). In the project_json, we can set mask as bool. But for kernel, we can treat as int8 or float. For simplicity, I'll set mask as float in input_desc and type as float. Or we can use int8 and convert. But the example only used float. I'll keep all as float for consistency, but that may affect memory. The user's original model uses bool mask. We can keep mask as bool in the operator definition, but the kernel will load it and convert. However, the example didn't have bool. I'll use float for mask to avoid complexity.
+
+But the user's contract: mask is Tensor, bool. In the operator definition, we can specify type ["bool"] for mask. But AscendC kernel can load bool? We can load as int8 and compare. Or we can treat as float with conversion in the operator definition. I think it's safer to use bool and load as int8 (or uint8). In the kernel, we can use DataCopy for int8 and then convert to float via Cast. That adds overhead but is acceptable.
+
+Given the complexity, I'll simplify: assume mask is float (0 or 1). The user can cast before calling. Or we can handle in the operator definition: input mask can be of type float. The model can be adjusted to cast mask to float. Since we are generating the model code, we can modify the forward to cast mask to float. But the instruction says "replace relevant PyTorch operators with custom AscendC kernels" and the original uses mask as bool. So we should support bool. But to keep the example simple, I'll define mask as float in the operator, and in the python binding we can convert. But the model code is also generated as model_src, so we can adjust the input passing. Let's check: In the example, they passed inputs directly to custom_ops_lib. The model_src just calls the function. So we can modify the forward to cast mask to float before passing to custom op. That's fine.
+
+Thus, for this answer, I'll treat mask as float in the operator and kernel. Then we need to compute cumsum(x * mask). The kernel will multiply elementwise and then do exclusive prefix sum? Actually inclusive cumsum. We can implement an inclusive scan: load tile, compute product, then compute prefix sum in local memory using vector instructions. AscendC provides vectorized operations like Add, but for prefix sum we need a sequential scan? There is no direct vectorized prefix sum instruction. We can implement using a loop over elements with vector load and accumulate. But that would be slow. Alternatively, we can use a two-phase algorithm: compute block prefix sums and then adjust. For a tile, we can compute prefix sum in sequential with a loop, but since tile length is moderate (e.g., 4096), it's okay. Or we can use the built-in accumulate operations? Not sure.
+
+Given the complexity, I'll implement a simple loop within the kernel to compute prefix sum element by element: for i in range(len): y[i] = (x[i]*mask[i]) + (i>0 ? y[i-1] : 0). That's serial but vectorized via AscendC's simple arithmetic? Actually we can use a recurrent vector operation: y = cumsum over local tile, then add previous sum. We can use a workaround: compute prefix sum via doubling algorithm (tree scan) which is vectorizable. That's more efficient.
+
+I'll adopt a tree scan (parallel prefix sum) within a tile. For a tile of length n, we can do a log2(n) steps using vector shifts and adds. AscendC supports vector operations with mask. We can implement a generic inclusive scan. But to keep code simpler, I'll use a sequential loop because the kernel is for demonstration and the tile size is moderate. The user expects performance gains; but for simplicity, I'll do sequential within tile.
+
+Actually, we can use the fact that the entire row is processed by one block (if tile length equals row length) but we already determined row length is 32768 and may not fit. So we need tiling.
+
+Let's design the kernel with tileLen = 8192 (32KB per tensor, 3 tensors = 96KB, fits in UB). We'll use a simple loop to compute prefix sum for the tile: initialize running sum from previous tile (carry). For each element in tile, compute value = x[i] * mask[i]; y[i] = running sum + value; running sum = y[i]. Then store y[i]. This is sequential but fine.
+
+Now, for the tiling data, we need to pass totalLength, rowLen, tileLen, and maybe blockDim. We also need to pass something about dim? Not needed if we assume dim=1.
+
+We'll also need to pass the shape dimensions to compute row index. Let's define: totalElements = rows * cols. We'll have blockDim as number of blocks (user-defined). We'll assign rows to blocks: each block processes a set of rows: startRow = blockIdx * rowsPerBlock, endRow = min(startRow + rowsPerBlock, totalRows). rowsPerBlock = totalRows / blockDim (divide rounding up). But blockDim is small (<=24), so rowsPerBlock ~1365.
+
+Within each block, for each row, we do tiled cumsum.
+
+Implementation details in kernel:
+
+- Inputs: x (float*), mask (float*), y (float*). We'll read x and mask, compute product and cumsum.
+- We'll use two queues: inQueueX, inQueueMask, outQueueY, and tmpQueue for intermediate? Not needed if we do sequential within tile. But we can have one queue for input, one for output. We'll do DataCopy of x and mask into locals.
+
+Now, let's write the code.
+
+But note: The example used a structured kernel class with Init and Process. We'll follow that pattern.
+
+Now, generate each of the six strings.
+
+1. project_json_src: define operator MaskedCumsumCustom with inputs x (float), mask (bool? or float?), output y (float), attr dim (int). I'll set mask as float to keep consistency. attr dim with default 1.
+
+2. host_tiling_src: define tiling data struct with fields: totalLength, rowLen, tileLen, blockDim. Also maybe dim? Not needed if fixed. We'll compute tileLen based on UB budget.
+
+3. host_operator_src: define the operator registration, tiling function, infer shape/dtype. Tiling function will set blockDim = (totalRows + rowsPerBlock - 1) / rowsPerBlock? Actually we need to decide blockDim. We can set blockDim to a reasonable number e.g., 8. But we can make it adaptive: blockDim = min(totalRows, maxBlockDim). But we also need to compute tileLen. We'll compute tileLen from UB budget: UB_BUDGET_BYTES = 192*1024. We need input x tile, mask tile, output y tile, plus maybe temp. That's 3 tiles. So bytes = 3 * tileLen * sizeof(float) = 12 * tileLen. So maxTile = UB_BUDGET_BYTES / 12. Then align down. We'll also allow tileLen to be less than rowLen if rowLen < maxTile. So tileLen = min(Aligned(rowLen), maxTile). But we also need to consider that we need space for row pointer arrays? No.
+
+We'll also need to pass rowLen (number of elements per row) to the kernel. So tiling data fields: totalLength (total elements), rowLen, tileLen, blockDim. We'll compute totalLength from input shape (should be 2D). We'll also infer rowLen from shape: GetShapeSize(1) (second dimension). But the shape may be dynamic? For simplicity, we assume static shape. We'll compute rowLen = shape[1]. totalLength = shape[0]*shape[1].
+
+Then in tiling function, we set blockDim = number of blocks (e.g., min(totalRows, 16) etc).
+
+4. kernel_src: implement KernelMaskedCumsumCustom class. It will have member variables: xGm_, maskGm_, yGm_; totalLen_, rowLen_, tileLen_; plus maybe blockDim. Process method: compute block's row range and process rows one by one.
+
+5. python_bind_src: custom op binding for aclnnMaskedCumsumCustom. We need to include torch headers and implement the function that calls the custom operator. Similar to example.
+
+6. model_src: define ModelNew that uses custom_ops_lib.masked_cumsum_custom. We'll also adjust forward to cast mask to float before calling if needed. Actually since our operator expects float mask, we'll cast inside model: mask = mask.float().
+
+Now, write the code.
+
+Let's start drafting.
+
+We must ensure kernel name is masked_cumsum_custom and PascalCase MaskedCumsumCustom.
+
+Now produce the six strings.

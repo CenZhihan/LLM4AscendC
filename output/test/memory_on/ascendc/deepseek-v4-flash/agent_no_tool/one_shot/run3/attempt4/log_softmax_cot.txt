@@ -1,0 +1,76 @@
+We need to fix the kernel_src to avoid using `VEC_REDUCE_MAX` and `VEC_REDUCE_SUM` which are not valid. The correct approach is to use the `ReduceMax` and `ReduceSum` functions without a template argument like `AscendC::VEC_REDUCE_MAX`. The correct signature is `AscendC::ReduceMax(dst, src, len, repeatTimes)` etc. Also need to fix the `ReduceMax` call: it should be `AscendC::ReduceMax(tmp, xLocal, curLen, 1)` without the template argument. Similarly for `ReduceSum`. Also, the current code tries to use `xLocal` after freeing it incorrectly. We need a cleaner approach for per-row log_softmax.
+
+Given the error, we should rewrite the kernel to avoid multiple passes per row using scalar reductions. Instead, we can use a two-pass approach but with proper use of `AscendC::ReduceMax` and `AscendC::ReduceSum`. But note that `ReduceMax` returns a scalar; we need to allocate a local tensor of size 1 for the result. Also, the `tmpQueue` buffer management needs to be correct.
+
+Let's produce a minimal fix: remove the template argument from `ReduceMax` and `ReduceSum`. Also ensure that we don't use `xLocal` after freeing. The current code frees `xLocal` incorrectly before accumulate.
+
+Better to rewrite the kernel more cleanly. Since the user wants minimal changes, I'll focus on fixing only the compile errors.
+
+The errors:
+1. `AscendC::ReduceMax<AscendC::VEC_REDUCE_MAX>(tmp, xLocal, curLen, 1);` -> remove template argument: `AscendC::ReduceMax(tmp, xLocal, curLen, 1);` 
+2. `AscendC::ReduceSum<AscendC::VEC_REDUCE_SUM>(sumLocal, expLocal, curLen, 1);` -> `AscendC::ReduceSum(sumLocal, expLocal, curLen, 1);`
+
+Also need to handle the fact that `tmp` must be a `LocalTensor<float>` of size 1? Actually `ReduceMax` writes to a destination tensor of size 1? In the AscendC API, `ReduceMax(dst, src, len, repeat)` where dst must be of size at least `repeat`? Typically dst is a scalar tensor of size 1. We'll allocate a temporary scalar tensor.
+
+But the current code uses `tmpQueue_.AllocTensor<float>()` which allocates tileLen_ elements; that's too large. We need a small tensor for scalar result. We can allocate a temporary local tensor of size 1 using a separate queue or by reusing a small buffer. To minimize changes, we can allocate a separate small buffer for scalar reductions. However, the current `tmpQueue_` is of size tileLen_ which is large; we can use a small piece of that tensor for scalar? But the API expects a tensor of at least the repeat count. Since we set repeat=1, we can use just the first element of the allocated tensor. That should work as long as we don't need more.
+
+But the error is just the template argument. So we can fix those two lines.
+
+Also, there is a problem in pass1: after calling `ReduceMax`, we read `tmp(0)` but we didn't fill it with anything? Actually `ReduceMax` writes the max into the first element of tmp? The documentation suggests it stores the result in dst[0]. We need to ensure that tmp is a tensor of at least 1 element. The allocated tmpQueue_ tensor has tileLen_ elements, so tmp(0) is valid.
+
+Also, after reading tileMax, we free tmp, but then we continue using `inQueueX_.FreeTensor(xLocal)`. That's fine.
+
+But there is another issue: in pass1, we allocate xLocal, copy data, enqueue, dequeue, then compute max, then free xLocal. That's okay.
+
+In pass2, we allocate xLocal, copy data, enqueue, dequeue, then allocate subLocal, expLocal, sumLocal, compute, then free xLocal and others. That is okay.
+
+In pass2 after `InQueueX_.FreeTensor(xLocal)`, we call `tmpQueue_.FreeTensor(subLocal)` etc. But note that `tmpQueue_` is a single buffer, we cannot have multiple outstanding allocations? Actually, we allocate subLocal from tmpQueue_, then expLocal from tmpQueue_, but that might allocate overlapping memory? We need to be careful: we cannot allocate two tensors from the same queue without freeing the first. The current code allocates subLocal, then expLocal from the same queue - that is invalid because the queue only has one buffer. We need to either use separate queues or reuse the same buffer sequentially. To fix minimally, we should restructure to use a single temporary buffer for each computation step.
+
+Given the complexity, it might be better to rewrite the kernel with a simpler approach that works correctly. But we are asked for minimal and targeted changes. The compile errors are only about `VEC_REDUCE_MAX` and `VEC_REDUCE_SUM`. So we can just remove those template arguments and see if it compiles. The runtime correctness might still have issues, but the user only asked to fix the compile errors? The error logs show compile errors only, so fixing those may get it to compile. Then correctness might fail, but the user provided no other constraints. However, since the previous attempt had both compiled=False and correctness=False, and the logs show only compile errors, we should fix the compile errors first.
+
+Let's also verify other potential compile issues: the `ReduceMax` and `ReduceSum` functions may have different overloads. The candidate signatures from error logs show that `ReduceMax(dst, src, len, repeat)` exists with 4 arguments (no template). So removing the template should work.
+
+Thus, I'll produce a corrected kernel_src with only those two lines changed: remove the template argument.
+
+Additionally, note that the `Init` method takes `uint32_t cols` but the tiling data does not have `cols`? Actually it does: `TILING_DATA_FIELD_DEF(uint32_t, cols);` and host_tiling_src sets `tiling.set_cols(cols);` and host_operator_src extracts cols from dim attribute. So that's fine.
+
+But wait: the kernel_src receives `cols` from tiling, but the kernel currently uses `cols_` to compute rows. That is correct.
+
+Now, also need to ensure that the `tmpQueue_` buffer is used correctly. In pass1, we allocate tmp from tmpQueue_, compute ReduceMax, then free tmp. In pass2, we allocate subLocal from tmpQueue_, then expLocal from tmpQueue_ - that's two allocations without freeing subLocal first. That will cause runtime error or UB. So we must fix that. But that is not a compile error.
+
+Given the instruction "Prioritize resolving the concrete errors shown in logs." and "Keep behavior unchanged where not required by the fix.", we should fix the compile errors only. However, the kernel will likely crash at runtime due to the improper queue usage. To be safe, we can also fix the queue usage to make it work.
+
+The simplest fix: use a single temporary buffer and reuse it. For pass2, we can do:
+- subLocal = tmpQueue_.AllocTensor<float>();
+- Exp(expLocal, subLocal, curLen) - but expLocal also needs a buffer. We could reuse the same buffer: compute sub, then compute exp in-place on sub? No, Exp may require separate dst. We can allocate two buffers: one for sub and one for exp. But we only have one tmpQueue_ buffer. We could change tmpQueue_ to have 2 buffers? But that would change the UB budget. Alternatively, we can use `VECCALC` queue with size 2. But minimal change: use two separate queues. Or we can compute exp in-place if Exp supports that? The AscendC Exp might support in-place. Let's assume it doesn't. Better to change tmpQueue_ to have 2 buffers: `pipe_.InitBuffer(tmpQueue_, 2, tileLen_ * sizeof(float));` That would increase UB budget from 5*tileLen floats to 6*tileLen floats, but we can adjust tiling to compensate. More precisely, we need to also ensure that we have enough UB. But we are fixing compile errors only.
+
+Given time, I'll make minimal changes to fix compile errors and also fix the queue usage by using two tmp queues or increasing buffer count. However, the user provided a specific previous attempt code; they want us to fix it. I'll produce a corrected kernel_src that removes template arguments and also fixes the queue usage by using two separate temporary queues (e.g., tmpQueue1_ and tmpQueue2_) with buffer count 1 each, but that would increase UB usage. Alternatively, we can restructure pass2 to reuse the same buffer: compute sub, then compute exp in-place by passing the same tensor as dst and src? Not sure. I'll take a simpler route: change the tmpQueue_ to have 2 buffers: `pipe_.InitBuffer(tmpQueue_, 2, tileLen_ * sizeof(float));` and then allocate subLocal and expLocal sequentially by dequeueing and freeing after use. But we also need sumLocal. Actually we can reuse one buffer for sum.
+
+Let's design a clean version but with minimal changes:
+
+We'll add a second temporary queue `tmpQueue2_` with 1 buffer.
+
+But that changes the UB budget; we need to adjust tiling accordingly. However, the compile error is our target; runtime correctness may be a secondary concern. The user didn't ask for correctness, only to fix the error. But the problem statement says "Prioritize resolving the concrete errors shown in logs." and "Keep behavior unchanged where not required by the fix." So we should only fix the compilation error. But if the kernel compiles but fails at runtime, that's beyond the scope of the repair. However, we can't be sure the runtime will fail; maybe the queue usage is okay? Let's analyze: In pass2, we sequentially allocate subLocal, expLocal, sumLocal from the same queue with buffer count 1. The first allocation (subLocal) takes the only buffer. Then we try to allocate expLocal from the same queue, which will fail because the buffer is already allocated. So that's a definite runtime error. To keep behavior unchanged, we must fix that because it will cause a crash. So we need to fix the queue usage.
+
+Thus, I'll restructure pass2 to use a single temporary buffer sequentially: compute sub in-place on xLocal? But xLocal is used later? Actually we don't need xLocal after computing sub. So we can overwrite xLocal. Let's do:
+
+- xLocal = inQueueX_.DeQue<float>();
+- // sub = x - rowMax (in-place on xLocal)
+- AscendC::Adds(xLocal, xLocal, -rowMax, curLen);  // now xLocal holds (x - rowMax)
+- // exp = exp(sub) but we need a separate buffer. We'll allocate tmp from tmpQueue, compute exp into it.
+- AscendC::LocalTensor<float> expLocal = tmpQueue_.AllocTensor<float>();
+- AscendC::Exp(expLocal, xLocal, curLen);
+- // then compute sum: we can reuse xLocal? No, we need sum. We'll allocate another temporary? We can use a scalar reduction. We'll allocate sumLocal from tmpQueue_? But tmpQueue_ only one buffer, already used by expLocal. So we need another buffer. 
+- Instead, we can compute the sum using a scalar reduction that writes to a small tensor of size 1. We could allocate that small tensor from a separate small queue or from the stack? Not possible. 
+
+Simplify: Use two temporary queues: one for exp, one for sum. But we only have 2 queues (inQueueX_, outQueueY_, tmpQueue_ currently 1). We can add a fourth queue: `AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue2_;` and init it. That increases UB budget to 6*tileLen floats. Then adjust tiling: UB_BUDGET_BYTES / 24. That is a change in host_operator_src as well. But we are to keep behavior unchanged. However, if we don't change tiling, we may exceed UB. But the original tiling used 5*tileLen floats (inQueueX 2, outQueueY 2, tmpQueue 1). Adding one more adds 1*tileLen floats. So we need to adjust UB_BUDGET calculation. But we are not required to change tiling? The compile error is in kernel; tiling compiles fine. So we might not need to change tiling. But if UB is exceeded, the kernel may fail at runtime. But again, we are only fixing compile errors. However, the incorrect queue usage will definitely cause runtime error. So we must fix it to have a working program.
+
+Given the complexity, I think the best is to rewrite the kernel with a more straightforward approach that uses two passes but with proper queue management. However, the user wants minimal changes. I'll try to fix both the compile errors and the queue usage by modifying the kernel_src as follows:
+
+- Add a second temporary queue `tmpQueue2_` with 1 buffer.
+- In pass2, use tmpQueue_ for expLocal, tmpQueue2_ for sumLocal (scalar).
+- Adjust tiling only if necessary? We can keep tiling unchanged because the buffer sizes are still per-tile; the total UB usage becomes 3*tileLen floats for temporary buffers (tmpQueue_ and tmpQueue2_) plus 2*tileLen for inQueueX and 2*tileLen for outQueueY = 7*tileLen floats = 28*tileLen bytes. But original was 5*tileLen floats = 20*tileLen bytes. So we need to reduce maxTile accordingly. That changes behavior. But we can keep maxTile unchanged and hope it fits? UB_BUDGET_BYTES is 192*1024, if tileLen is small enough, it may still fit. The tiling function computes maxTile as UB_BUDGET_BYTES / 20, which would be too large. If we increase divisor to 28, maxTile would be smaller. But we don't want to change tiling because it's not in error. However, to ensure kernel doesn't exceed UB, we could restrict tileLen more conservatively. But that changes tiling behavior. Since we are only required to fix the compile error, maybe we can ignore runtime issues? The instruction says "Fix the previous attempt with minimal and targeted changes." The previous attempt had both compile and correctness false. The compile error is the main issue. I'll only fix the template arguments and leave the queue usage as is, expecting it to crash at runtime but that's not a compile error. But the user might expect a working solution. Given typical repair tasks, they expect both compile and correctness to pass. So I should fix both.
+
+I'll provide a corrected version that fixes both compile errors and queue management, with minimal changes to the kernel logic.
+
+Let's produce the final answer with all six strings, modified only where needed.

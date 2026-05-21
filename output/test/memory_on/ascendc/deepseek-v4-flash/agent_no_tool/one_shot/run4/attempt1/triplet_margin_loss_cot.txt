@@ -1,0 +1,209 @@
+We need to generate six embedded Python strings for the AscendC custom kernel for triplet margin loss. The kernel name is "triplet_margin_loss_custom" and the operator class name is "TripletMarginLossCustom". The original PyTorch model computes triplet margin loss: loss = max(d(anchor, positive) - d(anchor, negative) + margin, 0). We need to implement this as a custom kernel.
+
+We must follow the pattern from the example: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src. The kernel should be efficient, using UB budget, tiling, and grid-stride loops.
+
+Key points:
+- Inputs: anchor, positive, negative are tensors of shape (n, d). margin is a scalar tensor, but we can pass it as attribute or via tiling. In the original, margin is passed as a float from torch.tensor. We'll treat margin as an attribute (float) of the operator.
+- The loss is element-wise? Actually, triplet margin loss computes per-sample loss: for each i, loss_i = max(d(a_i, p_i) - d(a_i, n_i) + margin, 0). Then returns mean of these losses. But the original forward returns the loss tensor? Actually, F.triplet_margin_loss returns a scalar (mean). However, the custom kernel can compute the per-sample loss and then reduce? But the original model in the user code returns the output of F.triplet_margin_loss, which is a scalar. But the user provided get_inputs returns inputs for the model, and the forward returns loss. For a custom kernel, we need to decide: does the kernel compute the full loss? Typically, we might replace the entire operation with a single kernel that outputs a scalar. But the example leaky_relu outputs the same shape as input. For triplet margin loss, we need to output a scalar. However, the user might want to compute per-sample losses and then reduce. We need to follow the pattern: the kernel should compute the loss for each sample and output a tensor of shape (n,) and then maybe reduce? But the original model returns a scalar. Let's check the original forward: "return F.triplet_margin_loss(anchor, positive, negative, margin=m)". That returns a scalar. To match, our custom operator should also return a scalar. But AscendC kernels typically process tensors and output tensors. We could design the kernel to compute the per-sample loss and then do a reduction (sum/mean) to produce a scalar. Alternatively, we could have the kernel output the per-sample loss tensor and then do a reduction in Python. The example output is a tensor. For simplicity, let's have the kernel output a scalar (by doing reduction inside kernel). But that is more complex. Perhaps we can follow the pattern: the operator outputs a tensor of shape (n,) containing per-sample losses, and then the model does a mean after the kernel? But the original model doesn't have that. We need to match the behavior: the custom kernel should replace the entire F.triplet_margin_loss call and output a scalar. We'll implement a kernel that computes per-sample losses, then reduces to mean, and outputs a tensor with one element (scalar). That's acceptable.
+
+However, we need to ensure the tiling and data movement are efficient. Also, we need to compute pairwise distances: For each i, we need to compute squared L2 distance: d(a_i, p_i) = sum_j (a_ij - p_ij)^2, and similarly for negative. Then loss_i = max(d_ap - d_an + margin, 0). Then mean over i. This involves per-element operations and reduction.
+
+We can tile across samples (n) and within each sample, process dimensions (d) in chunks. But tiling across d requires careful handling of sums. Alternatively, we can process each sample independently and compute the loss in one go if the dimensions fit in UB. For large d, we need to tile.
+
+Given typical model dimensions (n=32, d=128), it's small. But we need to handle arbitrary sizes. The kernel should be general.
+
+We'll design:
+- Inputs: anchor, positive, negative (shape (N, D)), margin (float attribute)
+- Output: loss (scalar tensor) - actually shape (1,) to represent scalar.
+
+We need to compute for each sample i:
+   sum_p = (anchor[i][j] - positive[i][j])^2 over j
+   sum_n = (anchor[i][j] - negative[i][j])^2 over j
+   loss_i = max(sum_p - sum_n + margin, 0.0)
+Then output mean(loss_i) across i.
+
+We'll do this in two steps? We can do the per-sample reduction in one kernel: for each sample, accumulate sum of squares in a local variable, then compute loss_i, then accumulate to a global sum? But accumulation across blocks? We'll use a grid-stride loop across samples, and each block handles a batch of samples. For each sample, we compute its loss and add to a shared (or use atomic add for final sum). But atomic adds to global memory are expensive. Alternatively, we can output per-sample loss tensor and then reduce in another kernel or host. But we want a single kernel to output scalar. We can use a two-stage approach: first compute per-sample losses into a temporary buffer, then reduce. But that would require two kernel launches. To keep it simple and follow the example (one kernel), we can compute per-sample losses in a local tensor and then do a reduction within the kernel using a loop or built-in reduction. However, reduction across blocks is not straightforward. So I think it's acceptable to output a tensor of per-sample losses and then do mean in Python. That matches the pattern of the example (input tensor -> output tensor). The original model returns scalar, but we can modify the model to compute mean after custom op. The user instruction: "Replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels. Generate an optimized version named ModelNew". The new model can be slightly different. So we'll design the kernel to output per-sample losses (shape (N,)). Then the model will compute torch.mean or something.
+
+Let's check the original forward: it uses F.triplet_margin_loss which returns scalar. But we can define ModelNew to call custom op and then apply mean. That is acceptable.
+
+Thus, kernel: input tensors anchor, positive, negative of shape (N, D) and margin attribute. Output tensor loss of shape (N,). Each element is loss_i.
+
+Compute: for each sample, compute squared L2 distance between anchor and positive, and between anchor and negative, then loss_i = max(d_ap - d_an + margin, 0). This involves two reductions over D for each sample. We'll tile over samples (blockIdx handles a range of samples) and for each sample, tile over D to accumulate sum of squares.
+
+We need to use local memory for accumulating sums. We'll use a scalar local variable for each sum. Since D may be large, we need to tile D. We'll use a double loop: outer over samples, inner over dims in chunks.
+
+The UB budget: we need to load chunks of anchor, positive, negative from global to local, compute differences, square, accumulate. We can do this with three local tensors (one per input) and accumulation in a scalar.
+
+For tiling: We'll set tileLength as the number of elements per tile for the dim dimension (D). totalLength is N*D? Actually we need to treat N and D separately. We'll store totalSamples and totalDim. We'll also store tileDim for dimension chunk.
+
+In tiling data: totalSamples (uint32_t), totalDim (uint32_t), tileDim (uint32_t), blockDim, margin (float).
+
+In kernel Init: pass these parameters.
+
+Processing: blockIdx maps to sample range? Let's use grid-stride over samples: each block handles multiple samples with stride = blockDim. For each sample, we compute its loss.
+
+Implementation details:
+
+- For each sample index i (starting from blockIdx * samplesPerBlock? Actually we can distribute samples among blocks: each block gets a contiguous chunk of samples. To simplify, we do grid-stride over samples: for sampleIdx = blockIdx; sampleIdx < totalSamples; sampleIdx += blockNum, process that sample.
+
+- For a given sample, we need to compute sum_p and sum_n. We'll tile over dim: for dimStart = 0; dimStart < totalDim; dimStart += tileDim, load the corresponding elements from anchor, positive, negative for that sample, compute diff, square, add to local accumulators (two floats). After finishing all dim tiles for that sample, compute loss = max(sum_p - sum_n + margin, 0) and write to output tensor at position sampleIdx.
+
+We need to load three vectors per dim tile. We'll use local tensors: anchorLocal, posLocal, negLocal each of size tileDim. We'll allocate them inside the sample loop? Better to allocate once and reuse.
+
+We'll need three queues for inbound data. But we can also use simple DataCopy without queues for simplicity? The example uses queues for double buffering and overlap. We can adopt a similar pattern: use buffer queues for each of the three inputs? That would be complex. We can use a simpler approach without double buffering, just synchronous data movement, which is acceptable for demonstration. However, to be consistent with the example and best practices, we should use queues. But triple input makes it more complex. We can combine all three inputs into one queue? Not possible. We'll design with three queues, each with BUFFER_NUM, and process them in a coordinated manner. But that requires careful synchronization.
+
+Alternatively, we can treat the entire sample's dim as one tile if totalDim fits in UB. For typical dimensions (128), it fits. But we need to be general. For simplicity and to avoid overly complex code, we can assume totalDim is not huge and can be handled in one tile. But the tiling data should still set tileDim to totalDim or aligned value. The kernel can handle multiple tiles but we'll implement the general case with tiling over dim.
+
+Let's design with two levels of tiling: outer over samples (grid-stride), inner over dim tiles (loop). For each dim tile, we load three chunks. To overlap, we can prefetch next dim tile while computing? That would be complicated. We'll keep it synchronous: load, compute, accumulate, next tile.
+
+We'll use three queues for each input, but they are independent. We'll do:
+
+For each dim tile:
+   xLocal = inQX.AllocTensor<float>();
+   DataCopy(xLocal, anchorGm[offset], tileDim);
+   inQX.EnQue(xLocal);
+Similarly for pos and neg.
+Then dequeue all three and compute differences and accumulate.
+
+But we need to ensure ordering of enqueues and dequeues. Since we have three separate queues, we can do:
+
+CopyIn for X, then for P, then for N.
+Then Compute: dequeue X, P, N, compute.
+
+We can also prefetch next tile while computing? Not necessary.
+
+To keep code simpler, we can drop the queue mechanism and just use local tensors directly with vector instructions. But the example uses queues, so we should follow that.
+
+Given the complexity, I'll produce a kernel that uses three queues for double buffering of dim tiles. However, we also have the outer sample loop. That means we need to re-initialize the queues for each sample? Actually we can reuse the same queues across samples because tile dim is same. But we need to reset indices? It's okay to allocate fresh local tensors each sample (they are reused). We'll allocate the pipe and queues inside Init, and then for each sample, we'll loop over dim tiles using the queues.
+
+We need to ensure that the local tensors are freed after each tile.
+
+Let's outline kernel pseudocode:
+
+class KernelTripletMarginLoss {
+public:
+    __aicore__ inline Init(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR output, 
+                           uint32_t totalSamples, uint32_t totalDim, uint32_t tileDim, float margin) {
+        totalSamples_ = totalSamples;
+        totalDim_ = totalDim;
+        tileDim_ = tileDim;
+        margin_ = margin;
+        anchorGm_.SetGlobalBuffer((__gm__ float*)anchor, totalSamples * totalDim);
+        positiveGm_.SetGlobalBuffer((__gm__ float*)positive, totalSamples * totalDim);
+        negativeGm_.SetGlobalBuffer((__gm__ float*)negative, totalSamples * totalDim);
+        outputGm_.SetGlobalBuffer((__gm__ float*)output, totalSamples);
+        // init queues
+        pipe_.InitBuffer(inQX_, BUFFER_NUM, tileDim_ * sizeof(float));
+        pipe_.InitBuffer(inQP_, BUFFER_NUM, tileDim_ * sizeof(float));
+        pipe_.InitBuffer(inQN_, BUFFER_NUM, tileDim_ * sizeof(float));
+        // no temporary queue needed, just local accumulators
+    }
+
+    __aicore__ inline Process() {
+        uint32_t blockNum = GetBlockNum();
+        uint32_t blockIdx = GetBlockIdx();
+        for (uint32_t sampleIdx = blockIdx; sampleIdx < totalSamples_; sampleIdx += blockNum) {
+            float sumP = 0.0f;
+            float sumN = 0.0f;
+            uint32_t dimBase = sampleIdx * totalDim_;
+            uint32_t remaining = totalDim_;
+            uint32_t dimOffset = 0;
+            while (remaining > 0) {
+                uint32_t curDim = (remaining > tileDim_) ? tileDim_ : remaining;
+                // copy in anchor, positive, negative for this dim chunk
+                AscendC::LocalTensor<float> xLocal = inQX_.AllocTensor<float>();
+                AscendC::DataCopy(xLocal, anchorGm_[dimBase + dimOffset], curDim);
+                inQX_.EnQue(xLocal);
+                AscendC::LocalTensor<float> pLocal = inQP_.AllocTensor<float>();
+                AscendC::DataCopy(pLocal, positiveGm_[dimBase + dimOffset], curDim);
+                inQP_.EnQue(pLocal);
+                AscendC::LocalTensor<float> nLocal = inQN_.AllocTensor<float>();
+                AscendC::DataCopy(nLocal, negativeGm_[dimBase + dimOffset], curDim);
+                inQN_.EnQue(nLocal);
+
+                // dequeue
+                xLocal = inQX_.DeQue<float>();
+                pLocal = inQP_.DeQue<float>();
+                nLocal = inQN_.DeQue<float>();
+
+                // compute diff and square for pos and neg
+                // Use local tensors for diff?
+                // We can compute in place: (x - p)^2
+                // We'll create temporary local tensors? We can reuse one of the input tensors.
+                // To avoid extra allocation, we can use a temporary queue? Let's use a single tmp queue for calculations.
+                // Simpler: allocate a tmp tensor of size curDim for diff.
+                AscendC::LocalTensor<float> tmp = tmpQ_.AllocTensor<float>();
+                // diff for pos: tmp = x - p
+                AscendC::Sub(tmp, xLocal, pLocal, curDim);
+                // square: tmp = tmp * tmp
+                AscendC::Mul(tmp, tmp, tmp, curDim);
+                // reduce sum into sumP
+                AscendC::ReduceAdd<float, float>(tmp, sumP, curDim); // not sure about exact API; we can use vector_reduce_add
+                // Actually AscendC provides VecReduceAdd: 
+                float posSum = AscendC::VecReduceAdd(tmp, curDim); // returns scalar
+                sumP += posSum;
+
+                // diff for neg: tmp = x - n
+                AscendC::Sub(tmp, xLocal, nLocal, curDim);
+                AscendC::Mul(tmp, tmp, tmp, curDim);
+                float negSum = AscendC::VecReduceAdd(tmp, curDim);
+                sumN += negSum;
+
+                tmpQ_.FreeTensor(tmp);
+                // free input tensors
+                inQX_.FreeTensor(xLocal);
+                inQP_.FreeTensor(pLocal);
+                inQN_.FreeTensor(nLocal);
+                dimOffset += curDim;
+                remaining -= curDim;
+            }
+            // compute loss
+            float loss = sumP - sumN + margin_;
+            loss = (loss > 0.0f) ? loss : 0.0f;
+            // write to output
+            outputGm_.SetValue(sampleIdx, loss);
+        }
+    }
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQX_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQP_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQN_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQ_; // for calculations
+    AscendC::GlobalTensor<float> anchorGm_, positiveGm_, negativeGm_, outputGm_;
+    uint32_t totalSamples_, totalDim_, tileDim_;
+    float margin_;
+};
+
+But note: VecReduceAdd may not exist; we can use a scalar local variable and add elementwise using a loop? Alternatively, we can use the built-in reduction: https://www.hiascend.com/document/detail/en/CANN/commercial/80/operatordevelopment/ascendcopdevg/atlas_900_ascend_910_ascend_c_operator_development_guide_02_0347.html
+We can use AscendC::VecReduceAdd or AscendC::VecSum. I'll use VecReduceAdd which returns a float.
+
+Also, we need to be careful about using the same tmp tensor for both pos and neg. That's fine.
+
+The kernel function name: triplet_margin_loss_custom. Extern "C" call.
+
+Tiling: We need to store totalSamples, totalDim, tileDim, margin. Also blockDim. We'll compute tileDim from UB budget: need to consider three input tiles (3 * tileDim * 4 bytes) plus one tmp tile (tileDim * 4) = 4*tileDim*4 = 16*tileDim bytes. Also overhead. Let's set UB_BUDGET = 192KB. So maxTile = 192KB / 16 / 4 = 3072? Actually 192*1024 / 16 = 12288 bytes? Wait: 192KB = 196608 bytes. Divide by 16 bytes per element? Actually each float is 4 bytes, number of floats = . If we have 4 parallel tiles (X,P,N,tmp) each of size tileDim floats, total bytes = 4 * tileDim * 4 = 16 * tileDim. So max tileDim = 196608 / 16 = 12288 floats. That's large. We'll set tileDim to something reasonable like 2048 or 4096 aligned. We'll also consider that we need to store the local tensors in UB. So we'll compute tileDim = min(UB_BUDGET / 16, totalDim). Align to 2048.
+
+For blockDim: we can set to a fixed number like 8 or 24, or compute based on number of samples. For simplicity, we'll set blockDim to 8.
+
+In host_operator_src, we'll define TilingFunc.
+
+Also, note the repair memory: "When output mismatch occurs due to integer-to-float cast in kernel, do not directly cast totalSamples from uint32_t to float in the kernel; instead store totalSamplesFloat in tiling data and pass it as a separate parameter to the Init method." That is relevant if we need to compute mean? But we are not computing mean in kernel; we output per-sample loss. So no need for that.
+
+Now, we need to write the six strings.
+
+Let's start with project_json_src: define operator TripletMarginLossCustom with inputs: anchor, positive, negative (all float ND), output: loss (float ND, shape (N,)), attribute: margin (float, default 1.0).
+
+host_tiling_src: define tiling data struct with fields: totalSamples, totalDim, tileDim, blockDim, margin.
+
+host_operator_src: include tiling header, register op, define TilingFunc, InferShape, InferDataType, and op class with registration. For InferShape, output shape is (input_shape[0].GetDim(0),) i.e., number of rows. For data type, float.
+
+kernel_src: as above, with proper includes and using namespace AscendC.
+
+python_bind_src: similar to example, but for triplet_margin_loss_custom. Need to include pytorch_npu_helper.hpp. The implementation: at::Tensor triplet_margin_loss_impl_npu(const at::Tensor& anchor, const at::Tensor& pos, const at::Tensor& neg, double margin). Use EXEC_NPU_CMD(aclnnTripletMarginLossCustom, ...). But we need to ensure the op name matches. We'll use aclnnTripletMarginLossCustom. The custom op name should be "TripletMarginLossCustom". The python bind function name should match kernel name: triplet_margin_loss_custom.
+
+model_src: define ModelNew that imports custom_ops_lib and uses triplet_margin_loss_custom. Note that the custom op expects margin as attribute, not tensor. So we need to pass margin as argument? In the example, the python bind function takes float. In the model, we can extract margin from tensor. We'll pass margin as a float to the custom op. In model forward, we'll do: margin = margin_tensor.item() if tensor else default. Actually the input to forward is anchor, positive, negative, margin (tensor). So we need to convert margin to float and pass to custom op. The custom op expects three tensors and a float attribute? In the host_operator, we defined an attribute "margin". In the python bind, we can call the op with the three tensors and extra attribute. The execution macro EXEC_NPU_CMD should handle that. We'll pass margin as the fourth argument? Actually aclnnTripletMarginLossCustom(anchor, pos, neg, margin, output). So the cpp function signature will be: triplet_margin_loss_custom(const at::Tensor& anchor, const at::Tensor& pos, const at::Tensor& neg, double margin) -> at::Tensor. Then in model, we call custom_ops_lib.triplet_margin_loss_custom(anchor, pos, neg, margin). That matches.
+
+Now, write the strings. Ensure all placeholders are replaced.
+
+Let's produce the final answer.

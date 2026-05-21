@@ -287,6 +287,8 @@ result = generate_kernel_with_agent(task, parse_tool_mode("kb,code_rag,env_check
 | `security_check` | 不安全模式扫描 |
 | `ascend_search` | 在线 Ascend 文档搜索（固定：`lang=zh`、`doc_type=DOC`、`version=8.5.0`） |
 | `ascend_fetch` | 在线 Ascend 文档单 URL 抓取（仅允许抓取本会话 `ascend_search` 返回过的 URL） |
+| `dtype_policy_engine` | 算子级 **dtype / 累加 / cast 阶段** 策略建议（CANN 8.3.rc 基线，**顾问**，不查文档签名） |
+| `dma_alignment_engine` | **DMA 几何与对齐** 建议：搬运字节对齐、`DataCopy` vs `DataCopyPad`、`Compare` 256B 等（**顾问**） |
 
 ### 3.3 提示策略（`generator/prompt_generators/`）
 
@@ -331,6 +333,8 @@ Agent 基于 LangGraph `StateGraph`：在 `build_agent_app` 入口会 **`get_too
 | 安全检查 | `security_check` | 规则集 | 危险模式 |
 | 在线文档搜索 | `ascend_search` | hiascend 在线文档 | 固定参数检索，`query` 必须中文 |
 | 在线文档抓取 | `ascend_fetch` | hiascend 在线文档详情页 | 每次仅 1 个 URL，且必须来自历史 `ascend_search` 结果；沉淀 `main_content/code_examples` |
+| Dtype 策略顾问 | `dtype_policy_engine` | 内置规则（`generator/agent/rules/`） | **不**访问文档库；根据 `args` 与 CANN 8.3.rc 启发式给出累加/cast 阶段建议 |
+| DMA 对齐顾问 | `dma_alignment_engine` | 同上 | **不**访问文档库；根据 `args.transfers` 检查对齐并建议 `DataCopy` / `DataCopyPad` 等 |
 
 底层仍以各 **Retriever** 实现为主；**`tool_dispatch`** 节点根据 `state["next_action"]`（小写键或 `ANSWER`）在 **同一 Registry** 上查找并调用 `handler`。
 
@@ -460,11 +464,132 @@ python3 tools/test_ascend_docs_tools.py \
 
 依赖：`requirements-generation.txt` 中已列出 `requests` 与 `beautifulsoup4`。
 
+#### 3.5.7 顾问工具：`dtype_policy_engine` / `dma_alignment_engine`
+
+二者均为 **纯规则顾问**：不参与编译或 NPU 评测，也不替代 `api_lookup` / `api_constraint`；需在 **`--tool-mode`**（或 `parse_tool_mode` 的逗号列表 / `frozenset`）中 **显式启用**（预置 `all` **不包含**这两项）。
+
+**1. 工具做什么**
+
+| 工具 | 作用 |
+|------|------|
+| `dtype_policy_engine` | 在 **算子级** 建议：目标精度模式（如 `match_pytorch`、`fp32_accum_fp16_io`）、`op_family` 下的 **累加 dtype**、load/compute/accumulate/store 各阶段的 **cast 取向**，与 MKB / PyTorch 参考习惯对齐（启发式）。 |
+| `dma_alignment_engine` | 在 **搬运级** 建议：每条 transfer 的 **字节总长与偏移** 是否满足常用对齐启发式、GM↔UB 场景下 **`AscendC::DataCopy` vs `DataCopyPad`**，若声明 `involves_api: Compare` 则检查 **extent 是否 256B 对齐** 等。 |
+
+**2. 输入 / 输出（对接 Agent 的 JSON 协议）**
+
+编排模型每轮输出 **一个** `ToolChoice` JSON（全局规则见 §3.5.3.1）。对上述工具：
+
+- **输入（模型 → 解析器）**
+  - **`query`**：短自然语言意图（算子场景、搬运场景）。
+  - **`args`**（对象，可选字段见 `generator/agent/builtin_tools.py` 中各工具的 `parameter_docs`）  
+    - `dtype_policy_engine`：`target_precision_mode`、`op_family`、`io_dtypes`、`stages` 等。  
+    - `dma_alignment_engine`：`transfers`（数组，每项含 `direction`、`dtype`、`elem_count` 或 `byte_length` 等）、可选 `chip`。
+
+- **输出（工具节点 → Agent 状态）**
+  - **列表字段（供下游 prompt 拼接）**：`dtype_policy_engine_results`、`dma_alignment_engine_results`，每项为 **一段字符串**：前半段为 **单行 JSON**（可 `json.loads`），分隔符 **`#######`**，后半段为简短中文摘要（见 `generator/agent/reporting/advisory_report.py`）。
+  - **结构化字段（便于脚本消费）**：`dtype_policy_engine_result`、`dma_alignment_engine_result`，为 **dict**，含 `schema_version`、`cann_version`、`summary`、`issues`、`recommendations`、`alignment_confidence` 等。
+
+**3. 为什么能帮助 Agent**
+
+- 与 **`api_lookup` / `api_constraint`** 分工：后两者偏向 **单个 API 符号** 与 **单次调用点** 的签名与约束；顾问工具覆盖 **整条 dtype 管线** 与 **多段 DMA 几何**，减少「只知道 API 名字却不知道何处 FP32 累加、何处应用 Pad」的断层。
+- 输出同时含 **机器可读 JSON** 与自然语言摘要，便于编排模型与最终写码模型消化；仍为 **建议**，最终以 **CANN 编译与 `eval_operator` 数值结果** 为准。
+
+**4. 工具调用如何记录（审计 / 误判分析）**
+
+以下字段可用于复盘「工具是否答错、是否误导下游」：
+
+| 来源 | 路径 / 字段 | 内容 |
+|------|----------------|------|
+| LangGraph 状态 | `tool_calls_log` | 每次工具执行追加一条：`round`、`tool`、`query`、**`response`（完整顾问输出字符串）**。 |
+| LangGraph 状态 | `tool_choice_json` | 最近一次解析成功的 **`tool` / `query` / `args`**（及可选 `thinking`），可与 `tool_calls_log` 对照「模型到底传了什么」。 |
+| LangGraph 状态 | `tool_choice_reasoning_log` | `choose_tool` 每轮一条：`prompt_excerpt`、`raw_model_output`、`selected_tool`、`thinking`、`parsed_ok` 等（见 `generator/agent/nodes/choose_tool.py`）。 |
+| LangGraph 状态 | `tool_choice_error_log` | JSON 解析失败或 tool 不在 `tool_mode` 时的错误与 **`raw_model_output` 截断**。 |
+| `generate_kernel_with_agent` 返回值 | `result.report` | `tool_calls`：`round`、`tool`、`query`、`response`（**默认最多保留约 500 字符**，过长加 `...`，完整内容请以图中的 `tool_calls_log` 为准）、`tool_choice`（与同 `round` 的 `tool_choice_reasoning_log` 合并）；`tool_selection_trace`；`tool_choice_parse_errors`。 |
+
+**提示**：若需事后完整比对顾问 JSON，请以 **`app.invoke` 结束时的 `final_state["tool_calls_log"]`** 或自行序列化完整状态为准；落盘的 `{op}_report.json` 可能对 `response` 做长度截断以防日志过大。
+
 ### 3.7 多轮自动修复脚本（按轮次命名汇总）
 
-`generator/scripts/run_agent_multi_rounds.py` 现已支持 **可配置轮次**（`--max-attempts >= 2`）与 **算子级并行**（`--parallel-ops`）。算子列表可与单轮脚本对齐：**显式传 `--ops`**，或 **省略 `--ops` 并用 `--categories` + 可选 `--kernelbench102`** 从数据集中展开（规则同 `generator/scripts/generation/generate_agent.py`；例如 `--categories activation --kernelbench102` 对应 12 个激活类算子）。虚拟类别 **`test_set`** 表示学长指定的固定 12 个评测算子，列表维护在 `generator/test_set_ops.py`。
+入口：[`generator/scripts/run_agent_multi_rounds.py`](generator/scripts/run_agent_multi_rounds.py)（MKB / AscendC 单算子）；CUDA-Agent 6K 见 [`generator/scripts/run_agent_cuda_agent_multi_rounds.py`](generator/scripts/run_agent_cuda_agent_multi_rounds.py)。
 
-示例：
+| 能力 | 说明 |
+|------|------|
+| 可配置轮次 | `--max-attempts >= 2`，**全局上限**（见下文「首轮 / 续跑」） |
+| 算子级并行 | `--parallel-ops`；每 attempt 内评测仍建议 `--eval-workers 1` |
+| 续跑 | `--continue-attempt` + `--continue-from <已有 run 目录>`，原地追加 `attempt(N+1)..M` |
+| 修复记忆 | `--use-repair-memory`，产物默认在 `output/memory_on/...`（见 [§3.7.1](#371-跨轮修复记忆repair-memory)） |
+
+**算子列表（首轮）**：显式 `--ops`，或 `--categories` + 可选 `--kernelbench102`（规则同 [`generate_agent.py`](generator/scripts/generation/generate_agent.py)）。虚拟类别 **`test_set`** 为固定 12 个评测算子，见 [`generator/test_set_ops.py`](generator/test_set_ops.py)。
+
+**自定义 OPP 与并行**：当 **`--parallel-ops > 1`** 时，每个并发子进程会把 **`LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH`** 解析为 **`<base>/_parallel_w(slot mod parallel_ops)`**，与 `eval_operator --txt-dir --workers` 约定一致，避免多进程覆盖 `libcust_opapi.so`；**`--parallel-ops 1`** 时不创建子目录。
+
+#### 首轮 / 续跑语义
+
+- **首轮**：`--max-attempts 5` → 生成 `attempt1` .. `attempt5`（未 pass 的算子跑满 5 轮或中途 pass 早停）。
+- **续跑**：`--max-attempts 10` + `--continue-attempt` → 仅对**尚未 pass** 的算子继续 `attempt6` .. `attempt10`；目录名**全局连续**，**原地写入**同一 `runN` 目录（不新建 run）。
+- **pass 跳过**：`fixed_on_attempt` 已设置，或最后一次 attempt 上 `compiled` 与 `correctness` 均为 true。
+- **续修起点**：取该算子**数字最大的** `attemptK/` 中 `{op}.txt` 与 `{op}_repair_context.txt`（**不**使用「最后一次仅 compile 通过」的 attempt）。
+
+#### 续跑专用参数
+
+| 参数 | 说明 |
+|------|------|
+| `--continue-attempt` | 开启续跑 |
+| `--continue-from PATH` | **必填**（与 `--continue-attempt` 成对）；已有 run 目录，建议写绝对路径 |
+| `--max-attempts M` | 新的**全局**上限，必须 **> 源目录** 最新 `attempts{N}_summary_*.json` 中的 N |
+| `--ops` | 可选；仅续跑列出的算子（须在源 run 的 summary 中存在） |
+
+续跑时**忽略** `--run`、`--categories`、`--kernelbench102`（算子集合以源 run 的 `attempts*_summary_all_ops.json` 中 `operator_keys` 为准）。若同时传 `--out-dir`，必须与 `--continue-from` resolve 后路径一致。**勿**对同一 run 目录并行启动两个续跑进程。
+
+#### 产物路径与命名
+
+默认根目录（无 `--out-dir`）：
+
+- 常规：`output/test/ascendc/<model>/agent_<tool_mode>/<strategy>/run<k>/`（`--test`）
+- 记忆开启：`output/test/memory_on/ascendc/.../run<k>/`（`--use-repair-memory`）
+
+按 `N = --max-attempts` 命名：
+
+- 单算子：`<op>_attemptsN_summary.json`
+- 全量：`attemptsN_summary_all_ops.json`
+- 每次续跑额外：`continue_report_<UTC>.json`（审计：基于哪条绝对路径、`skip_passed` / `continue` 等）
+
+旧文件（如 `attempts5_*`）**保留**；续跑结束后会新增 `attempts10_*` 等，不覆盖历史快照。
+
+#### 示例 A：test_set + repair memory（首轮 5 轮，tmux 后台）
+
+环境（与单轮 / 评测一致，按需 export）：
+
+```bash
+source /root/miniconda3/etc/profile.d/conda.sh
+conda activate czh_environ
+cd /root/czh/LLM4AscendC
+export USE_API_CONFIG=1
+export LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH=/root/czh/LLM4AscendC/ascend_custom_opp
+export LLM4ASCENDC_REF_ON_CPU=1
+```
+
+首轮（`--run 0` 写入 `.../one_shot/run0/`，`attempt1`..`attempt5`）：
+
+```bash
+tmux new-session -d -s run_test_set_ds_v4_mem_run0 \
+  "bash -lc 'source /root/miniconda3/etc/profile.d/conda.sh && conda activate czh_environ && cd /root/czh/LLM4AscendC && export USE_API_CONFIG=1 && export LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH=/root/czh/LLM4AscendC/ascend_custom_opp && export LLM4ASCENDC_REF_ON_CPU=1 && python generator/scripts/run_agent_multi_rounds.py --model deepseek-v4-flash --categories test_set --test --tool-mode no_tool --strategy one_shot --run 0 --use-repair-memory --max-attempts 5 --parallel-ops 4 --eval-workers 1 --eval-npu 4 --eval-mode full --clean-policy force 2>&1 | tee /root/czh/LLM4AscendC/run_test_set_ds_v4_mem_test_run0.log'"
+```
+
+查看进度：`tmux attach -t run_test_set_ds_v4_mem_run0` 或 `tail -f .../run_test_set_ds_v4_mem_test_run0.log`。
+
+#### 示例 B：在同一 run 上再跑 5 轮（attempt6..10）
+
+对比各次 `attempts5_summary_all_ops.json` 中 pass 数量后，选定表现最好的 run 目录（例如 `run0`），再执行：
+
+```bash
+tmux new-session -d -s run_test_set_ds_v4_mem_run0_cont \
+  "bash -lc 'source /root/miniconda3/etc/profile.d/conda.sh && conda activate czh_environ && cd /root/czh/LLM4AscendC && export USE_API_CONFIG=1 && export LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH=/root/czh/LLM4AscendC/ascend_custom_opp && export LLM4ASCENDC_REF_ON_CPU=1 && python generator/scripts/run_agent_multi_rounds.py --model deepseek-v4-flash --test --tool-mode no_tool --strategy one_shot --use-repair-memory --continue-attempt --continue-from /root/czh/LLM4AscendC/output/test/memory_on/ascendc/deepseek-v4-flash/agent_no_tool/one_shot/run0 --max-attempts 10 --parallel-ops 4 --eval-workers 1 --eval-npu 4 --eval-mode full --clean-policy force 2>&1 | tee /root/czh/LLM4AscendC/run_test_set_ds_v4_mem_test_run0_cont.log'"
+```
+
+说明：无需 `--run` / `--categories`；`--continue-from` 指向首轮产物目录；`--max-attempts 10` 表示全局上限 10。结束后查看 `attempts10_summary_all_ops.json` 与 `continue_report_*.json`。
+
+#### 示例 C：小规模调试（前台，3 个算子）
 
 ```bash
 python3 generator/scripts/run_agent_multi_rounds.py \
@@ -479,17 +604,65 @@ python3 generator/scripts/run_agent_multi_rounds.py \
   --eval-mode full --clean-policy force
 ```
 
-输出命名规则（按 `N = --max-attempts` 动态命名）：
+#### CUDA-Agent 6K 多轮与续跑
 
-- 单算子汇总：`<op>_attemptsN_summary.json`
-- 全算子汇总：`attemptsN_summary_all_ops.json`
+[`run_agent_cuda_agent_multi_rounds.py`](generator/scripts/run_agent_cuda_agent_multi_rounds.py) 使用相同 OPP 沙箱规则；汇总为 `attemptsN_summary_all_rows.json`。续跑时：
 
-例如 `--max-attempts 3` 时：
+```bash
+python3 generator/scripts/run_agent_cuda_agent_multi_rounds.py \
+  --continue-attempt \
+  --continue-from /path/to/cuda_agent_ops_6k/.../run0 \
+  --max-attempts 10 \
+  --use-repair-memory \
+  --dataset-path /root/czh/LLM4AscendC/data/external/CUDA-Agent-Ops-6K/cuda_agent_ops_6k.jsonl
+```
 
-- `gelu_attempts3_summary.json`
-- `elu_attempts3_summary.json`
-- `softmax_attempts3_summary.json`
-- `attempts3_summary_all_ops.json`
+可选 **`--row-keys ca6k_00055 ...`** 或 **`--indices`** 仅续跑部分行。首轮仍须 **`--indices` / `--range` / `--all` 三选一**。
+
+#### 3.7.1 跨轮修复记忆（repair memory）
+
+多轮脚本支持 **`--use-repair-memory`**（`run_agent_multi_rounds.py` / `run_agent_cuda_agent_multi_rounds.py`）：开启后会在 **`attempt ≥ 2`** 时从全局记忆库 **检索**若干条经验注入 Agent，并在评测通过后按规则 **写入**新记忆；默认产物根路径在 **`output/memory_on/...`**（与 `--test` 组合时为 `output/test/memory_on/...`），关闭该开关则与接入记忆前行为一致。
+
+- **存储根目录**：默认 **`<REPO_ROOT>/repair_memory/`**；可用 **`LLM4ASCENDC_REPAIR_MEMORY_ROOT`** 覆盖；**`LLM4ASCENDC_REPAIR_MEMORY=0`** 关闭写入与检索。常见子路径：
+  - `canonical/repair_memories.jsonl` — 全局记忆真源（JSONL，一行一条）
+  - `inbox/<run_slug>/` — 单次 run 待 merge 的 `mem_*.jsonl`
+  - `archive/removed_memories.jsonl` — 维护脚本删除条的完整归档（便于排查误删）
+  - `maintenance_reports/report_<timestamp>.json` — 维护 dry-run / 审阅报告
+- **单条 schema（`repair_memory_v1`）**：除 `natural_language`、tier、transition 外，支持 **`symptom_anchor_*`**（流水线表象：CPack、txt 缺块等）与 **`root_cause_anchor_*`**（编译/API 根因，从 build/eval 日志优先抽取）。旧条可无 root 字段，与新区块共存，无需迁移。
+- **自然语言**：Review LLM 生成 **英文**一句（`When ... do not ...; instead ...`）；写库前经模板校验，拒绝 CoT 污染（如 `We need to...`）。**canonical 已有行不会自动改写**。
+- **评测与 Review 日志对齐**：失败时 `eval_operator` 使用 **02-build / 06-eval 日志 tail（默认 220 行）** 与分层 `correctness_info`（`root_cause` / `symptom`）；写记忆与修代码 agent 共用 `build_attempt_error_bundle` / `format_repair_error_context`，避免 Review 只见 CPack 尾日志。
+- **Manifest 选条**：`build_manifest_lines` 每行 `id, op, category, tool_mode, tier, root, symptom, summary`；**不按**当前 run 的 `tool_mode` / `eval_mode` 预筛；选条 LLM 优先匹配 **root/summary** 中的 compile/API 线索。注入块含 `root_cause_anchor_after` / `symptom_anchor_after` + NL。
+- **总结输入**：相邻两轮 `format_attempt_signals_for_review`（含 `log_excerpt`）+ 可选 **txt unified diff**（有上限）。
+- **记忆库维护**（独立脚本，不改动保留条的 NL）：
+
+```bash
+# 预览：规则清洗 + 桶内 LLM 去重（默认 dry-run，写 report）
+python generator/scripts/maintain_repair_memory.py --model <your-model>
+
+# 仅规则清洗（不调去重 LLM）
+python generator/scripts/maintain_repair_memory.py --skip-dedup
+
+# 确认 report 后写回 canonical（.bak 备份 + 删除条进 archive）
+python generator/scripts/maintain_repair_memory.py --model <your-model> --apply
+
+# 按已审阅 report 精确删除，避免重跑 LLM 导致报告不一致（推荐）
+python generator/scripts/maintain_repair_memory.py \
+  --apply-report repair_memory/maintenance_reports/report_<timestamp>.json --apply
+```
+
+  - Phase1 **固定规则**删除：schema/模板不合格、CoT 残留、仅 CPack 表象且无 API 细节的泛泛条。
+  - Phase2 **规则分桶**（txt 缺块 / CPack / opbuild / 507035 / Shape API / compile / pybind 等）。
+  - Phase3 **桶内 LLM 去重**：只输出 `drop_ids`，不合并或改写记忆；同桶内不同修复点可都保留。
+  - `--apply-report` 默认 `remove_list`：只删 report 中列出的 id；若 report 之后又 append 了新记忆，**新条会保留**。canonical 自 report 后未变时可用 `--apply-report-mode kept_ids`。
+
+- **其它工具**：
+
+```bash
+# 从 canonical 渲染人类可读的 manifest.txt
+python generator/scripts/render_repair_memory_manifest.py
+```
+
+- **设计说明与示例 prompt 快照**：[`docs/repair_memory_design.md`](docs/repair_memory_design.md)（含 §8 维护流程）、[`generator/agent/_example_prompts_memory/`](generator/agent/_example_prompts_memory/)（Review / 选条 / inject 的英文 message 实录，已与 `root`/`symptom`/`log_excerpt` 实现对齐）。
 
 ### 3.6 配置与依赖
 
@@ -519,7 +692,13 @@ python3 generator/scripts/run_agent_multi_rounds.py \
 | `generator/agent/retrievers/ascend_docs_search_retriever.py` | 在线 Ascend 文档搜索 retriever（hiascend） |
 | `generator/agent/retrievers/ascend_docs_fetch_retriever.py` | 在线 Ascend 文档详情抓取与结构化解析 retriever |
 | `generator/agent/agent_config.py` | 工具键常量、`parse_tool_mode`、`tool_mode_to_string`、Agent LLM 本地文件加载 |
-| `generator/agent/_example_prompts_relu_kb/` | `choose_tool` / `answer` 侧提示样例快照（与线上一致时宜同步更新） |
+| `generator/repair_memory/` | 跨轮修复记忆：schema、tier、写入 pipeline、`error_signals`、manifest 选条、merge、`maintenance` 等 |
+| `generator/scripts/maintain_repair_memory.py` | 记忆库维护：规则清洗、桶内 LLM 去重、`--apply-report` 按报告写回 |
+| `generator/scripts/render_repair_memory_manifest.py` | 从 canonical 导出 `repair_memory_manifest.txt` |
+| `tools/common/error_extract.py` | 分层抽取 `root_cause` / `symptom`（eval 与 repair memory 共用） |
+| `repair_memory/`（仓库根下） | 默认记忆库：`canonical/`、`inbox/`、`archive/`、`maintenance_reports/`；见 `.gitignore` |
+| `generator/agent/_example_prompts_memory/` | Repair-memory 相关 LLM prompt 英文快照（Review / 选条 / 注入，展示用） |
+| `docs/repair_memory_design.md` | 修复记忆机制设计说明（含维护与 log parity，与实现对齐） |
 | `tools/test_ascend_docs_tools.py` | 在线文档工具本地试跑脚本（search/fetch/chain） |
 | `generator/rag/` | RAG 代码索引与嵌入检索（ChromaDB + BGE-M3） |
 | `generator/prompt_generators/` | 提示策略实现（rag、add_shot、selected_shot 等） |
