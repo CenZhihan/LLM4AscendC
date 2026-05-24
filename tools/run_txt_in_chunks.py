@@ -8,6 +8,12 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tools.common.operator_txt import iter_mkb_operator_txts  # noqa: E402
+
 
 @dataclass(frozen=True)
 class RunResult:
@@ -17,15 +23,7 @@ class RunResult:
 
 
 def _iter_txts(txt_dir: pathlib.Path) -> list[pathlib.Path]:
-    # Match tools/eval_operator.py: skip CoT sidecars like leaky_relu_cot.txt
-    return sorted(
-        [
-            p
-            for p in txt_dir.iterdir()
-            if p.is_file() and p.suffix == ".txt" and not p.stem.endswith("_cot")
-        ],
-        key=lambda p: p.name,
-    )
+    return iter_mkb_operator_txts(txt_dir)
 
 
 def _run_one(*, repo_root: pathlib.Path, txt: pathlib.Path, mode: str, clean_policy: str) -> RunResult:

@@ -73,29 +73,6 @@ def _artifact_group_rel_from_txt_path(txt_path: pathlib.Path) -> Optional[pathli
     return rel_parent
 
 
-def _apply_parallel_opp_env_if_needed(*, op_slot: int, parallel_ops: int) -> None:
-    """
-    Isolate custom OPP install roots when --parallel-ops > 1 (align with eval_operator --workers).
-    See run_agent_multi_rounds._apply_parallel_opp_env_if_needed.
-    """
-    if parallel_ops <= 1:
-        return
-    from tools.common.env import load_env_config
-
-    cfg = load_env_config()
-    if not cfg.ascend_custom_opp_path:
-        return
-    base = pathlib.Path(cfg.ascend_custom_opp_path)
-    bucket = op_slot % parallel_ops
-    isolated = base / f"_parallel_w{bucket}"
-    isolated.mkdir(parents=True, exist_ok=True)
-    os.environ["LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH"] = str(isolated)
-    print(
-        f"[ALLOC] LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH={isolated} "
-        f"(slot={op_slot} mod parallel_ops={parallel_ops} -> bucket={bucket})"
-    )
-
-
 def _cuda_agent_eval_result_json_path(txt_path: pathlib.Path, op_key: str) -> pathlib.Path:
     from tools.cuda_agent_eval.constants import default_cuda_agent_art_root
 
@@ -531,10 +508,13 @@ def _run_single_cuda_agent_job(
     seed_repair_context_path: str = "",
     prior_attempts: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    _apply_parallel_opp_env_if_needed(op_slot=op_slot, parallel_ops=parallel_ops)
-    device_id = op_slot % eval_npu
-    os.environ["ASCEND_VISIBLE_DEVICES"] = str(device_id)
-    print(f"[ALLOC] op_key={op_key} slot={op_slot} ASCEND_VISIBLE_DEVICES={device_id} (eval_npu={eval_npu})")
+    from tools.common.env import apply_agent_parallel_slot_env
+
+    apply_agent_parallel_slot_env(op_slot=op_slot, parallel_ops=parallel_ops, npu_count=eval_npu)
+    print(
+        f"[ALLOC] op_key={op_key} slot={op_slot} ASCEND_VISIBLE_DEVICES="
+        f"{os.environ.get('ASCEND_VISIBLE_DEVICES')} (eval_npu={eval_npu})"
+    )
     category = str(row.get("data_source") or "cuda_agent")
     return run_multi_attempt_for_cuda_row(
         op_key=op_key,
@@ -1045,6 +1025,11 @@ def main() -> int:
             f"[WARN] parallel_ops ({args.parallel_ops}) > eval_npu ({args.eval_npu}); "
             "multiple jobs will share visible devices."
         )
+    if args.parallel_ops > 1:
+        from tools.common.env import ensure_parallel_build_jobs
+
+        jobs = ensure_parallel_build_jobs(worker_count=args.parallel_ops)
+        print(f"[batch] LLM4ASCENDC_BUILD_JOBS={jobs} (parallel_ops={args.parallel_ops})")
 
     dataset_path = args.dataset_path.resolve()
     if not dataset_path.is_file():

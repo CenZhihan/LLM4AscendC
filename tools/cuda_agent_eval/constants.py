@@ -37,6 +37,16 @@ def suggested_op_key_ca6k(row_index: int) -> str:
     return f"ca6k_{row_index:05d}"
 
 
+def parse_row_index_from_ca6k_op_key(op_key: str) -> int:
+    """Parse 0-based row index from bundle stem / op_key like ca6k_00055."""
+    import re
+
+    m = re.fullmatch(r"ca6k_(\d+)", op_key.strip())
+    if not m:
+        raise ValueError(f"op_key {op_key!r} is not ca6k_XXXXX format")
+    return int(m.group(1), 10)
+
+
 REF_CODE_FILENAME = "reference_code.py"
 MODEL_NEW_FILENAME = "model_new.py"
 META_TASK_FILENAME = "meta_task.json"
