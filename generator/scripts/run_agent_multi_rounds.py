@@ -52,6 +52,26 @@ def _normalize_ascend_search_version(value: Optional[str]) -> Optional[str]:
     return t or None
 
 
+def _require_repair_memory_runtime() -> None:
+    """repair-memory imports openai; must run under project conda, not CANN python3.11."""
+    try:
+        import openai  # noqa: F401
+    except ImportError as e:
+        raise SystemExit(
+            "repair-memory requires package 'openai' in the active Python.\n"
+            f"  sys.executable = {sys.executable}\n"
+            "  Use ONLY: source scripts/activate_czh_environ.sh\n"
+            "  Do NOT source /usr/local/Ascend/ascend-toolkit/set_env.sh after activate "
+            "(it prepends python3.11 and breaks openai/torch_npu).\n"
+            f"  Detail: {e}"
+        ) from e
+    exe = str(pathlib.Path(sys.executable).resolve())
+    if "envs/czh_environ" not in exe:
+        print(
+            f"[WARN] repair-memory expected miniconda env czh_environ; got interpreter {exe}"
+        )
+
+
 def _artifact_group_rel_from_txt_path(txt_path: pathlib.Path) -> Optional[pathlib.Path]:
     txt = txt_path.resolve()
     out_root = OUTPUT_ROOT.resolve()
@@ -1024,6 +1044,9 @@ def main() -> int:
                 "(default when --out-dir is unset); "
                 f"current run_dir={out_run_dir}"
             )
+
+    if args.use_repair_memory:
+        _require_repair_memory_runtime()
 
     from generator.repair_memory.paths import run_slug_from_run_dir
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,8 @@ class EnvConfig:
 
 
 _ASCEND_CUSTOM_OPP_ENV = "LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH"
+_ASCEND_CUSTOM_OPP_BASE_ENV = "LLM4ASCENDC_ASCEND_CUSTOM_OPP_BASE"
+_PARALLEL_W_DIR_RE = re.compile(r"^_parallel_w\d+$")
 # CANN 8.x TBE/AscendC 编译链绑定 Python 3.11；conda 评测环境多为 3.10（torch cp310）。
 # 若 build.sh 误用 3.10，常见现象为 kernel *.json 为空、JSONDecodeError(EB0500)。
 _CANN_BUILD_PYTHON_CANDIDATES = (
@@ -114,6 +117,32 @@ def _strip_conda_from_pythonpath(env: dict[str, str]) -> None:
     env["PYTHONPATH"] = ":".join(parts)
 
 
+def resolve_ascend_custom_opp_base(path: str | None = None) -> str:
+    """
+    Canonical OPP install root without per-worker suffixes.
+
+    Agent/eval may set LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH to .../_parallel_w2; calling
+    init_parallel_* again must not append another _parallel_w* on top (nested paths).
+    """
+    explicit_base = os.environ.get(_ASCEND_CUSTOM_OPP_BASE_ENV, "").strip()
+    if path is None and explicit_base:
+        return str(Path(explicit_base).resolve())
+
+    raw = (path or os.environ.get(_ASCEND_CUSTOM_OPP_ENV, "")).strip()
+    if not raw:
+        return str((ROOT_DIR / "ascend_custom_opp").resolve())
+
+    cur = Path(raw).resolve()
+    while _PARALLEL_W_DIR_RE.fullmatch(cur.name):
+        cur = cur.parent
+    return str(cur)
+
+
+def parallel_opp_path_for_bucket(*, base_opp: str, bucket: int) -> str:
+    base = resolve_ascend_custom_opp_base(base_opp)
+    return str(Path(base) / f"_parallel_w{bucket}")
+
+
 def load_env_config() -> EnvConfig:
     """
     若设置 LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH，则覆盖默认 ascend_custom_opp_path。
@@ -189,13 +218,16 @@ def init_parallel_op_slot_os_environ(
     npu_count = max(1, npu_count)
     opp_bucket = op_slot % parallel_ops
     device_id = op_slot % npu_count
-    cfg = load_env_config()
-    if cfg.ascend_custom_opp_path and parallel_ops > 1:
-        opp = str(Path(cfg.ascend_custom_opp_path) / f"_parallel_w{opp_bucket}")
+    base_opp = resolve_ascend_custom_opp_base()
+    if parallel_ops > 1:
+        opp = parallel_opp_path_for_bucket(base_opp=base_opp, bucket=opp_bucket)
         Path(opp).mkdir(parents=True, exist_ok=True)
+        os.environ[_ASCEND_CUSTOM_OPP_BASE_ENV] = base_opp
         os.environ[_ASCEND_CUSTOM_OPP_ENV] = opp
     else:
-        opp = cfg.ascend_custom_opp_path or "(default)"
+        opp = base_opp
+        os.environ[_ASCEND_CUSTOM_OPP_BASE_ENV] = base_opp
+        os.environ[_ASCEND_CUSTOM_OPP_ENV] = base_opp
     os.environ["ASCEND_VISIBLE_DEVICES"] = str(device_id)
     merged = build_subprocess_env(load_env_config())
     os.environ.update(merged)
@@ -218,9 +250,11 @@ def init_parallel_worker_os_environ(
     Binds NPU, isolates OPP install root, and merges CANN build env into os.environ.
     """
     device_id = worker_id % max(1, npu_count)
-    opp = str(Path(base_opp) / f"_parallel_w{worker_id}")
+    base = resolve_ascend_custom_opp_base(base_opp)
+    opp = parallel_opp_path_for_bucket(base_opp=base, bucket=worker_id)
     Path(opp).mkdir(parents=True, exist_ok=True)
     os.environ["ASCEND_VISIBLE_DEVICES"] = str(device_id)
+    os.environ[_ASCEND_CUSTOM_OPP_BASE_ENV] = base
     os.environ[_ASCEND_CUSTOM_OPP_ENV] = opp
     merged = build_subprocess_env(load_env_config())
     os.environ.update(merged)
