@@ -23,7 +23,18 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.common.env import EnvConfig, build_subprocess_env, load_env_config, shell_prefix  # noqa: E402
+from tools.common.env import (  # noqa: E402
+    EnvConfig,
+    build_subprocess_env,
+    ensure_parallel_build_jobs,
+    init_parallel_worker_os_environ,
+    load_env_config,
+    shell_prefix,
+)
+from tools.common.operator_txt import (  # noqa: E402
+    is_mkb_operator_txt_path as _is_mkb_operator_txt_path,
+    list_skipped_non_mkb_txts,
+)
 from tools.common.error_extract import (  # noqa: E402
     build_layered_errors_from_log_text,
     extract_core_error,
@@ -38,11 +49,6 @@ OPS_ROOT = ROOT / "operators"
 ART_ROOT = ROOT / "artifacts"
 OUTPUT_ROOT = ROOT / "output"
 TOOLS_ROOT = ROOT / "tools"
-
-
-def _is_mkb_operator_txt_path(p: pathlib.Path) -> bool:
-    """True for MKB bundle *.txt; False for CoT sidecars (e.g. leaky_relu_cot.txt)."""
-    return p.is_file() and p.suffix == ".txt" and not p.stem.endswith("_cot")
 
 
 @dataclass(frozen=True)
@@ -196,6 +202,18 @@ def copytree_clean(src: pathlib.Path, dst: pathlib.Path) -> None:
     shutil.copytree(src, dst)
 
 
+def _cap_msopgen_build_parallelism(project_dir: pathlib.Path) -> None:
+    """Replace build.sh -j$(nproc) with a capped job count (see LLM4ASCENDC_BUILD_JOBS)."""
+    build_sh = project_dir / "build.sh"
+    if not build_sh.is_file():
+        return
+    jobs = os.environ.get("LLM4ASCENDC_BUILD_JOBS", "16").strip() or "16"
+    text = build_sh.read_text(encoding="utf-8")
+    patched = text.replace("-j$(nproc)", f"-j{jobs}")
+    if patched != text:
+        build_sh.write_text(patched, encoding="utf-8")
+
+
 def _patch_makeself_tar_format(project_dir: pathlib.Path) -> None:
     """
     Makeself uses ustar by default, which may fail when packaging hardlink entries with long link names.
@@ -320,6 +338,7 @@ def build_and_install_operator(
             shutil.copytree(src, dst, dirs_exist_ok=True)
 
         _patch_makeself_tar_format(project_dir)
+        _cap_msopgen_build_parallelism(project_dir)
 
         # 3) build and install .run
         log_02 = logs_dir / f"{ts}-02-build.log"
@@ -614,12 +633,7 @@ def _parallel_worker_main(
     eval/spec.py (torch.device("npu:0")) maps to device_id = worker_id % npu_count.
     Consumes txt paths from task_q until sentinel None.
     """
-    device_id = worker_id % npu_count
-    os.environ["ASCEND_VISIBLE_DEVICES"] = str(device_id)
-    print(f"[batch] [w{worker_id}] ASCEND_VISIBLE_DEVICES={device_id} (npu_count={npu_count})")
-    opp = pathlib.Path(base_opp) / f"_parallel_w{worker_id}"
-    opp.mkdir(parents=True, exist_ok=True)
-    os.environ["LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH"] = str(opp)
+    init_parallel_worker_os_environ(worker_id=worker_id, base_opp=base_opp, npu_count=npu_count)
     art_root = pathlib.Path(art_root_str)
     while True:
         item = task_q.get()
@@ -715,10 +729,17 @@ def main() -> int:
         group_rel = _artifact_group_rel_from_txt_dir(txt_dir)
         art_root = _artifacts_root_for_group(group_rel)
         files = sorted(p for p in txt_dir.glob("*.txt") if _is_mkb_operator_txt_path(p))
+        skipped = list_skipped_non_mkb_txts(txt_dir)
+        if skipped:
+            print(f"[batch] skipping {len(skipped)} non-MKB txt: {', '.join(skipped[:8])}" + (
+                f" ... (+{len(skipped) - 8} more)" if len(skipped) > 8 else ""
+            ))
         if not files:
             raise RuntimeError(
-                f"no MKB operator .txt files in {txt_dir} (files ending with _cot.txt are skipped)"
+                f"no MKB operator .txt files in {txt_dir} "
+                "(skips *_cot.txt, *_repair_context.txt)"
             )
+        print(f"[batch] evaluating {len(files)} MKB operator txt(s)")
 
         if args.workers == 1:
             rc = 0
@@ -756,6 +777,9 @@ def main() -> int:
                 "(see tools/common/env.py). Each worker installs to <that path>/_parallel_w<id>."
             )
         base_opp = cfg_parallel.ascend_custom_opp_path
+        jobs = ensure_parallel_build_jobs(worker_count=args.workers)
+        ncpu = os.cpu_count() or 16
+        print(f"[batch] LLM4ASCENDC_BUILD_JOBS={jobs} (auto: {ncpu} cpus / {args.workers} workers)")
         ctx = multiprocessing.get_context("spawn")
         task_q = ctx.Queue()
         result_q = ctx.Queue()

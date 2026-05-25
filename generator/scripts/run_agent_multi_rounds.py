@@ -70,32 +70,6 @@ def _eval_result_json_path(txt_path: pathlib.Path, op: str) -> pathlib.Path:
     return art_root / op / f"result_{op}.json"
 
 
-def _apply_parallel_opp_env_if_needed(*, op_slot: int, parallel_ops: int) -> None:
-    """
-    When multiple operator jobs run concurrently (ProcessPoolExecutor), each child must install
-    custom OPP under its own root — same convention as eval_operator --txt-dir --workers (see
-    _parallel_worker_main): <base>/_parallel_w<bucket>.
-
-    With max_workers=parallel_ops, concurrently running tasks have distinct op_slot % parallel_ops.
-    """
-    if parallel_ops <= 1:
-        return
-    from tools.common.env import load_env_config
-
-    cfg = load_env_config()
-    if not cfg.ascend_custom_opp_path:
-        return
-    base = pathlib.Path(cfg.ascend_custom_opp_path)
-    bucket = op_slot % parallel_ops
-    isolated = base / f"_parallel_w{bucket}"
-    isolated.mkdir(parents=True, exist_ok=True)
-    os.environ["LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH"] = str(isolated)
-    print(
-        f"[ALLOC] LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH={isolated} "
-        f"(slot={op_slot} mod parallel_ops={parallel_ops} -> bucket={bucket})"
-    )
-
-
 def _run_eval_for_txt(
     txt_path: pathlib.Path,
     mode: str,
@@ -567,10 +541,10 @@ def _run_single_op_job(
     memory_timeout: float = 5.0,
     memory_keep_local_repair_context: bool = True,
 ) -> Dict[str, Any]:
-    _apply_parallel_opp_env_if_needed(op_slot=op_slot, parallel_ops=parallel_ops)
-    device_id = op_slot % eval_npu
-    os.environ["ASCEND_VISIBLE_DEVICES"] = str(device_id)
-    print(f"[ALLOC] op={op} slot={op_slot} ASCEND_VISIBLE_DEVICES={device_id} (eval_npu={eval_npu})")
+    from tools.common.env import apply_agent_parallel_slot_env
+
+    apply_agent_parallel_slot_env(op_slot=op_slot, parallel_ops=parallel_ops, npu_count=eval_npu)
+    print(f"[ALLOC] op={op} slot={op_slot} ASCEND_VISIBLE_DEVICES={os.environ.get('ASCEND_VISIBLE_DEVICES')} (eval_npu={eval_npu})")
     return run_multi_attempt_for_op(
         op=op,
         category=category,
@@ -1128,6 +1102,11 @@ def main() -> int:
             f"[WARN] parallel_ops ({args.parallel_ops}) > eval_npu ({args.eval_npu}); "
             "multiple op jobs will share visible devices."
         )
+    if args.parallel_ops > 1:
+        from tools.common.env import ensure_parallel_build_jobs
+
+        jobs = ensure_parallel_build_jobs(worker_count=args.parallel_ops)
+        print(f"[batch] LLM4ASCENDC_BUILD_JOBS={jobs} (parallel_ops={args.parallel_ops})")
 
     llm_config = get_llm_config_compatible(cli_model=args.model)
     resolved_model = llm_config["model"]

@@ -180,7 +180,9 @@ def main() -> int:
     rows: list[tuple[str, str]] = []
     mismatches: list[dict] = []
 
-    for txt_path in sorted(TXT_DIR.glob("*.txt")):
+    from tools.common.operator_txt import iter_mkb_operator_txts
+
+    for txt_path in iter_mkb_operator_txts(TXT_DIR):
         op_key = txt_path.stem
         try:
             from vendor.mkb.ref_paths import get_ref_py_path
