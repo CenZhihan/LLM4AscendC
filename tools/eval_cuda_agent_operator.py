@@ -32,6 +32,7 @@ from tools.common.env import (  # noqa: E402
     ensure_parallel_build_jobs,
     init_parallel_worker_os_environ,
     load_env_config,
+    resolve_ascend_custom_opp_base,
 )
 from tools.common.operator_txt import (  # noqa: E402
     is_mkb_operator_txt_path,
@@ -310,10 +311,12 @@ def main() -> int:
                 "Parallel --txt-dir requires LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH "
                 "(each worker uses <path>/_parallel_w<id>)"
             )
+        base_opp = resolve_ascend_custom_opp_base(cfg_parallel.ascend_custom_opp_path)
+        os.environ["LLM4ASCENDC_ASCEND_CUSTOM_OPP_BASE"] = base_opp
+        os.environ["LLM4ASCENDC_ASCEND_CUSTOM_OPP_PATH"] = base_opp
         jobs = ensure_parallel_build_jobs(worker_count=args.workers)
         ncpu = os.cpu_count() or 16
         print(f"[batch] LLM4ASCENDC_BUILD_JOBS={jobs} (auto: {ncpu} cpus / {args.workers} workers)")
-        base_opp = cfg_parallel.ascend_custom_opp_path
         ctx = multiprocessing.get_context("spawn")
         task_q = ctx.Queue()
         result_q = ctx.Queue()

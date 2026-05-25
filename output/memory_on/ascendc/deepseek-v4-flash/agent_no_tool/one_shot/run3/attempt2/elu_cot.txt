@@ -1,0 +1,82 @@
+We need to fix the previous attempt based on the error logs. The errors are:
+1. "no member named 'CMP_GE' in namespace 'AscendC'" – The kernel used `AscendC::CMP_GE` which doesn't exist. In AscendC, comparison operations use `AscendC::Compare` with a mode like `AscendC::CMPMODE::GE`. Alternatively, we can avoid explicit Compare+Select by using simpler math operations. Since the ELU formula requires a conditional, we can implement it using max/min and multiplication without explicit Compare/Select. That is more reliable and avoids the missing CMP_GE error.
+
+2. "no matching function for call to 'Select'" – Because the mask type is not uint8_t correctly. If we avoid Select entirely, we bypass this.
+
+3. "static assertion failed ... TPipe::InitBuffer(T& que, ...) not supports T as TBuf" – The previous code used `pipe_.InitBuffer(constBuf_, 1, tileLen_ * sizeof(float));` where `constBuf_` is a `TBuf`. The error says InitBuffer does not support TBuf. The correct way is to use a queue (TQue) instead of TBuf for a constant buffer. Alternatively, we can avoid needing a constant buffer by using `AscendC::Sub` with a scalar 1.0f (i.e., `Sub(t1, t1, 1.0f, len)`) instead of subtracting a constant tensor. That eliminates the need for the constBuf_ entirely.
+
+Thus, the fix:
+- Remove constBuf_ and its InitBuffer.
+- Replace constant subtraction with `AscendC::Sub(t1, t1, 1.0f, len)`.
+- Replace the Compare+Select with a conditional that uses max/min to compute ELU: 
+   ELU(x) = max(x,0) + alpha * (exp(min(x,0)) - 1)
+   But careful: formula is: x if x>=0 else alpha*(exp(x)-1). We can compute:
+   let exp_part = Exp(x)
+   let sub = exp_part - 1.0
+   scale = alpha * sub
+   Then use Select, but to avoid Select, we can use:
+   y = (x >= 0) * x + (x < 0) * alpha * (exp(x) - 1)
+   But that requires multiplication by boolean mask. Simpler: use existing max/min:
+   y = max(x, 0) + alpha * (exp(min(x, 0)) - 1)
+   Because min(x,0) keeps negative part, exp(min(x,0)) is exp(x) for negative x, and exp(0)=1 for x>=0? Wait: if x>=0, min(x,0)=0, then exp(0)=1, then 1-1=0, so term is 0, leaving max(x,0)=x. That matches. But careful: exp(0)=1, so term becomes 0, correct. For x<0, min(x,0)=x, exp(x)-1, scaled by alpha. max(x,0)=0. So y = alpha*(exp(x)-1) correct. This works without any conditional.
+   However, we need to compute exp from a local tensor. We can compute exp once on xLocal, then apply min to get negative part? Actually, we need exp(x) for the whole tensor, then we need to compute exp(min(x,0)). That requires computing min(x,0) first, then exp. That's two operations. Alternatively, we can compute exp on x, then use a mask to zero out positive part? That again requires Select. The max/min approach may be slightly less efficient but avoids Select. Let's implement:
+   t1 = Exp(x)   // exp(x)
+   t2 = Sub(t1, 1.0f)   // exp(x)-1
+   t2 = Mul(t2, alpha)   // alpha*(exp(x)-1)
+   // Now we need to add max(x,0). We can compute max_val = Max(x, 0) -> AscendC::Max
+   // Then y = max_val + t2 (but for x>=0, t2 = alpha*(1-1)=0, so y=x; for x<0, max_val=0, y = alpha*(exp(x)-1))
+   That is correct. So we need to compute max(x,0). AscendC::Max takes two tensors or a tensor and scalar. We can use `AscendC::Max(yLocal, xLocal, 0.0f, len)` to get max(x,0) into yLocal, then add t2.
+   That avoids Compare/Select entirely.
+
+- Also, the InitBuffer for tmpQueue2 is no longer needed because we need two temporary tensors? We'll have t1 for exp result, t2 for sub/mul result, and yLocal for final. We need two temp queues. Actually, we need three: one for exp result, one for sub/mul result, and one for max result? But we can reuse: we can compute exp into t1, then sub into t1 (reuse), then mul into t1 (reuse), then compute max into yLocal, then add t1 into yLocal. So we only need two temp queues: one for exp/tmp, and one for nothing else? Actually, we need a temporary for the result of max? But we can write max directly into yLocal, then add. So we need only one temporary tensor for exp and subsequent operations. Let's design:
+   - Allocate t1 from tmpQueue1_ (size tileLen).
+   - Compute Exp(t1, xLocal, len)
+   - Sub(t1, t1, 1.0f, len)
+   - Muls(t1, t1, alpha_, len)
+   - Compute Max(yLocal, xLocal, 0.0f, len)   // yLocal is output queue tensor
+   - Add(yLocal, yLocal, t1, len)
+   That works. So we only need tmpQueue1_ for t1. tmpQueue2_ can be removed.
+   Also, we don't need constBuf_ at all.
+
+- Adjust UB_BUDGET_BYTES accordingly: now we use:
+   inQueueX: 2*tile, outQueueY: 2*tile, tmpQueue1: 1*tile
+   Total floats = 5*tile => bytes = 20*tile. The previous had 7*tile, now simpler.
+   So adjust tiling host code: UB_BUDGET_BYTES/20.
+
+- Also note the error about constBuf_ InitBuffer, which we remove.
+
+- The host_operator_src needs to be adjusted for the tiling data: we no longer have constBuf_, so the UB model changes. Update the comment and the division factor.
+
+- The kernel_src completely rewrite as described.
+
+- Other files (project_json, host_tiling, host_operator, python_bind, model) remain mostly same except tiling data field count unchanged? The tiling data still has totalLength, tileLength, blockDim, alpha. That's fine.
+
+- Also ensure that the kernel uses correct AscendC API: `AscendC::Exp`, `AscendC::Sub`, `AscendC::Muls`, `AscendC::Max`, `AscendC::Add`. All exist.
+
+- The `AscendC::Sub` with scalar: `AscendC::Sub(t1, t1, 1.0f, len);` works? The API: `Sub(LocalTensor<T> dst, LocalTensor<T> src, T scalar, uint32_t len)`. Yes, that's fine.
+
+- The `AscendC::Max` with scalar: `AscendC::Max(yLocal, xLocal, 0.0f, len);` works? There is a Max overload taking two tensors or tensor and scalar. Should work.
+
+- Also check `AscendC::Muls`: `Muls(LocalTensor<T> dst, LocalTensor<T> src, T scalar, uint32_t len)`. Good.
+
+- No need for ReinterpretCast.
+
+- Also ensure the kernel function name is `elu_custom` as defined.
+
+- In the previous kernel_src, there was a compilation error about static_assert for TBuf. We remove that entirely.
+
+Now produce the corrected code with minimal changes.
+
+We need to output the six strings. I'll write them out with proper indentation.
+
+Note: The previous attempt had a comment about UB budget: "7 * tile" but we change to "5 * tile". Also adjust the constant UB_BUDGET_BYTES division accordingly.
+
+Also the hard cap was 4096, which may be too small? But we keep same as previous for consistency. Actually, the leaky_relu example had HARD_CAP_ELEMS=32768. But previous elu had 4096. That might cause issues if tileLen too small, but we can keep as is for minimal change. However, the error was not about that. We can keep the tiling logic same except UB division factor.
+
+Let's update host_operator_src: change comment and division from 28 to 20.
+
+Also change maxTile calculation: UB_BUDGET_BYTES / 20.
+
+Also ensure that we are not using `constBuf_` anywhere in host code (it's in kernel only). No change needed.
+
+Now produce the final answer.
