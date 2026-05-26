@@ -1,0 +1,62 @@
+We need to produce six strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src for a custom AscendC operator named "min_gpt_new_gelu_custom" (PascalCase: MinGptNewGeluCustom). The original model implements GELU approximation (tanh version). We must replace with the custom kernel.
+
+From memories: Use ALIGN_ELEMS=16, HARD_CAP_ELEMS=4096, maxTile=UB_BUDGET_BYTES/28. Also ensure all blocks present.
+
+Operator signature: takes a tensor x, returns y. No extra attributes (no negative_slope). So attr list empty? In original model, no scalar parameter. But the Gelu formula uses constants. We'll embed constants in kernel.
+
+Compute: 0.5 * x * (1.0 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))). Need to compute in kernel using AscendC intrinsics.
+
+We'll need tiling data: totalLength, tileLength, blockDim. Possibly no extra float attr.
+
+In project_json_src: define op MinGptNewGeluCustom, input x float ND, output y float ND, no attr. But the user instruction expects PascalCase matching kernel name. So op name "MinGptNewGeluCustom".
+
+host_tiling_src: define tiling data structure with totalLength, tileLength, blockDim (no negativeSlope). Use uint32_t for lengths, no float field.
+
+host_operator_src: implement TilingFunc, InferShape, InferDataType, and op registration. Use UB budget: 192*1024 bytes. For Gelu, vector ops likely 3-4 intermediate tensors? We'll assume similar to leaky_relu, but we have more operations. Use equal budget? Memory 2 says for vector core exception, use ALIGN_ELEMS=16, HARD_CAP_ELEMS=4096, maxTile=UB_BUDGET_BYTES/28. We'll follow that. We'll need to compute tileLen accordingly. BlockDim: similar adaptive.
+
+Note: The kernel requires constants: sqrt(2/pi) ≈ 0.7978845608028654, 0.044715, 0.5. We'll define them as float constants in kernel.
+
+In kernel_src: Implement KernelMinGptNewGeluCustom with Init and Process. Use double buffering. Computation steps: x -> compute x3 = x * x * x? Actually x^3. Then term = x + 0.044715 * x3. Then term2 = sqrt2pi * term. Then tanh_val = tanh(term2). Then result = 0.5 * x * (1.0 + tanh_val). AscendC has Tanh (maybe in math.h). We'll use AscendC::Tanh (likely in vec math). We'll need temporary local tensors.
+
+We'll use 4 local tensors: xLocal, x3Local, termLocal, tanhLocal? Could reuse. We'll have inQueueX, outQueueY, and intermediate buffers. Let's design: use 2 double buffers for in and out, and one extra scalar buffer for intermediate? Actually we need at least: x, x3, temp1, temp2, tanh, result. That's many. But we can reuse memory: e.g., compute x3 in a temp, then add to x, multiply, tanh, etc. Use pipe with multiple queues or free tensors.
+
+Simpler: Use pipe with a single intermediate buffer for all temps (like tmpQueue in leaky_relu). But we need multiple variables. We can allocate large local tensor of tileLen floats and then use pointer arithmetic? Not allowed with LocalTensor? We can use Multiple LocalTensors with same size. Since we have 4 intermediate tensors (x3, term, tanh, y), but many can share. Let's allocate 3 extras: one for x3, one for temp, one for tanh. We'll free after use.
+
+Better: use VecIn queue for x, VecOut for y, and VecCalc for intermediate. We'll allocate up to 3 tensors from tmpQueue? But tmpQueue has only 1 buffer with size tileLen floats. We can use one tensor for multiple operations by reassigning? Not directly. Actually we can allocate multiple tensors from tmpQueue if we enqueue and dequeue? But we have only 1 buffer in tmpQueue. So we need to allocate multiple buffers. We can create additional queues or use local tensors not tied to queues? The pipe supports multiple queues. For intermediate, we can have multiple independent queues, but that uses more UB. However we have budget: let's compute worst-case floats: x: tileLen, y: tileLen, intermediate1: tileLen, inter2: tileLen, inter3: tileLen = 5 tileLen floats. That matches leaky_relu's 5 tileLen. So same budget: UB_BUDGET_BYTES / (5*4) = UB_BUDGET_BYTES/20 per element? But memory 2 says UB_BUDGET_BYTES/28. So we must use that to avoid vector core exception. So we use 28 bytes per element? Actually that's for some other operation? Let's follow memory 2: set ALIGN_ELEMS=16, HARD_CAP_ELEMS=4096, maxTile=UB_BUDGET_BYTES/28. That implies we think each element uses 28 bytes of UB? That's 7 floats per element? That's odd but we follow the repair memory. So tiling will compute tileLen accordingly.
+
+In kernel, we still need to allocate local tensors. We can allocate 4 tensors: inX, outY, and two intermediate (tmp1, tmp2). That's 4 tileLen floats, but we might need 5? Let's plan: step1: compute x3 = pow(x,3) = x*x*x. We can do Mul(xLocal, xLocal, x3Local)? Actually need three multiplications. Could do: x2 = AscendC::Mul(xLocal, xLocal); x3 = AscendC::Mul(x2, xLocal). Then term = xLocal + 0.044715 * x3. Then term2 = sqrt2pi * term. Then tanh = AscendC::Tanh(term2). Then result = 0.5 * xLocal * (1.0 + tanh). So we need temporary for x2, x3, term, term2, tanh, result. But many can reuse same memory: e.g., after computing x3, we can reuse x2 buffer for term. We'll carefully reuse. Use three extra tensors: t1, t2, t3. Steps: 
+1. Load x -> xLocal.
+2. Mul(xLocal, xLocal, t1) -> x2.
+3. Mul(t1, xLocal, t2) -> x3.
+4. Muls(t2, 0.044715f, t2) -> 0.044715*x3.
+5. Add(t2, xLocal, t2) -> x + 0.044715*x3.
+6. Muls(t2, sqrt2pi, t2) -> sqrt2pi * that.
+7. Tanh(t2, t3) -> tanh.
+8. Add(t3, 1.0f, t3) -> 1+tanh.
+9. Mul(t3, xLocal, t3) -> x*(1+tanh).
+10. Muls(t3, 0.5f, yLocal).
+
+We need t1, t2, t3. That's 3 intermediates plus x and y = 5 tileLen floats. Good.
+
+Now implement kernel with double buffering for in and out, and a single intermediate queue? But we need three separate intermediate buffers. We can use a queue with multiple buffers? Or allocate them directly from pipe not via queue. AscendC allows allocating local tensors without queue using pipe.AllocTensor? Not typical. We can create separate queues for each intermediate but that overcomplicates. Instead, we can use a single "temp" queue with multiple buffer slots. In leaky_relu, they used tmpQueue with 1 buffer. But we can set BUFFER_NUM=3 for tmpQueue? Then we can allocate each intermediate sequentially. We'll define tmpQueue with BUFFER_NUM=3. But careful: enqueue/dequeue order. We'll allocate t1, t2, t3 from tmpQueue in order, use them, then free all. That should work.
+
+Thus kernel design: 
+- inQueueX: 2 buffers
+- outQueueY: 2 buffers
+- tmpQueue: 3 buffers (all same tileLen)
+
+Process: iterate over grid-stride tiles, prefetch next tile for overlap.
+
+Implementation details: Use AscendC::Muls, Mul, Add, Tanh. Need to include math header? Possibly kernel_operator.h already includes some math functions. We'll use AscendC::Tanh.
+
+Now python_bind_src: similar to leaky_relu but for min_gpt_new_gelu_custom. Use aclnnMinGptNewGeluCustom. Since no attr, just pass tensor.
+
+model_src: import custom_ops_lib, call function min_gpt_new_gelu_custom. original model forward returns f(x); new model should do same.
+
+Also note: In host_operator_src, we must set InferShape and InferDataType. Also register op with correct naming.
+
+Check memories: all required blocks must be present. We'll produce them.
+
+One more: In project_json_src, no attr needed because no extra parameters beyond input.
+
+Let's write code.

@@ -1,0 +1,208 @@
+We need to analyze the correctness failure. The previous attempt compiled successfully but produced all zeros output. The kernel is supposed to implement torch.tril(x, offset). The reference output (golden) shows lower-triangular elements preserved and upper ones zeroed, with offset=1 (so also one superdiagonal preserved). The new output is all zeros, meaning the kernel is not computing correctly.
+
+Looking at the kernel code in kernel_src: it processes tiles, and inside Compute it iterates over each element in the local tile and applies a row/col check. However, there are several issues:
+
+1. The tile processing uses base offset in global memory, but the row/col computation uses globalIdx % matSize (where matSize = height_*width_). However, the input tensor is 4D: [batch, channels, height, width]. The position within the last two dimensions (height, width) should be extracted from the global linear index after accounting for the batch and channel dimensions. The current code assumes that globalIdx % (height*width) gives the correct position within the matrix, but this is only true if the tensor is stored as [batch, channels, height*width] contiguous? Actually, the shape is (batch, n_channels, height, width) with ND format, so elements are stored in row-major order: index = ((b * n_channels + c) * height + h) * width + w. So the last two dimensions are indeed the inner dimensions, and the "matrix" is actually each (height, width) slice for each (b,c) pair. So globalIdx % (height*width) gives the index within the slice. That seems correct.
+
+2. But the row and col calculation: row = matIdx / width_, col = matIdx % width_. Then condition: col - row <= offset_. For tril, the condition is col <= row + offset. Actually torch.tril: elements on and below the diagonal (including offset superdiagonals) are preserved. So condition is row >= col - offset. The standard condition is: keep if col <= row + offset. The code uses static_cast<int32_t>(col) - static_cast<int32_t>(row) <= offset_. That's equivalent to col - row <= offset, which is col <= row + offset. Yes, that's correct.
+
+3. So why does the kernel output all zeros? Perhaps the tiling data is not being passed correctly, or the kernel is not reading the tiling data correctly. The warning "tiling struct [Ca6k00290CustomTilingData] is conflict with one in file ca6k00290_custom_tiling.h, line 5" suggests a potential naming conflict. But the compilation succeeded and the kernel ran but produced zeros. Another possibility: the grid-stride loop in Process() is not covering all elements? It uses: for (uint32_t base = blockIdx * tileLen_; base < totalLen_; base += blockNum * tileLen_). That's fine.
+
+4. The Compute function uses xLocal(i) to read element i of the local tensor, but the local tensor is a 1D buffer of length len. However, the index i should correspond to the global element at base + i. That is fine.
+
+5. But there's a subtle bug: the CopyIn and CopyOut use AscendC::DataCopy with len number of elements, not bytes. DataCopy copies elements (each float) by specifying number of elements, not bytes. That's correct.
+
+6. However, the Compute function does not use any vector instructions; it's a scalar loop. In AscendC, scalar operations are allowed but must be done carefully because local tensors are accessed via operator() which returns a scalar reference. That should work.
+
+7. More likely issue: the tileLen_ might be too large, causing out-of-bounds access or segmentation fault. But all zeros suggests the kernel might be setting all elements to 0.0f? Actually, the Compute function sets yLocal(i) = 0.0f for out-of-triangle elements, and yLocal(i) = val for in-triangle. If the condition is always false (i.e., col - row <= offset is never true), then all zeros would be produced. But that seems unlikely. Or maybe the condition is reversed? Let's double-check: For offset=1, we want to keep elements where col <= row+1. For triangular, we keep if col <= row + offset. The code checks: if (static_cast<int32_t>(col) - static_cast<int32_t>(row) <= offset_) -> true means below diagonal? Example: row=2, col=3, offset=1 --> col-row=1 <=1 -> true, should keep. That's correct. So condition is fine.
+
+8. Another potential issue: the tiling data fields: offset is passed as int32_t, but the kernel reads tiling_data.offset. In the host operator, we set tiling.set_offset(*offset) where offset is a pointer to int32_t from attrs. That's correct.
+
+9. However, there is a mismatch in the host_operator_src: the include header is "#include "ca6k_00290_custom_tiling.h"" but the tiling data class is defined in host_tiling_src with include guard? Actually the host_tiling_src defines the tiling data in a namespace. The host_operator_src should include the correct header. The previous attempt used "#include "ca6k_00290_custom_tiling.h"". But in the previous attempt, the project_json_src has op name "Ca6k00290Custom", and the host operator file is likely compiled as ca6k_00290_custom.cpp. The tiling header should be named ca6k_00290_custom_tiling.h? Actually the build system expects the tiling file name to match the operator name. The previous attempt had host_tiling_src defining Ca6k00290CustomTilingData, and the host_operator_src includes "ca6k_00290_custom_tiling.h". That should be consistent.
+
+10. The warning "tiling struct [Ca6k00290CustomTilingData] is conflict with one in file ca6k00290_custom_tiling.h, line 5" suggests that there might be duplicate definitions because the build generates another tiling file automatically? But that warning might not be fatal.
+
+11. Another critical issue: the kernel uses a scalar loop over each element. For a tiled processing, the tile length might be large (e.g., 32768 elements). That loop in Compute is serial, which could be extremely slow but should still produce correct results. However, the fact that output is all zeros suggests that the kernel might be writing all zeros due to an issue in the global memory addressing or the DataCopy. Let's examine the CopyOut: it copies from yLocal to yGm_[gmOffset] with len elements. That should write the computed values to global memory. But if the Compute function never sets yLocal to non-zero, those zeros are written. So the condition must be wrong.
+
+12. Wait: The condition uses int32_t cast for col and row. col and row are uint32_t from computation. If offset_ is stored as int32_t (from tiling), but in the kernel we set offset_ from tiling_data.offset which is int32_t. That's fine. But if offset_ is negative? In the example, offset=1, positive.
+
+13. However, there's a potential off-by-one: torch.tril offset: positive offsets include more superdiagonals. For a matrix, rows and columns are 0-indexed. The condition col <= row + offset. That is what we have: col - row <= offset. But note: the tensor has shape (batch, n_channels, height, width). The last two dimensions are height and width. The row is along height, col along width. The tril offset applies to these last two dimensions. So correct.
+
+14. Let's also check the tile iteration: In Process, for each tile, we compute curLen = min(tileLen_, remaining). In Compute, we use xLocal(i) for i=0..curLen-1. But the computation of matIdx uses globalIdx = base + i. That's fine. But what about the alignment? The tile length may not be a multiple of width? The row/col calculation assumes that each row has exactly width_ elements, which is true. But if tileLen_ is not aligned to width, then the loop will process partial rows. However, the condition still works on a per-element basis. So should be fine.
+
+15. The output is all zeros, so maybe the condition is always false for all elements because row and col indices are computed incorrectly. Let's simulate for a tiny case: Suppose height=2, width=2, offset=1, tensor of shape [1,1,2,2]. Elements: (0,0), (0,1), (1,0), (1,1). Conditions: col-row <=1? For (0,0): 0-0<=1 true; (0,1):1-0<=1 true; (1,0):0-1<=1 true; (1,1):1-1<=1 true. So all elements kept. That would not produce all zeros. But if offset=0, then (0,1):1-0>0 false, that element would be zero. However, the test offset is 1, so all elements would be kept for a 2x2 matrix. But the actual tensor is 2048x2048, so many elements should be kept.
+
+Thus the condition is correct.
+
+16. Perhaps the issue is that the kernel is not being called with the correct arguments, or the tiling data is not being read properly. The warning "tiling struct ... conflict" might indicate that the automatic code generation creates a different tiling struct, and the kernel is using the wrong one. But the kernel uses GET_TILING_DATA which reads from the pointer provided by the runtime. The tiling data structure in the kernel must match exactly the one defined in host_tiling_src and used in host_operator_src. The fields defined in host_tiling_src are: totalLength, tileLength, blockDim, height, width, offset. The kernel reads totalLength, tileLength, height, width, offset. It does not use blockDim. That's fine.
+
+17. But note: the order of fields in the tiling data matters. In host_tiling_src, the order is: totalLength, tileLength, blockDim, height, width, offset. In the kernel, we read tiling_data.totalLength, tiling_data.tileLength, tiling_data.height, tiling_data.width, tiling_data.offset. The blockDim field is present but not used. The GET_TILING_DATA macro typically uses packed struct alignment? The AscendC framework expects the tiling data to be packed. The field order must match. That should be fine.
+
+18. Another possibility: the kernel uses a scalar loop that is extremely slow, and perhaps the runtime is not executing it correctly due to timeout? But it produced output (all zeros) so it did run.
+
+19. Let's check the model_src: It creates ModelNew with init_inputs, which are [n_channels, tril_offset]. In __init__, it sets self.tril_offset = init_inputs[1] (since len>=2). That's correct. In forward, it calls fn(x, self.tril_offset). The python_bind_src defines ca6k_00290_impl_npu which takes at::Tensor self and int64_t offset, and calls EXEC_NPU_CMD(aclnnCa6k00290Custom, self, offset, result). That should call the operator.
+
+20. The project_json_src has "attr" with name "offset", default 0, type int. So the operator expects an attribute "offset". That is passed in the ACL call as the second argument. Should be fine.
+
+21. The critical error is that the kernel output is all zeros, while golden output has correct tril. So the kernel's Compute is not acting correctly. Let's re-examine the Compute function more carefully:
+
+```
+__aicore__ inline void Compute(uint32_t base, uint32_t len) {
+    AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+    AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+
+    const uint32_t matSize = height_ * width_;
+
+    for (uint32_t i = 0; i < len; ++i) {
+        uint32_t globalIdx = base + i;
+        uint32_t matIdx = globalIdx % matSize;
+        uint32_t row = matIdx / width_;
+        uint32_t col = matIdx % width_;
+        float val = xLocal(i);
+        if (static_cast<int32_t>(col) - static_cast<int32_t>(row) <= offset_) {
+            yLocal(i) = val;
+        } else {
+            yLocal(i) = 0.0f;
+        }
+    }
+
+    outQueueY_.EnQue(yLocal);
+    inQueueX_.FreeTensor(xLocal);
+}
+```
+
+Consider the case where the tensor has batch=2, channels=3, height=2048, width=2048. The total elements = 2*3*2048*2048. The global index is linear. The "matrix" for each (b,c) pair is of size height*width. The modulo operation matIdx = globalIdx % matSize gives the index within that matrix. However, this assumes that all matrices are processed in order: first all elements of (b=0,c=0), then (b=0,c=1), etc. In row-major storage, that is correct. So matIdx is correct.
+
+But row = matIdx / width_, col = matIdx % width_. That correctly gives the (h,w) coordinates within that slice.
+
+The condition col - row <= offset_ should work.
+
+But why all zeros? Could it be that the kernel is not reading the correct value of offset_? Perhaps offset_ is 0? In the tiling, we set tiling.set_offset(*offset) where offset is pointer from attrs. The default value in project_json is 0, but the test passes tril_offset=1. The runtime should set the attribute to 1. Let's check python_bind_src: it passes offset as second argument to the ACL function. The ACL function should set the attribute. So offset should be 1.
+
+But the kernel output is all zeros, which would happen if condition is always false. For condition to be always false, we need col - row > offset for all elements. For offset=1, the only elements where col - row > 1 are those with more than one columns below the row? Actually condition false when col > row+1. That is for elements strictly above the first superdiagonal. Many elements are on or below the diagonal, so they would be kept. But all zeros suggests that the condition is never true, i.e., offset is being treated as -1 or something. Maybe offset_ is negative? But we set it as int32_t, and the input is positive.
+
+Alternatively, perhaps the Compute function is not being called at all? But then CopyOut would write uninitialized yLocal which might be zeros or garbage. But the output is consistent zeros, so likely yLocal is initialized to zeros (LocalTensor allocated from pipe may be zero-initialized). That would produce zeros.
+
+But if Compute is not called, then the pipeline would not enqueue yLocal, and CopyOut would try to dequeue from an empty queue, causing a hang or error. So Compute must be called.
+
+Another possibility: the CopyIn and Compute order: Process does CopyIn, then Compute, then CopyOut. But before Compute, we call CopyIn which allocates and enqueues xLocal. Then Compute dequeues xLocal, computes, enqueues yLocal. Then CopyOut dequeues yLocal. That's correct.
+
+But what if the tileLen_ is 0? In host operator, we compute tileLen with alignment. But if totalLength < ALIGN_ELEMS, we set tileLen = totalLength (if aligned down yields 0, use totalLength). So tileLen should be >0. But the Process has an early return if totalLen_==0 or tileLen_==0. Should be fine.
+
+22. I suspect a bug in the grid-stride loop: for (uint32_t base = blockIdx * tileLen_; base < totalLen_; base += blockNum * tileLen_). This works only if all blocks have the same tileLen_. That's fine. But what if tileLen_ is not a multiple of the slice size (width)? That's okay.
+
+23. However, there is a critical issue: the kernel uses a scalar loop over each element, which is extremely inefficient and might exceed some execution time limit? But that wouldn't cause wrong values, only timeout.
+
+24. Let's look at the compute: xLocal(i) and yLocal(i) access the i-th element of the local tensor. That is correct.
+
+25. Another possibility: the local tensor size is tileLen_ * sizeof(float). But the DataCopy copies len elements, which may be less than tileLen_ (curLen may be less than tileLen_ for the last tile). However, when we allocate the local tensor in CopyIn, we use inQueueX_.AllocTensor<float>() without specifying size; it uses the size set during pipe_.InitBuffer: tileLen_ * sizeof(float). So the local buffer has capacity for tileLen_ elements. But we only copy len elements into it. The remaining elements are uninitialized. In Compute, we only access i from 0 to len-1, so that's fine. Similarly, we allocate yLocal with same size. That's fine.
+
+26. But the condition might be wrong due to an integer overflow? For large globalIdx, the modulo matSize might be incorrect if matSize is not a power of 2? No, modulo is correct.
+
+27. I think the most likely issue is that the tiling data fields are not being read correctly because of alignment/packing mismatch. The AscendC GET_TILING_DATA macro expects the tiling data structure to be packed (aligned to 1 byte). The TILING_DATA_FIELD_DEF uses default alignment. There might be padding between fields because of uint32_t and uint32_t and int32_t. In the host_tiling_src, the fields are: uint32_t totalLength, uint32_t tileLength, uint32_t blockDim, uint32_t height, uint32_t width, int32_t offset. All 4-byte types, so no padding. Should be fine.
+
+28. Another potential issue: the function signature of the kernel is: extern "C" __global__ __aicore__ void ca6k_00290_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling). GET_TILING_DATA(tiling_data, tiling) expands to something like: const Ca6k00290CustomTilingData &tiling_data = *reinterpret_cast<const Ca6k00290CustomTilingData*>(tiling); That should work.
+
+29. The warning in the log about tiling struct conflict might be causing the system to use a different tiling struct. But the kernel is compiled with the same header, so it should use the same. The conflict might be benign.
+
+30. Let's think about the possibility that the kernel is not being executed on the actual data because of some optimization? Unlikely.
+
+31. I'll propose a fix: Instead of a scalar loop, use vectorized operations for performance and correctness. But the correctness failure might be due to the loop not executing correctly. Maybe the issue is that the kernel does not have a proper synchronization between tiles? Or the offset is not being taken as signed? The comparison uses int32_t cast for col and row, but col and row are uint32_t. If offset is large (positive), the subtraction could overflow if col is large? For col=2047, row=0, col-row = 2047, which fits in int32_t. So no overflow.
+
+32. Another possible bug: In the Compute function, we compute matIdx = globalIdx % matSize. But what if globalIdx is large (up to 2*3*2048*2048 = 25 million) and matSize is 4 million, modulo is fine.
+
+33. I'm leaning towards the condition being incorrectly inverted. Let's double-check with example: Suppose offset=1, row=0, col=1. Then col-row=1 <=1 true, so we keep. That is correct (superdiagonal). If row=1, col=0: 0-1=-1 <=1 true, keep (below diagonal). So all elements are kept. But the golden output shows many zeros for upper triangle beyond superdiagonal. So for row=0, col=2 (assuming width>2), col-row=2 >1, should be zero. That's correct. So condition is correct.
+
+34. So why all zeros? Must be that the input data xLocal is always zero? Check CopyIn: data is copied from xGm_[gmOffset] for len elements. But if xGm_ is not set correctly? We set xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_); That is correct.
+
+35. Another possibility: The kernel is only executed for blockIdx=0 due to some grid configuration? But the output shape matches input shape, so all elements are written. If only block 0 runs, it would write only first tile of zeros (or correct values) and leave rest as zeros? But the output shows all zeros, so maybe even block 0 writes zeros.
+
+36. Let's test the condition in Python: Suppose we have a tensor of shape (1,1,3,3) with offset=1. The tril output would be:
+[[1,1,0],
+ [1,1,1],
+ [1,1,1]] if values are [1,2,3,4,5,6,7,8,9] row-major. The condition col-row<=1 yields (row0,col0)0<=1 true, (0,1)1<=1 true, (0,2)2<=1 false, (1,0)-1<=1 true, (1,1)0<=1 true, (1,2)1<=1 true, (2,0)-2<=1 true, (2,1)-1<=1 true, (2,2)0<=1 true. So position (0,2) is zero. So some zeros. But in the test output, the golden output shows large areas of zeros in the upper right, not all zeros. The new output is all zeros.
+
+37. I suspect the kernel might be using a different condition: if (col - row > offset) then set to 0, else keep. That's what we have. But maybe the condition is reversed in the actual execution due to a logic error? No, the code is straightforward.
+
+38. Another idea: The kernel function name in the kernel_src is "ca6k_00290_custom". The GET_TILING_DATA macro might rely on the operator name to find the tiling struct. The op name in project_json is "Ca6k00290Custom". The tiling data struct is "Ca6k00290CustomTilingData". The macro GET_TILING_DATA(tiling_data, tiling) is defined in the header and works with the struct name. But the kernel function is named "ca6k_00290_custom", which might be different from the operator name. However, the entry point can be any name; the operator infrastructure maps the kernel name to the binary based on the kernel registration. In the host_operator_src, we didn't set the kernel name explicitly; the kernel is compiled and packaged with the operator. The link between operator and kernel is done by the build system based on the op name and kernel name in the project JSON? Actually, in the build system, the kernel source file should have a function with a specific name that matches the operator name? In the original example, the kernel function is "leaky_relu_custom" and the operator name is "LeakyReluCustom". They are different but it worked. So that should be fine.
+
+39. Wait: In the original example, the project_json_src has "op": "LeakyReluCustom", and the kernel function is "leaky_relu_custom". The build system matches them by convention? Possibly the kernel file name should match the op name? But the example works.
+
+40. I think the most promising fix is to ensure the tiling data fields are read correctly by making the struct packed and aligned. Also, the offset field should be int32_t, but we can use int32_t.
+
+41. However, the all-zero output strongly suggests that the Compute function always goes to the else branch, setting yLocal(i)=0.0f. That would happen if the condition is always false. For that to happen, we need col - row > offset_ for all elements. But if offset_ is large positive, many elements satisfy condition. For all elements to fail, offset_ would have to be negative and large in magnitude. For example, offset_ = -2048 would make col - row > -2048 almost always true except for col very negative? Actually, col - row can be as low as -2047 (if col=0, row=2047). If offset_ is -2048, then col - row > -2048 is almost always true (since -2047 > -2048 true), so many elements would still be true. To have all false, offset_ would need to be very negative such that col - row <= offset_ never holds. Since min col-row is -2047, if offset_ < -2047, then condition never true. Could offset_ be -32768? No, int32_t, default is 0. But maybe the tiling data is not being set correctly, and offset_ remains uninitialized (0) or some negative value. But if offset_ is 0, then condition col - row <= 0 would be false for elements above the main diagonal, i.e., col > row. That would set those to zero. But many elements (on or below diagonal) would be kept. So not all zeros.
+
+44. So the only way to get all zeros is if offset_ is negative such that col - row <= offset_ never true, or if the buffer is never written with actual values. But we saw that CopyIn copies from global memory. Possibly the global memory pointer is wrong? Or the kernel is not reading from xGm_ correctly?
+
+45. Let's examine the Process loop again: for (uint32_t base = blockIdx * tileLen_; base < totalLen_; base += blockNum * tileLen_). This works only if all blocks have the same tileLen_. That's fine.
+
+46. But what if tileLen_ is 0? Then base remains 0 and the loop condition base < totalLen_ is true (since totalLen_ >0), but the loop body would have curLen = totalLen_ - base = totalLen_, which is > tileLen_? Actually, if tileLen_=0, then the condition "if (curLen > tileLen_) curLen = tileLen_;" would set curLen = 0. So CopyIn with len=0, then Compute with len=0, then CopyOut with len=0. That would cause no data movement. And since the output tensor is allocated with empty_like, it might be zero-initialized. So all zeros. Is it possible that tileLen_ becomes 0? In host_operator_src, we compute tileLen with AlignDown and maxTile. If totalLength is less than ALIGN_ELEMS, we use aligned = AlignDown(totalLength, ALIGN_ELEMS). If totalLength < ALIGN_ELEMS, then aligned = 0, then we set tileLen = (aligned > 0) ? aligned : totalLength. So if totalLength>0, tileLen = totalLength (not zero). So tileLen should be >0. But in the kernel, tileLen_ is set from tiling_data.tileLength. So it should be >0.
+
+47. Another possibility: the tiling data is not being passed correctly because the workspace and tiling addresses are swapped? In the kernel signature, the parameters are: GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling. The runtime passes tiling data as the fourth argument. The GET_TILING_DATA macro uses the fourth argument. That's standard.
+
+48. Let's look at the autogen code: the build system generates aclnn_ca6k00290_custom.cpp which probably calls the kernel with appropriate arguments. That should be fine.
+
+49. Perhaps the issue is that the kernel is using a scalar loop which is not allowed in AscendC? No, scalar operations are allowed, but the loop might be optimized away? Unlikely.
+
+50. I'll propose a revised kernel that uses vectorized operations where possible, but more importantly, I'll ensure that the Compute uses the correct condition and also add debugging? But we can't debug. Instead, I'll rewrite the kernel to use a different approach: process each row per slice using vectorized operations to set zeros above the diagonal. But that would require more complex indexing and might be error-prone.
+
+Given the time, I think the simplest fix is to ensure that the tiling data struct is packed and to double-check the condition. Also, I'll add a check: if the condition is true, set yLocal(i) = xLocal(i); else set to 0.0f. That's what we have.
+
+But to resolve the all-zero output, I suspect the issue is that the local tensor buffer size is tileLen_ * sizeof(float), but when we allocate tensors in queue, we don't specify size; it uses the size set in pipe_.InitBuffer. That size is in bytes. That is correct.
+
+I'll try a different approach: instead of computing row/col mod matSize, we can compute the row and col directly from the global index using the batch and channel dimensions? Actually, we need to know the number of channels and batch to compute the starting index of each matrix. But we can compute the linear index within the 4D tensor. We have the shape: (batch, channels, height, width). The strides: width, height*width, channels*height*width, batch*channels*height*width? Actually, ND format is row-major with innermost dimension contiguous. So the stride for the last dimension is 1, for the previous is width, etc. But we only need the row and col within the matrix. The matrix index within the total can be computed as: globalIdx % (height*width) gives the index within the matrix. This works regardless of batch and channels because they are outer dimensions. So that part is correct.
+
+But maybe the issue is integer division/modulo is slow? Not relevant.
+
+I'll try to think of another scenario: the kernel is being compiled for a different architecture? It says ascend910b, which is correct.
+
+Given the difficulty, I'll make a minimal change: In the kernel, ensure that the offset is read as int32_t and use it correctly. Also, I'll change the condition to: if (row + offset_ >= col) { keep } else { zero }. That is equivalent to col <= row + offset, which is col - row <= offset. The current code uses col - row <= offset, which is same. But maybe due to unsigned integer promotion? col and row are uint32_t, offset_ is int32_t. In expression (static_cast<int32_t>(col) - static_cast<int32_t>(row)) <= offset_, both sides are int32_t, fine.
+
+I wonder if the build system's autogen tiling struct has different field ordering or includes extra fields. The warning "tiling struct is conflict" suggests that there is an automatically generated tiling struct from the project JSON that might have only the fields defined in the op (totalLength, tileLength, blockDim, height, width, offset?) but maybe not all. The autogen tool might generate a tiling data struct based on the op's tiling data descriptor. But we defined our own tiling data in host_tiling_src. The build system might generate another one from the tiling descriptor in the project JSON? Actually, the project JSON doesn't contain tiling data definition; it's only in the C++ files. The warning might be because there are two definitions of the same struct in different included headers. That should not cause functional issues.
+
+Let's re-check the host_tiling_src: The file name should be "ca6k_00290_custom_tiling.h" or "ca6k00290_custom_tiling.h"? In the host_operator_src, we include "ca6k_00290_custom_tiling.h". But the project structure might expect the tiling header to have the same name as the op file, which is "ca6k_00290_custom.cpp" -> tiling header "ca6k_00290_custom_tiling.h". That's fine.
+
+But the log shows: "op_host/CMakeFiles/cust_optiling.dir/ca6k00290_custom.cpp.o" and "op_host/CMakeFiles/cust_optiling.dir/ca6k_00290_custom.cpp.o" both exist. There might be two source files with similar names: ca6k00290_custom.cpp and ca6k_00290_custom.cpp. The build system might be processing both, causing duplicate definitions. In the project, the host operator file is generated from the project JSON and the user-provided host_operator_src. The kernel file is generated from kernel_src. The tiling header is generated from host_tiling_src. The autogen might produce a file named ca6k00290_custom.cpp (without underscore) while our host_operator_src is named ca6k_00290_custom.cpp (with underscore). That could cause the warning and potential issues. The previous attempt used host_operator_src with underscore, but the project_json has op "Ca6k00290Custom". The autogen may generate source files with the op name in lowercase without underscores. That could cause two different host operator files to be compiled, leading to duplicate symbols. However, the build succeeded.
+
+Perhaps the duplicate causes the tiling data struct to be defined twice, and the linker picks one. The warning says "tiling struct [Ca6k00290CustomTilingData] is conflict with one in file ca6k00290_custom_tiling.h, line 5". That suggests that there is a file ca6k00290_custom_tiling.h (without underscore) that also defines the same struct. That might be the autogen file. So our host_tiling_src should be consistent with the autogen expectations. We need to ensure our tiling header file name matches the op name without underscore? Actually, the op name is "Ca6k00290Custom". The build system might generate tiling header with name "ca6k00290_custom_tiling.h" (all lowercase, with underscores between words). In the log, there is "ca6k00290_custom_tiling.h" and "ca6k_00290_custom_tiling.h"? The warning mentions "ca6k00290_custom_tiling.h". Our host_operator_src includes "ca6k_00290_custom_tiling.h", which is different. So the include might not find the correct header, and the linker uses the one from autogen? But our host_operator_src includes our custom header, but if the autogen also generates a header with the same struct, there could be conflict. To avoid conflict, we should ensure our tiling header name matches the autogen's expectation. The build system expects the tiling header to be named after the op file, which is derived from the op name. The op name "Ca6k00290Custom" should map to file "ca6k00290_custom.cpp" and tiling header "ca6k00290_custom_tiling.h". So we should use that name. In the previous attempt, the host_operator_src file was named "ca6k_00290_custom.cpp"? Actually, the host_operator_src content is what? It's provided as a string and will be written to a file by the build system. The build system's project structure expects the host operator file to be named after the op name with underscore format. In the previous attempt, the host_operator_src content is used to generate the file. But the autogen also generates a file. There might be a naming mismatch.
+
+To fix, we should use the correct file naming. In project_json_src, the "op" is "Ca6k00290Custom". The build system will generate files with name "ca6k00290_custom" (without underscore between 6k and 00290? Actually, "ca6k00290_custom" because it lowercases and inserts underscores at word boundaries? The default is to convert CamelCase to snake_case: "ca6k00290_custom". That is "ca6k00290_custom" (no extra underscore after '6k' because '6k' is not a word boundary). So the filename should be "ca6k00290_custom.cpp" and tiling header "ca6k00290_custom_tiling.h". In the previous attempt, we used "ca6k_00290_custom_tiling.h" with an extra underscore. That might cause the include to not find the header, but the build succeeds because there is also an autogen header. However, the tiling struct from our header and the autogen struct might be different? The autogen might generate a minimal tiling struct with only the fields defined in the project JSON? But our project JSON doesn't have tiling data fields. So the autogen tiling struct might be empty or have default fields. That could cause the kernel to read garbage.
+
+Thus the fix is to align the tiling header naming and include. Also ensure that our tiling data struct is the one that gets used. We should name the tiling header file correctly: "ca6k00290_custom_tiling.h" and include it accordingly in host_operator_src. Also, the kernel should include the tiling header to use GET_TILING_DATA. The kernel includes "kernel_operator.h" which might not include the tiling header. It relies on GET_TILING_DATA macro being defined. That macro is defined in the kernel header when the tiling data struct is declared. But the kernel file does not include the tiling header; the build system provides the tiling data definition through the generated header. The kernel should include the correct tiling header. In the previous attempt, the kernel_src does not include any tiling header; it just uses GET_TILING_DATA which is provided globally. But if the macro definition is not available, compilation would fail. It compiled, so it must be available. But the macro might be expecting a specific struct name. GET_TILING_DATA(tiling_data, tiling) expects a struct with name OpName + "TilingData". Since our struct is Ca6k00290CustomTilingData, and the op is Ca6k00290Custom, it should match. So that's fine.
+
+However, the conflict warning indicates there are two definitions of the struct: one in our tiling header and one in the autogen tiling header. The autogen tiling header might have a different layout if it was generated from a different schema. To avoid that, we should not define our own tiling data in a separate header; instead, we can put the tiling data definition in the host_operator_src? But the build system expects a tiling header file. The standard approach is to provide host_tiling_src which will be written to a file and included. The autogen also generates a tiling header. If both have the same struct definition, there will be a conflict. Usually, the user should provide the tiling data definition in the host_tiling_src, and the autogen should not generate another one if the user provides one. But the autogen might still generate one if the project JSON contains tiling data fields? In our project_json_src, we don't have any tiling data fields, so the autogen might generate an empty or default tiling struct. That could conflict.
+
+To fix, I propose to remove the custom tiling data definition and instead use the default tiling data provided by the framework? But we need to pass the offset and shape info. The standard way is to define the tiling data in the host_tiling_src and the build system should use it. The warning might be harmless, but the kernel might still read the wrong struct if the linker picks the wrong one.
+
+Given the output is all zeros, it's likely that the tiling data being read has zero totalLength or zero tileLen or wrong offset. I'll adjust the host_tiling_src to use the same file naming as autogen: change the tiling header to be "ca6k00290_custom_tiling.h" and update include in host_operator_src accordingly. Also, ensure that the fields are exactly as expected. Additionally, I'll simplify the kernel: instead of processing the whole tensor with row/col per element, I'll assume four-dimensional input and use the shape knowledge. Also, I'll use vectorized Compare and Select operations to improve performance.
+
+But the main issue is correctness. I'll rewrite the kernel to be simpler: treat the input as 4D, but process each tile as a 1D chunk, and for each element compute row/col. To avoid the potential tiling struct conflict, I'll rename the tiling struct to include the op name correctly.
+
+Also, in the host_operator_src, we should set the tiling data using the correct field names. The fields are: totalLength, tileLength, blockDim, height, width, offset. That matches the kernel.
+
+I'll make the following changes:
+
+- In project_json_src, rename the op to "Ca6k00290Custom" (already).
+- In host_tiling_src, define the struct as Ca6k00290CustomTilingData with fields in order: totalLength, tileLength, blockDim, height, width, offset. Use the same field names as before.
+- In host_operator_src, include "ca6k00290_custom_tiling.h" (without the extra underscore). Also, ensure the namespace is correct.
+- In kernel_src, include the tiling header? Actually, the build system provides the tiling struct automatically. The kernel should include the header that defines the type, which is typically provided by the build system via a generated header. In the previous example, the kernel did not include any tiling header; it just used GET_TILING_DATA. That works because the macro is defined when the operator is built. So we don't need to include anything. But to be safe, we can include the tiling header in the kernel. However, the kernel_src is compiled separately; the build system may insert the include. I'll not include it explicitly.
+
+- I'll also fix the Compute function to correctly handle the condition, but I'll also add a check: if (row + offset >= col) keep else zero. That is the same.
+
+But the root cause of all zeros might be something else. Let's check the model_src: it passes x and self.tril_offset to the custom op. The python_bind_src defines the function ca6k_00290_custom which calls aclnnCa6k00290Custom. The function expects a tensor and an int64_t offset. That's fine.
+
+However, note that the example leaky_relu had a scalar attribute (negative_slope) passed as a float, and the python_bind_src passed it as double. Here offset is int64_t. The project JSON defines "attr" with type "int", which likely maps to int64_t. That's fine.
+
+One more check: in the host_operator_src, we set tiling.set_offset(*offset). But the attribute is of type int32_t? The project JSON says "type": "int". In Ascend, the runtime attribute for int is usually int64_t. But we read it as int32_t. That could truncate if the value fits, but for 1 it's fine. However, if the tiling field offset is int32_t and the attribute is int64_t, we might be reading only the low 32 bits. That's okay.
+
+But the kernel reads tiling_data.offset as int32_t. If the attribute is -1, it would be fine. For offset=1, it's positive.
+
+I think the most promising fix is to ensure the tiling header file name consistency. Let's adopt the same naming as the autogen: "ca6k00290_custom_tiling.h". Also, the host_operator_src file name should match the op name without underscore: "ca6k00290_custom.cpp". In the previous attempt, we had host_operator_src as a string that will be written to a file. The build system's project JSON specifies the op name, and the build tool will generate a file with that name. Our host_operator_src should be written to that file. The file name is determined by the project structure, not by the content. So we don't need to worry about the file name inside the source code. The include directive should reference the correct tiling header file. The tiling header file will be generated from host_tiling_src and placed in the same directory. So the include should be "ca6k00290_custom_tiling.h". That should resolve the conflict.
+
+Thus, I'll change the host_operator_src include to "#include "ca6k00290_custom_tiling.h"" and the host_tiling_src to define the struct in a header file with that name.
+
+Also, I'll modify the kernel_src to include the tiling header explicitly: #include "ca6k00290_custom_tiling.h". That should ensure the struct definition is available.
+
+Additionally, I'll simplify the loop to avoid potential issues with modulo and division. Instead of computing globalIdx % matSize each time, we can compute the base of the matrix containing globalIdx. But given time, I'll keep the loop but add a check: if (offset < 0 special case). But no.
+
+Let's now produce the corrected code.

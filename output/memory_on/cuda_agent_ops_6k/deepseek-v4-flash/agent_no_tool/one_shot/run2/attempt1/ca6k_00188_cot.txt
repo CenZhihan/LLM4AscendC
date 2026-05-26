@@ -1,0 +1,205 @@
+We need to implement torch.cummin as a custom AscendC operator. We'll produce six Python strings. The operator name stem is ca6k_00188, so JSON uses "Ca6k00188Custom". The kernel name should be ca6k_00188_custom. The reference computes cumulative minimum (along dim=0) and returns values (we only need values, not indices). Input shape: (10000, 128). We'll implement a fused cumulative min operator.
+
+We need to be careful: cummin is a scan operation. On Ascend, we need to implement an efficient parallel scan? But for simplicity, given the task expects a single op, we can implement a straightforward tile-based cumulative min. However, scanning across dim=0 of size 10000 with 128 columns - we can process each column independently. Could implement as a kernel that for each column, does a serial cumulative min. Since 10000 is large, we can use multiple blocks to process different columns. The operator can have one input tensor of shape (10000, 128) and output same shape. We'll define blockDim = 1? Actually we can parallelize over columns. Each column is independent. We'll use blockDim = number of columns (128) maybe? But we need to consider UB budget. Simpler: use one block per column, but the tiling logic can set blockDim = 128 or less. The kernel will iterate over rows for its assigned columns.
+
+Let's design: The operator accepts a 2D tensor. We'll compute cumulative minimum along dim=0 for each column. We'll flatten the tensor to have totalLength = rows * cols. But we need to know rows and cols. We can pass rows and cols via tiling data. The kernel: each block processes a contiguous chunk of columns. For each column, it does a serial loop over rows: keep a running min and write to output. This requires reading input and writing output.
+
+Implementation details:
+- Tiling data: totalRows, totalCols, tileRows (maybe not needed since we process columns in parallel). Actually we can partition columns among blocks: blockDim = number of blocks, each block processes a range of columns. We'll set blockDim to min(128, available cores) but we can just use 128 blocks if possible. We'll define in tiling: blockDim (number of blocks used), colsPerBlock (number of columns per block). The kernel: for each column in its range, it reads all rows sequentially, computes cumulative min, writes output.
+
+We need to be careful about UB budget: We need to allocate local memory for reading rows? We can process one column at a time: we can load a tile of rows? Actually cummin requires scanning entire dimension, so we can't avoid loading all rows for a column. We can load a small tile of rows (e.g., 1024) at a time and process in chunks. But cumulative min needs the previous min value from previous tile. So we can do a loop over rows with tile size, keeping a running min across tiles.
+
+We'll use a 1D array of input and output. The kernel will iterate over its assigned columns, and for each column, iterate over rows with tile size of rows (maybe hundreds). Since total rows 10000, we can tile rows as well. We'll set tileRows to a reasonable size like 2048. The kernel will loop over row blocks, maintaining a scalar running min. This requires only a small local buffer for one tile of input and one tile of output (maybe not needed to buffer output temporarily; we can write directly to global output using DataCopy, but we need to accumulate min. Better to read input tile into local, compute mins, write output tile.
+
+Implementation:
+- Input: x is a 2D float tensor of shape (rows, cols) in row-major. We'll treat it as (rows * cols) array. For column j, element at row i is index i*cols + j. We'll compute output[i*cols + j] = min_{k=0..i} input[k*cols+j].
+
+In kernel:
+- For each column j in block's range:
+  - Initialize runningMin = +inf (or first element).
+  - For row chunk start = 0; start < totalRows; start += tileRows:
+    - curRows = min(tileRows, totalRows - start)
+    - Load a tile of input values for this column: starting at address x + (start*cols + j), stride = cols? Actually elements are not contiguous in memory because column elements are spaced by cols. But we can load them as strided? The DataCopy in AscendC expects contiguous data? It can handle strided? Actually DataCopy can copy contiguous 1D data from global to local. For a column, the elements are not contiguous; they are separated by cols elements. So we cannot directly load a contiguous block. To load a tile of a column, we would need to use a gather operation or load row-wise. Better approach: instead of processing columns, process rows? But cummin along dim=0 requires scanning rows, so processing column-wise is natural but memory access is strided.
+
+Alternative: Since we have only 128 columns, we could transpose the data so that columns become contiguous. But that adds overhead. Another approach: Use a kernel that processes all columns at once, but with a double-buffered row-wise method? Actually we can iterate over rows: for each row, update running min for each column. That would be more memory-friendly: read one row (128 floats) from global, compute new cumulative min per column by comparing with previous row's cumulative min, write output row. That is straightforward: we can have a local buffer of size 128 for running min. Then we iterate rows from 0 to rows-1. At row i, read input row i, compute new min for each column: new_min = min(prev_min, input), write output row i. This requires only reading/writing one row at a time, which is contiguous. UB buffer: we need two buffers: one for input row (128 floats), one for output row (128 floats), and one for running min (128 floats). Total about 384 floats = 1536 bytes, well under UB budget. So this is easy.
+
+Thus the kernel will have one block? Actually we can parallelize by splitting rows? But cumulative min depends on previous rows, so we cannot parallelize rows; we must process sequentially. So we must have a single block? But for large rows, that's fine. However, we can also parallelize by columns if we use multiple blocks each processing a subset of columns, but then each block still must scan all rows for its columns. That would be independent. So we can split columns among blocks, each block having its own running min buffer for its assigned columns. That improves parallelism. We'll do that.
+
+Thus tiling: totalRows, totalCols, blockDim (number of blocks), colsPerBlock. For each block: process columns from blockIdx * colsPerBlock to min(blockIdx * colsPerBlock + colsPerBlock, totalCols). Since totalCols=128, we can set blockDim=1 or 8? We'll set blockDim to the number of available cores, but we need to set it in host operator. We'll compute blockDim as min(totalCols, 24) or so. Each block will have a local mini-buffer for the columns it handles. We'll allocate local tensors: inputRowBuf, outputRowBuf, runningMinBuf. The runningMinBuf is initialized with a large number (e.g., 10000 or INF). We'll use AscendC::LocalTensor<float>. We'll loop over rows: for i in range(totalRows): read input row for the columns this block cares about? But the input row for all columns is contiguous, but we only need a subset. Simpler: each block reads the entire row (128 floats) from global? That would cause duplicate reads across blocks. Better: each block reads its own columns by loading a piece of the row: starting at x[ i * totalCols + colStart ], length = numColsBlock. That is contiguous because columns of a row are sequential. So we can do that: for each row, load input slice of size numColsBlock. Then compute new min per column, write output slice. That is efficient.
+
+Thus kernel details:
+- Init: xGm_, yGm_, totalRows, totalCols, colStart, numCols, blockIdx (implicit from GetBlockIdx). We'll precompute colStart and numCols based on blockIdx and blockDim passed via tiling.
+- The host tiling will set blockDim, totalRows, totalCols. The kernel will compute colStart = (totalCols / blockDim) * blockIdx; numCols = ... adjust for remainder.
+- We'll have local buffers: inputRowBuf (numCols), outputRowBuf (numCols), runningMinBuf (numCols). Allocate in pipe.
+- Process: for row = 0..totalRows-1:
+  - CopyIn: DataCopy from xGm_[row*totalCols + colStart] of length numCols.
+  - Compute: for each column j in [0, numCols): new_min = min(runningMin[j], inputRow[j]); outputBuf[j] = new_min; runningMin[j] = new_min.
+  - CopyOut: DataCopy outputBuf to yGm_[row*totalCols + colStart].
+
+We'll use double buffering for input rows? Not strictly needed due to small size. But we can do simple single buffer.
+
+Now the host operator: need to set blockDim. Since totalCols=128, we can set blockDim = min(128, 24) = 24. But we need to ensure each block has at least some columns. If blockDim=24, colsPerBlock = ceil(128/24)=6 (some blocks get 5 or 6). That's fine.
+
+We also need to handle cases where tiles may be zero-length? No.
+
+Now, the python_bind_src: we need to bind the op to a function. Use EXEC_NPU_CMD with aclnnCa6k00188Custom. Provide implementation.
+
+Model_src: use custom_ops_lib to call the function.
+
+Now, produce the six strings. Note: The example uses r""" but we can use triple quotes with backslash escapes as needed. Also need to avoid breaking the Python parser.
+
+One more thing: the JSON must include "op" as root key. We'll have a single op Ca6k00188Custom.
+
+Let's write each one.
+
+project_json_src: JSON for operator Ca6k00188Custom with input x (float, ND), output y (float, ND), and attr dim (int) maybe? Actually we need to pass dim=0 as attribute. The reference uses dim=0. We'll make dim an attribute with default 0.
+
+host_tiling_src: Tiling header with fields: totalRows, totalCols, blockDim. (No need for tileRows since we process one row at a time.) Actually we need to pass blockDim and maybe colStart per block? Or we can compute in kernel from blockIdx and blockDim. The tiling data should contain enough info for kernel to know its range. We'll pass totalRows, totalCols, blockDim. Kernel will compute its own colStart and numCols using blockIdx, blockDim, totalCols.
+
+host_operator_src: Define TilingFunc that computes totalRows, totalCols from input shape (1-D? Actually input is 2D, so we need to get shape dims). The input shape is (rows, cols). We'll set shape size and compute dims. Also set blockDim = min(totalCols, 24) or maybe compute based on data size. We'll use a fixed maxBlocks = 24. But need to ensure correctness: the kernel uses GetBlockNum() and GetBlockIdx(), so host sets blockDim. We'll set blockDim = min(totalCols, 24). Also need to register InferShape and InferDataType.
+
+Since the JSON declares dim attribute, we can read it, but for simplicity we can ignore since we always use dim=0.
+
+Now, kernel_src: The kernel function ca6k_00188_custom.
+
+Note: The kernel name in the original example is leaky_relu_custom. Our kernel name should be ca6k_00188_custom. Must match the function name in extern "C" and the JSON operator name (the op name is Ca6k00188Custom, but the kernel implementation function is independent, but we must ensure the symbol matches the op registration? Typically the kernel function name is the same as the operator name in snake_case. The provided example uses leaky_relu_custom. So we use ca6k_00188_custom.
+
+However, in the project JSON, the op name is "Ca6k00188Custom". The generated code expects the kernel entry point to be e.g., ca6k_00188_custom. We'll match.
+
+Now, python_bind_src: Use aclnnCa6k00188Custom.
+
+Now, including necessary headers: "kernel_operator.h", "register/tilingdata_base.h", "register/op_def_registry.h", etc. as in example.
+
+Let's craft the strings.
+
+Important: Use correct namespaces and include guards. Also, for the host operator, we need to include "ca6k_00188_custom_tiling.h" (the generated tiling header). We'll name it after kernel name.
+
+Potential issues: The tiling data structure name in host_tiling_src must match: Ca6k00188CustomTilingData.
+
+Now, let's write each variable.
+
+I'll produce the answer as a single Python code block with six assignments.
+
+Note about repair memories: None directly related to cummin. But memory 1 mentions not using manual sigmoid; not relevant. Memory 2 warns about duplicate OP_ADD; we should avoid manual OP_ADD and rely on autogen. But our operator is not generated by autogen? Actually we are writing from scratch, so we need to register the op manually using OP_ADD? Or we can rely on the JSON-driven autogen to generate registration. In the example, they used OP_ADD in host_operator_src. But memory 2 says that if autogen already defines the operator, manual OP_ADD causes redefinition. In our case, we are creating a new operator, so autogen will generate REG_OP from JSON, and we should not also add OP_ADD? However, the example includes both JSON and host_operator_src with OP_ADD. That may be fine if we only have one registration. But to be safe, we can follow the example pattern: include OP_ADD in host_operator_src. Since we are not using autogen for the entire pipeline? Actually the standard flow is: JSON -> autogen generates registration and adaptor. Then host_operator_src provides the implementation. The autogen generates a REG_OP(...). OP_ADD is another way. The example uses OP_ADD in a custom OpDef class. That might conflict. But since the example uses it successfully, we can replicate. I'll keep OP_ADD as in example.
+
+But memory 2 says: "When build fails due to redefinition of 'Ca6k00045Custom' in op_proto.h caused by manual OP_ADD ... do not add a second registration with OP_ADD; instead remove the manual OP_ADD and rely solely on the autogen REG_OP." So if autogen generates REG_OP, then manual OP_ADD is duplicate. In our case, we are not running autogen? The standard workflow for this task typically uses the JSON to generate some code, but the provided example includes OP_ADD in host_operator_src and it works. However, to avoid potential conflict, we can follow the example exactly: include OP_ADD. I'll assume it's acceptable.
+
+Better to be safe and not include manual OP_ADD, but the example does include it. I'll follow the example.
+
+Now, write the code.
+
+Make sure to use proper float initialization for running min: we can set to the first input value for each column. Actually we can initialize running min with +infinity. In AscendC we can use AscendC::SetVal to set all to a large number like 1e37. But easier: at row 0, we set output = input and running min = input. So we can handle first row specially, or we can set running min to INF initially and then compute min normally, which will work as INF > first input. So set runningMin to INF.
+
+We'll use AscendC::Duplicate to set local tensor to INF? Or use AspendC::Broadcast of a scalar? We can use AscendC::Mins? Actually we can simply use AscendC::Mins to compute min(runningMin, input). For first row, if runningMin is INF, then min gives input. So we need to initialize runningMin to INF. We can do that by calling AscendC::SetLocalTensor or using a loop. Since numCols is small, we can use a for loop. Or use AscendC::Duplicate to assign a scalar. In AscendC, we can use AscendC::Broadcast to set a local tensor to constant. But that may require extra pipe. Simpler: use a scalar loop over columns. Since numCols <= 6, it's fine.
+
+Alternatively, we can handle first row separately: for row=0, simply copy input to output and set runningMin = input. Then for rows 1..N-1, compute min. That avoids INF. I'll do that.
+
+Now, implement kernel:
+
+- Init: get colsStart, numCols.
+- If numCols == 0 return.
+- Initialize local buffer for row inputs: inputBuf of size numCols, outputBuf, runningMinBuf.
+- Process rows:
+  - CopyIn for this row slice.
+  - If row == 0: set runningMin = inputBuf; write inputBuf to output.
+  - Else: for j in range(numCols): tmp = min(runningMin[j], inputBuf[j]); outputBuf[j] = tmp; runningMin[j] = tmp.
+  - CopyOut.
+
+But we need to compute min per element. AscendC provides vectorized min (Vmin). We can use AscendC::Min for element-wise min between two tensors. So we can do:
+  - Compute newMin = AscendC::Min(runningMinBuf, inputBuf, numCols).
+  - Then assign runningMinBuf = newMin, outputBuf = newMin.
+But we need to be careful: we need to preserve data. We'll use a temporary tensor? We have inputBuf, outputBuf, runningMinBuf, and maybe a tempBuf. We can use runningMinBuf directly if we do newMin = Min(runningMinBuf, inputBuf) and then store result to outputBuf and then copy to runningMinBuf? Actually AscendC::Min returns a new local tensor; we need to allocate it. Better to do: temp = pipe_->AllocTensor<float>(numCols); AscendC::Min(temp, runningMinBuf, inputBuf, numCols); then Swap(runningMinBuf, temp); then copy temp to outputBuf? Or we can do: outputBuf = Min(runningMinBuf, inputBuf); then runningMinBuf = outputBuf; but that would require outputBuf and runningMinBuf to be separate. We'll allocate three buffers: inQueueX (input row), outQueueY (output row), runningMinBuf (persistent). And a fourth buffer tempBuf for min computation. Use a double buffer for input? Actually we don't need double buffering because the loop is serial. We'll allocate in pipe: inQueueX (BUFFER_NUM=2), outQueueY (2), runningMinBuf (1), tempBuf (1). But that may be overkill. Since we process rows one by one, we can use single buffer. Use pipe->InitBuffer(inQueueX, 1, ...), outQueueY, tmpQueue. We'll follow pattern from example: use queues for input and output to leverage DMA overlap? But since we process row sequentially and compute is cheap, we can just use direct CopyIn and CopyOut without queues. Simpler: use local tensors from pipe directly (no queues) to avoid complexity. The example uses queues for overlap, but for small row slices it may not matter. We can use simpler approach: allocate local tensors in pipe, and in each iteration do: DataCopy from global to local, compute, DataCopy to global. No need for queues. We'll use non-queue tensors for simplicity. Use AscendC::LocalTensor<float> xLocal, yLocal, runningMin, tmp. No EnQue/DeQue. This is acceptable.
+
+So kernel structure:
+```
+class KernelCa6k00188Custom {
+public:
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalRows, uint32_t totalCols, uint32_t blockDim) {
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalRows * totalCols);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalRows * totalCols);
+        totalRows_ = totalRows;
+        totalCols_ = totalCols;
+        blockDim_ = blockDim;
+        // compute column range for this block
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t colsPerBlock = (totalCols + blockDim - 1) / blockDim;
+        colStart_ = blockIdx * colsPerBlock;
+        numCols_ = min(colsPerBlock, totalCols - colStart_);
+        // allocate local buffers
+        pipe_.InitBuffer(xBuf_, numCols_ * sizeof(float));
+        pipe_.InitBuffer(yBuf_, numCols_ * sizeof(float));
+        pipe_.InitBuffer(runningMinBuf_, numCols_ * sizeof(float));
+        pipe_.InitBuffer(tmpBuf_, numCols_ * sizeof(float));
+    }
+    __aicore__ inline void Process() {
+        if (numCols_ == 0) return;
+        // For each row
+        for (uint32_t row = 0; row < totalRows_; row++) {
+            // Copy input slice
+            AscendC::LocalTensor<float> xLocal = xBuf_.Get<float>();
+            AscendC::DataCopy(xLocal, xGm_[row * totalCols_ + colStart_], numCols_);
+            // Compute
+            AscendC::LocalTensor<float> runningMin = runningMinBuf_.Get<float>();
+            AscendC::LocalTensor<float> tmp = tmpBuf_.Get<float>();
+            if (row == 0) {
+                AscendC::DataCopy(runningMin, xLocal, numCols_);  // runningMin = input
+                AscendC::DataCopy(yBuf_.Get<float>(), xLocal, numCols_);
+            } else {
+                AscendC::Min(tmp, runningMin, xLocal, numCols_);
+                AscendC::DataCopy(yBuf_.Get<float>(), tmp, numCols_);
+                AscendC::DataCopy(runningMin, tmp, numCols_);
+            }
+            // Copy output
+            AscendC::DataCopy(yGm_[row * totalCols_ + colStart_], yBuf_.Get<float>(), numCols_);
+        }
+    }
+private:
+    // declare pipe, buffers...
+};
+```
+But using Get() repeatedly may cause issues because it allocates each time? Actually pipe buffer works like a singleton. We'll use a more careful approach: store pointers or just allocate once and reuse.
+
+We'll define:
+```
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> xBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> yBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> runningMinBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tmpBuf_;
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+    uint32_t totalRows_;
+    uint32_t totalCols_;
+    uint32_t blockDim_;
+    uint32_t colStart_;
+    uint32_t numCols_;
+```
+In Process, we can get references to the local tensors once:
+```
+AscendC::LocalTensor<float> xLocal = xBuf_.Get<float>();
+AscendC::LocalTensor<float> yLocal = yBuf_.Get<float>();
+AscendC::LocalTensor<float> runningMin = runningMinBuf_.Get<float>();
+AscendC::LocalTensor<float> tmp = tmpBuf_.Get<float>();
+```
+But these tensors can be reused for each iteration; they point to same memory. So we can just use them.
+
+Now, we need to include correct headers and extern "C" entry.
+
+Now, host_tiling_src: define TilingData with fields: totalRows, totalCols, blockDim.
+
+host_operator_src: include the tiling.h, register op, define TilingFunc, InferShape, InferDataType. Use the same pattern as example but with Ca6k00188Custom.
+
+In TilingFunc, compute totalRows and totalCols from input shape dims. Since input is 2D ND, we can get shape dimension 0 and 1. Use context->GetInputShape(0)->GetDimCount() and GetDim(i). We'll assume 2D. Then set blockDim = min(totalCols, 24). We'll use uint32_t.
+
+Also need to set workspace to 0.
+
+project_json_src: define op with input x (ND, float), output y (ND, float), attr dim (int, optional, default 0) even though we always use dim=0.
+
+python_bind_src: define a function that calls aclnnCa6k00188Custom with the tensor and dim (or just dim=0). Use pytorch_npu_helper.
+
+model_src: define ModelNew with forward using custom_ops_lib.ca6k_00188_custom(x, dim=0) or just (x, 0). The reference uses x and dim=0. We'll pass dim as positional.
+
+Now, we must be careful about the function name in model_src: The python bind should expose a function called "ca6k_00188_custom". In the example, they used _FN = 'leaky_relu_custom' and getattr. We'll do similar.
+
+Now, write the code. Let's produce the answer.

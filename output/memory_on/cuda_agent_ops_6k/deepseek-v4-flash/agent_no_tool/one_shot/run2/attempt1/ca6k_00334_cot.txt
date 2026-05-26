@@ -1,0 +1,141 @@
+We need to generate the six Python strings for a fused AscendC custom operator replacing torch.cumprod. The operator name stem is ca6k_00334, so kernel/JSON/operator names: project JSON op name "Ca6k00334Custom", kernel name "ca6k_00334_custom", etc.
+
+We need to design a custom AscendC kernel that computes cumulative product along a given dimension. The input tensor shape: [8192, 3, 4] (input_dim1=8192, input_dim2=3, input_dim3=4), dim=0. So we need to compute cumprod along dim 0, meaning for each (j,k) across the first dimension, compute the cumulative product of the 8192 elements.
+
+We need to produce a fused operator that matches the behavior of torch.cumprod. Since it's a single op, we can implement a custom kernel.
+
+But we should consider the constraints: use a single fused custom op or a small set. Since it's just cumprod, a single op is fine.
+
+The kernel must handle arbitrary shapes? The model uses fixed shape: [8192,3,4] with dim=0. But the kernel should be generic enough to handle any shape and dim? The reference program uses dim=0, but the operator should accept dim as an attribute. In the JSON, we need an attr for dim (int). The tiling should compute the cumulative product in a way that handles the dimension.
+
+Cumulative product is a prefix operation. For a given axis, we can process the dimension sequentially. Since the tensor is large (8192 * 3 * 4 = 98304 elements), we can tile along the flattened dimension but need to respect the dimension structure.
+
+Simpler approach: For cumprod along dim=0, each column (j,k) is independent. We can flatten the last two dimensions and treat them as batch. The operation is: for each index i from 1 to N-1 (N=8192), output[i] = output[i-1] * input[i]. This is a sequential dependency along the first dimension.
+
+We can implement a tiling strategy that processes chunks of rows? But since there is dependency across rows, we can't parallelize across the first dimension. However, we can parallelize across the batch (the product of other dimensions). So we can split the work by the flattened last dimensions. Let's define: total length = N * C, where C = dim2 * dim3 = 12. So we have 12 independent sequences each of length 8192. We can assign blocks to handle subsets of these sequences.
+
+Better: Use blockDim = number of blocks, each block handles a portion of the batch (e.g., each block handles one or more sequences). Within each block, we process the sequence sequentially, using local memory for accumulating product. Since the sequence length is 8192, we might need to tile further if UB memory is limited. We can process chunks of the sequence, but the cumulative product requires previous result. So we can process the sequence in chunks of tileLen, but we need to carry over the last product from previous tile.
+
+We can use a "carry" variable: For each sequence, after processing a tile, we multiply the next tile's elements by the last product of the previous tile. This is similar to prefix scan but with multiplication.
+
+We need to design tiling: totalLength = N * C (where N is the dimension of cumprod, C is product of other dims). But we also need to know the shape to know the stride between consecutive elements along the cumprod dimension. For dim=0, the stride is C (since elements are in row-major, consecutive rows are spaced by C). So we need to handle indexing: For each sequence (j,k), the elements are at positions: start + i*C for i in 0..N-1, where start is the offset of the first element of that sequence.
+
+To simplify, we can precompute the total number of elements (N*C) and also pass the stride (C) and the number of sequences (C) and the length of each sequence (N). Alternatively, we can pass the shape and dim, and compute indexing in kernel. But for tiling, we need to know the shape to split work.
+
+Given the fixed model shape, we can hardcode? But the operator should be generic. However, the reference uses a fixed shape from get_inputs, but the model is defined with tensor_shape and dim as attributes. The model's __init__ takes tensor_shape and dim, and forward uses dim. So the operator should accept shape info? Actually, the operator receives the tensor and the dim as attr. The tiling function can compute the shape from the input tensor shape. So we can get the shape and compute the necessary parameters.
+
+Let's design:
+
+- Input: x (float tensor of any shape)
+- Attribute: dim (int), default 0? But reference uses dim=0. We'll make attr required with default 0.
+- Output: y same shape.
+
+In tiling, we need to compute totalLength = size of x. Also we need to know the dimension to compute stride and length of cumulative axis. We can get shape from GetInputShape(0). Then compute: dim = attrs->GetAttrPointer<int>(0); axis = dim; if negative, adjust. Then compute outerSize = product of dims before axis, innerSize = product of dims after axis? Actually, for cumulative along axis, the number of sequences is totalSize / size_of_axis, and the length of each sequence is size_of_axis. We can compute: sizeAxis = shape.GetDim(dim); outerSize = shape.GetSize() / sizeAxis (product of all other dims). Then we can tile by splitting the outerSize (sequences) across blocks.
+
+The kernel can process each sequence independently. For each sequence, we need to iterate sequentially through the axis. We can use a loop over the axis length. Since UB memory is limited, we may need to tile the axis length as well, but we can process in chunks of tileLen with a carry product.
+
+We'll need local memory for a tile of the sequence and maybe for the output. We can use a ping-pong buffer for input, and compute output in-place? Since dependency, we can compute in place using local memory.
+
+Simpler: Process per sequence fully? Not possible if sequence length is large. 8192 is large but we can process in one go if UB can hold 8192 floats? 8192 * 4 = 32KB, plus output also 32KB, total 64KB, plus temp maybe 32KB = 96KB. UB budget is 192KB, so we can actually process the entire sequence in one tile if we use double buffer? But we need to read from global and write to global. We can do: for each sequence, allocate local buffer for input and output of size tileLen = sizeAxis. But if we process multiple sequences per block, we need to handle them sequentially or parallel? We can assign each block a subset of sequences, and for each sequence, load all elements (if UB can hold) and compute cumprod.
+
+But we need to consider general case where axis size may be huge. For simplicity, we can design with tiling of axis length. We'll set tileLen based on UB budget: we need inQueueX (tileLen), outQueueY (tileLen), plus tempQueue for maybe one vector (tileLen). Also we need a scalar carry. So we can set tileLen = floor(UB_BUDGET_BYTES / (3 * sizeof(float))) aligned.
+
+Then for each sequence, we process in chunks of tileLen, reading from global, computing cumulative product with carry, writing output.
+
+We also need to handle the case where axis length <= tileLen: then we can process whole sequence in one tile.
+
+We need to be careful with indexing: For each sequence, the elements are spaced by stride = innerSize (if row-major). Actually, for shape [N, C] where C is product of other dims, stride between consecutive elements along dim=0 is C. So we can compute base index for sequence s: s (since row-major). Then for i in 0..N-1, element index = s + i * C. So we can read using a global tensor with that stride.
+
+In kernel, we can set xGm_ as a flat buffer of totalLength. Then for a given sequence idx, the starting address is sequenceIdx (since row-major, first element of sequence is at offset sequenceIdx). Then we can read consecutive elements with stride C (which is outer product). We can use DataCopy with a stride? But DataCopy requires contiguous elements. So we need to gather manually? That is inefficient. Better to restructure: For cumprod along dim=0 of a tensor of shape [N, C], the data layout has all elements contiguous. The first N elements are for sequence 0? Actually, row-major: first sequence (index 0) is elements at positions 0, C, 2C, ..., (N-1)C. Second sequence starts at index 1: positions 1, 1+C, 1+2C, ... So they are interleaved if we think of flat buffer. That makes it non-contiguous for reading a full sequence. This is problematic.
+
+Alternative: We can transpose the tensor in host tiling to make cumprod axis contiguous? But we cannot change the layout. However, we can perform cumprod in-place by using the fact that the output has same shape and we can compute using outer loop over sequences and inner loop over axis with manual indexing. But DataCopy requires contiguous. So we have two options:
+
+1. Use a vectorized gather operation? AscendC has maybe vector gather? Not sure. Simpler: We can treat the problem as computing cumprod over the first dimension of a 3D tensor [N, C] (where C=12). Since C is small (12), we can process each tile as a block of rows? Actually, we can load a tile that contains a contiguous chunk of data. For example, load a block of rows? If we load consecutive elements from global, they correspond to different sequences. That might be okay if we can vectorize the operation across sequences.
+
+Consider: We want to compute cumprod over dimension 0 for all sequences. This is similar to doing a prefix scan over the tensor along the first axis. If we load a contiguous tile of size tileLen from the flat buffer, that tile will contain elements from different sequences and different positions. But we need to apply the prefix product along the axis, which is a different pattern.
+
+Given that C is only 12, we can handle each sequence within a block by iterating over axis length (8192) and for each step, reading the element from global (non-contiguous). That is many global loads. But we can use DataCopy with a vector gather? Not directly.
+
+Maybe we can redesign: Instead of operator that takes arbitrary shape, we can fuse the cumprod by reshaping the tensor to 2D [N, C] in the kernel, and then process by loading entire slices along axis? Since C is small, we can load all C elements at once for a given row? Actually, to compute cumulative product, we need to multiply previous row's result with current row's input. So we need to read current row (contiguous chunk of size C) and previous row's output (contiguous chunk of size C). So if we process row by row, we can load two contiguous rows at a time: current input row and previous output row (which is same size). This is feasible because rows are contiguous in memory (since row-major). So for tensor shape [N, C], row i is contiguous from i*C to (i+1)*C. So we can compute cumprod by iterating rows i from 0 to N-1:
+- For i=0: output_row0 = input_row0
+- For i>0: output_rowi = output_row(i-1) * input_rowi (element-wise multiplication)
+
+This is straightforward! We can load two consecutive rows, compute element-wise multiplication, and write output row.
+
+Thus, the problem reduces to: For a 2D tensor of shape [N, C], compute row-wise cumulative product along the first dimension. This is efficient because each row is contiguous. We can tile the rows: we can process multiple rows per iteration, using tiles of rows. Since we need to carry the previous row's output, we must process rows sequentially. We can process a tile of rows at a time? For example, we can load a tile of K rows (tileLen rows), compute cumulative product within that tile using the carry from previous tile, and write output rows. This allows parallelism across the C dimension (within a row). So we can use vector operations on entire rows.
+
+Memory: For tile of K rows, we need to store input rows (K * C floats) and output rows (same). Plus maybe temporary. UB budget: 192KB. If C=12, each row is 48 bytes. So K = floor(192KB / (2 * 48)) ≈ 2048 rows? That's huge. Actually 192KB / (2 * 12 * 4) = 192*1024 / 96 = 2048 rows. So we can process 2048 rows per tile. But total rows N=8192, so 4 tiles. Good.
+
+So tiling: tileRows = number of rows to process per iteration. We'll set based on UB budget, but also we need to account for temporary buffers. We'll use three buffers: inQueue (tileRows * C), outQueue (tileRows*C), and a temporary for multiplication? We can reuse outQueue for output and also need a buffer for input. We can do: load input rows into inQueue, then compute output rows directly into outQueue using the carry and then write outQueue to global.
+
+Specifically:
+- carry = previous row (size C) stored in a separate buffer (carryQueue).
+- For first tile: input_rows[0] is copied to output_rows[0] (no multiplication), then for i=1..K-1: output_rows[i] = output_rows[i-1] * input_rows[i] (element-wise). But careful: output_rows[i-1] is already computed and stored in the outQueue? We can compute in place: for row i from 1 to K-1: out[i] = out[i-1] * in[i] (element-wise). This requires having out[i-1] available. We can store in a temporary carry buffer. Alternatively, we can use a local tensor for current output and copy from previous.
+
+Simplify: Process one row at a time? But that would be slow. Since C is small, we can still process row by row within a block. But we want parallelism across rows? We can assign each block to handle a range of rows? No, because dependency along rows prohibits parallelism. However, we can parallelize across the C dimension because rows are small. So we can use vector operations on entire rows. With tileRows > 1, we can process multiple rows in one loop? Not easily due to dependency. Better to process row by row but use vector instructions for each row. That is fine: for each row, we load a row (C elements), multiply with previous row (C elements), store. This uses vector operations. UB usage per row: 2*C*4 bytes = 96 bytes. So we can pipeline with double buffer to hide latency.
+
+We can design kernel to process one row per iteration, but double-buffer the input and output to overlap data copy with compute.
+
+Simpler: Use a single buffer for current input row, and a separate buffer for previous output row. We'll use AscendC's vector operations. Since C is small (12), we can even use scalar loops? But better to use vector.
+
+Let's design tiling:
+- totalRows = shape.GetDim(dim) (size of cumprod axis)
+- rowSize = totalElements / totalRows (product of other dims)
+- We'll iterate over rows sequentially.
+- We can set tileLen = 1? But we want to use DataCopy for contiguous rows. We can load one row at a time (size rowSize floats). For each block, we can handle entire axis? But we need to assign blocks to work on different parts? Since axis is sequential, we cannot parallelize across blocks. So we use a single block? Not efficient. But the model's tensor size is only 98304 floats, which is small. We can set blockDim=1 and process all rows sequentially. But to make it scalable, we can parallelize across the other dimensions? Wait: The axis is dim=0, but we can parallelize across the row dimension? Actually, rows are independent? No, the cumprod operation across rows has dependency. So we cannot parallelize across rows. However, we can parallelize across the other dimensions? But the other dimensions are part of each row. The operation is row-wise: each element in the row is independent of other elements in the same row? Actually, the cumprod along axis only involves the same index across rows. So for each column (i.e., element position within a row), the cumprod is independent across columns. So we can parallelize across the C dimension. That means we can use vector operations that operate on all C elements at once. So we need only one block to process all rows sequentially, but we can use vector instructions to process all C elements in parallel. That is fine.
+
+But what about larger tensors? For generality, we can still use single block and process rows sequentially, using vector ops. That is typical for prefix scan. The kernel is simple.
+
+Alternatively, we can split the C dimension across blocks. For example, if C is large, we can assign each block a subset of columns. But here C=12, so not needed. We'll design a generic kernel: single block, process all rows sequentially using pipelined double buffer.
+
+We still need tiling to set parameters: totalRows, rowSize, and maybe tileRows for double buffering? We can process row by row, using two buffers: one for current input row, one for previous output row. We can also prefetch next row while computing current.
+
+Simplify: Use a ping-pong buffer for input: two buffers of size rowSize. Use a separate buffer for previous output. Process:
+- Load first row from global to inBuf[0].
+- This row is also output row[0]: copy to outGlobal and also store in prevOut local.
+- For i=1..totalRows-1:
+  - Load row i into inBuf[ping] (while computing previous maybe).
+  - Compute: out = prevOut * inBuf[ping] (element-wise).
+  - Store out to global (row i).
+  - Update prevOut = out.
+We can use double buffer for input to overlap load with compute. But since compute is simple, we can just process sequentially without double buffering.
+
+Given the small size, we can even load all rows into UB? But total data: 98304 * 4 = 384KB, exceeds UB. So we need to stream.
+
+But note: We need to handle any shape. So we design a generic kernel that processes rows sequentially with tiling of rows? Actually, rows are sequential and we have dependency, so we can't process multiple rows in parallel. But we can process multiple rows per tile if we load a chunk of rows (e.g., tileRows) and then compute within that chunk? But the dependency between rows within a chunk is sequential, so we still need to compute row by row. Using tileRows could allow us to use larger DataCopy but the compute is still sequential. So we can set tileRows=1 to simplify. Then the kernel loops over rows, each iteration loads one row (rowSize floats), computes, stores. That is fine.
+
+To use vectorized multiplication, we need to use AscendC's vector Mul. We'll have local tensors: xLocal for current input row, yPrev for previous output row, yCur for current output (or we can reuse yPrev). We'll allocate a buffer for yPrev (size rowSize) in tmpQueue.
+
+Thus, tiling: rowSize = totalElements / totalRows; totalRows = shape.GetDim(dim); we also need totalElements from shape. We'll set tileLength = rowSize (number of elements per row). We'll also set blockDim = 1 (since task is sequential). But to be generic, we can set blockDim = 1. However, the host tiling must set blockDim; we can set to 1.
+
+But the memory says: "use direct member assignment like tiling.N = N" for tiling data. So we'll define tiling fields: totalRows, rowSize, etc.
+
+Let's implement:
+
+project_json_src: operator name "Ca6k00334Custom", input: x, output: y, attr: dim (int, default 0). No other attributes.
+
+host_tiling_src: TilingData struct with fields: totalRows, rowSize, negativeSlope not needed. Actually we need dim? We can get dim from tiling data? We can pass dim as attr to kernel. But easier: pass totalRows and rowSize computed from shape and dim in tiling function. So tiling data: totalRows, rowSize.
+
+host_operator_src: Implement TilingFunc and InferShape, InferDataType. Use direct assignment for tiling fields. Ensure no OP_ADD duplication (use REG_OP only from autogen). We'll include "ca6k_00334_tiling.h" from autogen? Actually, the tiling header is generated from host_tiling_src. The host_operator_src includes that header. We'll avoid manual OP_ADD.
+
+kernel_src: Implement kernel to iterate over rows, using vector Mul. We'll use AscendC vector types.
+
+python_bind_src: Bind the op as ca6k_00334_custom.
+
+model_src: Use custom_ops_lib ca6k_00334_custom.
+
+We must ensure numerical match with torch.cumprod. Since cumprod along dim=0 with row-major, our row-wise element-wise multiplication is correct.
+
+Now produce the six strings.
+
+Note: The reference program uses tensor_shape and dim as init inputs, but model forward just does cumprod. Our ModelNew will call the custom op with x and dim.
+
+We need to be careful: The custom op expects dim as attribute, not as input. So we pass dim as second argument? In python_bind, we need to accept dim as attribute. Usually, NPU ops with attrs are called via aclnn with attr list. We'll implement python_bind to call aclnnCa6k00334Custom with attribute dim.
+
+Also, the reference uses dim=0. Our op should accept dim as attribute.
+
+Now write the code.
+
+I'll write the strings with proper escaping.
+
+Let's begin.

@@ -1,0 +1,95 @@
+We need to analyze the previous attempt and errors. The error says the txt bundle is missing blocks: ['host_operator_src', 'kernel_src', 'python_bind_src']. So the previous generated code did not have those variables defined (or they were truncated/incomplete). Looking at the previous attempt full generated code, it ends abruptly after `OutputOutputOutput`. So the generated code was incomplete due to a bug in the code generation (likely a typo in the host_operator_src string that got cut off). The fix is to generate a complete and correct solution with all six blocks properly defined.
+
+We need to produce six Python string variables: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src. The kernel name is ca6k_00282_custom, PascalCase Ca6k00282Custom. The operator should implement InstanceNorm3d fused? Actually the reference is nn.InstanceNorm3d. InstanceNorm normalizes each channel independently across spatial dimensions. The formula: y = (x - mean) / sqrt(var + eps) * gamma + beta, but if affine=False, gamma=1, beta=0. Also track_running_stats=False means no running stats. So it's simple per-channel normalization.
+
+We need to write a fused AscendC kernel that does instance normalization. Need to handle input shape: (N, C, D, H, W). Each channel of each sample is normalized independently. So we have N*C independent groups, each of size D*H*W. We need to compute mean and variance per channel per sample, then normalize.
+
+Constraints: Use the same AscendC infrastructure as the leaky_relu example. Need tiling data, host operator, kernel, python bindings.
+
+We must ensure the operator works for float32 only (as in the reference). The JSON should specify input x (float, ND), output y (float, ND). Attribute eps (float, default 1e-5).
+
+Tiling: The UB budget is limited. We need to tile the spatial dimension. For each channel, we need to compute mean and variance. That requires summing over spatial elements. We can do two passes: first compute sum and sum of squares, then compute mean and variance, then normalize. Or use a single-pass algorithm with running mean/variance? But AscendC doesn't have built-in reduce operations across global memory easily. Typically, we stream tiles and accumulate locally, then write back. However, for large spatial dimensions, we need to tile.
+
+Given the input size: batch_size=2, in_channels=8, depth=512, height=40, width=40 => total spatial per channel = 512*40*40 = 819200. That's large. So we need to tile the spatial dimension per channel. Each independent group (N*C = 16 groups) processes its own spatial data. We can assign each group to a block or multiple blocks? The tiling will determine blockDim. We can parallelize over N*C groups (i.e., each block processes one channel of one sample). That is natural: blockDim = N*C = 16. Each block handles its own channel. Then within a block, we tile the spatial dimension.
+
+Kernel design: Each block gets its channel index based on blockIdx. Compute totalElements = spatialSize. We'll use a double buffering approach to compute mean and variance in a single pass? Actually we need two passes: first pass to compute sum and sum_sq, then compute mean and variance, then second pass to normalize. But we can compute mean and variance on the fly using a loop that accumulates sum and sum_sq, then after the loop, compute mean and variance, then loop again to write normalized values. That requires storing the entire spatial data in global memory anyway. We can read twice: once to compute sum/sum_sq, once to normalize. Or we can store the data in local memory? Not possible for large size. So we'll do two passes: first pass loop over tiles to compute sum and sum_sq; after loop, compute mean and var; second pass loop over tiles to compute output. That requires two reads of input. Acceptable.
+
+We'll use a tiling approach where each block processes its own channel's spatial data in tiles. The tiling data should include: totalLength (spatial size per channel), tileLength, N, C, spatialSize, eps. Also we need blockDim = N*C.
+
+Host operator: TilingFunc sets blockDim to N*C, computes tileLength from UB budget. For double buffering with two queues (input double buffering, output double buffering), we need maybe 2*tileLen for input, 2*tileLen for output, plus temporary for mean/var? But mean and var are scalars per channel, stored in registers/local memory. So UB budget: approx 4*tileLen floats? Actually input and output double buffering: 2*tileLen each for double buffer in and out? But we can also reuse one buffer for both passes. Simpler: we can do single buffer: read tile, compute partial sums, then discard, then later read again for normalization. That only needs 1*tileLen for input read. For output, we need 1*tileLen for writing. So total UB budget: 2*tileLen floats. For safety, we can set UB_BUDGET_BYTES = 192KB, so max floats = 192*1024/4 = 49152. Divide by 2 = 24576 per buffer. We'll align down to 2048. So tileLen can be up to 24576. But we need to ensure it covers the whole spatial size? We'll tile.
+
+Now, we must be careful about the kernel code: use AscendC APIs: DataCopy, LocalTensor, etc. Also compute sum and sum_sq using vector instructions: we can use a loop with AscendC::ReduceAdd? Actually there is no direct vector reduce. We need to accumulate manually: for each tile, we can compute partial sum and sum_sq by summing elements using a loop that adds each element? That would be slow. Better: use vector multiply for square and then reduce using something like AscendC::ReduceSum? There is AscendC::ReduceSum for local tensor? Actually AscendC provides ReduceAdd across elements of a local tensor. Yes, we can use AscendC::ReduceAdd(localTensor, len) to get sum of all elements in that tensor. Similarly for sum of squares: compute elementwise square, then ReduceAdd. That is efficient.
+
+So for each tile:
+- CopyIn tile.
+- Compute sum_tile = ReduceAdd(xLocal, tileLen).
+- Compute xSqLocal = xLocal * xLocal (elementwise).
+- Compute sumSq_tile = ReduceAdd(xSqLocal, tileLen).
+- Accumulate into global sum_channel and sumSq_channel (in registers).
+We need to ensure we accumulate over all tiles.
+
+After all tiles processed, compute mean = sum / spatialSize, var = sumSq/spatialSize - mean^2, then invStd = 1/sqrt(var + eps).
+
+Then second pass: for each tile, read x again, compute normalized output, write.
+
+But careful: we are using global memory for input and output. We can reuse the same input buffer? We need to read again, so we must keep input data in global memory. That's fine.
+
+Now, implement kernel with double buffering for reads? Not necessary for single-pass accumulate, but we can still use double buffering for the second pass for performance.
+
+Simplify: Use a single buffer for both passes, but we can still use double buffering for the read in the second pass. However, for the first pass, we don't need to keep the data, so single buffer is fine. For simplicity, we'll implement two separate loops: first loop with single buffered reads (no double buffer, just copy, compute, free). This is simpler and less error-prone.
+
+Kernel class: Init with pointers, totalLength (spatialSize), tileLength, N, C, eps. Process: calculate channel index, then first pass accumulate sum and sumSq, then second pass write output.
+
+We also need to handle the case where spatialSize is smaller than tileLength.
+
+Edge cases: if tileLen is 0, skip.
+
+Now, writing the kernel_src string. Must include proper headers and extern "C" __global__ __aicore__ void ca6k_00282_custom(...). Use GET_TILING_DATA macro.
+
+Also need to ensure the tiling data fields are correctly defined in host_tiling_src. Use setter methods for all fields.
+
+Now, python_bind_src: It uses pytorch_npu_helper.hpp and EXEC_NPU_CMD. The operator name must match the one used in host_operator_src. It should call aclnnCa6k00282Custom? Actually the binding uses aclnn prefix + operator name? Looking at the example: EXEC_NPU_CMD(aclnnLeakyReluCustom, ...). So for our operator, it should be aclnnCa6k00282Custom. We need to define the custom op with that name. In host_operator_src, we have the op class and OP_ADD. The naming: class name Ca6k00282Custom. The aclnn function name will be aclnnCa6k00282Custom. That's fine.
+
+But we also need to register for backends? The python_bind_src uses TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) and m.impl("ca6k_00282_custom", ...). That's consistent.
+
+Now, model_src: imports torch, torch_npu, custom_ops_lib. It defines class ModelNew with forward that calls custom_ops_lib.ca6k_00282_custom(x). But we need to include eps? The model_src should match the original Model's forward signature. Original Model takes x and returns normalized x. The init takes num_features, eps, etc. For ModelNew, we need to accept same init arguments? The example model_src only takes inputs in forward, not in init. So ModelNew should accept eps as attribute? The original Model's forward does not take eps as argument; it is stored in the module. So ModelNew should store eps and use it. But the op expects eps as attribute. The custom op invocation? The python_bind_src defines a function that takes self (tensor) and maybe negative_slope as double. For our case, we need to pass eps? The binding function signature should be ca6k_00282_custom(Tensor x, double eps) -> Tensor. Then ModelNew stores eps as an attribute and passes it. But the op has eps as attribute in JSON, so it's a compile-time constant? Actually it's an attribute, so it can be set per op instance. The aclnn API likely takes attribute arguments. In the example, negative_slope was passed as a separate argument to the aclnnLeakyReluCustom. So we need to define our aclnn custom op that takes eps as an argument. The python binding should be something like:
+
+at::Tensor ca6k_00282_custom_impl_npu(const at::Tensor& self, double eps) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnCa6k00282Custom, self, eps, result);
+    return result;
+}
+
+Then in model_src, we import custom_ops_lib and call custom_ops_lib.ca6k_00282_custom(x, self.eps). But the ModelNew's forward signature must match the original: takes only x. So we need to store eps in ModelNew. The original Model init takes num_features, eps, etc. For simplicity, we can ignore num_features (since we only need eps for the op). But we must keep the same init signature? The user instruction says "keep naming/contracts consistent with project_json/host/kernel/python bindings". The reference Model has __init__ that takes num_features, eps, momentum, affine, track_running_stats. ModelNew should match that interface so that the test harness can call get_init_inputs() which returns [in_channels]. The test harness will instantiate ModelNew with those init arguments. The current get_init_inputs returns [in_channels] only. That is consistent with the original Model's __init__ expecting num_features as first argument. So ModelNew.__init__ should accept *init_inputs, and we can store the first argument as num_features (though we may not need it) and perhaps eps? Actually the original __init__ passes num_features, eps=1e-5, etc. The get_init_inputs only supplies [in_channels]. So the default eps=1e-5 will be used. So ModelNew.__init__ can ignore num_features and just store eps as default. But better: we can define __init__(self, num_features, eps=1e-5, momentum=0.1, affine=False, track_running_stats=False) and store eps from the constructor. However, the test harness calls ModelNew(*get_init_inputs()), so only positional arguments, no keyword. So we need __init__(self, num_features, use_defaults?) Actually we can just accept *init_inputs and extract num_features, then set default eps. But that loses the flexibility. Since the reference uses default eps=1e-5, we can hardcode eps=1e-5 in ModelNew. But safer: implement __init__(self, *args) and assume first arg is num_features, set self.eps = 1e-5. Or we can use the same signature but with defaults. Problem: the test harness might check that ModelNew can be instantiated with the same arguments as Model. Since Model.__init__ signature is (num_features, eps=1e-5, ...), and get_init_inputs returns [in_channels], then calling Model(in_channels) works because eps has default. So ModelNew should also accept (num_features, eps=1e-5, ...) but we only pass num_features. So we can define ModelNew.__init__(self, num_features, eps=1e-5, ...). That should work. We'll store self.eps.
+
+Now, the model_src forward: call custom_ops_lib.ca6k_00282_custom(x, self.eps).
+
+We also need to ensure the python_bind_src defines the function with two arguments. TORCH_LIBRARY_IMPL: m.impl("ca6k_00282_custom", &impl_npu). The function name in Python should be "ca6k_00282_custom". That matches.
+
+Now, assemble the six strings.
+
+Potential pitfalls: host_operator_src must use the correct include for tiling header. The tiling header name should be "ca6k_00282_custom_tiling.h". In the tiling data class, we used Ca6k00282CustomTilingData. In host_operator_src, we include that header.
+
+Also, the kernel function name in kernel_src must match the operator name used in the op registration. In the example, the kernel was leaky_relu_custom. We'll use ca6k_00282_custom.
+
+Check that the JSON project_json_src uses "op" key at the root.
+
+Now, write the code carefully.
+
+Let's write each string:
+
+project_json_src: Define input x (float, ND), output y (float, ND), attr eps float optional default 1e-5.
+
+host_tiling_src: Define TILING_DATA with fields N, C, spatialSize, tileLen, eps. Use setter methods.
+
+host_operator_src: Include tiling header, implement TilingFunc, InferShape, InferDataType, OpDef class named Ca6k00282Custom, OP_ADD. Must set blockDim.
+
+kernel_src: Implement KernelCa6k00282Custom class. Process per channel. Use two passes.
+
+python_bind_src: Use pytorch_npu_helper, define impl function, TORCH_LIBRARY_IMPL, PYBIND11_MODULE.
+
+model_src: Import torch_npu, custom_ops_lib. Define ModelNew with proper __init__ and forward.
+
+Need to ensure no syntax errors. Use proper AscendC includes.
+
+Let's write.

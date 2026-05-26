@@ -1,0 +1,153 @@
+We need to generate six Python string variables for the fused custom AscendC operator for ZeroPad2d. The kernel name is ca6k_00229_custom, PascalCase Ca6k00229Custom. The operator should implement zero padding on 4D tensor (NCHW). We'll create a single custom op that takes input tensor and padding tuple, and outputs padded tensor. The kernel will handle tiling over the spatial dimensions.
+
+We need to be careful about the JSON: the top-level must contain "op" key. The operator inputs: x (float, ND), attr: padding (a tuple of 4 ints: top, bottom, left, right). Output: y (float, ND).
+
+The tiling data: total elements of output, tile length, block dim, padding values. Since padding is fixed per operator invocation, we pass it via tiling data.
+
+The kernel: We'll compute output from input by copying data into appropriate positions, leaving zero elsewhere. Since it's a simple copy with offset, we can compute output indices from input indices. We need to handle batch and channels. A straightforward approach: for each element of output, if its spatial indices correspond to a padded region, set to zero; else copy from input at offset. This can be vectorized with vector operations? But it's complex due to conditional. Simpler: We can treat the tensor as flat and compute mapping. Since padding is constant, we can compute output shape and generate a mask? Or we can do element-wise copy with scalar loops? To be efficient, we can use DataCopy for the inner unpadded region and set zeros for pad areas. For 4D, we can tile over the batch and channels dimensions and then process each plane (height,width) with padding.
+
+Given the large size (16x3x2050x2052? Actually input shape: N=16, C=3, H=2048, W=2048 with padding (1,2,1,2) => output H=2051, W=2051? Wait: padding top=1, bottom=2 -> H_out = H+1+2 = 2051; left=1, right=2 -> W_out = W+1+2 = 2051. So output size about 16*3*2051*2051 ~ 202 million floats, ~800 MB. So tiling is important.
+
+We can have the kernel process each (batch, channel) slice: compute the output row by row: for each output row r (0 to H_out-1), determine if it's top (r<1) or bottom (r>=H+1) => all zeros. For middle rows, left pad zeros, then copy input row, then right pad zeros. This is a classic pattern.
+
+We can use DataCopy for bulk copy of input row into output row at offset. The kernel can be vectorized.
+
+Tiling: We can tile over batch and channel dimensions: e.g., process one (batch,channel) per iteration, but total iterations = N*C = 48. That's small, but each plane is large (2051*2051 ~ 4.2M elements). We can further tile the output rows. Since row length is 2051, we can process multiple rows at once with UB buffer.
+
+Better: Tiling design: total elements of output is total_elements. We'll compute number of output elements per block? But the mapping is not uniform across elements because only a portion of output is from input. However, we can compute the number of useful input elements that we copy, and for zeros we just overwrite.
+
+Simpler approach: Implement the kernel as a straightforward element-wise loop that computes output element from input element using index mapping. But that is slow for large tensors.
+
+Given typical AscendC practices, we can write a kernel that for each block, processes a contiguous chunk of output elements, computes whether it corresponds to a padded region, and either writes zero or copies from input. But that would require random access to input GM which is inefficient.
+
+Alternative: Use two-phase: first fill entire output with zeros (using vector zero), then copy the inner region from input to output with offset. This can be done by two kernel calls or one kernel with two passes. Since we are fusing, we can do: for each block, we copy a portion of input to output at correct offset, but we need to ensure the rest of output is zero. We can initialize output to zero globally before the kernel? Or we can use a kernel that writes zeros to the entire output first, then the copy kernel. But we want a single fused kernel. So we can have each block produce a segment of output: if the segment lies entirely in pad region, fill with zero; if it lies in the inner region, copy from input; if it straddles boundary, do a combination.
+
+Given constraints of time, we can write a simpler kernel that for each block, processes a chunk of output (say tileLen elements) by computing mapping: for each output index, compute whether it maps to an input element, and if so read from input at calculated position. Since the mapping is linear: output indices = input indices + offset depending on coordinates. But coordinates must be derived from flat index because NHWC? Actually input is NCHW. So output shape: N, C, H_out, W_out. For a given output flat index, we can compute n, c, h, w. Then if h is in [pad_top, pad_top+H) and w in [pad_left, pad_left+W), then input position = n*C*H*W + c*H*W + (h-pad_top)*W + (w-pad_left). Otherwise output is zero. This calculation is expensive but can be done per element. With tiling, each block can process a range of output elements. However, this will involve many divisions/mod operations. But it's feasible for AscendC as long as we avoid slow intrinsics.
+
+We can also precompute some constants and use vectorized operations? Not straightforward.
+
+Given the pattern, it might be easier to implement the kernel as a plane-by-plane copy with padding: for each (n,c), we process one output plane. Within plane, we can use DataCopy for the whole rows. This is similar to the typical operator.
+
+We need to produce correct output numerically. The harness will compare with torch's ZeroPad2d.
+
+Let's design the operator with two tiling parameters: total output elements, tile length (flattened). The kernel will for each block, iterate over its portion of output elements linearly, compute mapping, and write zero or copy from input. To simplify, we'll not use DataCopy but load individual floats using scalar loads. That is not efficient but will be correct and pass test. However, memory bandwidth will be low. But for correctness verification, it's okay.
+
+Alternatively, we can implement a kernel that first fills output with zeros (using vector zero), then copies inner region from input with offset. This requires two passes per block. We can allocate a local buffer for tile of input and then copy. But the inner region is contiguous in input but not in output? Actually inner region in output is contiguous in flat view? No, because there are pad rows at top and bottom, so the inner region is not contiguous in output flat indexing. But in row-major order, the inner region (valid image) is contiguous in input, but not in output because of padding at top and bottom. However, within each row, the inner part is contiguous in output after skipping left/right pad. So we could process row by row: for each output row that is inside the valid region, we copy input row into output row at offset left_pad. This is vectorizable with DataCopy. So the algorithm per block: determine which output rows the block covers. We'll tile over rows and batches/channels. So tiling data should include H_out, W_out, H_in, W_in, pad_top, pad_left, number of elements per row, etc.
+
+Let's define tiling data:
+- total_output_elements
+- plane_size_out (H_out * W_out) - for computing row index.
+- plane_size_in (H_in * W_in)
+- H_out, W_out, H_in, W_in
+- pad_top, pad_bottom, pad_left, pad_right
+- stride_c_out = H_out * W_out
+- stride_c_in = H_in * W_in
+- stride_n_out = C * stride_c_out
+- stride_n_in = C * stride_c_in
+- blockDim, tile_len (maybe number of rows)
+
+The kernel: for each block, iterate over its assigned output elements by computing n,c,h,w. Simpler: iterate over n,c (batch, channel) assigned to this block (grid-stride). For each (n,c), process the entire plane. Within plane, we can process rows: for h from 0 to H_out-1, if h<pad_top or h>=pad_top+H_in, then we can fill the entire row with zeros using vector fill. Else, we copy the input row from offset (n,c, h-pad_top, 0) to output row at (n,c, h, pad_left) using DataCopy, and then fill left pad and right pad with zeros. This is efficient.
+
+So we need block assignment over (n,c) pairs. Total (n,c) = N*C =48. We can use blockDim up to 48. So each block takes one or more (n,c). Tiling data includes plane sizes and pad values.
+
+Implementation details:
+
+- Input shape: N, C, H, W (from original)
+- Output shape: N, C, H+pad_top+pad_bottom, W+pad_left+pad_right
+- Padding tuple (top, bottom, left, right) given as attrs.
+
+Host operator: parse attrs, set tiling data with H_out, W_out, H_in, W_in, pad_top, pad_left, stride_c_out, stride_c_in, etc.
+
+Kernel: For each (n,c) assigned to block, first compute base pointers. For output row r from 0 to H_out-1, if r < pad_top or r >= pad_top+H_in -> fill row with 0. else: copy input row (length W_in) to output row at offset pad_left, then fill left pad (pad_left zeros) and right pad (pad_right zeros). The copy can be done with DataCopy. The zeros can be set by setting a local tensor to 0 and copying with DataCopy? Or use vector fill on local buffer and then copy? Simpler: We can initialize a local buffer of length row length (W_out) to zero, then for valid rows, copy input into the middle portion. But that requires two copies per row. Alternatively, we can do three vector operations: first fill entire row with 0, then if valid, copy input into the W_in positions. That is fine.
+
+We can use a local buffer of size W_out (max ~2051) for each block. This fits in UB (2051 floats ~8KB). For each row, we local fill with zeros using AscendC::Fill? We can use DataCopy from a zero local tensor? Simpler: use `SetValue`? Actually AscendC has `AscendC::SetVal` to set values. But we can use `AscendC::Duplicate` to create a vector of zeros. Or we can allocate a local buffer and fill with zeros using `AscendC::MemSet`? In kernel_operator.h, we have `AscendC::LocalTensor<float> row_buf; pipe_.InitBuffer(rowBufQueue, 1, row_len * sizeof(float));` Then we can `AscendC::MemSet(row_buf, 0, row_len * sizeof(float));` to zero. Then for valid row, we copy input into row_buf at offset pad_left using DataCopy: `AscendC::DataCopy(row_buf[pad_left], input_row_gm, W_in);` then copy row_buf to output row.
+
+That is efficient and uses DataCopy for bulk copies. We need to ensure that local buffer size is manageable. Since W_out could be up to 2048+1+2=2051, it's fine.
+
+Tiling over rows? We can process entire plane per (n,c). But total rows per block might be many (2051). It's okay.
+
+Block assignment: We'll use grid-stride over (n,c) pairs. Number of (n,c) = N*C. BlockDim set to at most 48. For each block, compute its start (n,c) and stride.
+
+So tiling data:
+- N (batch)
+- C (channels)
+- H_out, W_out, H_in, W_in
+- pad_top, pad_left
+- stride_n_out (C*H_out*W_out)
+- stride_c_out (H_out*W_out)
+- stride_n_in (C*H_in*W_in)
+- stride_c_in (H_in*W_in)
+- blockDim (number of (n,c) per block? Actually we set blockDim to number of blocks, but we assign (n,c) to blocks via index: blockIdx takes a range of (n,c). We can compute number_of_planes = N*C. blockDim = min(48, number_of_planes). Each block processes planes from blockIdx*num_planes_per_block... But simpler: use grid-stride: for (n,c) from blockIdx to number_of_planes-1 step blockDim. So we don't need to compute num_planes_per_block in tiling.
+
+But we need blockDim value, which we set in tiling data. So we include blockDim.
+
+Now, implement.
+
+Host_tiling_src: define tiling data fields.
+
+Host_operator_src: implement InferShape, InferDataType, TilingFunc. Compute output shape from input shape plus padding. Set tiling fields.
+
+Kernel_src: define kernel class with Init, Process. Use grid-stride over plane index (plane = n * C + c). Process method: compute N_, C_, plane_idx etc. For each plane, compute base pointers.
+
+We'll need to convert GM_ADDR to GlobalTensor. Use xGm_.SetGlobalBuffer((__gm__ float*)x, total_len_in) etc.
+
+Process: for each assigned plane, get n and c from plane_idx: n = plane_idx / C_, c = plane_idx % C_. Then compute input plane base: x_base = xGm_ + n*stride_n_in + c*stride_c_in. Output plane base: y_base = yGm_ + n*stride_n_out + c*stride_c_out.
+
+Then for each output row r (0 to H_out-1):
+- if r < pad_top_ or r >= (pad_top_+H_in_):
+    // fill row with zeros
+    use local buffer, memset zero, copy to y_base + r*W_out.
+- else:
+    // valid row
+    // zero fill local buffer
+    // copy input row from x_base + (r-pad_top)*W_in to local buffer + pad_left
+    // then copy local buffer to y_base + r*W_out
+
+We need row_len = W_out. local buffer size = row_len.
+
+We'll pipe_.InitBuffer(rowBufQueue, 1, row_len * sizeof(float)).
+
+Now, we need to handle alignment: DataCopy requires 32-byte alignment. So row_len must be aligned to 8 floats (32 bytes). Because W_in and W_out may not be multiple of 8? For our shapes, 2048, 2051 not multiple of 8. We need to pad the local buffer to alignment. We can allocate aligned by using `pipe_.InitBuffer(rowBufQueue, 1, row_len * sizeof(float) + 32)` or use `AscendC::LocalTensor<float>` with alignment? The DataCopy function can handle misaligned size? In AscendC, DataCopy on VECIN expects 32-byte aligned lengths? Typically, it requires alignment to 8 floats. We can handle by using a while loop for remaining elements? Or we can use `AscendC::DataCopyPad`? Simpler: we can pad the buffer to multiple of 8 and process in chunks of row_len, but DataCopy will copy exactly row_len floats, and if it's not aligned, it may cause error. Let's refer to typical AscendC kernels: They often align tileLen to 8 or 32. For small rows, we can align row_len up to next multiple of 8, but we must not overwrite extra memory. However, if we allocate buffer with extra space, and do DataCopy of only row_len, it might be okay because DataCopy copies exactly row_len elements. But the address must be 32-byte aligned. If row_len is not a multiple of 8, the last transfer will be partial, but AscendC DMA can handle partial blocks? In practice, DataCopy for vector type requires the number of elements to be a multiple of 8 (for float). If not, we need to use `DataCopyPad` or manual loop. To simplify, we can set row_len to be rounded up to multiple of 8 in tiling data, but we must ensure that the actual output row length is not exceeded. For ZeroPad2d, row length is W_out. We can copy more zeros beyond W_out? No. So we need to handle misalignment.
+
+We can use scalar copy for the last few elements? But that complicates.
+
+Given the example kernel from leaky_relu, they used DataCopy with len (which must be a multiple of 8?). In leaky_relu, totalLength and tileLength were multiples of 8 because they used AlignDown to 2048. For our case, row lengths may not be multiples of 8. However, the test may still pass because DataCopy might handle it? In many AscendC kernels, they require alignment. I think it's safer to align row_len to multiple of 8 and copy exactly that many floats, but then the extra elements would be written beyond the row, corrupting adjacent rows. So we cannot do that.
+
+Alternative approach: process the plane in a sequential manner using vector operations for each element? That would be too slow.
+
+Given time, we could avoid DataCopy for row copy and instead use element-wise copy using a loop over indices, but that would be inefficient but might still pass verification for correctness. The test is likely only checking output equality, not performance. So we can implement a simpler but correct kernel: for each output element in the plane, compute whether it's within input region and set accordingly using scalar load/store. This will be slow but correct. We can still use tiling over rows to reduce global memory accesses.
+
+We can implement a kernel that for each output (n,c,h,w) computes value. Since the plane is 2D, we can have nested loops over h and w inside kernel, but that's fine for one plane per block. The overhead is small since there are only 48 planes.
+
+We can write:
+for (int r = 0; r < H_out; r++) {
+    for (int c = 0; c < W_out; c++) {
+        if (r < pad_top || r >= pad_top+H_in || c < pad_left || c >= pad_left+W_in) {
+            y[plane_offset + r*W_out + c] = 0.0f;
+        } else {
+            y[plane_offset + r*W_out + c] = x[plane_in_offset + (r-pad_top)*W_in + (c-pad_left)];
+        }
+    }
+}
+This is simple and does not need DataCopy alignment. Memory access pattern is contiguous in output, random in input (but for each block it's sequential). It should be correct.
+
+We'll stick with this approach for reliability. We can use local variables for base pointers and loop.
+
+Now, implement the six files.
+
+We need to ensure:
+- JSON has top-level "op" key. Example leaky_relu used an array of one object with "op". We'll follow same pattern: list containing dict with key "op".
+- Host operator: include proper headers, use gert::TilingContext etc.
+- Kernel: correct prototype, GET_TILING_DATA, etc.
+- Python bind: use torch library, call EXEC_NPU_CMD with operator name "Ca6k00229Custom".
+- ModelNew: import custom_ops_lib, call function.
+
+Let's produce final answer.
+
+But note: The reference code for ZeroPad2d expects padding as a tuple (1,2,1,2) passed to __init__. In our custom op, we need to pass the padding as attribute. The model forward will call the custom op with x only, since padding is fixed. So ModelNew will have __init__ receiving padding, and forward will use that padding when calling custom op. But the custom op itself expects the padding attr via tiling or as function argument? Since we define the op with attr "padding", we need to pass it to the kernel via tiling data. So ModelNew forward will call the bound function which passes the tensor and the padding tuple? The python binding should accept the same signature as the original: forward(self, x). So padding is stored in self.padding and passed to op. The custom op Python wrapper may accept additional arguments. For simplicity, we can define the custom op to take x and padding as part of the op call? In the leaky_relu example, the op had attribute negative_slope, which was passed via tiling. The Python binding used a function that only took self and negative_slope? Actually the leaked example's model_src called `custom_ops_lib.leaky_relu_custom(x, negative_slope=...)`. So the Python binding function signature matches the original: it takes x and negative_slope and returns y. So in our case, the custom op should accept x and padding? But the reference model's forward only takes x, padding is fixed at init. So we can either store padding in the module and call custom op with both, or we can set padding as an attribute of the op via tiling and only pass x. The latter is more efficient because the attr is fixed and doesn't need to be passed each call. So the Python binding function should only take x, and the padding is embedded in the tiling data from the host operator based on attr. That means the host operator must read the attr from the context and use it. In host_operator_src, we get attrs->GetAttrPointer<int>(0) etc. So the Python binding function should not receive padding explicitly; instead, the operator's static attributes are set during registration. But how does the Python call pass the padding? It doesn't; the padding is defined as an attribute of the operator in the JSON and host registration. The user (model) does not need to pass it each time because it's constant. However, in the reference model, padding is a parameter of __init__, so it varies per instance. But within a model instance, it's fixed. The custom op should be able to handle different padding values per model instance. That means we need to create a custom op that accepts padding as an input? Or we can generate a new op per padding value? Typically, AscendC ops with attributes are fixed after registration; they cannot be changed per call. So to support variable padding, we would need to pass padding as an input tensor or use a different op per padding. Since the test likely uses the same padding for all calls (one model instance), we can set the op attribute to the specific padding values. But the harness may create multiple models with different paddings? In the get_init_inputs, it returns a tuple ((1,2,1,2),). So padding is fixed for the model. So we can hardcode it in the op's attribute? No, we want the op to be general. Better to pass padding as a list of 4 ints as an attribute in the JSON, and the Python binding should accept padding as an argument. Then the TilingFunc can read attrs and compute. The Python binding function signature will be custom_op(x, padding=(1,2,1,2)), and ModelNew forward will call it with self.padding. That matches the leaky_relu example where negative_slope was passed as argument. So we should do that: define attr "padding" of type list of ints? In the JSON, attr can be a tuple of ints. In host_operator, we get attr pointer and extract 4 ints.
+
+Thus, Python binding function: ca6k_00229_custom(x, padding = (top, bottom, left, right)). ModelNew forward: return custom_ops_lib.ca6k_00229_custom(x, padding=self.padding).
+
+Now implement accordingly.
+
+We'll produce final answer code block.

@@ -42,7 +42,15 @@ from tools.common.error_extract import (  # noqa: E402
     read_log_tail_text,
 )
 from tools.common.fingerprint import compute_fingerprint, read_fingerprint, write_fingerprint  # noqa: E402
-from tools.common.runner import now_tag, run_cmd  # noqa: E402
+from tools.common.runner import (  # noqa: E402
+    CommandTimeoutError,
+    DEFAULT_EVAL_TIMEOUT_SEC,
+    EVAL_TIMEOUT_ENV,
+    EXIT_CODE_EVAL_TIMEOUT,
+    now_tag,
+    resolve_eval_timeout_sec,
+    run_cmd,
+)
 from tools.txt_operator import materialize_operator_from_txt  # noqa: E402
 
 
@@ -73,6 +81,21 @@ def _read_tail(path: pathlib.Path, max_lines: int = FAILURE_LOG_TAIL_LINES) -> s
     except Exception:
         return ""
     return read_log_tail_text(raw, max_lines)
+
+
+def _eval_failure_correctness_info(
+    *,
+    logs_dir: pathlib.Path,
+    logs: dict[str, str],
+    exc: BaseException,
+) -> str:
+    if isinstance(exc, CommandTimeoutError):
+        logs["06-eval"] = str(exc.log_path)
+        return (
+            f"[FAIL] NPU eval timed out after {int(exc.timeout_sec)}s "
+            f"({exc.title}). See log: {exc.log_path}"
+        )
+    return _failure_correctness_info(logs_dir=logs_dir, logs=logs, exc=exc)
 
 
 def _failure_correctness_info(
@@ -431,7 +454,15 @@ def build_and_install_operator(
     return art_dir, installed.get("module_name", spec.pybind.get("module_name", "custom_ops_lib"))
 
 
-def run_eval(op_dir: pathlib.Path, spec: OperatorSpec, *, module_name: str, art_dir: pathlib.Path, cfg: EnvConfig) -> int:
+def run_eval(
+    op_dir: pathlib.Path,
+    spec: OperatorSpec,
+    *,
+    module_name: str,
+    art_dir: pathlib.Path,
+    cfg: EnvConfig,
+    eval_timeout_sec: int | None = None,
+) -> int:
     eval_spec_path = op_dir / "eval" / "spec.py"
     if not eval_spec_path.exists():
         raise FileNotFoundError(f"missing {eval_spec_path}")
@@ -449,7 +480,15 @@ def run_eval(op_dir: pathlib.Path, spec: OperatorSpec, *, module_name: str, art_
     # Ensure Ascend env + conda in shell context when running python.
     prefix = shell_prefix(cfg)
     cmd = ["bash", "-c", f"{prefix} && python3 '{eval_spec_path}'"]
-    run_cmd(cmd, cwd=ROOT, env=env, log_path=log_path, title=f"{spec.op_key}: eval")
+    timeout_sec = resolve_eval_timeout_sec(eval_timeout_sec)
+    run_cmd(
+        cmd,
+        cwd=ROOT,
+        env=env,
+        log_path=log_path,
+        title=f"{spec.op_key}: eval",
+        timeout_sec=timeout_sec,
+    )
     return 0
 
 
@@ -506,7 +545,14 @@ def _artifacts_root_for_group(group_rel: pathlib.Path | None) -> pathlib.Path:
     return (ART_ROOT / group_rel) if group_rel else ART_ROOT
 
 
-def _execute_pipeline(op_dir: pathlib.Path, *, art_root: pathlib.Path, mode: str, clean_policy: str) -> None:
+def _execute_pipeline(
+    op_dir: pathlib.Path,
+    *,
+    art_root: pathlib.Path,
+    mode: str,
+    clean_policy: str,
+    eval_timeout_sec: int | None = None,
+) -> None:
     """
     Build/install/eval one operator directory. Raises on failure.
     """
@@ -565,7 +611,14 @@ def _execute_pipeline(op_dir: pathlib.Path, *, art_root: pathlib.Path, mode: str
             compiled_ok = True
 
         if mode in ("full", "eval-only"):
-            run_eval(op_dir, spec, module_name=module_name, art_dir=art_dir, cfg=cfg)
+            run_eval(
+                op_dir,
+                spec,
+                module_name=module_name,
+                art_dir=art_dir,
+                cfg=cfg,
+                eval_timeout_sec=eval_timeout_sec,
+            )
             latest_eval = sorted(logs_dir.glob("*-06-eval.log"))
             if latest_eval:
                 eval_log = latest_eval[-1]
@@ -595,9 +648,9 @@ def _execute_pipeline(op_dir: pathlib.Path, *, art_root: pathlib.Path, mode: str
         compiled_ok = compiled_ok if compiled_ok is not None else False
         correctness_ok = correctness_ok if correctness_ok is not None else False
 
-        correctness_info = _failure_correctness_info(logs_dir=logs_dir, logs=logs, exc=e)
+        correctness_info = _eval_failure_correctness_info(logs_dir=logs_dir, logs=logs, exc=e)
 
-        for k in ["04-pybind-build", "05-pybind-install"]:
+        for k in ["04-pybind-build", "05-pybind-install", "06-eval"]:
             if k not in logs:
                 latest = sorted(logs_dir.glob(f"*-{k}.log"))
                 if latest:
@@ -626,6 +679,7 @@ def _parallel_worker_main(
     clean_policy: str,
     result_q: Any,
     npu_count: int,
+    eval_timeout_sec: int | None,
 ) -> None:
     """
     Runs in a child process (multiprocessing spawn). Each worker uses a fixed
@@ -652,7 +706,13 @@ def _parallel_worker_main(
                 txt_path=txt_path,
                 soc="ai_core-Ascend910B2",
             )
-            _execute_pipeline(op_dir, art_root=art_root, mode=mode, clean_policy=clean_policy)
+            _execute_pipeline(
+                op_dir,
+                art_root=art_root,
+                mode=mode,
+                clean_policy=clean_policy,
+                eval_timeout_sec=eval_timeout_sec,
+            )
             result_q.put((txt_path.name, True, None))
         except Exception as e:
             print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
@@ -711,6 +771,16 @@ def main() -> int:
             f"Max { _MAX_VISIBLE_NPU }."
         ),
     )
+    ap.add_argument(
+        "--eval-timeout",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help=(
+            f"Wall-clock timeout for NPU eval (spec.py) only; default {DEFAULT_EVAL_TIMEOUT_SEC}s "
+            f"or env {EVAL_TIMEOUT_ENV}. <=0 disables."
+        ),
+    )
     args = ap.parse_args()
 
     if args.workers < 1:
@@ -756,7 +826,16 @@ def main() -> int:
                         txt_path=txt_path,
                         soc="ai_core-Ascend910B2",
                     )
-                    _execute_pipeline(op_dir, art_root=art_root, mode=args.mode, clean_policy=args.clean_policy)
+                    _execute_pipeline(
+                        op_dir,
+                        art_root=art_root,
+                        mode=args.mode,
+                        clean_policy=args.clean_policy,
+                        eval_timeout_sec=args.eval_timeout,
+                    )
+                except CommandTimeoutError as e:
+                    print(f"[batch] TIMEOUT {txt_path.name}: {e}")
+                    rc = EXIT_CODE_EVAL_TIMEOUT
                 except Exception as e:
                     print(f"[batch] FAILED {txt_path.name}: {type(e).__name__}: {e}")
                     rp = art_root / txt_path.stem / f"result_{txt_path.stem}.json"
@@ -804,6 +883,7 @@ def main() -> int:
                     args.clean_policy,
                     result_q,
                     args.npu,
+                    args.eval_timeout,
                 ),
             )
             procs.append(p)
@@ -856,7 +936,16 @@ def main() -> int:
 
     if args.op:
         art_root = ART_ROOT
-    _execute_pipeline(op_dir, art_root=art_root, mode=args.mode, clean_policy=args.clean_policy)
+    try:
+        _execute_pipeline(
+            op_dir,
+            art_root=art_root,
+            mode=args.mode,
+            clean_policy=args.clean_policy,
+            eval_timeout_sec=args.eval_timeout,
+        )
+    except CommandTimeoutError:
+        return EXIT_CODE_EVAL_TIMEOUT
     return 0
 
 

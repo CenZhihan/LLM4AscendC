@@ -1,0 +1,113 @@
+We need to analyze the error logs. The kernel compiled successfully but runtime error: "The write address of the MTE instruction is out of range." This is a memory access violation, likely due to incorrect buffer sizes or out-of-bounds access in the kernel.
+
+Key issues from previous attempt:
+- The kernel uses `DataCopy` to copy into a buffer of size `inLenMax_`, but `inLenMax_` is computed as `((tileOutLen_ - 1) * stride_ + kernelSize_ + 31) / 32 * 32`. This is an attempt to align the input length for the tile. However, the copy uses `len` which is the actual number of elements. If `inLenMax_` is smaller than the actual needed `inLen`, there will be an out-of-bounds write.
+- Also, `DataCopy` takes the number of elements, not bytes. The buffer is initialized with `inLenMax_ * sizeof(float)` bytes. So if `inLen` > `inLenMax_`, buffer overflow.
+
+Moreover, the tiling data fields: `totalOutLen`, `tileOutLen`, `totalInLen`. But the kernel also uses `stride` and `kernelSize` from tiling. The tiling calculation in host_operator_src computes `out_len` from the last dimension, assumes input shape is 3D (batch, channels, length). Good.
+
+But the kernel's `CopyIn` passes `inLen` which may be larger than `inLenMax_`. Let's examine the computation: `inLen = (outStart + outLen - 1) * stride_ + kernelSize_ - inStart`. That is the number of input elements needed for that output tile. `inLenMax_` is computed from `tileOutLen_` (max output elements per tile) as: `((tileOutLen_ - 1) * stride_ + kernelSize_ + 31) / 32 * 32`. This estimates the maximum input elements needed for a full tile, aligned to 32. However, if `tileOutLen_` is large (like 16384), then `inLenMax_` = ((16383)*2 + 3 + 31)/32*32 ≈ (32766+34)/32*32 = 32800/32*32 = 1025*32 = 32800, which is about 2x tileOutLen. That might be okay, but the buffer size is `inLenMax_ * sizeof(float)` ~ 131200 bytes, well within UB budget.
+
+But the problem could be that the kernel computes `inLen` for the current tile and then does `CopyIn` with that exact length. However, the buffer was allocated with `inLenMax_` elements, but the actual `inLen` might be less, that's fine (copy fewer elements). But if `inLen` is larger, overflow.
+
+Maybe the issue is in `Compute` loop: it accesses `xLocal.GetValue(i * stride_ + j)` where `xLocal` is a local tensor of size `inLen` (the actual length copied in). The indices `i*stride_ + j` should be within [0, inLen-1]. Since `stride_=2`, `kernelSize_=3`, for i up to `outLen-1`, the max index is `(outLen-1)*stride_ + (kernelSize_-1) = (outLen-1)*2 + 2 = 2*outLen`. The input length needed is `(outLen-1)*stride_ + kernelSize_ = (outLen-1)*2 + 3 = 2*outLen + 1`. So the max index is `2*outLen`, which is less than `2*outLen+1`, so within bounds. However, the `CopyIn` copies exactly `inLen = (outLen-1)*stride_ + kernelSize_` elements, so the local tensor has that many elements. The access `xLocal.GetValue(i*stride_ + j)` is fine.
+
+But the real issue might be that after `CopyIn` with length `inLen`, the local tensor's size is `inLen`. But the `inQueueX_` buffer was allocated with `inLenMax_` elements, which may be larger than `inLen`. That is fine. However, `DataCopy` expects the source global memory length to be `len` elements. That should be fine.
+
+Another potential issue: the kernel uses `DataCopy` for input and output. The output buffer size is `tileOutLen_ * sizeof(float)` bytes. The output length used is `outLen`, which is ≤ `tileOutLen_`. So no overflow.
+
+But the runtime error "write address of the MTE instruction is out of range" indicates a memory access violation during vector instruction (MTE = memory transfer engine?). Possibly during `DataCopy` from local to global? The error says "write address of the MTE instruction is out of range." That suggests writing to global memory beyond the allocated region.
+
+Let's check `yGm_.SetGlobalBuffer((__gm__ float*)y, totalOutLen_);` and then `DataCopy(yGm_[gmOutOffset], yLocal, outLen);`. Here `gmOutOffset` is the output start index in the flattened output tensor. Since each block processes non-overlapping output tiles, the offset should be within range. But note: the output shape is (batch, channels, out_len). The total number of output elements is `batch * channels * out_len`. The offset for each block is computed as `outStart = blockIdx * tileOutLen_`. This assumes a contiguous flattened output, which is correct.
+
+But there is a mismatch: the tiling data `totalOutLen` is `batch_channels * out_len` (total output elements). The kernel uses `totalOutLen_` to set global buffer size. Good.
+
+But what about the input offset? `inStart = outStart * stride_` in the kernel. However, the input tensor is (batch, channels, in_len). When flattened, the offset for a specific output element `outStart` should be `outStart * stride_` only if we are indexing in the last dimension, but since we have multiple channels and batches, we need to account for that. Wait: The kernel treats the input as a 1D flattened tensor. The output is also flattened. The LPPool1d operation is applied independently to each channel of each sample. The sliding window operates only on the last dimension. So within a single channel, the input index for output position `i` is `i*stride`. Across channels, the data is contiguous. So if we flatten the input in row-major order (batch, channels, length), then the input element corresponding to output element `out_idx` (where `out_idx` goes across all channels and batches) is: channel = (out_idx % (channels * out_len)) // out_len? That's complicated.
+
+Actually, the standard approach: for LPPool1d, the output shape is (N, C, L_out) with L_out = floor((L_in - kernel_size)/stride + 1). The operation is: for each n, c, for each output position i, output = (sum_{j=0}^{kernel_size-1} |input[n,c, i*stride+j]|^p)^{1/p}. This is independent per channel. So the output is a tensor of shape (N, C, L_out). The flattened output index `out_idx` corresponds to (n, c, i) where i = out_idx % L_out, c = (out_idx // L_out) % C, n = out_idx // (C*L_out). The input index for a given output index `out_idx` and kernel offset j is: n = out_idx // (C*L_out), c = (out_idx // L_out) % C, i = out_idx % L_out, then input flat index = n * C * L_in + c * L_in + (i*stride + j). The difference between consecutive output indices within the same channel and n is stride in input. But across channels, the offset in input is L_in.
+
+However, in the current kernel, the offset for `inStart` is computed as `outStart * stride_`, and the input global buffer is set to `totalInLen_` elements. This treats the entire input as a contiguous 1D array. That would only be correct if the input's last dimension is the only one and we are processing a 1D signal (no channels). But the input has shape (N, C, L). The offset should be: for output index `outStart` (flattened), the corresponding input start index in the flattened input is: `base_in = (outStart // out_len) * L_in + (outStart % out_len) * stride`. Because the non-last dimensions contribute an offset of `(outStart // out_len) * L_in` (each group of L_out outputs corresponds to a channel within a batch). But our kernel currently uses `inStart = outStart * stride_`, which is wrong.
+
+This is likely the root cause: the input offset calculation is incorrect, causing out-of-bounds reads and then incorrect outputs or crashes. The error "write address out of range" may be due to a read that goes beyond the input buffer, then later writes corrupted values.
+
+We need to fix the kernel to correctly compute input offsets. However, the kernel is designed to work on the flattened tensors. We need to pass the input length per channel (L_in) and output length per channel (L_out) to correctly compute offsets. Alternatively, we can restructure the kernel to process per channel, but that may be more complex.
+
+Given the constraints (minimal targeted changes), we can add tiling data fields for `inLenPerChannel` and `outLenPerChannel`, and compute offsets correctly. Or we can keep the flattened approach but pass also the channel stride `L_in`. Since the kernel already has `totalInLen_`, we can compute `L_in` by dividing `totalInLen_` by number of channels? But we don't have number of channels directly. We can compute it: `numChannels = totalOutLen_ / outLenPerChannel`, and `inLenPerChannel = totalInLen_ / numChannels`. But that may lose precision if shapes are not aligned.
+
+Better: pass `inLenPerChannel` and `outLenPerChannel` from tiling. The tiling host already computes `in_len` and `out_len`. The tiling data can include these. Then in the kernel, we can compute the proper offset.
+
+Also, the tile size should be in terms of output elements per channel? Currently tileOutLen_ is the total number of output elements per tile across all channels? The tiling computes `totalOutLen = batch_channels * out_len` and `tileOutLen` as a portion of totalOutLen. That's fine. But then the block processes a contiguous chunk of the flattened output, which spans multiple channels. To compute input offsets correctly, we need to map that output index to the correct input index.
+
+Let's redesign the kernel to work on a per-channel basis: each block processes a set of channels? Or we can keep the current block stride but fix the offset calculation.
+
+Given time, the minimal fix is to add two tiling fields: `inLenPerChannel` (the length of the last dimension of input) and `outLenPerChannel`. Then in the kernel, compute the proper input offset:
+
+`uint32_t channel_group_size = outLenPerChannel;` // number of output elements per channel
+`uint32_t out_pos_in_channel = outStart % channel_group_size;`
+`uint32_t channel_index = outStart / channel_group_size;`
+`uint32_t inStart = channel_index * inLenPerChannel + out_pos_in_channel * stride_;`
+
+This fixes the offset.
+
+Also, ensure the buffer sizes are correct. The input buffer needs to hold the input elements for a tile. The maximum number of input elements needed for a tile is: for a tile of `tileOutLen_` output elements, the input elements needed per channel group? Actually, the tile covers a range of output indices that may span across channel boundaries. The tile size `tileOutLen_` might be larger than `outLenPerChannel`. The input elements needed for a contiguous block of output indices is not simply `tileOutLen_ * stride_` because of channel boundaries. To simplify, we can make each tile only process output within the same channel? Or we can compute the input length for the tile as: compute start and end output indices, then compute the input start and end using the proper mapping.
+
+Simplify: Since the operation is independent per channel, we can have each block process one or more entire channels. But the original approach with grid-stride over the flattened output is common. Let's fix the offset calculation properly.
+
+We'll add to tiling: `inLenPerChannel`, `outLenPerChannel`. Then in kernel:
+
+```cpp
+uint32_t channel_id = outStart / outLenPerChannel_;
+uint32_t out_pos = outStart % outLenPerChannel_;
+uint32_t inStart = channel_id * inLenPerChannel_ + out_pos * stride_;
+uint32_t inLen = (outLen - 1) * stride_ + kernelSize_; // This remains correct relative to inStart because within same channel? But outLen may span across channels? If outLen > outLenPerChannel_ - out_pos, then it crosses channel boundary. So we need to ensure that tile does not cross channel boundaries, or handle splitting. To avoid complexity, we can set tileOutLen_ to be a divisor of outLenPerChannel_ so that each tile processes whole channels. Actually, we can enforce that each block processes one channel at a time. Simpler: set blockDim = number of channels, each block processes one channel. But we need to accommodate variable number of channels.
+
+Given the constraints, the minimal fix to avoid out-of-bounds is to correct the offset calculation and ensure the tile size does not cause cross-channel access. We can limit tileOutLen_ to be ≤ outLenPerChannel_ in the tiling, or split tiles at channel boundaries.
+
+Let's modify the tiling host to ensure tileOutLen_ divides outLenPerChannel_ or at least does not exceed it. Actually, we can set tileOutLen_ to be the smaller of the UB-limited tile and outLenPerChannel_. Since outLen is not huge (in_len=16384, kernel=3, stride=2 => out_len=(16384-3)//2+1=8191), outLenPerChannel=8191, totalOutLen=128*32*8191=33550336. A tile of 16384 output elements would span 2 channels fully. That's fine if we handle channel crossing. But our current offset calculation assumes continuous channel. Let's implement proper channel-aware offset.
+
+We'll pass `outLenPerChannel` and `inLenPerChannel` from tiling. In kernel, compute `channel_id = outStart / outLenPerChannel_; out_pos_in_channel = outStart % outLenPerChannel_; inStart = channel_id * inLenPerChannel_ + out_pos_in_channel * stride_; inLen = min((outLen - 1) * stride_ + kernelSize_, inLenPerChannel_ - out_pos_in_channel * stride_);` Actually we need to ensure we do not read beyond the end of the channel. The correct input length for the tile is: the last input index needed is for the last output element in the tile, which is at outStart+outLen-1. Its channel id and position: last_channel = (outStart+outLen-1) / outLenPerChannel; last_out_pos = (outStart+outLen-1) % outLenPerChannel; last_in_index = last_channel * inLenPerChannel_ + last_out_pos * stride_ + kernelSize_ - 1. Then inLen = last_in_index - inStart + 1. This handles channel boundaries.
+
+That's more complex but doable.
+
+Alternatively, we can restructure to process per channel: each block gets a channel index, processes all output for that channel. That simplifies offset. We'll change the kernel to use blockIdx as channel index, and each block processes the entire channel. This eliminates cross-channel complexity. The number of blocks should equal the number of channels (batch*channels). For this model, batch=128, channels=32, total channels=4096. That's within block limits (max 24? Actually we set blockDim up to 24, but we can increase). The UB budget allows each block to process one channel's worth of data (outLen=8191). That's fine. We'll set blockDim = batch_channels (but capped at 24 per previous tiling, but we can increase cap). The constraint says use up to 24 blocks for stability, but with 4096 channels we need more blocks. However, each block processes one channel, we can set blockDim = number of channels, but AscendC supports many blocks (up to 64 or more). But the previous tiling limits to 24 for "stability". Let's not change that arbitrarily.
+
+Another approach: keep grid-stride but with correct offset. Let's implement the correct offset calculation with channel-aware inLen.
+
+We'll modify tiling data to include `outLenPerChannel` and `inLenPerChannel`. Then kernel computes:
+
+```cpp
+uint32_t channel_id = outStart / outLenPerChannel_;
+uint32_t out_pos = outStart % outLenPerChannel_;
+uint32_t inStart = channel_id * inLenPerChannel_ + out_pos * stride_;
+uint32_t last_out = outStart + outLen - 1;
+uint32_t last_channel = last_out / outLenPerChannel_;
+uint32_t last_out_pos = last_out % outLenPerChannel_;
+uint32_t last_in = last_channel * inLenPerChannel_ + last_out_pos * stride_ + kernelSize_ - 1;
+uint32_t inLen = last_in - inStart + 1;
+```
+
+This handles channel boundaries.
+
+Now, the buffer size for input: we need to allocate at least `inLenMax_` which is the maximum possible `inLen` across all tiles. We can compute in host: `maxTileInLen = ((tileOutLen_-1) * stride + kernelSize + (inLenPerChannel - 1))`? Actually worst case is when the tile spans two channels: the input length is `(outLen_prev_remain * stride + kernelSize) + (outLen_next_part * stride + kernelSize)`? Simpler: we can allocate a buffer large enough to hold the maximum number of input elements for any tile. Since `tileOutLen_` is at most a few thousand, we can compute an upper bound: `inLenMax_ = (tileOutLen_ + 1) * stride_ + kernelSize_` but that's not precise. To be safe, we can allocate buffer of size `(tileOutLen_ * stride_ + kernelSize_ + 31) & ~31` which is approximately `tileOutLen_ * stride_ + kernelSize_ + 32`. That should be sufficient even if crossing channel? Actually the input indices are not contiguous across channel boundaries; the gap between channels is `inLenPerChannel - (out_pos*stride+kernelSize) + next channel start. So the actual input elements needed are not contiguous in global memory? Wait, the input global buffer is contiguous across all channels. So the input indices for a tile that spans two channels are a contiguous range in the flattened input? Starting at `inStart` and ending at `last_in`, which includes elements from the end of one channel and the beginning of the next. That range is contiguous because the flattened input is contiguous. So `inLen` is the number of elements in that contiguous range. So we can use `inLenMax = (tileOutLen_ * stride_ + kernelSize_ + 31)` as an upper bound? Actually for a tile of `tileOutLen_` output elements, the maximum span in flattened input is: the last output element's index minus the first output element's index in flattened input. The first output element's index in input is `first_out_idx = outStart_global`. The last output element's index in input is `last_out_idx = outStart_global + (outLen-1)*stride + kernelSize-1`. The difference is `(outLen-1)*stride + kernelSize-1`. So the maximum number of input elements needed is `(tileOutLen_ - 1)*stride_ + kernelSize_`. Because `outLen <= tileOutLen_`. So `inLenMax = (tileOutLen_ - 1)*stride_ + kernelSize_`. We can allocate that plus some alignment. That's what we originally had. So the buffer size is fine.
+
+The problem is not buffer size but offset calculation. So we fix offset calculation.
+
+Also, in the kernel, we need to compute inLen as above, not reusing the old simple formula.
+
+Let's rewrite the kernel accordingly.
+
+We'll also adjust host tiling to include `inLenPerChannel` and `outLenPerChannel`.
+
+Now, implement the fix.
+
+We need to produce the six string variables with corrected code.
+
+Changes:
+- Add `inLenPerChannel` and `outLenPerChannel` to tiling data.
+- In host tiling function, compute these and set.
+- In kernel, use these to compute correct offsets.
+- Adjust Compute loop: use local tensor indexing correctly.
+
+Also, ensure the kernel's `Init` takes the new parameters.
+
+Let's write the corrected code.

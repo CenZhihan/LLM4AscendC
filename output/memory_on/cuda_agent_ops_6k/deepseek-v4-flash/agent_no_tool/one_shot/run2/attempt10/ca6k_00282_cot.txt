@@ -1,0 +1,217 @@
+We need to analyze the previous attempt and logs to understand the correctness failure. The previous attempt compiled successfully (no build errors), but the correctness test failed (output mismatch). The eval log shows the output is all zeros. That suggests the kernel is producing zeros instead of the correct instance norm output.
+
+The kernel appears to compute mean and variance across the spatial dimensions for each channel of each batch, then normalize. The output being all zeros could happen if:
+- The mean/variance computation is incorrect (e.g., using scalar reduce incorrectly)
+- The second pass normalization uses incorrect scaling (maybe invStd is zero or inf)
+- Tile loops are wrong
+
+Looking at the kernel: first pass accumulates sum and sumSq over spatialSize elements using tiles. But note: the kernel uses `AscendC::ReduceAdd` to produce a scalar from a local tensor, then adds that to the running sum. That should be correct, but we must ensure `ReduceAdd` works properly on AscendC. Also, the second pass uses `Sub` and `Mul` but note that `AscendC::Sub(yLocal, xLocal, mean, curLen)` subtracts a scalar (mean) from each element of xLocal? The signature: `Sub(localTensor, localTensor, const float, len)` should broadcast the scalar. That's correct.
+
+Another issue: the variance formula: variance = sumSq/n - mean^2. That is correct.
+
+But why all zeros? Possibly the `sqrtf` inside the kernel is not allowed or works differently. But more likely: the issue is that the kernel processes each channel independently, but the global memory offset calculation might be wrong: `baseOffset = n * C_ * spatialSize_ + c * spatialSize_`. For 5D tensor (N, C, D, H, W), spatialSize = D*H*W, and the offset should be (n*C + c)*spatialSize. That's correct.
+
+But wait: the kernel uses `xGm_.SetGlobalBuffer((__gm__ float*)x, N_ * C_ * spatialSize_)`. That's the total number of floats. Then accessing `xGm_[baseOffset + offset]` should be fine.
+
+Another possibility: the second pass uses `AscendC::Sub(yLocal, xLocal, mean, curLen)` but mean is a float variable (scalar). The Sub API might require a scalar constant? The documentation: `Sub(LocalTensor<T> dstLocal, LocalTensor<T> srcLocal, const T scalar, const int32_t calcCount)` should work.
+
+Check if `ReduceAdd` returns a scalar in a local tensor of size 1. Then we access `sumScalar(0)`. That should be fine.
+
+Potential problem: The kernel uses `sqrtf` (from C standard) inside a kernel? AscendC kernels use `Sqrt` from AscendC API, not `sqrtf`. The kernel uses `sqrtf(variance + eps_)`. That might not be available or cause compile issues, but it compiled so maybe it's allowed? But using `AscendC::Sqrt` would be safer. However, the output being all zeros suggests maybe `sqrtf` returns something weird.
+
+But more critically: the previous attempt's kernel does not use the AscendC built-in sqrt; it uses `sqrtf` which might compile but produce incorrect results or be emulated slowly? Could cause numerical issues? But all zeros? Not likely.
+
+Another thing: the second pass uses `invStd = 1.0f / (variance + eps_ > 0 ? sqrtf(variance + eps_) : 0.0f)`. If variance+eps_ is negative (due to floating point), then invStd becomes 0/0? Actually the condition is >0, else 0.0f, but if variance+eps_ == 0, then it's 0.0f, leading to division by zero? Wait: `1.0f / 0.0f` produces infinity, not zero. But the output is zero, not inf. So maybe the condition is always false? No.
+
+Simplify: The kernel might have an integer division issue? No.
+
+Also note: The tiling sets `tileLen` as align down of spatialSize if smaller than maxTile. But if spatialSize is not aligned to 8, then tileLen might be smaller than spatialSize. The first pass loops and sets curLen = (remaining > tileLen_) ? tileLen_ : remaining. That's fine.
+
+But the second pass also loops with same tileLen, and uses `AscendC::DataCopy(yGm_[baseOffset + offset], yLocal, curLen)`. That writes the normalized values back.
+
+All zeros output suggests that the normalization produces zeros. That could happen if invStd is 0? But invStd would be 0 only if variance+eps_ is huge? Actually invStd = 1/sqrt(var+eps) is never zero. So maybe the Sub/Mul produce zeros because mean is huge? Not.
+
+Wait: Could it be that `AscendC::ReduceAdd` does not work as expected? Maybe it accumulates into a scalar but the result is stored in a local tensor and we read it using `sumScalar(0)`. That might be incorrect if the local tensor is not fully updated. But the kernel compiled and ran.
+
+Another possibility: The kernel uses `scalarQueue_` for a tensor of size 1 (sizeof(float)). But it allocates and frees multiple times; might cause issues. But the error would be runtime, not all zeros.
+
+Given the logs show no runtime error, it's likely a logic error. Let's re-examine the kernel's second pass: It recomputes mean and invStd after first pass. But then it normalizes each tile using those values. That should produce nonzero output.
+
+But the output from the log is all zeros. That suggests the kernel is never writing any non-zero data to the output buffer, or it is writing something that becomes zero after some operation.
+
+Possibility: The kernel does not handle the case where `tileLen_` is 0 (if spatialSize is 0). But spatialSize is 512*40*40=819200, not zero.
+
+Maybe the tiling sets `tileLen` wrong: In host operator, tileLen calculation: `uint32_t tileLen = (spatialSize < maxTile) ? AlignDown(spatialSize, ALIGN_ELEMS) : maxTile;` then `if (tileLen == 0) tileLen = spatialSize;`. So tileLen could be large if spatialSize < maxTile, then AlignDown to 8 might be fine. But if spatialSize is 819200 and maxTile is 24576, then tileLen = maxTile = 24576 (aligned). That's fine.
+
+Another issue: In the kernel, the first pass loops over tiles to compute sum and sumSq. But the second pass uses the same tileLen and offset. However, note that after the first pass, the tiles used in the second pass must be reloaded from global memory. That is done: the second pass reloads xLocal via DataCopy. So that's correct.
+
+But could it be that the memory for `sqQueue_` and `inQueueX_` are sharing the same buffer? No, they are separate.
+
+Wait: The kernel uses `sqQueue_` for square, but it is a pipe queue. The usage: `sqQueue_.FreeTensor(sqLocal)` after use. That's correct.
+
+I suspect the issue might be with the reduction sum using `AscendC::ReduceAdd`. Not sure.
+
+Given the correctness failure, and since the task is to repair with minimal changes, we should focus on fixing the kernel to compute InstanceNorm3d correctly. The previous attempt's kernel computes mean and variance in a two-pass approach but may have bugs in the reduction or normalization.
+
+Alternatively, we can use the AscendC built-in instance norm functions? But the task requires a custom kernel. 
+
+Simplify: Instead of a two-pass, we can compute mean and variance in one pass using the standard formula: mean = sum(x)/N, var = sum(x^2)/N - mean^2. That's what we did.
+
+But we need to ensure the reduction is correct. Perhaps the issue is that `ReduceAdd` produces a local tensor with one float, but we are calling it multiple times and adding to a float variable. That should work.
+
+Let's look at the concrete log: The output tensor printed is all zeros. That strongly suggests that the kernel's second pass is not writing values (maybe the DataCopy is not executed) or the invStd is zero/NaN.
+
+Check the division: `float invStd = 1.0f / (variance + eps_ > 0 ? sqrtf(variance + eps_) : 0.0f);` If variance+eps_ is positive, we compute sqrt and invert. If variance+eps_ is <=0, we set invStd to 0? Actually: `1.0f / 0.0f` is inf, not zero. But the condition: if variance+eps_ > 0 then sqrt else 0.0f. So if variance+eps_ <= 0, we divide by 0, resulting in inf. Then Mul by invStd would produce inf or NaN, not zero. So that would not produce zeros.
+
+Maybe the sqrtf returns 0 for positive numbers? Unlikely.
+
+Another thought: The kernel might be failing to initialize correctly because the tiling data is not passed correctly? But the build succeeded and it ran without crash.
+
+Let's look at the host operator: It does not include the `OP_ADD` macro. That's fine because the autogen handles registration. But we need to ensure the kernel name matches the op name. The kernel function is `ca6k_00282_custom`. The op name in JSON is `Ca6k00282Custom`. The kernel symbol used in the JSON's "kernel" field should match. In the autogen, the kernel function name is derived from the op name. Typically it becomes `ca6k_00282_custom`. So that's consistent.
+
+However, the host operator file must also define the infer shape and data type functions. The previous attempt host_operator_src includes only `InferShape` and `InferDataType` inside namespace `ge`, but does not have the `OP_ADD` or any class definition for the operator. The autogen likely generates the operator registration based on the JSON and the provided tiling function. The TilingFunc is registered via `context->SetBlockDim` etc., and it's called. But the host operator file must be compiled and linked. The previous attempt's file only contains TilingFunc and infer functions. That should be fine because the autogen generates the rest.
+
+But the log shows a warning: `[Warning]: tiling struct [Ca6k00282CustomTilingData] is conflict with one in file ca6k00282_custom_tiling.h, line 5`. This warning might indicate a duplicate definition of the tiling struct, which could cause issues if the struct layout is different. The tiling data file is generated from host_tiling_src, and the autogen also generates a tiling data header. There could be a conflict. The warning says "conflict with one in file ca6k00282_custom_tiling.h, line 5". That file is likely the autogen-generated one. The struct definition may differ. In the previous attempt, the host_tiling_src defines fields: N, C, spatialSize, tileLen, eps. The autogen might expect the fields to be exactly the ones defined in the tiling data base, but the names must match. The autogen generates tiling data header based on the op name and the tiling data class defined in the host_tiling_src? Actually, the autogen creates a tiling data header from the JSON? Not exactly. The tiling data is defined by the user in the tiling header, and the autogen includes it. So there should be only one definition. The warning indicates that there are two definitions of `Ca6k00282CustomTilingData` - one from our host_tiling_src (which becomes the tiling header) and one from the autogen? But the autogen does not generate tiling data; it includes the user's tiling header. So the duplication might be because we have two .cpp files that each include the tiling header? In the previous attempt, we have two source files: `ca6k00282_custom.cpp` (from autogen? Actually the autogen generates `ca6k00282_custom.cpp` and `ca6k_00282_custom.cpp`? The build log shows both are compiled: `[ 75%] Building CXX object op_host/CMakeFiles/cust_optiling.dir/ca6k00282_custom.cpp.o` and `[ 75%] Building CXX object op_host/CMakeFiles/cust_optiling.dir/ca6k_00282_custom.cpp.o`. So there are two files. One is the user-provided (from host_operator_src, named as ca6k_00282_custom.cpp) and the other is the autogen-generated (ca6k00282_custom.cpp). Both include the tiling header, but the autogen also includes the tiling header in its generated file. However, the tiling struct is declared only once if we use include guards. The warning says "conflict with one in file ca6k00282_custom_tiling.h, line 5". That means there are two definitions of the same struct in different translation units, which is fine for C++ as long as they are the same (ODR). The warning is just informational. So that might not be the cause of correctness failure.
+
+Now, the memory references: Memory 3 and 4 mention not using setter methods for tiling data; instead assign directly. In the previous attempt, we used `tiling.set_N(N)` etc. That compiled, but maybe the setter methods are not generated properly? The warning about tiling struct conflict might cause the setter to not be generated? But it compiled.
+
+Given the correctness failure, the most likely issue is in the kernel's computation. Let's re-implement the kernel more robustly, using AscendC built-in functions for reduction and normalization. But we must keep the fix minimal. Perhaps the problem is using `sqrtf` instead of `AscendC::Sqrt`. Let's change that.
+
+Also, we should ensure that the reduction uses `AscendC::ReduceAdd` correctly. We can test by outputting the mean and variance? Not possible.
+
+Another potential issue: The kernel uses `sqQueue_` which is a queue of size BUFFER_NUM (2) with tileLen floats. That is fine.
+
+Maybe the issue is that the kernel does not use `SetBlockDim` correctly? The blockDim is set to N*C, which is 2*8=16. That's okay.
+
+But in the kernel, the blockIdx is used to map to a specific (n,c). The condition `if (blockIdx >= N_ * C_) return;` ensures only valid blocks work. So each block processes one channel of one batch. That's fine.
+
+The only way output becomes all zeros is if the second pass writes zeros. That could happen if invStd is zero, which happens if variance+eps_ <= 0 and we set denominator to 0.0f -> inf -> but Mul by inf produces inf, not zero. Unless the AscendC Mul behaves differently? Or if the Sub produces zeros because xLocal is already zero? Not.
+
+Wait: What if the kernel's first pass computes sum and sumSq incorrectly, leading to mean=0 and variance=0? Then invStd = 1/sqrt(eps_) which is >0. So normalized output would be x/eps (since mean 0). That would be nonzero. So not zeros.
+
+Unless the first pass never executes because tileLen_ is 0? But spatialSize is 819200, tileLen is 24576, so it loops.
+
+Let's examine the tile loop in first pass: 
+```
+uint32_t remaining = spatialSize_;
+uint32_t offset = 0;
+while (remaining > 0) {
+    uint32_t curLen = (remaining > tileLen_) ? tileLen_ : remaining;
+    // Load x tile
+    ...
+    // sum part
+    AscendC::ReduceAdd(sumScalar, xLocal, curLen);
+    sum += sumScalar(0);
+    ...
+    offset += curLen;
+    remaining -= curLen;
+}
+```
+This should accumulate sum over all spatial elements.
+
+But note: `AscendC::ReduceAdd` may not be the correct API for scalar reduction. The API might be `ReduceAdd(LocalTensor<T> dst, LocalTensor<T> src, int32_t count)` where dst must be a local tensor of at least 1 element. That is what we do. But perhaps the reduction only works on elements up to a certain size? The document says ReduceAdd supports up to 256 elements? Actually, in AscendC, `ReduceAdd` is for vector reduction with a limit on the number of elements (e.g., 256). The kernel uses tileLen up to 24576, which is far larger than the maximum reduction size. This is likely the root cause. The `ReduceAdd` function may silently produce incorrect results for large sizes, or not reduce at all. That would cause sum to be zero if the reduction returns zero for each tile, or incorrect.
+
+Yes! That is a typical pitfall. `ReduceAdd` is not a general reduction over large arrays; it is for small vectors up to a certain limit (often 256 or 4096). For large tiles, we need to do a multi-level reduction. The previous attempt's kernel incorrectly uses `ReduceAdd` on a tile of size up to 24576. That would give wrong results.
+
+Thus, the fix is to implement a proper summation using a loop with limited reduction steps. For example, we can accumulate sum in a local scalar by iterating over the tile in chunks of a smaller size (e.g., 256) and using `ReduceAdd` on each chunk, or we can compute sum using `ReduceAdd` on the entire tile but that's not supported. The correct approach is to use `AscendC::ReduceAdd` only on a small block, then accumulate.
+
+Simplify: We can change the kernel to compute mean and variance using a single pass that also normalizes in the same pass if we have the memory, but we need to compute the mean first.
+
+Alternate approach: Use two passes but ensure each reduction is done in small chunks. For each tile, we can sum by breaking into smaller blocks (e.g., 256 elements) and reduce each block to a scalar, then sum those scalars. Or we can use the built-in `AscendC::Tensor` reduction functions like `AscendC::Sqrt` etc., but there is no built-in sum for large tensors.
+
+Thus, we need to modify the kernel to handle reduction correctly.
+
+Given the repair constraint: "Prioritize resolving the concrete errors shown in logs." The error is all-zero output. We'll fix the reduction.
+
+Also, we should use `AscendC::Sqrt` instead of `sqrtf`. And ensure the tiling data assignment uses direct member assignment (memory 3/4) to avoid setter issues. But the previous attempt used setters and compiled, so it's not the issue. However, to be safe, we should follow memory 3/4 and assign directly. But the log shows a warning about tiling struct conflict, but not a compilation error. We'll keep setters if they work, but we might switch to direct assignment to be safe.
+
+Also, we need to include the operator registration in host_operator_src? The memory 1 says not to add OP_ADD to avoid duplication. The previous host_operator_src did not have OP_ADD, and it compiled. So that's fine.
+
+Now, design the fix:
+
+1. In kernel_src, modify the reduction loops to use chunked reduction with `ReduceAdd` on small chunks (e.g., 256 elements). We'll define a constant `REDUCE_CHUNK = 256`. For each tile, we'll loop over sub-chunks, do `ReduceAdd` on a local tensor of size chunk, accumulate into a scalar.
+
+2. Use `AscendC::Sqrt` for the sqrt.
+
+3. Ensure the local tensor allocations are sufficient for the chunk size.
+
+4. Possibly avoid the two-pass by computing normalized output in one pass after computing mean and variance? That's fine if we store the entire tile and do the normalization in the same loop? But we need mean/variance first, so two passes are okay.
+
+We'll also simplify: Instead of two passes, we can compute sum and sumSq in first pass, then in second pass do normalization by loading the same tile again.
+
+But we must ensure that the second pass also breaks into chunks for the Sub and Mul operations, but those element-wise operations can be done over the entire tile length (up to 24576) because they are vector operations not reductions. So that's fine.
+
+We'll modify the first pass to chunk reduction:
+
+```
+constexpr int32_t REDUCE_CHUNK = 256;
+uint32_t remaining = spatialSize_;
+uint32_t offset = 0;
+while (remaining > 0) {
+    uint32_t curLen = (remaining > tileLen_) ? tileLen_ : remaining;
+    // load x tile
+    AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+    AscendC::DataCopy(xLocal, xGm_[baseOffset + offset], curLen);
+    // reduce sum over this tile in chunks
+    uint32_t pos = 0;
+    while (pos < curLen) {
+        uint32_t chunk = (curLen - pos > REDUCE_CHUNK) ? REDUCE_CHUNK : (curLen - pos);
+        AscendC::LocalTensor<float> sumChunk = scalarQueue_.AllocTensor<float>();
+        AscendC::ReduceAdd(sumChunk, xLocal[pos], chunk);  // need to offset xLocal
+        sum += sumChunk(0);
+        scalarQueue_.FreeTensor(sumChunk);
+        // similarly for sumSq: square first then reduce
+        AscendC::LocalTensor<float> sqChunk = sqQueue_.AllocTensor<float>();
+        AscendC::Mul(sqChunk, xLocal[pos], xLocal[pos], chunk);
+        AscendC::LocalTensor<float> sumSqChunk = scalarQueue_.AllocTensor<float>();
+        AscendC::ReduceAdd(sumSqChunk, sqChunk, chunk);
+        sumSq += sumSqChunk(0);
+        scalarQueue_.FreeTensor(sumSqChunk);
+        sqQueue_.FreeTensor(sqChunk);
+        pos += chunk;
+    }
+    inQueueX_.FreeTensor(xLocal);
+    offset += curLen;
+    remaining -= curLen;
+}
+```
+
+But note: `xLocal[pos]` creates a subtensor starting at pos. That should work.
+
+We also need to allocate `scalarQueue_` with size `REDUCE_CHUNK * sizeof(float)`? No, `ReduceAdd` outputs a single float, so we need a tensor of size 1. The queue is initialized with size `sizeof(float)`. That's fine.
+
+But we need `sqQueue_` to hold the squared values before reduction, but we can just use a local tensor from `sqQueue_` of size chunk. The queue was initialized with `tileLen_ * sizeof(float)`, so it can hold a chunk.
+
+To avoid complexity, we can allocate temporary local tensors for chunks from `tmpQueue_` (like VECCALC). We already have `tmpQueue_`? In the previous kernel we didn't have a generic tmp queue, only sqQueue_ and scalarQueue_. We can add a general tmp queue.
+
+Simplify further: Use a separate temporary buffer for chunk operations. But we can also use `sqQueue_` for squared values and `scalarQueue_` for reduction result. We'll keep that.
+
+Also, for the sqrt, use `AscendC::Sqrt(tensor, tensor, count)`? Actually `AscendC::Sqrt` takes a local tensor and returns a local tensor. We need to compute sqrt of a scalar. Better to compute `invStd` on the host? No, it must be on device. We can compute sqrt using `AscendC::Sqrt` on a local tensor of size 1: create a tensor with value `variance + eps_`, then use `AscendC::Sqrt` on that tensor, then invert.
+
+So:
+
+```
+AscendC::LocalTensor<float> epsTensor = scalarQueue_.AllocTensor<float>();
+epsTensor(0) = variance + eps_;
+AscendC::Sqrt(epsTensor, epsTensor, 1);
+float invStd = 1.0f / epsTensor(0);
+scalarQueue_.FreeTensor(epsTensor);
+```
+
+But note: `AscendC::Sqrt` modifies in place. That's fine.
+
+Also, we must ensure that `variance + eps_` is positive; it should be due to eps.
+
+Now, regarding the tiling data setters: The memory 3/4 suggest using direct assignment. The previous attempt used setters and it compiled, but the warning about conflict may be related. To be safe, we'll use direct assignment in host_operator_src.
+
+We also need to include the `OP_ADD` macro? Memory 1 says not to add because autogen handles it. The previous attempt did not have it, and it compiled. So we omit.
+
+Now, rewrite the six strings. Keep the same structure but fix the kernel and tiling assignment.
+
+Also, note that the model_src uses `custom_ops_lib` and the function name `ca6k_00282_custom`. That's consistent.
+
+Let's produce the corrected code.
+
+We must output exactly one code block with the six assignments.
+
+We'll include the minimal changes.

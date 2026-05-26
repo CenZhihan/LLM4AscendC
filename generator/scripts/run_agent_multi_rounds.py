@@ -96,6 +96,7 @@ def _run_eval_for_txt(
     clean_policy: str,
     eval_workers: int = 1,
     eval_npu: int = 1,
+    eval_timeout_sec: int | None = None,
 ) -> int:
     if eval_workers != 1:
         raise ValueError(
@@ -114,7 +115,9 @@ def _run_eval_for_txt(
             clean_policy,
         ]
     )
-    proc = subprocess.run(cmd, cwd=str(REPO_ROOT), check=False)
+    if eval_timeout_sec is not None:
+        cmd.extend(["--eval-timeout", str(eval_timeout_sec)])
+    proc = subprocess.run(cmd, cwd=str(REPO_ROOT), check=False, env=os.environ.copy())
     return int(proc.returncode)
 
 
@@ -128,16 +131,30 @@ def _synthetic_result_payload_when_eval_json_missing(
     eval_mode: str,
     eval_rc: int,
     result_path: pathlib.Path,
+    eval_timeout_sec: int | None = None,
 ) -> Dict[str, Any]:
     """
     eval_operator normally writes result_<op>.json even on failure; if the subprocess exits
     without creating the file (crash, pre-pipeline bug), synthesize the same top-level shape
     so repair rounds still get correctness_info and a written json for debugging.
     """
-    msg = (
-        f"eval_operator did not emit result json (subprocess rc={eval_rc}). "
-        f"Expected path: {result_path}"
-    )
+    from tools.common.runner import DEFAULT_EVAL_TIMEOUT_SEC, EXIT_CODE_EVAL_TIMEOUT
+
+    if eval_rc == EXIT_CODE_EVAL_TIMEOUT:
+        limit = (
+            eval_timeout_sec
+            if eval_timeout_sec is not None and eval_timeout_sec > 0
+            else DEFAULT_EVAL_TIMEOUT_SEC
+        )
+        msg = (
+            f"[FAIL] NPU eval timed out after {limit}s (subprocess rc={eval_rc}). "
+            f"No result json at {result_path}"
+        )
+    else:
+        msg = (
+            f"eval_operator did not emit result json (subprocess rc={eval_rc}). "
+            f"Expected path: {result_path}"
+        )
     return {
         "result": {
             op: {
@@ -271,6 +288,7 @@ def run_multi_attempt_for_op(
     max_attempts: int,
     eval_workers: int,
     eval_npu: int,
+    eval_timeout_sec: int | None = None,
     ascend_search_version_filter: Optional[str] = None,
     run_slug: str = "",
     memory_root: Optional[pathlib.Path] = None,
@@ -421,6 +439,7 @@ def run_multi_attempt_for_op(
                 clean_policy=clean_policy,
                 eval_workers=eval_workers,
                 eval_npu=eval_npu,
+                eval_timeout_sec=eval_timeout_sec,
             )
             outcome.eval_ran = True
             result_path = _eval_result_json_path(gen["txt_path"], op)
@@ -430,6 +449,7 @@ def run_multi_attempt_for_op(
                     eval_mode=eval_mode,
                     eval_rc=eval_rc,
                     result_path=result_path,
+                    eval_timeout_sec=eval_timeout_sec,
                 )
                 result_path.parent.mkdir(parents=True, exist_ok=True)
                 _write_json(result_path, payload)
@@ -544,6 +564,7 @@ def _run_single_op_job(
     max_attempts: int,
     eval_workers: int,
     eval_npu: int,
+    eval_timeout_sec: int | None = None,
     op_slot: int,
     parallel_ops: int,
     ascend_search_version_filter: Optional[str] = None,
@@ -578,6 +599,7 @@ def _run_single_op_job(
         max_attempts=max_attempts,
         eval_workers=eval_workers,
         eval_npu=eval_npu,
+        eval_timeout_sec=eval_timeout_sec,
         ascend_search_version_filter=ascend_search_version_filter,
         run_slug=run_slug,
         memory_root=memory_root,
@@ -659,6 +681,7 @@ def _continue_single_op_worker(
         max_attempts=new_max_attempts,
         eval_workers=args_dict["eval_workers"],
         eval_npu=args_dict["eval_npu"],
+        eval_timeout_sec=args_dict.get("eval_timeout_sec"),
         op_slot=op_slot,
         parallel_ops=args_dict["parallel_ops"],
         ascend_search_version_filter=ascend_vf,
@@ -772,6 +795,7 @@ def _run_continue_session(
             max_attempts=args.max_attempts,
             eval_workers=args.eval_workers,
             eval_npu=args.eval_npu,
+            eval_timeout_sec=args.eval_timeout,
             op_slot=op_slot,
             parallel_ops=args.parallel_ops,
             ascend_search_version_filter=ascend_vf,
@@ -817,6 +841,7 @@ def _run_continue_session(
             "max_log_lines": args.max_log_lines,
             "eval_workers": args.eval_workers,
             "eval_npu": args.eval_npu,
+            "eval_timeout_sec": args.eval_timeout,
             "parallel_ops": args.parallel_ops,
             "use_repair_memory": args.use_repair_memory,
             "memory_backend": args.memory_backend,
@@ -895,6 +920,7 @@ def _run_continue_session(
         "parallel_ops": args.parallel_ops,
         "eval_workers": args.eval_workers,
         "eval_npu": args.eval_npu,
+        "eval_timeout_sec": args.eval_timeout,
         "run_dir": str(out_run_dir),
         "categories": prior_agg.get("categories", list(args.categories)),
         "kernelbench102": prior_agg.get("kernelbench102", args.kernelbench102),
@@ -1031,6 +1057,16 @@ def main() -> int:
     parser.add_argument("--parallel-ops", type=int, default=1, help="Number of ops to run in parallel.")
     parser.add_argument("--eval-workers", type=int, default=1, help="Pass-through eval workers per attempt.")
     parser.add_argument("--eval-npu", type=int, default=1, help="Pass-through eval npu count per attempt.")
+    parser.add_argument(
+        "--eval-timeout",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help=(
+            "Pass-through NPU eval (spec.py) wall-clock timeout per attempt; "
+            "default 1200s or env LLM4ASCENDC_EVAL_TIMEOUT_SEC. <=0 disables."
+        ),
+    )
     parser.add_argument(
         "--ascend-search-version",
         default=None,
@@ -1247,6 +1283,7 @@ def main() -> int:
         "parallel_ops": args.parallel_ops,
         "eval_workers": args.eval_workers,
         "eval_npu": args.eval_npu,
+        "eval_timeout_sec": args.eval_timeout,
         "run_dir": str(out_run_dir),
         "categories": list(args.categories),
         "kernelbench102": args.kernelbench102,
@@ -1280,6 +1317,7 @@ def main() -> int:
                 max_attempts=args.max_attempts,
                 eval_workers=args.eval_workers,
                 eval_npu=args.eval_npu,
+                eval_timeout_sec=args.eval_timeout,
                 op_slot=op_slot,
                 parallel_ops=args.parallel_ops,
                 ascend_search_version_filter=ascend_vf,
@@ -1314,6 +1352,7 @@ def main() -> int:
                     max_attempts=args.max_attempts,
                     eval_workers=args.eval_workers,
                     eval_npu=args.eval_npu,
+                    eval_timeout_sec=args.eval_timeout,
                     op_slot=op_slot,
                     parallel_ops=args.parallel_ops,
                     ascend_search_version_filter=ascend_vf,

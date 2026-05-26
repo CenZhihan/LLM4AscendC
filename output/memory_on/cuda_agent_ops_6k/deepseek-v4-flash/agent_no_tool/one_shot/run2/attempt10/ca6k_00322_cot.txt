@@ -1,0 +1,140 @@
+We need to fix the correctness issue. The previous attempt's kernel code used a slow element-wise approach (GetValue/SetValue) which likely produces correct results but the output shows all zeros. That suggests the kernel is not actually writing the data correctly. Also the tiling data showed conflict warnings but compiled. The output mismatch indicates the kernel output is all zeros.
+
+The main problem: The kernel uses `AscendC::DataCopy(yGm_[base], xLocal, curLen);` but yLocal is allocated but never used. The code allocates yLocal but then writes to xLocal (which is an input tensor) and copies that to output. That is a misuse of queues: inQueueX_ and outQueueY_ are not being used properly. The kernel also uses `xLocal.SetValue` which is slow but should work. However the output is all zeros, likely because of incorrect indexing or the DataCopy isn't working.
+
+Better approach: Use AscendC's vectorized operations to perform channel shuffle efficiently. But given the constraint of minimal changes, we need to fix the kernel to output non-zero correct values.
+
+First, check the kernel: It allocates xLocal as a local tensor from inQueueX_ (VECIN), then writes into it using SetValue. Then it copies xLocal to yGm_ using DataCopy. That is unconventional but could work if the DataCopy direction is correct. However, the output is all zeros. Possibly the issue is that the input buffer (inQueueX_) is not initialized with data from global memory. The kernel does not call DataCopy to load x into xLocal; it directly allocates and writes. So xLocal initially contains uninitialized data. The SetValue should write the permuted values, but the initial zeros could be if the GetValue from xGm_ returns zeros? But x is random, so it should not be zero.
+
+Alternatively, maybe the whole approach is flawed because of the queue management: after allocating xLocal from inQueueX_, the kernel never enqueues it. Then later it tries to FreeTensor, but the queue is not used correctly. This might cause undefined behavior.
+
+Given the complexity, it's better to rewrite the kernel using a simpler but correct method: load a tile of input data into a local tensor, permute it in-place using a two-buffer swap (or use a local temporary), then copy the result to global output. However, channel shuffle is a permutation that cannot be done in-place easily because each output element comes from a different input index. So we need to read the input in a permuted order and write directly to output.
+
+Alternative: Use DataCopy to load the entire x tensor contiguously? But then we need to permute locally, which may exceed UB budget for large tensors. Better to process per tile: for each tile of output (contiguous block in y), compute the corresponding input indices, then copy those input elements into a local buffer (one by one), then write the local buffer to the output tile. That is what the previous code attempted but with incorrect queue usage.
+
+Fix: Remove the use of inQueueX_ entirely (or keep it for loading input tile if we want). Actually, we don't need input tile buffer because we are reading scattered input elements. So we can just allocate a local tensor from outQueueY_ (which is for output) and fill it directly, then DataCopy to global. We don't need inQueueX_ for this approach. However, we still need to handle tiling.
+
+Simplify: For each tile (contiguous block of output), allocate a local tensor of size tileLen, loop over each index in the tile, compute input index, get value from global input using GetValue, set value in local tensor, then copy local tensor to global output. This avoids queues for input. But need to be careful with queue usage for output: we should use outQueueY_ correctly.
+
+The previous attempt allocated yLocal but never used it, and used xLocal (from inQueueX_) as the buffer. That's wrong. Let's rewrite:
+
+- Allocate local buffer from outQueueY_ (since it's for output).
+- Fill it with permuted values.
+- Enqueue the tensor, then dequeue and DataCopy to global output.
+- Free.
+
+But need to ensure the queue size matches tileLen.
+
+Also, the Process loop has an issue: it uses a while (base < totalLen_) with strideElems, but the loop increments base += strideElems. However, within the loop, it does not handle prefecthing and the next iteration will reallocate new tensors, which may cause queue overflow because the previous tensor is not freed until after DataCopy. Actually, the previous code allocated and freed inside the loop, so that should be fine. But it allocated yLocal and never freed it? It freed both at the end: `outQueueY_.FreeTensor(yLocal); inQueueX_.FreeTensor(xLocal);`. However, it allocated yLocal before xLocal but never used yLocal. That's a memory leak? No, it freed yLocal later. The issue is that xLocal is from inQueueX_, not from outQueueY_. That is confusing.
+
+Better to refactor: Use only outQueueY_ for output buffer. Allocate buffer, fill, then DataCopy, then free. No input queue needed.
+
+Let's rewrite kernel_src accordingly.
+
+Also, the tiling data fields: we have N, C, H, W, groups, totalLength, tileLength, blockDim. The kernel init takes those. The process loop uses N_, C_, H_, W_, groups_, Cg_ (computed as C/groups). That's fine.
+
+But the kernel currently uses `hw = H_ * W_;` and `nc = C_ * hw;` and indexing. That is correct.
+
+However, the kernel loads tile based on base (output index). The input index computation `inIdx = n * nc + c_in * hw + h * W_ + w;` is correct for NCHW format.
+
+Now, the output mismatch may also be due to the fact that the kernel only processes a subset of elements because of stride? The grid-stride loop is intended to split work among blocks. That is fine.
+
+But the output is all zeros, which could indicate that the kernel is not writing to yGm_ at all, or the DataCopy is not happening. Or maybe the local buffer is not being written correctly because SetValue might have issues when the tensor is not properly initialized or when using queue allocation.
+
+Let's test with a simple fix: use a local tensor declared without queue (using AscendC::LocalTensor<float> yLocal; and allocate with pipe_.InitBuffer? Actually, we can't allocate stack tensors. We must use queues or pipe allocated buffers. The correct approach is to use a local tensor from a queue.
+
+Simplify: Use only one queue for output, and allocate a local tensor, fill it, then DataCopy, then FreeTensor.
+
+Implementation: In Process, at each tile, allocate from outQueueY_, fill, DataCopy, FreeTensor. No need for inQueueX_. But we still need to initialize the queue buffer size in Init: pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float)); That is already there.
+
+So modify kernel:
+
+```
+__aicore__ inline void Process()
+{
+    if (totalLen_ == 0 || tileLen_ == 0) return;
+    uint32_t blockNum = AscendC::GetBlockNum();
+    uint32_t blockIdx = AscendC::GetBlockIdx();
+    uint32_t strideElems = blockNum * tileLen_;
+    uint32_t base = blockIdx * tileLen_;
+    if (base >= totalLen_) return;
+
+    const uint32_t nc = C_ * H_ * W_;
+    const uint32_t hw = H_ * W_;
+
+    while (base < totalLen_) {
+        uint32_t curLen = totalLen_ - base;
+        if (curLen > tileLen_) curLen = tileLen_;
+
+        // Allocate output buffer
+        AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+
+        // Fill with permuted values
+        for (uint32_t i = 0; i < curLen; i++) {
+            uint32_t idx = base + i;
+            uint32_t n = idx / nc;
+            uint32_t rem = idx % nc;
+            uint32_t c_out = rem / hw;
+            uint32_t hwRem = rem % hw;
+            uint32_t h = hwRem / W_;
+            uint32_t w = hwRem % W_;
+
+            uint32_t c_in = (c_out % groups_) * Cg_ + (c_out / groups_);
+            uint32_t inIdx = n * nc + c_in * hw + h * W_ + w;
+            float val = xGm_.GetValue(inIdx);
+            yLocal.SetValue(i, val);
+        }
+
+        // Copy to global output
+        AscendC::DataCopy(yGm_[base], yLocal, curLen);
+
+        outQueueY_.FreeTensor(yLocal);
+
+        base += strideElems;
+    }
+}
+```
+
+And remove inQueueX_ from Init and class members. Also remove the BUFFER_NUM for inQueueX_.
+
+Also, need to adjust Init to not init inQueueX_.
+
+Check: outQueueY_ must be initialized with BUFFER_NUM=2. That's fine.
+
+Now, about the tiling data: we have conflict warning: "tiling struct [Ca6k00322CustomTilingData] is conflict with one in file ca6k00322_custom_tiling.h, line 5". This warning is harmless but indicates duplicate definitions? But it compiled. Might be a naming mismatch between "ca6k00322_custom_tiling.h" and "ca6k_00322_custom_tiling.h". In host_operator_src, we include "ca6k_00322_custom_tiling.h". But the tiling header file is actually named "ca6k00322_custom_tiling.h" (without underscore after ca6k). The project JSON expects the tiling header to be generated from the op name. The warning suggests there are two different tiling data structs with the same name? Actually it says "conflict with one in file ca6k00322_custom_tiling.h, line 5". That file is the real auto-generated one. Our included file might be a different one? In host_operator_src, we have `#include "ca6k_00322_custom_tiling.h"`. But the build likely generates a tiling header named "ca6k00322_custom_tiling.h" (no extra underscore after ca6k). The op name in the JSON is "Ca6k00322Custom". The file naming convention: The generated tiling header is based on the op name lowercased, e.g., "ca6k00322_custom_tiling.h". Our host_tiling_src defines a struct with the same name, but it's included from a different file name. The warning indicates that there are two struct definitions with the same name, which is not good. We should either remove the duplicate tiling data definition in host_tiling_src and rely on the auto-generated one, or ensure the tiling data file name matches.
+
+Given the repair memory 1: "When opbuild fails with redefinition of `class ge::op::Ca6k00322Custom` in `autogen/op_proto.h`, do not add a duplicate `REG_OP` block in op host source files". That's about op definition, not tiling. But similar principle: we might have duplicate tiling struct. The warning says "conflict with one in file ca6k00322_custom_tiling.h", meaning the build already generates that file, and our host_tiling_src is intended to be that file? Actually, the tiling data struct should be defined in the tiling header (host_tiling_src). But the build also auto-generates a tiling header from the operator definition? No, the tiling header is provided by the user. The warning might be because the opbuild tool also generates a tiling data struct from the operator info? Or maybe the naming mismatch: we include "ca6k_00322_custom_tiling.h" but the actual file generated from our host_tiling_src is "ca6k00322_custom_tiling.h" (without underscore) due to the op name. The include path might be case-insensitive? It's murky. To avoid the conflict, ensure that the tiling header file name matches exactly the op name converted to lower case with underscores. The op name is "Ca6k00322Custom". Lowercased: "ca6k00322_custom". So the expected file is "ca6k00322_custom_tiling.h". But our host_operator_src includes "ca6k_00322_custom_tiling.h" which has an extra underscore after ca6k. That's wrong. We need to change the include directive to `#include "ca6k00322_custom_tiling.h"` in host_operator_src. Since the variable host_tiling_src is the content of the tiling header file, it will be written to the correct filename by the build system based on the op name. So we should keep the include consistent.
+
+Thus, change host_operator_src include to `#include "ca6k00322_custom_tiling.h"`.
+
+Also, in host_tiling_src, the namespace and struct names are fine as they are auto-generated? Actually, the user provides the tiling data definition, and it must match the expected struct name. The struct name is "Ca6k00322CustomTilingData". That's fine.
+
+Now, the kernel name: the entry point is `ca6k_00322_custom`. That matches the python binding. In previous attempt, the kernel function name in kernel_src is `ca6k_00322_custom`. Good.
+
+Now, check the host_operator_src: it defines op class and tiling function. It uses `#include "ca6k_00322_custom_tiling.h"`. Change to correct include.
+
+Also, note that in host_operator_src, the TilingFunc uses setter methods which are fine (the tiling data class should have those). But memory 3 and 4 suggest that some builds require direct assignment. In this case, we have setter methods, and they compiled fine. So keep as is.
+
+Now, the python_bind_src: uses aclnnCa6k00322Custom. The autogen function name is based on op name: aclnnCa6k00322Custom. That matches.
+
+The model_src: imports custom_ops_lib and calls the function with x and groups. That should work.
+
+Now, the main correctness issue is the kernel logic. We will rewrite kernel_src to be simpler and correct: use only output queue, fill with permuted values, copy. Also ensure that the loop condition handles tiling correctly.
+
+We also need to consider that the kernel uses `AscendC::GetBlockNum()` and `AscendC::GetBlockIdx()`. That's fine.
+
+One more thing: The tiling data includes blockDim, but the kernel doesn't use it. That's okay.
+
+Now, we need to output the corrected code. The output format: exactly the six variables.
+
+Let's construct the new code.
+
+Key changes:
+- Fix kernel_src: remove inQueueX_, use only outQueueY_, implement loop correctly.
+- Fix host_operator_src include: "ca6k00322_custom_tiling.h" (no underscore after ca6k).
+- Possibly adjust host_tiling_src? It already uses the correct struct name.
+- No changes to project_json_src, python_bind_src, model_src.
+
+Also, ensure that the kernel process loop uses the correct stride and terminates.
+
+Let's write the corrected code.

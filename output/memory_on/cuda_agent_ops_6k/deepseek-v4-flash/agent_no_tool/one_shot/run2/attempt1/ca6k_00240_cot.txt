@@ -1,0 +1,143 @@
+We need to produce six Python string variables for a fused custom AscendC operator that replaces `torch.binary_cross_entropy_with_logits`. The operator name stem is `ca6k_00240_custom` and PascalCase `Ca6k00240Custom`. The fused operator will compute binary cross entropy with logits: loss = max(x,0) - x*y + log(1+exp(-abs(x))). But note that the reference forward returns a scalar? Actually `torch.binary_cross_entropy_with_logits` returns a tensor of same shape as input (element-wise loss) unless reduction is 'none' (default is 'mean'?). In the given reference, no reduction is specified, so default is 'mean'? Wait, PyTorch documentation: `torch.nn.functional.binary_cross_entropy_with_logits` has reduction='mean' by default. But in the Model, they use `torch.binary_cross_entropy_with_logits(y_pred, y_true)` which returns a scalar tensor (mean). However, the harness likely compares outputs exactly. We need to match the numerical output.
+
+But careful: The instruction says "Reference PyTorch program (class Model is the golden behavior; you will provide ModelNew in model_src only)". The model uses `torch.binary_cross_entropy_with_logits` which applies element-wise binary cross entropy and then reduces (default mean). So the output is a scalar tensor (0-dim). Our custom op should also output a scalar tensor (mean). Since AscendC kernels typically operate on tensors with ND format, we need to compute element-wise loss and then reduce to mean. This is a fused op: element-wise plus reduction.
+
+We can implement a single kernel that takes two tensors (float32), computes element-wise binary cross entropy with logits, and then performs mean reduction (sum all elements / N). The output will be a tensor of shape [1] or scalar. To keep it simple, we can output a tensor of shape [1] (scalar). But the reference output is a scalar (shape []). Ideally we output a tensor of shape [1] and then squeeze? Or we can output a scalar tensor by using shape with 0 dims? AscendC may not support 0-dim tensors easily. Better to output a tensor of shape [1] and let the binding or model handle squeeze. The harness will compare outputs; we need shape match. If the reference returns a scalar, our custom op must also return a scalar (shape []). But AscendC operator output shape defined in project JSON should match what the kernel writes. The kernel can write a single value to global memory, and the output shape in the output_desc should be shape [1]? Actually, if we specify output shape as [1], the framework will expect a tensor of shape [1]. But the reference gives scalar (shape []). To match, we can have the custom op output a tensor of shape [] by setting shape size 0? That might not be allowed. Alternatively, we can implement reduction in the host side after the kernel? But we are fusing into one op. The project JSON output_desc shape can be dynamic: we can set shape to [1] and then in the binding or model, we squeeze to scalar. Or we can define the output as a scalar in the op definition using a shape that is empty? In AscendC, you can define a scalar attribute? Probably not.
+
+Better approach: The harness likely compares outputs with atol/rtol. If our op returns a tensor of shape [1] and the reference returns a scalar, they may still match if the harness flattens? But we should aim for exact shape match. Let's check the memory: might be okay.
+
+But we have constraints: "Implement a single fused custom op (or a small set) on NPU that matches the reference Model outputs for the same inputs". So we need to produce exactly the same output tensor shape and values.
+
+To avoid shape mismatch, we can implement the op to compute element-wise loss and output the same shape as input, and then have the PyTorch model (ModelNew) apply mean to match the reference? But the instruction says replace the operator, not the whole model. The model only has that one op. So we can implement a custom op that computes the element-wise loss, and then in ModelNew we call that op and then torch.mean? But that would split the fusion. Better to fuse the entire computation into one kernel that outputs a scalar.
+
+But the kernel can output a single element tensor (shape [1]) and then we can reshape to scalar in the binding or Python wrapper. That is fine.
+
+Let's design:
+
+- Input: x (float32, ND), y (float32, ND) - same shape.
+- Output: loss (float32, ND) shape [1] (scalar mean).
+
+In the kernel, we need to compute element-wise: max(x,0) - x*y + log(1+exp(-abs(x))). Then sum all elements, then divide by total number of elements. But careful about numerical stability: use the formula that uses log1p and exp(-abs(x)). We'll implement on AscendC.
+
+Steps:
+1. Load tiles.
+2. For each tile, compute element-wise loss using vector intrinsics.
+3. After processing all tiles, we need to reduce the element-wise losses to a single scalar sum. Since we are grid-stride, each block will compute a partial sum of its assigned elements. Then in the end, we need to reduce across blocks. We can either do a second kernel (not allowed) or use a shared memory reduction. Better to design the kernel to output a partial sum per block, then have the host-side tiling set blockDim to 1 and do a single block that processes all data and outputs the sum directly? But that may be slow for large tensors.
+
+Alternatively, we can use a two-pass approach: one kernel to compute element-wise loss and output a tensor of same shape, then a second kernel to compute mean? But we want a single fused op. We can implement the op as a single kernel with multiple blocks that each compute partial sums, then use a global atomic add to accumulate? AscendC doesn't support atomic operations easily in vector core? Might be possible with scalar unit.
+
+Given typical AscendC patterns for reduction, they often use a separate kernel for reduction, or use the built-in ReduceSum. But we can try to use AscendC's ReduceAdd intrinsics? There is `AscendC::ReduceAdd` which can be used across elements in a vector. But not across blocks.
+
+Simpler: set blockDim = 1 in tiling, so only one block processes all data. Then we can accumulate a local sum in a scalar register? But we need to process in tiles to fit in UB. We can keep a local sum variable that accumulates after each tile. At the end, output that sum divided by total elements. This works because the kernel only has one block. For large tensors, it may be slow but acceptable for fused demo.
+
+Thus, in tiling, we set blockDim = 1. The kernel's Process() will iterate over all tiles (with grid stride but blockNum=1) and accumulate sum into a local variable. Then output a single element to global memory.
+
+We'll need to declare the output shape in project JSON as [1] (scalar). In the kernel, we write to y[0].
+
+Alternatively, we can use a scalar tensor with shape [].
+
+But AscendC kernel kernel signature: `GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling`. The output tensor y is a pointer. We need to specify the output shape in operator definition. In project JSON, we can set output_desc with shape as [1] (or scalar?). Since the operator is built with InferShape that sets output shape to [1] (scalar). Or we can set it as [1] and later in model we squeeze.
+
+We'll go with shape [1] and then in ModelNew, after calling the custom op, we will squeeze the result to match expected scalar. Or we can define the op to output scalar directly. Let's check if AscendC allows shape with 0 dimensions: in the project JSON, we can set "format": "ND" and "type": "float". The shape is dynamic; we can set "shape": {"dim": 0} for scalar? But typical examples show shape as [1] for scalar outputs. We'll use [1].
+
+In ModelNew, we'll do: result = custom_op(x, y).squeeze() or something. But careful: the model forward must return a tensor (scalar). So we can squeeze.
+
+Now, we need to produce the six strings.
+
+Let's craft project_json_src:
+
+Following the example, we have an op named "Ca6k00240Custom" with inputs x and y (both float, ND), output loss (float, ND), and no attributes. We'll include "attr": [] (empty). We'll also need to set "op_file": etc. But the example project_json_src is a JSON array containing one op object. We'll replicate that structure.
+
+host_tiling_src:
+
+We need a tiling data struct with fields: totalLength, tileLength, negativeSlope? Not needed. Instead fields: totalLength, tileLength, blockDim, sumBuffer? Actually for reduction we need no extra attributes. We'll have fields: totalLength (uint32_t), tileLength (uint32_t), blockDim (uint32_t). Also we might need a temporary buffer for the partial sum? Since we only use one block, we don't need. So tiling data: totalLength, tileLength, blockDim. We'll compute tileLength from UB budget similar to example but simpler: we have two inputs and one output, plus temporary for element-wise computation. The element-wise computation requires at least: read x and y, compute intermediate, output loss. We'll need a buffer for x and y (2 tiles) and a buffer for output (1 tile) and a temp buffer for intermediate (maybe 1 tile). So total 4 tiles float. UB budget conservative: 192KB = 192*1024 bytes = 49152 floats. So tileLen = 49152 / 4 = 12288, align down to 2048 => 12288. But we can compute dynamically.
+
+host_operator_src:
+
+We need TilingFunc that sets blockDim=1, sets tiling fields. Also need InferShape and InferDataType. We must not add OP_ADD because the memory says autogen already does that. So we use only REG_OP? Actually the example includes a manual OP_ADD in the class definition. But memory says avoid manual OP_ADD. So we should not include that. The autogen will generate REG_OP from the project JSON. So we only need to provide TilingFunc, InferShape, InferDataType. So the host_operator_src should contain only the namespace optiling with TilingFunc and namespace ge with InferShape/InferDataType, and maybe a class definition? Actually the example includes a class LeakyReluCustom that defines inputs/outputs and calls SetInferShape etc. and then OP_ADD. But if we remove OP_ADD, we still need to register the operator with the framework? The autogen script will generate a separate file that uses REG_OP to define the operator, and we should not duplicate that. So we should not include the manual class definition. Instead, we only provide TilingFunc and infer functions? But the example includes both class definition and TilingFunc as a separate function in optiling namespace. In the memory, they said "do not add a second registration with OP_ADD; instead remove the manual OP_ADD and rely solely on the autogen REG_OP." So we can keep the class definition but remove the OP_ADD line? The class definition itself might cause redefinition if autogen also defines the same class. The memory says autogen already defines the class via REG_OP macro. So we should not define the class manually at all. Instead, we only need to provide the tiling function and infer functions as free functions in ge and optiling namespaces. The autogen will call these via some registration? Actually the typical pattern: the operator class is defined in autogen, which calls the tiling function set via SetTiling. So the tiling function must be defined and the class's registration of the tiling function happens in the autogen? That seems not. Usually, the host operator code (host_operator_src) contains the operator class that sets the tiling. But if we remove that, the framework won't know the tiling function. However, the memory repair suggests that the autogen already defines the operator with a default tiling (maybe empty) and if we also define a class, it causes redefinition. But we need to set the tiling. One approach: in host_operator_src, we can define the tiling function and also provide a registration macro that associates the tiling with the operator without redefining the class. For example, use REG_OP_TILING? Not sure.
+
+Given the complexity and the memory hints, we should follow the example pattern but remove the OP_ADD line? In the example, they have:
+
+```cpp
+namespace ops {
+class LeakyReluCustom : public OpDef {
+public:
+    explicit LeakyReluCustom(const char* name) : OpDef(name)
+    {
+        ...
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(LeakyReluCustom);
+} // namespace ops
+```
+
+If we remove the OP_ADD line, the class is defined but not added. The autogen may still add the operator via REG_OP, but the class definition might conflict? The memory says "do not add a second registration with OP_ADD". So we can keep the class definition (which sets tiling and infer) but do not call OP_ADD. The autogen's REG_OP will likely create a separate class or registration, potentially causing redefinition of the class? The memory says "redefinition of 'Ca6k00045Custom' in op_proto.h caused by manual OP_ADD". So it's specifically the OP_ADD macro that causes duplicate registration, not the class definition itself. So we can keep the class definition without OP_ADD. That should be safe. We'll do that.
+
+Thus, in host_operator_src, we keep the class definition, set tiling and infer, but do not call OP_ADD. Also we include the TilingFunc as a function in optiling namespace. The class will be defined in the same file. That should be fine.
+
+Now, kernel_src:
+
+We need to implement the kernel. We'll use a single block (blockDim=1). The Process() will iterate over all values with a stride of tileLen (no grid stride since only one block). We'll accumulate sum in a local variable (float). After processing all tiles, we write sum/totalLength to y[0].
+
+We need to handle the case where totalLength is large and we iterate with tiles.
+
+Compute element-wise loss using the stable formula:
+
+max(x,0) - x*y + log(1+exp(-abs(x)))
+
+We'll use AscendC vector intrinsics: Max, Mul, Sub, Abs, Exp, Log1p? There is Log1p (log(1+x)), but we need log(1+exp(-abs(x))). We can compute:
+
+1. abs_x = Abs(x)
+2. neg_abs_x = -abs_x
+3. exp_x = Exp(neg_abs_x)
+4. one_plus_exp_x = Adds(exp_x, 1.0)
+5. log_term = Log(one_plus_exp_x)  // or use Log1p(exp_x) for better precision? Actually log1p(exp(-abs(x))) = log(1+exp(-abs(x))). That is exactly what we need.
+But AscendC intrinsic `Log1p` computes log(1+x). So we can compute:
+
+tmp = Exp(-Abs(x))
+log_term = Log1p(tmp)
+
+Also compute max_part = Max(x, 0)
+x_times_y = Mul(x, y)
+loss = Sub(Add(max_part, log_term), x_times_y)
+
+Check formula: original binary_cross_entropy_with_logits: loss = max(x,0) - x*y + log(1+exp(-abs(x))) (see PyTorch source). So that's correct.
+
+We'll store partial sum in a local variable `partialSum` (float). For each tile, we compute loss vector, then reduce to sum using Hsum or use scalar accumulate loop? AscendC provides `Hsum` (half sum?) Actually there is `ReduceSum` vector intrinsic? For a vector, we can sum elements by repeatedly adding. Simpler: we can use scalar addition: for each element, compute loss as scalar using vector operations? That would be slow. Better: compute loss vector, then use `AscendC::ReduceAdd` to get the sum of the vector elements into a scalar. There is `AscendC::ReduceAdd` that works on a LocalTensor and reduces to a scalar in UB. We need to accumulate across tiles.
+
+We'll have a local scalar sum variable `accumSum` (float) in UB. After each tile, we compute element-wise loss into a temporary tensor, then call `AscendC::ReduceAdd` to get sum of that tile and add to `accumSum`. Since we have only one block, we can just use a float stored in UB and add after reduction using scalar operation.
+
+Thus, we need a temporary tensor for loss, and also for intermediate computations. We'll design the pipe with buffers: inQueueX, inQueueY (in), outQueueLoss (output tile? Actually we only need to output a single scalar, not per-tile losses. So we can skip output queue for tiles. We only need to accumulate sum. So we can use inQueueX and inQueueY for input, and a tmpQueue for loss computation. After reduction, we store final scalar to global memory.
+
+But we still need to allocate a local tensor for loss to compute reduction. We can use a buffer in VECCALC.
+
+Simplify: Use a single queue for input data, do compute and accumulate, then write final scalar. We'll follow a pattern:
+
+- Init pipe with two input buffers (for x and y), one temp buffer for loss.
+- In Process loop: for each tile, CopyIn x and y, DeQue, compute loss vector in tmp, use ReduceAdd to get sum, add to accumSum, free tensors.
+- After loop, write accumSum / totalLength to y[0].
+
+We need to ensure that the sum is computed correctly.
+
+Now, python_bind_src:
+
+We need to provide a binding to call the custom op. It should include the header for aclnn (like aclnnLeakyReluCustom) but our op name is Ca6k00240Custom. So we will call EXEC_NPU_CMD(aclnnCa6k00240Custom, ...). Must match the generated API.
+
+We'll create a function ca6k_00240_custom_impl_npu that takes two tensors and returns a tensor (scalar). Then register as TORCH_LIBRARY_IMPL for 'myops' or whatever. In the example, they use 'myops' namespace. We'll use 'myops' as well. The op name in torch will be "ca6k_00240_custom" (the kernel name). In model_src, we will import custom_ops_lib and call custom_ops_lib.ca6k_00240_custom.
+
+model_src:
+
+Simple: call the imported function, possibly squeeze the result.
+
+Now, let's write the code.
+
+Note: We need to specify the kernel name in kernel_src as `ca6k_00240_custom`. The kernel function signature must match: `extern "C" __global__ __aicore__ void ca6k_00240_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)`. We'll use `GET_TILING_DATA(tiling_data, tiling)`.
+
+Now, produce the six strings. We'll write in a single Python code block.
+
+Be careful with indentation and escaping.
+
+Let's start.
