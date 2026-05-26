@@ -1,0 +1,91 @@
+We need to understand the failure. The build succeeded, but correctness test failed: the output tensor has zeros for the last three rows (out of batch_size=128 rows? Actually it's a 3D tensor of shape [128,4096,4095], argmax over dim=1, so output shape [128,4095]. The reference output is correct, but the new output has zeros for rows after some point. Specifically, the output shows first three rows match, then all zeros afterwards. This suggests that the kernel only processed a subset of the output. Likely the tiling or block assignment is wrong, or the kernel's Process only covers a portion of the output.
+
+Looking at kernel: It uses grid-stride: each block handles a range of output indices from base to base+tileLen. But the total output length is d1*d2 = 4096*4095 = 16,777,? actually 4096*4095 = 16,778,? Let's compute: 4096*4095 = 4096*(4096-1) = 4096^2 - 4096 = 16,777,216 - 4096 = 16,773,120. So output size is 16.7 million. TileLen is set to TILE_ELEMS=4096, which is small. Number of blocks = ceil(totalOutputLength / tileLen). Tiling sets blockDim = min(24, max(8, numTiles)). But totalOutputLength is 16.7M, tileLen is 4096 => numTiles ~ 4096, so blockDim = 24. That's fine: 24 blocks each handle about 16.7M/24 = 698k output elements. But the kernel's Process loops for outIdx from base to end (max tileLen=4096). That's only 4096 elements per block, far less than the total per block. Wait, the kernel loops for outIdx from base to base+tileLen, but base = blockIdx * tileLen. That means each block only processes one tile of size tileLen. It doesn't continue to next tile. The grid-stride is missing. The kernel should loop over all tiles assigned to this block, using a while loop with stride = blockNum * tileLen. But the current code only processes one chunk. That explains why only first few rows are correct: Block0 processes indices 0..4095, Block1 processes 4096..8191, etc. But there are 24 blocks, so total processed = 24*4096 = 98304, which is far less than 16.7M. The output shows zeros for most entries, meaning they were never written. The zeros are default from at::empty. So the kernel only writes a small fraction of output.
+
+But wait, the kernel's Process also has a comment "Prefetch first tile" but no loop. Actually it has a while loop? No, it's not present. The kernel from the prior attempt for leaky_relu does have a while loop with stride. But for argmax, they forgot the loop. They directly process only one tile.
+
+So fix: modify kernel to loop over output indices with stride blockNum * tileLen, similar to the leaky_relu kernel pattern. Also need to adjust tiling to compute proper tileLen and blockDim, but the main issue is kernel loop.
+
+Additionally, the tiling could be improved, but let's focus on minimal fix: add a while loop to the kernel's Process to iterate over all tiles for this block.
+
+Also note: The kernel uses GlobalTensor.GetValue/SetValue which is inefficient but okay for correctness. However, it also uses xGm_ and yGm_ directly. The while loop should be: while (base < totalOutputLen_) { compute tile; base += stride; }. But careful: the base and end should be recalculated per iteration. The existing code sets base = blockIdx * tileLen_; end = base + tileLen_; then loops over outIdx from base to end. After that, we need to advance base by stride and continue until base >= totalOutputLen_.
+
+So we add:
+
+```
+uint32_t stride = blockNum * tileLen_;
+while (base < totalOutputLen_) {
+    // compute for this tile
+    // ... existing loop but with base and end computed fresh
+    // then base += stride;
+}
+But also need to break if tile size changes for last tile.
+
+Better to restructure: keep the while loop, but the existing code already has base and end. We'll wrap it.
+
+Also need to handle the case where tileLen_ may be zero? Not needed.
+
+Additionally, the tiling sets tileLen = min(totalOutput, TILE_ELEMS). That's fine but maybe we can increase tileLen to reduce overhead. But not required.
+
+Another potential issue: output shape decomposition: The kernel assumes 3D input. But input is 3D: [128,4096,4095]. That's fine. But the output shape is [128,4095]. The outShape_ and outStride_ are computed correctly. However, the decomposition of outIdx into coords for non-reduced dims assumes the output is 2D and that the first non-reduced dimension is d0? Actually input has dims d0=128, d1=4096, d2=4095. If dim=1 (reduce d1), then output shape is [d0, d2] = [128,4095]. outShape_[0] = d0 (128), outShape_[1] = d2 (4095). outStride_[0] = stride[0] = d1*d2 = 4096*4095, outStride_[1] = stride[2] = 1. The decomposition loop: for d in 1..0 (reverse), coord[d] = tmp % outShape_[d], tmp /= outShape_[d]. That works. But note that the coordinates are used to compute linear linearIdx = coord[0]*stride[0] + coord[1]*stride[2] + r*stride[1]? Actually they iterate d=0..2 and add coord[coordIdx] * stride[d] for non-reduced dims. That is correct.
+
+So the main fix is adding the while loop.
+
+Also, the tiling host code sets blockDim based on numTiles but maybe we need to ensure tileLen is decent. Currently tileLen=4096 is small; we could increase it. But let's keep minimal change.
+
+We need to modify kernel_src accordingly. Also ensure that the kernel loop uses the same pattern as leaky_relu: prefetch next tile early? For argmax, we are not doing double buffering (just GetValue/SetValue, no vector operations). So we can just have a simple loop without prefetch. But we need to avoid excessive GetValue calls per element (which is O(reduceLen)). That's fine for correctness.
+
+Thus, we will add a while loop in Process:
+
+```
+void Process()
+{
+    if (totalOutputLen_ == 0) return;
+    uint32_t blockNum = AscendC::GetBlockNum();
+    uint32_t blockIdx = AscendC::GetBlockIdx();
+    uint32_t base = blockIdx * tileLen_;
+    uint32_t stride = blockNum * tileLen_;
+    while (base < totalOutputLen_) {
+        uint32_t end = base + tileLen_;
+        if (end > totalOutputLen_) end = totalOutputLen_;
+        // ... existing loop from base to end
+        base += stride;
+    }
+}
+```
+
+But careful: base is updated after processing each tile. Also we need to recompute end each iteration.
+
+We'll also adjust the existing loop to use local base and end: they are already set, but we need to re-initialize base and end inside while. So we can rename outer base/end to currentBase, currentEnd.
+
+Let's rewrite Process accordingly.
+
+Also, we should adjust tiling to maybe increase tileLen to use more UB buffer. But that's not required for correctness; the kernel will still work.
+
+Potential issue: The kernel uses GlobalTensor.GetValue/SetValue, which is fine. However, each element access is a global memory access; but for correctness it's okay.
+
+Now, the error log shows the output has zeros for later rows, which matches only some blocks processed. So fix is adding the stride loop.
+
+Also check that the tiling sets tileLen correctly: it uses TILE_ELEMS=4096. That's fine. Not necessary to change.
+
+Now, also check python bind: The python_bind_src uses `EXEC_NPU_CMD(aclnnArgmaxOverADimensionCustom, self, dim, result);` - but the aclnn interface may expect dim as int64_t. That's fine.
+
+But there's another subtle point: In host_operator_src, InferShape uses `*context->GetAttrs()->GetAttrPointer<int64_t>(0);` but the attr name is "dim" and default is 0. That's fine.
+
+Potential issue with negative dim: The tiling handles negative dim at runtime. But InferShape also handles it. That's okay.
+
+One more thing: The kernel uses int32_t for shapes; but d0/d1/d2 are up to 4096*4095=~16 million, fits in int32. Output totalLength up to 128*4095=524160, fits. So int32 is okay.
+
+Now, we must produce the corrected code strings. We'll only modify kernel_src to add the while loop. Optionally, we could adjust tileLen to a larger value for better performance, but minimal fix.
+
+Let's craft the corrected kernel_src.
+
+We also need to ensure the code compiles. The while loop should be inside Process. We'll keep the existing code and wrap it.
+
+I'll write the corrected kernel_src now.
+
+Also note: The original kernel already has a comment "Prefetch first tile" but no actual loop. We'll replace with proper loop.
+
+We'll output only the six strings, unchanged except kernel_src.
+
+Now, produce final answer.

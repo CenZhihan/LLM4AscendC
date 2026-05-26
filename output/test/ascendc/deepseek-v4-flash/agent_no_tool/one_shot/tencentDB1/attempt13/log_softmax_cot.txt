@@ -1,0 +1,77 @@
+We need to fix the AscendC kernel for LogSoftmaxCustom. The error logs show "vector core execution abnormal" and "MPU address access is invalid". This suggests memory access issues. The previous kernel uses scalar loops inside vector code, which is problematic: mixing scalar and vector operations on vector hardware leads to invalid memory accesses. Also, the tiling uses dim (inner dimension) to compute batchSize_ but the shape is (batch_size, dim) = (4096, 393216). The total length is huge (batch_size * dim = 4096 * 393216 = about 1.6e9), which likely exceeds uint32 max. That's a major issue: totalLength overflows uint32. The logs show "MPU address access invalid", likely due to overflow or out-of-bounds.
+
+Key issues:
+1. totalLength computed from shape size can exceed 2^32. Need to use uint64 or handle larger sizes? But AscendC typically uses uint32 for data sizes, but the tensor buffer allocations are based on total elements. The kernel uses uint32 for totalLen_, but the actual elements can be >4e9. Actually 4096*393216 = 1,610,612,736 which is about 1.6e9, less than 2^32 (4.29e9), so uint32 is fine. Wait: 4096*393216 = 4096*393216 = let's calculate: 4000*393216 = 1,572,864,000; plus 96*393216 = 37,748,736; total = 1,610,612,736. That's < 2^32, so uint32 fine.
+
+But the error "MPU address access is invalid" suggests the kernel is accessing out-of-bounds memory. The grid-stride loop for rows uses row start = row * dim_. With blockIdx up to blockDim_-1 (max 24) and row incrementing by blockDim_, but the while loops inside row process dim_ elements. However, the tileLen_ is large (UB_BUDGET_BYTES/20 = 192*1024/20 = 9830, aligned down to 8192? Actually ALIGN_ELEMS=2048, so maxTile = AlignDown(9830,2048)=8192). HARD_CAP_ELEMS=32768, so tileLen=8192. Then numTiles = CeilDiv(totalLength, tileLen) = CeilDiv(1.6e9, 8192) ~ 196,608, blockDim clamped between 8 and 24, so blockDim=24. That means each block handles many rows, but the row loop increments by blockDim (24) and starts at blockIdx. That's fine.
+
+But the while loops inside each row use LoadTile, then manually loop over elements with xLocal.GetValue(i) and sum. That scalar loop inside a vector kernel likely causes the MPU error because the scalar unit cannot access vector local memory properly. The AscendC API for local tensors returns a scalar value, but the hardware may not support random access like that. Instead, we should use vector operations for max, sum, exp, etc.
+
+We need to rewrite the kernel using vectorized operations: reduceMax, reduceSum, etc. But AscendC does not have direct reduce operations in kernel_operator.h? Actually there are operations like "ReduceMax" or "Max" that work on tensors. However, for scalar results, we can use the "Scalar" approach with "SetValue" and "GetValue". But the manual scalar loops over vector local tensors are illegal.
+
+Better approach: Use AscendC's built-in vectorized reduction? There is "AscendC::Max" that does element-wise max, but not reduce. For reduce, we can use "AscendC::ReduceMax" if available, but it's not in common kernel_operator.h. Alternatively, we can use a two-pass approach with vector operations for max and sum but still need to get scalar results. We can use a scalar variable and update it in a loop using vector operations? Actually we can use "AscendC::Max" between two scalars? Not.
+
+Simpler: Use the fact that for each block, we only handle one row at a time? Actually we can process a whole row at once if it fits in UB. But dim=393216, tileLen=8192, so need multiple tiles per row. The scalar loop is problematic. Instead, we can use the vector unit to compute row max via a series of vector max reductions. But AscendC does not provide a direct vector reduce. However, we can implement a hierarchical reduction using shared memory or multiple passes. But that's complex.
+
+Given the time, a simpler fix: Use a single block per row (blockDim = number of rows? Actually batch_size=4096, blockDim limited to 24). That's too many rows per block. But we can set blockDim = 1 and process rows sequentially? That's inefficient but might work.
+
+Alternatively, redesign to use a different tiling: Process each row with a single tile if dim fits in UB? dim=393216, need ~393216 floats = ~1.5MB, UB is 192KB, so no.
+
+We must use multiple tiles per row, but avoid scalar loops. AscendC's "Mins", "Maxs" can be used with a scalar, but we need to get the max of a tile. We can use "AscendC::Max" between two local tensors? Actually we can do: start with a scalar maxVal = -INF, then for each tile, compute max of tile, then compare with scalar using "AscendC::Maxs" (scalar vs tensor) but that returns tensor. To get max of tile, we can use "AscendC::ReduceMax" if available. Let's check common AscendC API: There is "AscendC::ReduceMax" in vector_reduce.h? Not sure.
+
+Given the time, the simplest fix to avoid the MPU error: remove the scalar loops entirely. Instead, we can use "AscendC::Max" with two tensors to get element-wise max, but we need a single max. We can use "AscendC::Max" between current max tensor and new tile, but that requires keeping a max tensor across tiles. That's possible: allocate a local tensor of size 1 (scalar tensor). Then for each tile, compute max of tile using "AscendC::Max" (element-wise) with a tensor of max values? No.
+
+Better: Use "AscendC::ReduceMax" from "reduce" operations. According to AscendC documentation, there is "ReduceMax" in "kernel_operator.h"? Actually in the community version, there are scalar reduction operations like "AscendC::Max" which can reduce a tensor to a scalar? I think there is "AscendC::Max" that takes two tensors and returns element-wise max, not reduce.
+
+But there is "AscendC::ReduceMax" if we include "reduce.h". Let's assume it's available. We can use "AscendC::ReduceMax(xLocal, workTensor, curLen)" to get scalar max. Similarly, "AscendC::ReduceSum" for sum. Then we can avoid scalar loops.
+
+Given the constraints, I'll modify the kernel to use AscendC vectorized reduction operations. Also, the tiling should use uint64 for totalLength? But uint32 is fine for this size.
+
+Also, the "hard_cap_elems" in tiling is 32768, but tileLen is 8192, fine.
+
+The host_operator_src uses GetInputShape(0)->GetOriginShape().GetShapeSize() which returns int64? Actually it returns int64? But cast to uint32 may overflow? Not in this case.
+
+Now, the python_bind_src uses "aclnnLogSoftmaxCustom" which likely expects the same operator name. The host_operator_src uses "LogSoftmaxCustom". That's consistent.
+
+The model_src passes dim as init_inputs[0], but the original model's dim is 1 by default. Get_inputs returns [x], no dim. So init_inputs empty, then self.dim=1. That matches.
+
+Now, correct the kernel to use vectorized reductions. I'll add #include "reduce.h" and use ReduceMax and ReduceSum. Also, need to handle tiling correctly: we need to keep track of max across tiles using scalar accumulator. ReduceMax returns scalar. So:
+
+float maxVal = NEG_INF;
+AscendC::LocalTensor<float> maxScalar = scalarQueue_.AllocTensor<float>();
+maxScalar.SetValue(0, maxVal);
+for each tile:
+  LoadTile;
+  AscendC::LocalTensor<float> tileMax = tmpQueue1_.AllocTensor<float>();
+  AscendC::ReduceMax(tileMax, xLocal, curLen); // tileMax[0] = max of xLocal
+  // compare with current max
+  AscendC::Max(maxScalar, maxScalar, tileMax, 1);
+  tmpQueue1_.FreeTensor(tileMax);
+  FreeTensor xLocal;
+maxVal = maxScalar.GetValue(0);
+
+Similarly for sum: use ReduceSum.
+
+Then for the output, use Adds.
+
+But careful: ReduceMax and ReduceSum output a tensor of 1 element. We can use that.
+
+Also, we need to include correct headers.
+
+Now, note that the previous kernel used "AscendC::Exp" which might require "exp.h". That's fine.
+
+Let's rewrite kernel_src with proper vectorized operations.
+
+Also, the tiling data passed "blockDim" but kernel uses blockDim_ from tiling. The tiling uses blockDim as number of blocks. That's fine.
+
+But the kernel's Process loop uses blockIdx and blockDim_ for row stride. The blockDim_ is set from tiling_data.blockDim, which is clamped between 8 and 24. That's okay.
+
+However, the batchSize_ = totalLen_ / dim_ might be integer division correct? totalLen_ is 4096*393216, dim_=393216, so batchSize_=4096. Good.
+
+Now, we must ensure that the totalLen_ is exactly batchSize_ * dim_, but the tiling's dim is set to the last dimension size (innerDim). That is correct for row-major contiguous data. The kernel assumes that data is row-major and each row of dim elements is contiguous. That's true for ND format.
+
+Now, the error "MPU address access is invalid" likely due to scalar memory accesses inside while loop. By replacing with vectorized reductions, we should fix it.
+
+Also, the kernel used tmpQueue2_ for subtraction; we can still use that.
+
+Let's produce the corrected code.

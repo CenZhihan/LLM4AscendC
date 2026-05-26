@@ -1,0 +1,178 @@
+```python
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelGemmBiasAddHardtanhMishGroupNormCustom {
+public:
+    __aicore__ inline KernelGemmBiasAddHardtanhMishGroupNormCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR gn_gamma, GM_ADDR gn_beta, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileLength,
+                                uint32_t batchSize, uint32_t numGroups,
+                                uint32_t outFeatures, uint32_t groupSize,
+                                float epsilon, float invGroupSize) {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+        batchSize_ = batchSize;
+        numGroups_ = numGroups;
+        outFeatures_ = outFeatures;
+        groupSize_ = groupSize;
+        epsilon_ = epsilon;
+        invGroupSize_ = invGroupSize;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        biasGm_.SetGlobalBuffer((__gm__ float*)bias, outFeatures_);
+        gammaGm_.SetGlobalBuffer((__gm__ float*)gn_gamma, outFeatures_);
+        betaGm_.SetGlobalBuffer((__gm__ float*)gn_beta, outFeatures_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueBias_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueGamma_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueBeta_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmp2Queue_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(sumQueue_, 1, sizeof(float));
+        pipe_.InitBuffer(meanQueue_, 1, sizeof(float));
+        pipe_.InitBuffer(varQueue_, 1, sizeof(float));
+        pipe_.InitBuffer(sqrtQueue_, 1, sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        const uint32_t blockNum = AscendC::GetBlockNum();
+        const uint32_t blockIdx = AscendC::GetBlockIdx();
+        const uint32_t totalGroups = batchSize_ * numGroups_;
+        const uint32_t stride = blockNum;
+        uint32_t gid = blockIdx;
+
+        while (gid < totalGroups) {
+            uint32_t sample = gid / numGroups_;
+            uint32_t group = gid % numGroups_;
+            uint32_t elemStart = sample * outFeatures_ + group * groupSize_;
+            uint32_t featureStart = group * groupSize_;
+            uint32_t elemLen = groupSize_;
+
+            if (elemStart + elemLen > totalLen_) break;
+
+            // Load x for this group
+            AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            AscendC::DataCopy(xLocal, xGm_[elemStart], elemLen);
+
+            // Load bias (broadcast per feature)
+            AscendC::LocalTensor<float> biasLocal = inQueueBias_.AllocTensor<float>();
+            AscendC::DataCopy(biasLocal, biasGm_[featureStart], elemLen);
+
+            // 1) bias add
+            AscendC::Add(xLocal, xLocal, biasLocal, elemLen);
+            inQueueBias_.FreeTensor(biasLocal);
+
+            // 2) hardtanh: clamp to [-1, 1]
+            AscendC::Mins(xLocal, xLocal, 1.0f, elemLen);
+            AscendC::Maxs(xLocal, xLocal, -1.0f, elemLen);
+
+            // 3) mish: x * tanh(softplus(x))
+            AscendC::LocalTensor<float> expLocal = tmpQueue_.AllocTensor<float>();
+            AscendC::LocalTensor<float> softplusLocal = tmp2Queue_.AllocTensor<float>();
+            AscendC::Exp(expLocal, xLocal, elemLen);
+            AscendC::Adds(softplusLocal, expLocal, 1.0f, elemLen);
+            AscendC::Log(softplusLocal, softplusLocal, elemLen);
+            AscendC::Tanh(softplusLocal, softplusLocal, elemLen);
+            AscendC::Mul(xLocal, xLocal, softplusLocal, elemLen);
+            tmpQueue_.FreeTensor(expLocal);
+            tmp2Queue_.FreeTensor(softplusLocal);
+
+            // 4) group norm
+            // --- mean ---
+            AscendC::LocalTensor<float> sumScalar = sumQueue_.AllocTensor<float>();
+            // Use template argument for pattern
+            AscendC::ReduceSum<AscendC::REDUCTION_TYPE_SUM>(sumScalar, xLocal, elemLen, 0);
+            AscendC::Muls(sumScalar, sumScalar, invGroupSize_, 1);
+            float meanVal = sumScalar(0);
+
+            // --- diff = x - mean ---
+            AscendC::Adds(xLocal, xLocal, -meanVal, elemLen);
+
+            // --- variance ---
+            AscendC::LocalTensor<float> sqrLocal = tmp2Queue_.AllocTensor<float>();
+            AscendC::Mul(sqrLocal, xLocal, xLocal, elemLen);
+            AscendC::ReduceSum<AscendC::REDUCTION_TYPE_SUM>(sumScalar, sqrLocal, elemLen, 0);
+            AscendC::Muls(sumScalar, sumScalar, invGroupSize_, 1);
+            float varVal = sumScalar(0) + epsilon_;
+
+            // --- invStd = rsqrt(var) ---
+            AscendC::LocalTensor<float> varTensor = sqrtQueue_.AllocTensor<float>();
+            varTensor(0) = varVal;
+            AscendC::Sqrt(varTensor, varTensor, 1);
+            float invStd = 1.0f / varTensor(0);
+            sqrtQueue_.FreeTensor(varTensor);
+            sumQueue_.FreeTensor(sumScalar);
+            tmp2Queue_.FreeTensor(sqrLocal);
+
+            // --- normalize ---
+            AscendC::Muls(xLocal, xLocal, invStd, elemLen);
+
+            // --- load gamma and beta ---
+            AscendC::LocalTensor<float> gammaLocal = inQueueGamma_.AllocTensor<float>();
+            AscendC::DataCopy(gammaLocal, gammaGm_[featureStart], elemLen);
+            AscendC::LocalTensor<float> betaLocal = inQueueBeta_.AllocTensor<float>();
+            AscendC::DataCopy(betaLocal, betaGm_[featureStart], elemLen);
+
+            // apply gamma and beta
+            AscendC::Mul(xLocal, xLocal, gammaLocal, elemLen);
+            AscendC::Add(xLocal, xLocal, betaLocal, elemLen);
+
+            // write output
+            AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+            AscendC::DataCopy(yLocal, xLocal, elemLen);
+            AscendC::DataCopy(yGm_[elemStart], yLocal, elemLen);
+
+            // free all tensors
+            inQueueX_.FreeTensor(xLocal);
+            inQueueGamma_.FreeTensor(gammaLocal);
+            inQueueBeta_.FreeTensor(betaLocal);
+            outQueueY_.FreeTensor(yLocal);
+
+            gid += stride;
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueBias_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueGamma_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueBeta_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmp2Queue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> sumQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> meanQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> varQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> sqrtQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> biasGm_;
+    AscendC::GlobalTensor<float> gammaGm_;
+    AscendC::GlobalTensor<float> betaGm_;
+    AscendC::GlobalTensor<float> yGm_;
+    uint32_t totalLen_{0};
+    uint32_t tileLen_{0};
+    uint32_t batchSize_{0};
+    uint32_t numGroups_{0};
+    uint32_t outFeatures_{0};
+    uint32_t groupSize_{0};
+    float epsilon_{1e-5f};
+    float invGroupSize_{0.0f};
+};
+
+extern "C" __global__ __aicore__ void gemm_bias_add_hardtanh_mish_group_norm_custom(GM_ADDR x, GM_ADDR bias, GM_ADDR gn_gamma, GM_ADDR gn_beta, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(td, tiling);
+    KernelGemmBiasAddHardtanhMishGroupNormCustom op;
+    op.Init(x, bias, gn_gamma, gn_beta, y, td.totalLength, td.tileLength, td.batchSize, td.numGroups, td.outFeatures, td.groupSize, td.epsilon, td.invGroupSize);
+    op.Process();
+}
+"""
+```

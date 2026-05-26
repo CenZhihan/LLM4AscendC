@@ -1,0 +1,93 @@
+We are asked to fix the previous attempt for masked_cumsum_custom. The errors are in the kernel_src: using global tensor subscript incorrectly. In AscendC, you cannot access individual elements of a GlobalTensor like an array; you need to use DataCopy or use local tensors. The previous attempt tried to do element-wise access with xGm_[gmOffset + i] which gives a GlobalTensor reference, not a scalar. That's the error.
+
+We need to rewrite the kernel to use proper vectorized operations with DataCopy and local tensors. However, the kernel is trying to do a cumulative sum along a dimension with mask. The operation is: for each row (outer dimension), compute cumulative sum of x * mask along the dim dimension.
+
+In AscendC, we can process each row by copying the row (or tile of the row) into local, then compute cumulative sum elementwise using a loop on local tensors, then copy back. But we must avoid element access on global. Instead, we can copy from global to local, then process local, then copy back.
+
+Since the cumulative sum is sequential, we need to do it sequentially within a row. We can tile the row into chunks, but the running sum must carry across chunks. The running sum is a scalar float that must be preserved across tiles.
+
+Alternatively, we can process the whole row at once if the row fits in UB. The original tiling computes tileLen based on UB budget. The row size is dimSize. If dimSize <= tileLen, we can process the whole row at once. But if dimSize > tileLen, we need multiple tiles.
+
+Simpler approach: use a single tile per row if possible, otherwise split. The previous tiling set tileLen based on UB budget and dimSize. But the kernel must handle tile-by-tile with running sum.
+
+We can fix the kernel to use proper AscendC APIs:
+
+- Use DataCopy to copy from global to local tensor.
+- Use local tensor arithmetic: Add, Mul etc. But cumulative sum is serial; we can implement a loop over elements in local tensor using a scalar variable runningSum.
+
+In AscendC, we can access local tensor elements with an index: localTensor[i] returns a scalar. That is allowed for LocalTensor but NOT for GlobalTensor. So we can copy a tile into local, then loop over the local elements.
+
+But the element-wise multiplication of mask (bool) with x: mask is uint8. We can copy mask tile into local as uint8, then convert to float and multiply.
+
+Better: we can use vectorized operations: first convert mask to float (using Cast), then Mul, then run cumulative sum with a loop.
+
+Given the complexity, perhaps the easiest fix is to keep the same algorithm but correct the global tensor access. The error is specifically that you cannot do xGm_[gmOffset + i] because that returns a GlobalTensor reference. However, in AscendC, if you have a GlobalTensor, you can use the subscript operator only if the tensor is a scalar? Actually, the operator[] on GlobalTensor is overloaded to return a reference to the element? Let's check typical AscendC examples. In many official samples, they do not use element-wise access on global tensors; they always use DataCopy to local. The error message says "no viable conversion from 'AscendC::GlobalTensor<float>' to 'float'". So the subscript returns a GlobalTensor, not a scalar. That is because the subscript operator returns a "reference" but it's not a simple C++ reference; it's a proxy object that can be assigned? Actually, in AscendC, __gm__ variables can be accessed with array indexing if they are declared as arrays? But we declared as GlobalTensor, not as a pointer.
+
+The typical pattern is to use the indexing operator on a GlobalTensor if you have a scalar variable? Wait: I recall that in AscendC, you can access global memory via `xGm_[index]` if you have a `GlobalTensor` and the index is within range, but it returns a reference that is convertible to T? The error says "no viable conversion from 'GlobalTensor<float>' to 'float'". So it seems that the subscript operator on a GlobalTensor returns a GlobalTensor object, not a scalar. That contradicts some older examples.
+
+Let me check the official AscendC documentation: For GlobalTensor, the subscript operator `operator[](int32_t)` returns a `GlobalTensor<T>` object that represents a slice? Actually, it might return a tensor of rank 0? That does not directly convert to T. The correct way to read a single element from global is to use `DataCopy` with a local tensor of size 1, or use `AscendC::SetValue`? But that's for local tensors.
+
+Given the constraint: "Prioritize resolving the concrete errors shown in logs." The error is at lines where we try to assign global tensor subscript to float. We must avoid that. We need to rewrite the kernel to copy tiles into local tensors and process locally.
+
+We have the original attempt's full code. We need to produce corrected kernel_src.
+
+We'll rewrite the kernel to:
+
+- Use `DataCopy` to copy a tile of x and mask from global to local.
+- Use local tensor element access for loop.
+- Write back via `DataCopy`.
+
+Also need to fix the python_bind_src: The signature should match the operator: `aclnnMaskedCumsumCustom` expects x, mask, dim, result. The dim is an int attribute, not a tensor. In the operator definition, dim is an attr. So the Python bind should call the aclnn with the attr value.
+
+Also the model_src: the forward signature expects (self, *inputs) and calls fn(*inputs). The original user's Model forward takes x, mask, dim. That should work.
+
+Now, produce the corrected six strings.
+
+Let's write the corrected kernel_src:
+
+We'll keep the class KernelMaskedCumsumCustom, but change Process to use local tensors.
+
+We'll need local tensors: xLocal, maskLocal, productLocal, yLocal, runningSum scalar. We'll allocate local tensors of tileLen.
+
+We'll use pipe_ with inQueueX, inQueueMask, outQueueY, and maybe a tmpQueue for product.
+
+Implementation:
+
+- CopyIn: do DataCopy for x and mask.
+- Compute: Deque xLocal and maskLocal, allocate yLocal and productLocal (maybe reuse maskLocal after conversion). Steps:
+  - Convert mask to float: use AscendC::Cast(maskFloatLocal, maskLocal, AscendC::RoundingMode::CAST_NONE, curLen) but mask is uint8. Actually Cast only works between some types? We can multiply: product[i] = xLocal[i] * (maskLocal[i] != 0). But to do vectorized, we can use AscendC::Muls with 1.0? Not straightforward.
+  - Simpler: loop over i, compute product = xLocal[i] * (maskLocal[i] ? 1.0f : 0.0f). Since local tensor supports subscript for reading (returns scalar), we can do:
+    for (uint32_t i = 0; i < curLen; ++i) {
+        float xv = xLocal(i); // or xLocal[i]? Let's check: LocalTensor also has operator() for index? Actually AscendC local tensors can use `xLocal(i)` or `xLocal[i]`? Documentation says both. We'll use `xLocal(i)` to be safe.
+        float maskv = (maskLocal(i) != 0) ? 1.0f : 0.0f;
+        float prod = xv * maskv;
+        cumVal = prod + runningSum;
+        yLocal(i) = cumVal;
+        runningSum = cumVal;
+    }
+  - But this loop is serial and may be slow but acceptable for small tile.
+- CopyOut: DataCopy from yLocal to global.
+
+We also need to handle multiple tiles per row with running sum.
+
+We'll need to manage tile boundaries.
+
+Now, fix the kernel_src content.
+
+Also check host_operator_src: The dim attribute type is int, but we used int32_t. Should be fine.
+
+Check tiling data: totalLength, dimSize, outerSize, tileLength, blockDim. The kernel uses these.
+
+Now, we must ensure no global element access.
+
+Let's produce the corrected code.
+
+We'll keep the same structure but replace the element loop with local accesses.
+
+Also in Init, we need to set up the pipe and buffers.
+
+Let's write it.
+
+Note: For bool mask, the dtype is uint8 (as used in GlobalTensor<uint8_t>). That's correct.
+
+Now, generate the final answer with only the six strings.

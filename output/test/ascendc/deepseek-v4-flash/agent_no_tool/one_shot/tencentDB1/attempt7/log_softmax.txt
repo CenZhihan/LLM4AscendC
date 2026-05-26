@@ -1,0 +1,176 @@
+```python
+kernel_src="""
+
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelLogSoftmaxCustom {
+public:
+    __aicore__ inline KernelLogSoftmaxCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileLength,
+                                uint32_t blockDim, uint32_t dim)
+    {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+        blockDim_ = blockDim;
+        dim_ = dim;
+        batchSize_ = totalLen_ / dim_;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(redQueue_, 1, 64 * sizeof(float));           // reduction result buffer (min size 64)
+        pipe_.InitBuffer(scalarQueue_, 1, sizeof(float));             // scalar tensor for broadcasting
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0 || tileLen_ == 0) return;
+
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        // Grid-stride over rows
+        for (uint32_t row = blockIdx; row < batchSize_; row += blockDim_) {
+            uint32_t rowStart = row * dim_;
+
+            // ---- Pass 1: compute max over the row ----
+            float maxVal = -1e38f;
+            uint32_t remaining = dim_;
+            uint32_t offset = 0;
+            while (remaining > 0) {
+                uint32_t curLen = (remaining > tileLen_) ? tileLen_ : remaining;
+                LoadTile(rowStart + offset, curLen);
+                AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+                float tileMax = TileMax(xLocal, curLen);
+                if (tileMax > maxVal) maxVal = tileMax;
+                inQueueX_.FreeTensor(xLocal);
+                remaining -= curLen;
+                offset += curLen;
+            }
+
+            // ---- Pass 2: compute sum of exp(x - maxVal) ----
+            float sum = 0.0f;
+            remaining = dim_;
+            offset = 0;
+            while (remaining > 0) {
+                uint32_t curLen = (remaining > tileLen_) ? tileLen_ : remaining;
+                LoadTile(rowStart + offset, curLen);
+                AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+                AscendC::LocalTensor<float> tmp = tmpQueue_.AllocTensor<float>();
+                // tmp = x - maxVal
+                AscendC::LocalTensor<float> constMax = scalarQueue_.AllocTensor<float>();
+                constMax.SetValue(0, maxVal);
+                AscendC::LocalTensor<float> broadMax = tmp; // reuse tmp
+                AscendC::BroadcastScalar(broadMax, constMax, curLen);
+                AscendC::Sub(tmp, xLocal, broadMax, curLen);
+                scalarQueue_.FreeTensor(constMax);
+                // exp(tmp)
+                AscendC::Exp(tmp, tmp, curLen);
+                float tileSum = TileSum(tmp, curLen);
+                sum += tileSum;
+                tmpQueue_.FreeTensor(tmp);
+                inQueueX_.FreeTensor(xLocal);
+                remaining -= curLen;
+                offset += curLen;
+            }
+
+            // ---- compute log(sum) ----
+            AscendC::LocalTensor<float> logTensor = scalarQueue_.AllocTensor<float>();
+            logTensor.SetValue(0, sum);
+            AscendC::Log(logTensor, logTensor, 1);
+            float logSum = logTensor.GetValue(0);
+            scalarQueue_.FreeTensor(logTensor);
+
+            float offsetVal = maxVal + logSum;
+
+            // ---- Pass 3: compute output y = x - offsetVal ----
+            remaining = dim_;
+            offset = 0;
+            while (remaining > 0) {
+                uint32_t curLen = (remaining > tileLen_) ? tileLen_ : remaining;
+                LoadTile(rowStart + offset, curLen);
+                AscendC::LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+                AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+                // y = x - offsetVal
+                AscendC::LocalTensor<float> constOff = scalarQueue_.AllocTensor<float>();
+                constOff.SetValue(0, offsetVal);
+                AscendC::LocalTensor<float> broadOff = tmpQueue_.AllocTensor<float>(); // we can reuse tmpQueue
+                AscendC::BroadcastScalar(broadOff, constOff, curLen);
+                AscendC::Sub(yLocal, xLocal, broadOff, curLen);
+                scalarQueue_.FreeTensor(constOff);
+                tmpQueue_.FreeTensor(broadOff);
+                inQueueX_.FreeTensor(xLocal);
+                outQueueY_.EnQue<float>(yLocal);
+                StoreTile(rowStart + offset, curLen);
+                remaining -= curLen;
+                offset += curLen;
+            }
+        }
+    }
+
+private:
+    __aicore__ inline float TileMax(const AscendC::LocalTensor<float>& src, uint32_t len)
+    {
+        AscendC::LocalTensor<float> dst = redQueue_.AllocTensor<float>();
+        AscendC::ReduceMax(dst, src, len, 1);
+        float val = dst.GetValue(0);
+        redQueue_.FreeTensor(dst);
+        return val;
+    }
+
+    __aicore__ inline float TileSum(const AscendC::LocalTensor<float>& src, uint32_t len)
+    {
+        AscendC::LocalTensor<float> dst = redQueue_.AllocTensor<float>();
+        AscendC::ReduceSum(dst, src, len, 1);
+        float val = dst.GetValue(0);
+        redQueue_.FreeTensor(dst);
+        return val;
+    }
+
+    __aicore__ inline void LoadTile(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm_[gmOffset], len);
+        inQueueX_.EnQue(xLocal);
+    }
+
+    __aicore__ inline void StoreTile(uint32_t gmOffset, uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueueY_.DeQue<float>();
+        AscendC::DataCopy(yGm_[gmOffset], yLocal, len);
+        outQueueY_.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> redQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> scalarQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalLen_ {0};
+    uint32_t tileLen_ {0};
+    uint32_t blockDim_ {0};
+    uint32_t dim_ {0};
+    uint32_t batchSize_ {0};
+};
+
+extern "C" __global__ __aicore__ void log_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelLogSoftmaxCustom op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength, tiling_data.blockDim, tiling_data.dim);
+    op.Process();
+}
+"""
+```

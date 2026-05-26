@@ -1,0 +1,73 @@
+We need to generate the six strings for a custom Ascend C kernel for layer normalization. The kernel name is `layer_norm_custom` (PascalCase: `LayerNormCustom`). The model uses `nn.LayerNorm` which has parameters: normalized_shape, eps (default 1e-5), elementwise_affine (default True). The model's init inputs: normalized_shape = (features, dim1, dim2) = (64,256,256). In forward, it takes x of shape (batch_size, features, dim1, dim2). But note: LayerNorm normalizes over the last N dimensions, where N is len(normalized_shape). So the normalized dimensions are the last three: features, dim1, dim2. So the input shape is (batch_size, 64, 256, 256). The operation: compute mean and variance over the last three dimensions, then normalize: (x - mean) / sqrt(var + eps) * gamma + beta, where gamma and beta are learnable parameters of shape normalized_shape. However, the model expects to use the same gamma and beta from the original nn.LayerNorm which are parameters. In the custom kernel, we need to handle weights and biases. The user instruction says "Replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels." We need to create a custom kernel that performs layer normalization with given weight and bias. The model_src will likely use the custom ops library.
+
+We need to define the operator in project_json_src with inputs: x, weight, bias (optional, as they can be None), and eps. Output: y. The kernel should compute layer normalization.
+
+We also need to include the tiling, host operator, kernel, python bind, and model source.
+
+We must follow the pattern from the example. The kernel function name in kernel_src must be `layer_norm_custom`. The operator definition in project_json_src and host_operator_src should be `LayerNormCustom`.
+
+We need to design the kernel. Layer normalization is more complex than leaky relu. We need to compute mean and variance over the last N dimensions. Typically, for Ascend C, we can use vector instructions to compute reduction. Since the input is 4D, we can reshape to 2D: (batch_size, features*dim1*dim2) and then compute mean/variance along the last dimension. Or we can use a tile-based approach where each block handles a certain number of rows (samples) and we compute reduction per row. This is similar to a row-wise normalization.
+
+We need to decide on tiling. The total elements per sample is product of normalized_shape = 64*256*256 = 4194304. That's large. We'll likely have multiple blocks processing different samples. Each block can compute the mean and variance for one or more samples. The UB budget needs to accommodate the data for a tile of one sample? Actually, we can process a chunk of samples per block. We'll set tiling to indicate total elements and tile length per block's iteration. Since normalization requires reduction, we need to compute sums. We can use vector reduction instructions.
+
+But for simplicity, we can design a kernel that processes one sample per block? The batch_size is 64, so 64 blocks. That is fine. Each block will handle one sample of length 4194304. That's a large tile. We can split the sample into multiple tiles for reduction accumulation. We'll do a two-pass: first pass compute sum and sum of squares for each tile, then combine to get mean and variance, then normalize.
+
+Alternatively, we can use the built-in Ascend C API? There is no built-in layer norm. We'll write custom.
+
+The kernel should accept x (float), weight (float), bias (float), eps (float). Weight and bias are of shape normalized_shape (3D) but can be broadcast? Actually, they are per dimension. In layer norm, weight and bias are applied after normalization, so they are element-wise multiplied. So we need to broadcast weight and bias to the full sample shape. Since the sample is (features, dim1, dim2), weight and bias are same shape, so we can treat them as tensors of that shape and multiply.
+
+In the kernel, we can load weight and bias from global memory and use them for scaling after normalization.
+
+Tiling: We'll set tile length based on UB size. For each block, we process one sample (or part of sample). We'll implement a grid-stride loop over the total elements, but we need to accumulate sum over the sample. So we need to sum across tiles. We can use a local buffer for partial sums and then combine at the end? Actually, we can do the reduction across tiles by keeping a running sum in a scalar variable (using vector reduce). But vector reduce operates on a local tensor. We can accumulate sum over tiles by adding the reduced value from each tile. We can use `AscendC::ReduceAdd` or similar.
+
+Simpler: For each block, we process one sample. We'll have a loop over tiles of that sample. For each tile, we compute the sum of elements and sum of squares using vector reduce (e.g., `AscendC::ReduceSum`). Then after all tiles, we have total sum and total sum of squares. Then compute mean and variance. Then loop again to normalize each tile using the computed mean and variance. This is a two-pass approach. The tile length should be chosen to allow two passes. We'll allocate input buffer, output buffer, and a temporary buffer for weight and bias? We can also preload weight and bias into UB if they fit. Weight and bias are 64*256*256 = 4194304 floats each, which is too large for UB (192KB UB ~ 49152 floats). So we cannot load the entire weight/bias. We'll need to load weight and bias tiles as well. That complicates. Alternatively, we can assume weight and bias are not used? But the original model uses them. However, in the given model, LayerNorm has default affine=True, so there are parameters. But the user might want to drop them? No, the model expects to use the same weights. We need to handle them.
+
+Another approach: Since weight and bias are of the same shape as the normalized dimensions, we can broadcast them by loading them once and reusing? But they are large. We could skip weight and bias in the kernel and have the model multiply after normalization? But that would not be a direct replacement. The custom operator should encapsulate the entire LayerNorm including weights.
+
+Given complexity, maybe we can design the operator to accept optional weight and bias, and if provided, apply them. But for the kernel, we need to handle them tile by tile. That requires loading weight/bias tiles. We can store weight and bias in global memory and load them in the same tile pattern as x. That is feasible. Since they are the same shape as the normalized dimensions (3D but can be flattened), we can index them accordingly.
+
+We'll assume the input x is of shape (batch, features, dim1, dim2) and normalized shape (features, dim1, dim2). Weight and bias are of shape (features, dim1, dim2). In the kernel, we compute per sample (batch index). For each sample, we compute mean and variance over the last three dimensions. Then we normalize and apply weight and bias.
+
+Tiling: We'll split each sample into tiles along the flattened normalized dimensions. Each tile has length tileLen. We'll accumulate sums across tiles. Then second pass to normalize and apply weight/bias using the same tile loading.
+
+UB budget: We'll need input buffer (tileLen), output buffer (tileLen), and temporary for weight and bias (tileLen each), and possibly for mean/variance calculation buffers. Total floats: input + output + weight + bias + 2 for intermediate? That's many. We can reuse buffers. For first pass, we need input buffer and maybe a sum buffer. For second pass, we need input buffer (or we can reuse the first input buffer? but we need original x again. We can store x in UB? If we store a copy, that's extra. Better to load x again from global. So we can have one input buffer, one output buffer, one weight buffer, one bias buffer. That's 4 * tileLen floats. Also we need a buffer for the scaled normalization? We can compute in place on output. So total UB usage = 4 * tileLen * sizeof(float). With UB 192KB, that allows 49152 floats /4 = 12288 tileLen. That's fine. We'll set tileLen accordingly.
+
+Also we need to store two accumulation scalars (sum and sumSq) per block.
+
+For performance, we can also prefetch.
+
+We'll design the kernel to have a class with Init, Process. Process will iterate over samples (batch) assigned to this block. Since batch is small (64), we can assign each sample to one block. But total elements = 64 * 4194304 = ~268M, which is large. With many blocks (say 64), each block handles one sample. That's fine. We'll use blockDim = batch_size = 64? But blockDim is number of AICore cores, typically 24 on 910B. So we cannot have 64 blocks. We'll need to split samples across blocks. We can have each block handle multiple samples. Or we can have each block handle a chunk of the sample? Actually, the reduction per sample requires all elements of that sample. So we must process each sample atomically on one block. So number of blocks should be at least number of samples. If we have only 24 cores, we process 24 samples per iteration? We can have grid-stride loop where each block handles multiple samples (step = blockNum). For each sample, we need to compute reduction, so we need to loop over samples assigned to this block. That's fine.
+
+Thus, tiling: totalLength = total elements? Actually, tiling data should include per-sample information? In the example, totalLength is total elements of input, but tileLength is a chunk size. We'll define totalLength as total number of elements, tileLength as chunk size for per-sample processing. But we also need to know the number of samples (batchSize) and the normalized dims product (normalizedSize). We can compute from totalLength and normalizedSize? We'll pass batchSize and normalizedSize separately in tiling data. Actually, we can pass batchSize and normalizedSize, and also tileLength (chunk size for loading within a sample). We'll define tiling data: totalLength, batchSize, normalizedSize, tileLength, eps, etc.
+
+Alternatively, to keep it simple, we can mimic the leaky relu pattern: totalLength and tileLength. But we need the shape information. The kernel can compute batchSize = totalLength / normalizedSize. We'll pass normalizedSize as another field. Also we need weight and bias pointers. In the example, the kernel only had two GM_ADDR (x,y) plus workspace and tiling. Here we need four GM_ADDR (x, weight, bias, y) plus workspace and tiling. We'll adjust.
+
+We'll define input_desc with x, weight, bias (all float). output_desc y. attr: eps (default 1e-5).
+
+In host_operator_src, we need to set tiling data accordingly.
+
+We'll write the kernel src with class KernelLayerNormCustom. The extern "C" function will be `layer_norm_custom` with parameters: GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling. In the Init, we get the fields from tiling.
+
+We'll implement two-pass process per sample: For each sample assigned to this block, we compute sum and sumSq by iterating over tiles of that sample, then compute mean, invStd, then second pass to normalize and apply weight/bias. We'll load weight and bias tiles in sync with x tiles.
+
+Because the sample is large, we'll use grid-stride over samples. For each sample, we do inner loop over tiles.
+
+We'll also handle the case where weight and bias may be null (if affine=False). But the model uses them, so we'll assume they are present.
+
+We must ensure the kernel compiles and works on Ascend 910B.
+
+Now, generate the six strings.
+
+We'll follow the same format as the example, with appropriate changes.
+
+Let's write them.
+
+Note: The python_bind_src should call aclnnLayerNormCustom? Actually, the NPU operator name is aclnnLayerNormCustom. We'll use that.
+
+We'll also need to update the model_src to use ModelNew with custom ops.
+
+We'll produce the six strings enclosed in triple quotes.
+
+We need to be careful with escaping.
+
+Let's start.
