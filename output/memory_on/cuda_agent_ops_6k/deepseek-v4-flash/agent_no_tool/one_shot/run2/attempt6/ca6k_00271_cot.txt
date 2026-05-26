@@ -1,0 +1,142 @@
+We need to fix the correctness issue with the adaptive average pooling 3D kernel. The previous attempt implemented a naive manual accumulation with GetValue/SetValue, which is not efficient and likely incorrect (since the output is all zeros). Also the output shape handling in the kernel is wrong: we need to produce output with shape (N, C, 1, 1, 1) and compute mean over D*H*W per (N, C) slice.
+
+Key issues:
+1. The kernel uses a for-loop with GetValue/SetValue which may not work correctly on AscendC. Better to use vectorized reduction. Since we only need sum and then divide, we can use AscendC::ReduceSum or similar. But AscendC API might not have direct reduce? We can use a local tensor and manual loop but using vector operations.
+
+2. The tiling and handling of blockDim: We have N*C blocks, each block computes mean over its spatial volume. The kernel should sum all elements in that spatial volume and write a scalar. We can use a simple accumulation in a local scalar variable.
+
+3. The previous attempt used a pipe and inQueueX/outQueueY but then used GetValue/SetValue for accumulation. That may be causing all zeros.
+
+4. The output buffer size: yGm_ should have size blockDim_ (N*C). But we set it to blockDim_ in Init, that's fine.
+
+But the output is all zeros, meaning the sum computation probably yields zero. The accumulation loop: for (uint32_t i = 0; i < curLen; i++) { float val = xTile.GetValue(i); ... }. But GetValue on a LocalTensor might not work as expected? Actually it should work but it's inefficient. More importantly, the accumulation variable accLocal is allocated with size 1 but we use SetValue/GetValue. That's okay.
+
+However, the problem might be that the kernel is not correctly indexing the input: startOffset = blockIdx * spatialVol_. Since blockIdx corresponds to (n*C + c) and input is [N, C, D, H, W] in ND format, the memory layout is contiguous with dimensions flattened. So index = (n*C + c)*spatialVol_ is correct.
+
+But the output is all zeros, suggesting either the loop never executes or the mean computation ends up zero due to division. Since the output is zeros, maybe the sum is zero because the input data has mean zero? But reference output is not zero (random input, output should be non-zero). Wait the reference output from eval log shows all zeros for the custom kernel output, but the golden should be non-zero. So the custom kernel is producing zero.
+
+Check: In the kernel, after the loop we have:
+float sum = accLocal.GetValue(0);
+pipe_.FreeTensor(accLocal);
+float mean = sum / static_cast<float>(spatialVol_);
+Then we write mean to yLocal and copy to yGm_.
+
+But accLocal is initialized to 0.0f, and we accumulate. If the loop runs correctly, sum should be non-zero. Unless the DataCopy from global memory fails or the local tensor is not filled.
+
+Potential issue: inQueueX_.AllocTensor<float>() and then DataCopy into xLocal, then EnQue, then DeQue yields xTile. But the DataCopy might not have completed before DeQue? Actually the pipe handles synchronization. The pattern is standard.
+
+But we also have an extra issue: the output shape: yGm_ should have size blockDim_ (N*C). But we set it as yGm_.SetGlobalBuffer((__gm__ float*)y, blockDim_); That's fine. But the host-side InferShape sets output shape to [N,C,1,1,1]. So the global memory for y is allocated accordingly (size N*C*1*1*1 = N*C). So writing one float per block is correct.
+
+Why zeros? Perhaps the loop over spatial volume uses tileLen_ which may be zero? The tiling calculates tileLength as maxTile (about 192*1024/(2*4)=24k elements). That seems fine. But check: if spatialVolume is large (512*128*128=8,388,608) and tileLength is 24k, the loop will execute many times. The accumulation should work.
+
+Another possibility: the pipe allocation of inQueueX_ is with BUFFER_NUM=2, and we use AllocTensor and EnQue/DeQue correctly. But we are also allocating accLocal with pipe_.AllocTensor. That might conflict? Actually TPipe::AllocTensor allocates from a different space (VECCALC?), but it's fine.
+
+The earlier log shows "tiling struct [Ca6k00271CustomTilingData] is conflict" warnings. That might be due to duplicate definitions in auto-generated and our files. But the build succeeded.
+
+The correctness failure: Output is all zeros. Let's improve the kernel to use AscendC vector operations for reduction. However, the simplest fix: use a scalar accumulation but ensure it works. Maybe we should use a different approach: instead of using GetValue/SetValue on local tensor, we can compute sum using a vectorized add and then reduce. But AscendC has no direct reduce sum? We can use a loop that accumulates into a scalar variable of type float (not tensor). But we need to get values from local tensor. That's what we did.
+
+Maybe the issue is that the local tensor xTile after DeQue is a handle, and GetValue is not valid? Actually GetValue is a method on LocalTensor that reads a scalar at index. It should work.
+
+Another thought: The blockDim_ in the kernel is set to N*C, but the number of blocks launched is determined by tiling blockDim. In the Process function, we check blockIdx < blockDim_. That's fine.
+
+But the output being zeros may be due to the fact that the sum is computed but then the division yields zero because spatialVolume is large and sum is small relative? Not likely.
+
+Let's look at the eval log: the output is all zeros, not just small. So either the sum is zero or the write doesn't happen.
+
+Possible cause: The yGm_ buffer is set with size blockDim_, but we only write one float per block, but the output shape expects N*C values. That's correct. However, the InferShape in host_operator_src sets the last three dims to 1, but the original shape has dims: [N, C, D, H, W]. After setting, output shape is [N, C, 1, 1, 1]. So the total number of elements is N*C. That matches.
+
+But wait, the host_operator_src also has a bug: in InferShape, it sets y_shape->SetDim(ndim-3, 1) etc. But the original shape from input might have 5 dims. That's fine.
+
+Now, the kernel's Process function: It allocates a temp tensor of size 1 for accumulator, initializes to 0, then loops over tiles. After loop, it gets the sum and frees accumulator, then computes mean. Then it allocates yLocal of size 1, sets value, and copies to yGm_. That seems correct.
+
+But maybe the problem is that the tile loop uses tileLen_ which might be set to a value that is not a multiple of ALIGN_ELEMS? But we aligned it. That should be fine.
+
+I recall that on AscendC, GetValue/SetValue can be slow but should work. However, previous debug attempts for other kernels showed that manual scalar operations using local tensor GetValue/SetValue can cause issues due to synchronization or memory consistency. Better to use vectorized operations.
+
+A more reliable approach: Use a local tensor of size tileLen_ to hold partial sums? But we need a scalar final sum. Alternatively, we can do the reduction in two steps: first compute sum per tile using AscendC::ReduceAdd? Not sure about API.
+
+Actually, we can use AscendC::Muls to multiply by 1 and then reduce? There is no direct reduce.
+
+But we can use a simple loop with a scalar C++ variable (not local tensor) to accumulate. However, we need to read from local tensor. We can do:
+
+float sum = 0.0f;
+for (uint32_t i = 0; i < curLen; i++) {
+    sum += xTile.GetValue(i);
+}
+
+That should work. But we already do that via accLocal. The problem might be that we use accLocal as a local tensor and update it with SetValue, but then after the loop we get the value. That's fine.
+
+Maybe the issue is that the initialization of accLocal to 0.0f with SetValue(0, 0.0f) is not correct? Actually we do accLocal.SetValue(0, 0.0f). That should set the first element to 0.0f. Later we get it with accLocal.GetValue(0). That's okay.
+
+Let's try a different strategy: Instead of using a local tensor for accumulator, we can use a float variable on the stack and sum directly. But we still need to extract values from xTile. That's fine.
+
+But given the zero output, the most likely cause is that the DataCopy from global memory does not work correctly because the buffer initialization or alignment is wrong. Or maybe the tile length is zero causing no iteration.
+
+Check tiling: totalLength = N*C*D*H*W. spatialVolume = D*H*W. tileLength = maxTile = UB_BUDGET_BYTES/(2*sizeof(float)) = 192*1024/8 = 24576. That's > 0. So loop should execute.
+
+Perhaps the kernel crashes silently? But the output is zeros, not garbage. Could be that the kernel exits early due to an error, leaving output buffer as zeros (it's allocated with empty_like and then the kernel may not write all blocks). But we see all zeros for all blocks, so the kernel didn't write any values.
+
+Check the condition: if (blockIdx >= blockDim_) return; blockDim_ is N*C = 2*64=128. Number of blocks is determined by tiling blockDim set in host tiling to N*C. That should be 128, so all blocks should execute.
+
+Maybe the problem is that we use pipe_.AllocTensor<float>(1) for accLocal, but later we free it with pipe_.FreeTensor(accLocal). That's okay. Then we allocate yLocal with outQueueY_.AllocTensor<float>(). That also works.
+
+Another potential issue: The kernel writes to yGm_ using DataCopy(yGm_[blockIdx], yLocal, 1). DataCopy expects the source and destination to be of local and global tensors. yGm_[blockIdx] is a slice starting at blockIdx with length 1? Actually GlobalTensor subscript returns a GlobalTensor with offset. The DataCopy signature: DataCopy(gm, local, len). So yGm_[blockIdx] should be a reference to the element at blockIdx. That should be correct.
+
+Given the difficulty, let's reconsider the approach: Instead of manual reduction, we can use the built-in AscendC vector arithmetic to compute sum across each tile using Muls and Add, then reduce? Actually we can use AscendC::ReduceSum if available. But that might not be in the kernel_operator.h.
+
+Alternatively, we can use a Python-side tiling that computes the mean using a different algorithm: sum all elements in a slice using a tree reduction. But that's complex.
+
+Maybe the simplest fix is to ensure that the kernel uses the correct indices and that the accumulation is done correctly. I suspect the issue may be with the pipe allocation for inQueueX_ and using it inside the loop with AllocTensor/EnQue/DeQue. That pattern is correct for double buffering, but here we are doing a single buffer (since we allocate a new tensor each iteration). That should still work.
+
+But note: we allocate xLocal, do DataCopy, EnQue, then later DeQue and use. That's fine. However, after using, we FreeTensor. That's also fine.
+
+Perhaps the problem is that we also use pipe_.AllocTensor for accLocal inside Process, but the pipe might be already managing the queues, and allocating a separate tensor might conflict. It's safer to use a local variable float sum = 0.0f; and avoid using a local tensor for accumulator.
+
+Let's rewrite the kernel to use a float sum variable and accumulate using GetValue.
+
+Also, we need to ensure that the output shape is correctly set. The host_operator_src InferShape sets the last three dims to 1, but we need to be careful: the input shape has 5 dims, so ndim=5, we set dim 2,3,4 to 1. That's correct.
+
+Now, the warning about tiling struct conflict: That might indicate that the autogen also generates the same tiling data class from the project JSON, and our tiling header defines it again. To avoid conflict, we can remove the duplicate definition in tiling header? But it's required. The build succeeded, so it's not fatal.
+
+Given the error log showing all zeros, the most direct fix is to ensure the kernel correctly computes the sum. Let's modify the kernel to use a simple float sum and avoid local tensor for accumulator. Also, we should ensure that we read all elements correctly.
+
+I will also adjust the tile length to be a multiple of something to ensure alignment. But the existing tiling should work.
+
+Let's produce the corrected code. I'll keep the project_json_src same, host_tiling_src same (with direct assignment to fields per memory 3/4? Actually we have used direct assignment already? The host_operator_src uses tiling.set_totalLength etc. That caused errors in previous attempts? No, the build succeeded. So setter methods are okay.
+
+But the correction memory says to use direct assignment. However, the previous attempt compiled, so either the setter works or the build didn't catch. To be safe, I'll change to direct assignment (e.g., tiling.totalLength = totalLength) to avoid potential issues.
+
+Also in host_tiling_src, the macros define fields, so we can assign directly. I'll update host_operator_src accordingly.
+
+Now, the kernel: I'll replace the manual accumulation with a float sum and loop over the local tensor. Also, I'll use a simpler pattern: allocate a single local tensor for the tile, copy data, then loop to sum, then free. No double buffering needed for this simple reduction. But double buffering can improve performance. However, we just need correctness. I'll keep the double buffering but simplify accumulation.
+
+Also, I'll add a check that tileLen_ is not zero.
+
+Let's rewrite kernel_src:
+
+- Use a float sum_ (register variable) instead of local tensor accLocal.
+- Accumulate with sum_ += xTile.GetValue(i)
+- After loop, mean = sum_ / spatialVol_
+- Write mean to yLocal (size 1) and copy out.
+
+To avoid issues with GetValue, we can use an alternative: copy the tile to a buffer and use vector add? But simpler: use a loop.
+
+I'll also ensure that the output buffer yGm_ is set with size blockDim_ and we write exactly one float per block.
+
+Now, the host_operator_src: change set_ to direct assignment. Also, the InferShape should be correct.
+
+Let's also check python_bind_src: It uses EXEC_NPU_CMD(aclnnCa6k00271Custom, self, result). That matches the autogen.
+
+Now, generate the corrected code.
+
+One more thing: The model_src should call the function with the input tensor. It does fn(*inputs). That's correct.
+
+I'll output the six strings.
+
+Note: The previous attempt had a warning "tiling struct [Ca6k00271CustomTilingData] is conflict". That might be because the autogen generates a tiling header from project JSON, and we also have our own tiling header. To resolve, we could align the names. But it didn't prevent build. However, it might cause runtime issues? The warning says conflict with one in file ca6k00271_custom_tiling.h. That is the autogenerated file. To avoid conflict, we can either not include our own tiling header (but we need it for the fields) or we can modify the project JSON to not generate tiling data? But the build toolchain automatically generates it. Usually, we should not duplicate the tiling data struct. But the typical pattern in the example (leaky_relu) includes both the tiling header and the host operator that uses that struct, and there is no autogen conflict because the autogen uses the same struct? Actually the autogen generates a tiling data struct from the attributes? But the leaky_relu example didn't have such warnings. The difference is that leaky_relu had an attribute (negative_slope) which is stored in tiling data, and the autogen might not generate tiling data because it's not in the project JSON? In the leaky_relu project JSON, there is no tiling data description; the tiling data is defined manually. So the autogen might not generate a tiling struct. In our project JSON, we have input format ND, type float, but no tiling. The autogen probably generates a tiling struct based on the op name. To avoid conflict, we should not define the tiling data in our tiling header? But we need it. Alternatively, we can rename the struct to avoid conflict? The warning is that the struct in our tiling header conflicts with the one in the autogen file. That suggests that both define the same struct. The autogen file likely has the same struct definition from the project JSON. To fix, we can remove our tiling header and instead let the autogen define it, and then include that header. Or we can keep our header but make sure it matches the autogen exactly (same fields). The warning is not blocking, but it might cause issues if the struct definitions differ. For correctness, we should align them.
+
+Given the constraints, I will keep the same tiling fields: totalLength, spatialVolume, tileLength, blockDim. That matches the previous attempt. The warning is just a warning; it compiled and ran. The correctness failure is likely due to kernel code, not the warning.
+
+Thus, I'll focus on fixing the kernel.
+
+I'll produce the final corrected code now.

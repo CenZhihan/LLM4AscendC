@@ -1,0 +1,103 @@
+We need to fix the embedding kernel. The previous attempt compiled but output was all zeros. The issue is likely that the kernel does not handle the embedding correctly: the DataCopy for the index reads a single int64, but then we try to access xLocal(0) which may not be correct because DataCopy copies into a local tensor in vector format. Actually, we can't directly index into a local tensor like that. We need to use a scalar variable or use the appropriate intrinsic to get the first element. Also, the tiling data structure had setter methods issue? But it compiled fine. However, the output was all zeros, meaning either the weight was not loaded correctly or the index was not read properly, leading to padding_idx handling or just zeros.
+
+In the kernel, we used:
+```
+AscendC::LocalTensor<int64_t> xLocal = inQueueX_.AllocTensor<int64_t>();
+AscendC::DataCopy(xLocal, xGm_[base], 1);
+int64_t idx = xLocal(0);
+```
+But DataCopy copies data into the local tensor. However, to read a scalar from a local tensor, we need to use a different approach. On AscendC, local tensors are vector registers. Accessing a scalar usually requires using the `GetValue` method or reading into a scalar variable via `SetValue`. Actually, we can use:
+```
+int64_t idx;
+AscendC::DataCopy(xLocal, xGm_[base], 1);
+AscendC::LocalTensor<int64_t> xLocalScalar = ...;
+// But simpler: use the first element of the local tensor after copying.
+// But xLocal(0) is not valid syntax. Instead, we can use:
+// int64_t idx = xLocal.GetValue(0); // Not sure.
+```
+Better approach: Instead of reading scalar indices one by one, we could process multiple indices in a tile. But the reference only does element-wise embedding lookup. For a fused kernel, we should process all indices in a grid-stride loop. But the current code uses a while loop and reads one index at a time, which is inefficient and may have the scalar access issue.
+
+The error of all zeros suggests the index read fails, so padding_idx always matches? Or the weight read fails. We need to fix the kernel to correctly read the index and fetch the corresponding weight row.
+
+I'll rewrite the kernel to process multiple indices per block using tile-based approach: each block processes a chunk of indices, loads them into a local int64 array, then for each index, we copy the corresponding weight row. However, AscendC does not support dynamic indexing into global memory? It supports vectorized gather, but for embedding lookup, we need to gather rows based on indices. A simple approach: each block processes a fixed tile of indices, loads them into local, then loops over them, for each index we compute the weight offset and copy the entire row using DataCopy. This is similar to the current but we handle scalar access differently.
+
+We can use the `DataCopy` to copy the index into a scalar by using a temporary local tensor of size 1 and then using `AscendC::LocalTensor<int64_t>::GetValue(0)`? Actually, AscendC documentation: For local tensor, after DataCopy, the data is in vector registers. To get a scalar, we can use `AscendC::LocalTensor<int64_t>` and then use `AscendC::SetValue` to assign to a scalar? There is `SetValue` and `GetValue` but they are for setting individual elements in a local tensor. To read a single element, you can use:
+```
+int64_t idx;
+AscendC::DataCopy(xLocal, xGm_[base], 1);
+idx = xLocal(0); // This is not valid in AscendC kernel.
+```
+Actually, in the provided leaky_relu example, they used `AscendC::Mins` etc. on local tensors, but not scalar extraction. For scalar extraction, you often need to use `AscendC::SetValue` and then read from a scalar buffer. Alternatively, you can avoid scalar extraction by using a vectorized approach: for each index, you can use `AscendC::DataCopy` from weight to output, but the weight offset is based on index. That requires dynamic addressing in global memory, which is supported by `wGm_[offset]`. Since we know the offset at compile-time? Not exactly. We can compute offset as `(uint32_t)idx * embeddingDim_` and use `wGm_[offset]`. That is valid because `GlobalTensor` supports indexing with a runtime value.
+
+The problem is reading the scalar index. I think we can use `AscendC::LocalTensor<int64_t>` and then use the built-in `AscendC::GetValue`? Let's recall: In the kernel, we have `LocalTensor<float>` and we can do `float val = xLocal(0);` I think that is actually valid in the latest AscendC API? The example code uses `xLocal(0)` in the leaky_relu? No, they didn't. But I've seen code that does `xLocal(index)` to access an element. But it's a function call not array subscript. Actually, `LocalTensor` class in AscendC overloads `operator()` to access elements? Yes, it does: `T operator()(uint32_t index) const`. So `xLocal(0)` should return the first element. That should work. So why all zeros? Possibly because the index is read correctly, but the weight fetch fails because `weightOffset` may be wrong? Or the output write fails.
+
+Another possibility: The tiling data is not set correctly. The `totalInputLen` is the number of indices (batch_size * seq_length). The output shape is (batch, seq, embedding_dim). In the kernel, we write `yGm_[outOffset]` where `outOffset = base * embeddingDim_`. That's correct.
+
+Maybe the issue is that the kernel uses `AscendC::Muls(yLocal, yLocal, 0.0f, embeddingDim_)` to zero-fill, but `yLocal` is uninitialized. That's fine.
+
+Maybe the issue is that `AscendC::DataCopy` expects the length in number of elements, not bytes. For `int64_t`, we copy 1 element, which is 8 bytes. That's fine. For `float`, we copy `embeddingDim_` elements. That's fine.
+
+But the output was all zeros, which could mean that for every index, the padding condition was satisfied (idx == paddingIdx_). That would happen if the index read returns zeros. So either the index data is not read correctly, or the padding_idx is -1 and actual indices are never -1, but output still zeros. Wait, in model_src, padding_idx is passed as -1 if None? Actually, the reference uses padding_idx=0, so padding_idx is 0. The input tensor has random indices from 0 to 999, so many indices are 0. If the index reading returns 0 for all, then all would be treated as padding and zero-filled. So likely the index read is wrong: maybe we are reading the wrong memory location because `xGm_[base]` is not correct when base is the block index. `base` starts at blockIdx and increments by blockNum. That's fine.
+
+But perhaps the issue is that the input tensor x is of type int64, and `xGm_.SetGlobalBuffer((__gm__ int64_t*)x, totalInputLen_)` is correct. `DataCopy` copies 1 element. All good.
+
+Another potential issue: The tiling data is set in host operator but the kernel declares `GET_TILING_DATA(tiling_data, tiling)`. The tiling data structure fields must match exactly. In host_tiling_src, we defined fields: totalInputLen, embeddingDim, numEmbeddings, paddingIdx, blockDim, tileLen. In kernel, we access tiling_data.totalInputLen_ etc. Note the naming: underscores vs no underscores. In the tiling data, the macro generates getters and setters with underscores? In the previous attempt, the host_tiling_src used `set_totalInputLen` and fields like `totalInputLen`. The kernel accessed `tiling_data.totalInputLen_`. That mismatch may cause incorrect values. Actually, the TILING_DATA_FIELD_DEF macro generates fields with underscore suffix? Let's inspect: In the leaky_relu example, they used `TILING_DATA_FIELD_DEF(uint32_t, totalLength);` and then used `tiling.set_totalLength(...)` and in kernel `tiling_data.totalLength`. So the field name is exactly as in the macro. In our host_tiling_src, we used `totalInputLen` without underscore. But in kernel we used `tiling_data.totalInputLen_` with underscore. That mismatch will cause compile error? It compiled fine, so maybe the macro generates both? Actually, in the leaky_relu, they used `totalLength` in both. In our case, we used `totalInputLen` in host but `totalInputLen_` in kernel. This mismatch would lead to reading garbage, likely zeros. That is a likely root cause.
+
+Also, in the host_tiling_src, we used `set_totalInputLen` which expects the field name exactly as defined (without underscore). So the kernel should use `tiling_data.totalInputLen` not `tiling_data.totalInputLen_`. Similarly for others.
+
+Therefore, fix the field names in kernel to match the tiling data definition: remove underscores from field accesses.
+
+Additionally, the kernel uses `tiling_data.tileLen_` but in tiling it's `tileLen`. So fix.
+
+Also, the kernel's `Init` parameters include `paddingIdx` as int64_t, but tiling_data.paddingIdx is int64_t. That's fine.
+
+Also, the `Init` method signature must match the call in Process. In previous code, the call is:
+```
+op.Init(x, weight, y,
+        tiling_data.totalInputLen_, tiling_data.embeddingDim_,
+        tiling_data.numEmbeddings_, tiling_data.paddingIdx_,
+        tiling_data.tileLen_);
+```
+After fixing, we need to change to:
+```
+op.Init(x, weight, y,
+        tiling_data.totalInputLen, tiling_data.embeddingDim,
+        tiling_data.numEmbeddings, tiling_data.paddingIdx,
+        tiling_data.tileLen);
+```
+
+Also, ensure that `totalInputLen` is the number of indices, not the byte size. The `GetShapeSize()` returns number of elements for a 1D shape? For a 2D shape (batch, seq), `GetShapeSize()` returns batch*seq, which is correct.
+
+Also, check the `InferShape`: we set dimNum = x_shape->GetDimNum() + 1, but for a 2D input, that gives 3D output. That's correct.
+
+Now, the kernel itself: The while loop reads one index at a time, which is inefficient but should work. However, we need to be careful: after reading the index, we immediately free the local tensor. Then we allocate yLocal. That's fine.
+
+But there is a subtle issue: `AscendC::DataCopy(yGm_[outOffset], yLocal, embeddingDim_)` writes from local to global. That is fine.
+
+Now, the output was all zeros, so likely the index read returned 0 always. That could be because the tiling data had wrong `totalInputLen` (maybe 0) or the global memory offset was wrong. If `totalInputLen` is 0, Process returns early. But output was non-zero shape but zero values. So totalInputLen was likely non-zero. The more plausible cause is the field name mismatch.
+
+Also, note that in the host operator, we used `set_totalInputLen` etc. That is fine. But the kernel must use consistent field names.
+
+Another potential issue: The tiling data structure in host_tiling_src uses `int64_t paddingIdx`. In the attribute, we defined type "int". In project_json, the attr type is "int". That should map to int64_t. But we need to ensure that the attribute is parsed correctly. In the host operator, we read `const int64_t paddingIdx = ...`. The `GetAttrPointer<int64_t>(0)` works if the attribute type matches. It compiled, so it's fine.
+
+Now, fix the kernel field names and also ensure that the `DataCopy` for the index uses correct length: 1 element (sizeof(int64_t)). That's fine.
+
+Also, we should consider using `AscendC::LocalTensor<int64_t>` and then `int64_t idx = xLocal(0);`. That should work.
+
+Let's also double-check the output size: The result tensor is allocated in python_bind with shape {batch, seq, embedding_dim}. The kernel writes `totalInputLen * embeddingDim` floats, so it matches.
+
+Now, there might be an issue with the output layout: The kernel writes row-major: for each index, write embeddingDim floats. That's correct.
+
+One more thing: The kernel uses `AscendC::DataCopy` for the weight row. The weight tensor is of shape (numEmbeddings, embeddingDim). We access `wGm_[weightOffset]` where `weightOffset = static_cast<uint32_t>(idx) * embeddingDim_`. If idx is negative (e.g., -1 from padding_idx? but padding_idx is 0 in our case), that would cause out-of-bounds. But random indices are >= 0.
+
+All right, let's produce the fixed code with corrected field names.
+
+Also, note the warning in logs: "tiling struct [Ca6k00294CustomTilingData] is conflict with one in file ca6k00294_custom_tiling.h, line 5". This is a harmless warning about duplicate definition? It may be due to the autogen vs our tiling header. But it compiles.
+
+Now, produce the six strings. Ensure project_json_src is a list with "op" key? Actually, the example had a list with one object having "op" key. That works. But the constraints say "The parsed JSON must have a top-level key 'op' (required by the Ascend build toolchain)." The example used a list with an object containing "op". That seems fine. I'll keep the list.
+
+Now, fix the tiling field names in kernel_src. Also, in host_tiling_src, we used `totalInputLen`, `embeddingDim`, etc. Those are fine.
+
+Now, also check the python_bind_src: we used `EXEC_NPU_CMD(aclnnCa6k00294Custom, x, weight, padding_idx, result);`. That matches the autogen API. Should be fine.
+
+Now, produce the final answer.

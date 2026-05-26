@@ -1,0 +1,90 @@
+We need to generate six Python string variables for a custom AscendC kernel "softmax_custom" (PascalCase: SoftmaxCustom). The original model applies torch.softmax(x, dim=1) on a tensor of shape (batch_size, dim). We must follow the provided example structure for leaky_relu_custom, but adapt for softmax.
+
+We need to produce:
+- project_json_src: operator definition with inputs, outputs, attributes (softmax has no extra attrs, but maybe a dim attribute? In the original, dim=1 is hardcoded, but for flexibility we could include dim as an optional attr. The example had negative_slope attr. We can add "dim" as optional with default 1. But careful: the kernel will assume dim=1 (softmax over last dimension? Actually shape is (batch_size, dim), so dim=1 is correct. We'll stick with no attr for simplicity, but to be consistent with example we can include a dim attr.)
+- host_tiling_src: tiling data struct with totalLength, tileLength, blockDim, and maybe negativeSlope-like? For softmax, we need to compute sum of exponentials, so we need a per-row reduction. This is more complex than leaky_relu. However, we can use a naive approach: load a tile, compute exp, sum over the tile using a local reduction? But softmax requires global reduction per row? Actually for a 2D tensor, softmax over dim=1 means each row independently. We can process rows as tiles: each tile is a contiguous chunk of the flattened tensor. Since dim is large (393216), we can treat each row as a tile? But rows are 393216 elements, that's too large for UB. We need to tile within each row. The kernel must compute softmax per row with multiple iterations. This is nontrivial but possible: we can use a two-pass approach: first compute max per row, then compute sum of exp(x_i - max) per row, then compute output. In AscendC, we can do per-row reduction across tiles. For simplicity, we could implement an element-wise softmax that assumes the input is already a single row? But the input shape is (4096, 393216) -> total 4096 rows, each row 393216 elements. We need to handle this.
+
+Given the complexity, we must produce a plausible kernel. The user expects a complete solution. Let's design:
+
+- The kernel name: softmax_custom, as given.
+- The kernel will be called with tensor x and optionally dim (but we'll assume dim=1 for simplicity, and we'll handle row-wise softmax).
+- Tiling: each block processes a contiguous segment of rows. Each row is processed in tiles (chunks of columns). We need to keep track of per-row max and sum across tiles. We can use local memory for the row's accumulated max and sum. Since rows are large, we'll process one tile at a time. Approach: For each row, in a loop over tiles: compute max, then compute exp and sum, then write output. This requires synchronizing within a row across tiles? Actually since each block handles a set of rows, and within one block we process tiles sequentially, we can maintain running max and sum per row. But we don't have enough UB for per-row accumulators for all rows simultaneously. We can process rows one by one: for each row, initialize max to -inf, then iterate tiles of that row. Not efficient but correct.
+
+Alternative: Use a simpler kernel that does softmax on a 1D tensor (single row) and let PyTorch handle batching? But the user wants to replace torch.softmax, which works on arbitrary dim. However, the example uses a simple element-wise operation. Softmax is more complex. We can still implement it correctly with a two-pass per row. Given the constraints of the example, we can produce a kernel that works for a flattened 1D input (ignoring batch dim) and assume dim=0? That would be wrong. Better to implement proper row-wise softmax.
+
+Given the time, I'll produce a kernel that performs softmax by:
+- Using a two-pass: first pass to compute max over each row (using a reduction), second pass to compute sum of exp(x_i - max) and output. But this requires two separate loops over global memory. That's acceptable.
+- Tiling: each block processes a set of consecutive rows. For each row, we load tiles of columns, compute max, store it temporarily, then second pass compute exp and scale. Need two passes per row.
+- We'll allocate a buffer for per-row max values (size numRows)? That could be large. Instead, we can do one pass per row: compute max, then compute sum and output in the same loop after max is known? Not possible because we need max first. So we can do: for each row, first loop over tiles to compute max, then second loop over tiles to compute sum/exp and output. This doubles GM access but works.
+
+We need to fit within UB budget. The example used UB_BUDGET_BYTES=192*1024 and maxTile = UB_BUDGET_BYTES/28 (from memory 2). For softmax, we need more temporary buffers: maybe 2 tiles for input/output, plus some for exp, plus accumulator. Let's estimate: We need inQueueX (input tile), outQueueY (output tile), tmpQueue for exp, plus maybe queue for max? Possibly 3 queues. So 3*tile elements * 4 bytes = 12*tile. Plus maybe a scalar for max. So maxTile ~ UB_BUDGET_BYTES/12? But memory 2 suggests 28 for division for leaky_relu (which had 5 queues). For softmax with 3 queues: 3*4=12, so maxTile = 192*1024/12 = 16384. But we also need alignment. We'll set ALIGN_ELEMS=16, HARD_CAP_ELEMS=4096 from memory 2. So tileLen limited to 4096. That's small compared to row length 393216, so each row will need many tiles.
+
+Implementation details:
+- Use grid-stride loop over rows: each block handles row indices from blockIdx*blockDim to totalRows, stride=blockDim*blockDim? Actually we need to distribute rows among blocks. Simpler: each block handles a contiguous chunk of rows: startRow = blockIdx * rowsPerBlock, endRow = min(totalRows, startRow+rowsPerBlock). rowsPerBlock = totalRows / blockDim.
+- For each row, we do two passes.
+- First pass: iterate over tiles of columns, compute max = max(max, tileMax) using AscendC::ReduceMax? But we need to find max across tile elements. We can use AscendC::ReduceMax with a local tensor to get scalar, then compare. Or use a naive loop? We can use AscendC::Max to compare elementwise, then reduce? Simpler: use AscendC::ReduceMax. For each tile, we compute the max element using AscendC::ReduceMax, then keep a scalar maxVal (in local variable, not tensor). Since we cannot have a scalar in UB? We can store in a local variable (float). Then second pass: for each tile, compute exp(x - maxVal), sum using AscendC::ReduceSum, then after knowing sum, divide each element? Actually for second pass, we need to compute exp(x-max) and then divide by total sum. But we don't know total sum until after processing all tiles. So we need a third pass? Or we can compute sum in the second pass and write output in a third pass. That's more passes. To avoid triple pass, we can store the sum from second pass and then do third pass? That's inefficient.
+
+Better: We can compute everything in one pass using a running sum and max? Not possible because exp depends on max.
+
+Given the complexity and the fact that the example is simple, maybe the intended kernel is for a row-wise softmax with a two-pass approach, but we need to keep it simple. We can assume that the input is a 1D tensor (flattened) and perform softmax over the entire tensor (dim=0). That would be incorrect for the model but might pass correctness? The model expects dim=1 (row-wise). So we must do row-wise.
+
+Alternative: We can implement softmax using a custom tiling that processes entire rows at a time if the row size fits in UB? But row size is 393216, too large. So tiling is necessary.
+
+We can use the AscendC API for softmax that might be provided? There is no built-in softmax in the kernel API, but we can use the vector instructions.
+
+Given the challenge, I'll produce a kernel that implements softmax by:
+- For each block, determine rows handled.
+- For each row, iterate columns in tiles.
+- First tile: compute max, store max. Second tile: compute sum of exp, store sum. Third tile: compute output = exp(x - max) / sum. That's three passes. We can combine the first two passes if we compute max and sum in same pass using max from previous? No.
+
+Given time, I'll make a simplified version that uses a two-pass approach but with a single loop that after computing max for the row, re-iterates tiles to compute output with a running sum? Actually we can compute sum and output simultaneously if we store the max. After max is known, we can compute exp and sum, but we need the sum before we can output. So we must either store the exp values temporarily in GM (too slow) or do a second loop to compute sum and then third loop to scale. That's three passes.
+
+I'll implement three passes:
+pass1: compute max per row
+pass2: compute sum of exp(x-max) per row
+pass3: compute output = exp(x-max)/sum
+
+Each pass iterates over tiles.
+
+We'll store max and sum in UB as local scalars (float variables). Since we process rows sequentially, we can reuse.
+
+Tiling: we'll have three queues: inQueueX for input, outQueueY for output, and tempQueue for exp values in pass2? Actually we need to compute exp in pass2 and also store output in pass3. We can reuse the same out queue for output. For pass2, we need to compute exp and accumulate sum, but we don't store the exp. So we can use a temporary queue for exp values? Not needed; we can compute exp and add to sum without storing. So for pass2, we only need to read input tile and compute exp and reduce sum. For pass3, we need to read input tile again, compute exp, and divide by sum, then write output. So we need to read the input tile three times per row. That's okay.
+
+We'll allocate queues: inQueueX for input, outQueueY for output, and a tempQueue for intermediate computations (maybe not needed). Actually for pass3, we need to compute exp and then multiply by 1/sum (reciprocal). We can use tempQueue to hold exp, then multiply by reciprocal. So we may need two temp queues? To keep within budget, we can limit tile size to fit.
+
+Given memory 2: use ALIGN_ELEMS=16, HARD_CAP_ELEMS=4096, maxTile=UB_BUDGET_BYTES/28. For softmax with three queues (in, out, temp) each of tileLen, plus maybe a queue for reduction accum? Actually we can do without extra queue for reduction: use AscendC::ReduceSum/ReduceMax. So total floats needed: inQueueX tile, outQueueY tile, tempQueue tile, plus maybe for reduction overflow? At least 3*tile floats * 4 = 12*tile bytes. So maxTile = UB_BUDGET_BYTES/12? But memory 2 says 28 for leaky relu (5 queues). To be safe, we can use a smaller factor: maybe 32? Let's compute: if we have 3 queues, factor=12, but memory suggests a larger division to be conservative. We'll use UB_BUDGET_BYTES/32 to be safe, giving maxTile=192*1024/32=6144. But HARD_CAP_ELEMS=4096 limits to 4096. So tileLen=4096.
+
+Now, we must ensure correctness. The memory 3 about Sigmoid says to use Reciprocal to reduce precision loss. For softmax, we can compute 1/sum and multiply.
+
+Implementation steps:
+
+1. In Init: receive totalLength (number of elements), tileLength, maybe dim (we'll ignore dim and assume row-major). We also need to know number of rows: totalLength / cols (but we don't have cols). We'll require that the input is 2D with dim=1 as axis. So we need to know the column size (dim). Alternatively, we can compute the number of rows by totalLength / cols. But we don't have cols. We can pass rowLength as a tiling parameter. So add rowLength to tiling data. Then totalLength = numRows * rowLength. So tiling data: totalLength, tileLength, blockDim, rowLength. Then in kernel, each row's columns = rowLength.
+
+2. In Process: compute totalRows = totalLen_ / rowLen_. Distribute rows to blocks: each block handles a contiguous set of rows. We'll compute startRow = blockIdx * (totalRows / blockNum) etc.
+
+3. For each row:
+   - Compute max: iterate from col=0 to rowLen_ with step tileLen_. For each tile, load x tile, compute local max using AscendC::ReduceMax, update maxVal.
+   - After maxVal known, compute sum: iterate again, for each tile, load x tile, compute exp of (x - maxVal) using AscendC::Sub + AscendC::Exp, then accumulate sum using AscendC::ReduceSum.
+   - After sumVal known, compute output: iterate again, for each tile, load x tile, compute exp of (x - maxVal) using Sub + Exp, then multiply by reciprocal of sumVal (AscendC::Reciprocal once then AscendC::Mul), write to output.
+
+We must ensure we don't exceed UB budget per pass. Since we reuse the same queues for each pass, we can do passes sequentially. The queues are reused.
+
+We'll implement with functions for each pass.
+
+Now, generate the six strings.
+
+project_json_src: define op SoftmaxCustom with input x, output y, optional attr "dim" with default 1.
+
+host_tiling_src: define tiling struct with totalLength, tileLength, blockDim, rowLength, dim? Actually we need rowLength. We'll include rowLength. Also negativeSlope? No. We'll include dim as attr but tiling data may not need dim.
+
+host_operator_src: implement TilingFunc: compute totalLength from shape, get dim attr (optional), if dim==1 then rowLength = shape[1]; else if dim==0 then rowLength = shape[0]? But dim=1 is typical. We'll assume dim=1. Compute tileLen using UB budget formula: maxTile = UB_BUDGET_BYTES/28 (from memory 2), align to 16, cap 4096. Then adjust based on rowLength. Compute blockDim based on number of rows (totalLength/rowLength). Set blockDim to at least 1, max 24. We'll adapt.
+
+kernel_src: implement KernelSoftmaxCustom class with Init, Process, and inner functions for each pass. Use queues.
+
+python_bind_src: similar to leaky_relu, but for softmax. We'll call it aclnnSoftmaxCustom.
+
+model_src: import custom_ops_lib, define ModelNew that calls custom_ops_lib.softmax_custom.
+
+We must ensure variable names and function names match: kernel name softmax_custom, PascalCase SoftmaxCustom.
+
+I'll write the code accordingly.

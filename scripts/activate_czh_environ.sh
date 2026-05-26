@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # 激活本项目隔离 conda 环境（路径均在 cenzhihan 目录下）
-unset https_proxy http_proxy all_proxy HTTPS_PROXY HTTP_PROXY ALL_PROXY no_proxy NO_PROXY PYTHONPATH
+unset https_proxy http_proxy all_proxy HTTPS_PROXY HTTP_PROXY ALL_PROXY no_proxy NO_PROXY
+# CANN set_env.sh 会读取 PYTHONPATH；勿 unset（bash set -u / nounset 下会报 unbound variable）
+export PYTHONPATH=""
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CZH_ENV_BIN="${ROOT}/miniconda3/envs/czh_environ/bin"
 

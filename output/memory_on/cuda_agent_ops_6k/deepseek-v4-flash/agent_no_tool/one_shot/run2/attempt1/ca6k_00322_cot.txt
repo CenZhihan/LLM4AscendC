@@ -1,0 +1,115 @@
+We need to generate six Python string variables for the fused custom AscendC operator for "F.native_channel_shuffle". The model takes a tensor of shape (batch_size, num_channels, height, width) and shuffles channels according to groups. The operation is: reshape to (batch_size, groups, num_channels//groups, height, width), transpose to (batch_size, groups, num_channels//groups, height, width) maybe? Actually F.native_channel_shuffle expects input shape (N, C, H, W) and groups: it splits C into groups*channels_per_group, then reshapes to (N, groups, channels_per_group, H, W), then transpose to (N, channels_per_group, groups, H, W), then reshape to (N, C, H, W). So it's essentially a permutation of channels.
+
+We need to write a custom AscendC kernel that does this efficiently. The operator name stem: ca6k_00322, so kernel/op name: ca6k_00322_custom, PascalCase: Ca6k00322Custom.
+
+The project JSON must have top-level "op" key. So we'll define operator metadata.
+
+Constraints: Need to match reference numerically. The reference uses F.native_channel_shuffle, which is a built-in PyTorch operation. We need to implement it in AscendC.
+
+The kernel will take input x (float) and groups (int? Actually groups is an attribute). Output y.
+
+We need to handle 4D tensor (N, C, H, W). The kernel should compute:
+
+Given input shape [N, C, H, W] and groups G, we have C = G * C_per_group.
+The operation: 
+1. Reshape to [N, G, C_per_group, H, W]
+2. Transpose dimensions 1 and 2 -> [N, C_per_group, G, H, W]
+3. Reshape to [N, C, H, W]
+
+Equivalently, for each output element (n, c, h, w), the input index is:
+Let c_g = c % G? Actually, we need to map output channel index to input channel index.
+Let C = G * Cg, where Cg = channels per group.
+Output channel index c (0..C-1) corresponds to:
+group_index = c % G? Wait, after transpose we have order: C_per_group, G. So output channel order: first all channels of group 0, then group 1, etc.? Actually standard channel shuffle: after transpose, we have shape (N, C_per_group, G, H, W). So channel dimension is (C_per_group * G). For output channel c, we can compute g = c // C_per_group? Let's derive.
+
+Input tensor shape: (N, C, H, W) with C = G * Cg.
+Reshape to (N, G, Cg, H, W). That means for a given batch n and spatial h,w, the input channel index c (0..C-1) is interpreted as (g, cg) where g = c // Cg, cg = c % Cg.
+Then transpose (1,2) gives shape (N, Cg, G, H, W). So the new channel dimension is Cg * G. For output channel index c_out (0..C-1), we have c_out = cg * G + g? Let's map: after transpose, the order of channels is: for each cg (0..Cg-1), for each g (0..G-1). So output channel index = cg * G + g.
+Thus input channel index c_in = g * Cg + cg, where cg = c_out // G, g = c_out % G? Wait solve: c_out = cg * G + g. So cg = c_out // G, g = c_out % G. Then c_in = g * Cg + cg.
+Therefore for each output element (n, c_out, h, w), the input element is (n, c_in, h, w) where c_in = (c_out % G) * Cg + (c_out // G).
+
+We can implement this with element-wise mapping. Since AscendC supports vectorized operations, we could do a simple index calculation and copy. But careful: the kernel must be efficient. We can use DataCopy with a stride pattern? However, the memory access pattern is non-contiguous across channels but within a channel it's contiguous. The total data size is N*C*H*W floats.
+
+A straightforward approach: For each output position (n, c, h, w), compute input index and perform a load and store. But that would be slow. Better: Use a tiling strategy where we load a tile of input data, rearrange in-place into a local buffer, then store. Since AscendC has vector instructions for permutation? There's no direct shuffle. We could use gather/scatter but that's for arbitrary indices. For channel shuffle, the pattern is regular: for a fixed (n, h, w), we have a contiguous block of C values that need to be permuted. So we can treat each spatial position independently. For each (n, h, w), we have a vector of length C. We can apply the permutation using local tensor operations.
+
+In the kernel, we can process tiles of spatial positions. For each tile, we load the entire channel dimension for those positions? That might be large. Better to tile both spatial and channel dimensions.
+
+Given UB size constraints, we need to tile the total tensor volume. The input is 4D, but we can flatten spatial dimensions to 1D for tiling. So total length = N * H * W * C. We tile along this flattened index.
+
+But the permutation involves only channel dimension, and spatial positions are independent. So if we tile a contiguous block of the flattened tensor, within each block the channel indices are contiguous only if we don't cross spatial boundaries. Actually flattening order is (n, h, w, c) if we use row-major. In PyTorch, shape (N, C, H, W) means stride: C*H*W, H*W, W, 1. So contiguous in memory is (N, C, H, W) -> index = n*C*H*W + c*H*W + h*W + w. So for fixed (n,h,w), channels are contiguous with stride H*W? Wait: c*H*W, so for fixed (n,h,w), consecutive channels are spaced by H*W. Actually: offset = n*C*H*W + c*H*W + h*W + w. So for fixed n, h, w, moving to next c adds H*W, not 1. So channels are not contiguous in memory; they are strided. The layout is channel-major: first all channels, then height, then width? Actually PyTorch standard NCHW: stride = (C*H*W, H*W, W, 1). So for a given (n, h, w), to access all channels, we need to read from offsets: base = n*C*H*W + h*W + w, then for c=0..C-1, index = base + c*H*W. So the channels are strided with stride H*W. That makes the permutation more complex: we cannot simply load contiguous blocks of entire channels for multiple spatial positions easily.
+
+Given the complexity, perhaps the simplest correct approach is to treat each output element independently and compute input index. Since the total number of elements is N*C*H*W, we can use a single loop with tiling, compute input index for each output element, load from global to local (using DataCopy with a scatter? Actually we can use a local buffer and manually load each element via SetValue/GetValue? That would be slow but acceptable for correctness.
+
+But we need performance. Alternatively, we can restructure the data layout by using a tiling that reads contiguous chunks from global memory, then applies the permutation in local memory, then writes contiguously. Since the input is not contiguous in channel dimension, reading contiguous chunks of the flattened tensor means we read blocks that span multiple spatial positions and channels. The permutation is only within each spatial position (fixed n,h,w). So we need to reorder channels within each group of C elements that correspond to the same (n,h,w). This is similar to a transpose within each spatial position.
+
+One approach: treat the tensor as 3D: (N*H*W, C). Then channel shuffle is a fixed permutation on the last dimension. So we have a matrix of shape (Nhw, C). We want to permute columns according to rule above. This is a simple permutation of columns for each row. In AscendC, we can load tiles of rows and columns. For each row (spatial position), we need to read all C elements (strided), apply permutation, and write out all C elements (strided). The permutation is the same for all rows. So we can compute a small lookup table of indices.
+
+Given the constraints, I'll implement a kernel that processes a tile of rows. For each row, we load a block of C floats from global memory (using DataCopy with a stride? DataCopy requires contiguous src and dst with possible offset? Actually DataCopy copies contiguous data from global to local. To load strided data, we need to do multiple copies or use gather. AscendC does not have a gather instruction? There is Scatter but for writes. For reads, we can use DataCopy with a non-unit stride? Not directly.
+
+Maybe we can use a two-step approach: first load the entire tensor as contiguous in NCHW order but then we need to reorder. Actually the input is already contiguous in NCHW order, meaning that the innermost dimension is width, then height, then channels, then batch. So for a fixed (n,c), h and w are contiguous? Wait: stride for h is W, so moving to next h adds W elements. For fixed (n,h), moving to next c adds H*W elements. So the elements of a single channel (n,c) are contiguous in h and w? Yes, because index = n*C*H*W + c*H*W + h*W + w, so for fixed n,c, as h and w vary, the offset changes by contiguous steps when w is inner loop. So each channel's data is a contiguous block of size H*W, but channels are separated by H*W.
+
+Thus the tensor can be seen as N * C matrices of size H*W, arranged in memory as: all channels for first batch, then all channels for second batch, etc. Within a batch, channels are stored consecutively: first channel 0 (H*W floats), then channel 1, etc. So the layout is batch-major, then channel-major, then spatial (row-major). This is standard NCHW.
+
+Given that, the channel shuffle operation for each batch is: we have C matrices of size H*W. We want to rearrange the order of these matrices according to the permutation. So essentially we need to permute the C matrices within each batch. This is a permutation of blocks of size H*W.
+
+Therefore, we can implement the kernel as: for each batch, for each output channel index c_out, compute input channel index c_in, then copy the block of size H*W from input to output with offset c_in*H*W to c_out*H*W (within batch). This is a simple block copy, which can be done with DataCopy.
+
+Since H and W can be large, we need to tile the spatial dimensions as well. So we have two levels of tiling: channel tiling and spatial tiling. We can process tiles of the spatial region, and for each tile, we process all channels? That might be efficient.
+
+Given the complexity, and the fact that the reference implementation is used for verification, we need to ensure correctness. I'll write a kernel that directly computes the output by iterating over all elements and computing input index. It won't be the fastest but will be correct.
+
+Given AscendC constraints, we can use a single loop over all elements, using a tiling that loads a contiguous block from global to local, then compute the mapping, then store. But if we load contiguous block, the mapping will be irregular. Better to load the input data as is, then reorder in local memory using a vector permute? AscendC has no general permute.
+
+Given time, I'll implement a straightforward element-wise kernel with index calculation. Use a local buffer of size tile_len (e.g., 1024 floats) to store input and output. For each element, compute output index and input index, then do a scalar load and store using SetValue/GetValue? But that's extremely slow. Alternatively, we can precompute the mapping of channel indices for each output channel and then use a loop over spatial positions and channels.
+
+Better: For each output channel c_out, we know the input channel c_in. So we can process by output channel. For each output channel, we copy the entire spatial block from input to output. That involves copying H*W elements from one location to another. We can use DataCopy with offsets.
+
+Thus the kernel can be: for each batch, for each output channel, copy H*W floats from input offset to output offset. This is simple and efficient. We need to handle large H,W by tiling the spatial dimension as well. So we have a 2D tiling: tile over spatial rows.
+
+Implementation plan:
+
+Tiling data: totalLength = N*C*H*W, tileLength (for spatial rows, e.g., rows per tile), blockDim.
+
+Kernel Init: receive totalLength, tileLength, groups, channels (C), H, W. Compute Cg = C/groups.
+
+Process: for batch index, for output channel index, for spatial rows tile, copy the tile.
+
+But we need to handle large tensors. Use grid-stride loops.
+
+Simplify: Since the operation is a permutation of channels, we can use a single kernel call with blockDim = number of output channels (C) * N? Too many blocks. Better to use spatial tiling.
+
+I'll implement a kernel that processes a tile of the output tensor. Each block handles a contiguous range of elements in the flattened output tensor. For each element, compute the input index by deriving (n,c_out,h,w) from the flattened index, then compute (c_in) and get input offset. Then load that element into local, compute? Actually just copy. But we need to do a single load and store per element. That is possible using DataCopy? No, because source is not contiguous. We can use SetValue/GetValue for scalar access? AscendC has element-wise access via LocalTensor.GetValue/SetValue? I think those exist. But they are inefficient.
+
+Given the complexity and time, I'll produce a kernel that does block copy for each channel. That is the most straightforward and efficient.
+
+We'll have parameters: N, C, H, W, groups. The kernel will have a loop over batches and channels and spatial tiles.
+
+The kernel function: void channel_shuffle(GM_ADDR x, GM_ADDR y, ...)
+
+I'll generate code now.
+
+We need to include all necessary includes.
+
+Let's start writing the six strings.
+
+First, project_json_src: define operator "Ca6k00322Custom" with input x (float, ND), output y (float, ND), attributes: groups (int), maybe also N,C,H,W as runtime? Actually we can infer shape from input tensor. The tiling data will include shape info. Attributes: groups (int). Also we need to pass groups to tiling.
+
+But note: the reference model takes groups as a class parameter. In the forward, it calls F.native_channel_shuffle(x, groups). So groups is an attribute. We'll define it as optional integer with default? But it must be provided. We'll set default 2.
+
+In host operator, we need to implement TilingFunc that calculates blockDim and tileLength based on total data size. Since the kernel is simple block copy per channel, we can process one channel per call? Or multiple.
+
+Simplify: Let each block process a contiguous chunk of the output tensor. We'll use grid-stride loops.
+
+We'll pass all shape parameters via tiling data: N, C, H, W, groups, totalLength. Then kernel will compute elementwise with index mapping.
+
+Given the constraints, I'll write the kernel as:
+
+For each output element index (global), compute (n, c_out, h, w) by decomposing index (since output is contiguous). Then compute c_in = (c_out % groups) * (C/groups) + (c_out // groups). Then input index = n*C*H*W + c_in*H*W + h*W + w. Then load x[input_index] and store to y[output_index]. This uses scalar operations. To make it vectorized, we can load a tile of output indices and compute input indices, then use DataCopy? Not easy.
+
+Given AscendC's limitations, we can use a local buffer to store a tile of input elements by doing multiple DataCopy with offsets? Actually we can compute the input offset for each element in the tile and then use DataCopy with different offsets? DataCopy copies contiguous data. So we would need to do a loop over elements, each doing a single DataCopy of 1 float? That's bad.
+
+Given the time, I'll implement the kernel with element-wise scalar moves using AscendC's local tensor access. I've seen examples using GetValue/SetValue. That might be acceptable for correctness, though not optimal.
+
+I'll proceed with that approach.
+
+Now, write the six strings.

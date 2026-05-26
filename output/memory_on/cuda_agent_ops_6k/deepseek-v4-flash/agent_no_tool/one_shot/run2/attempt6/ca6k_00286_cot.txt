@@ -1,0 +1,68 @@
+We need to fix the correctness issue: the kernel output is all zeros, meaning the nearest neighbor + relu computation is not producing correct results. The errors show that the new output is all zeros, while the reference output has non-zero values. The kernel uses a scalar buffer and copies one element at a time, but the DataCopy for scalar might be problematic, also the usage of Max on a scalar tensor might be buggy. Also the kernel uses a single scalar buffer and processes element by element, which is extremely inefficient but that's not the correctness issue.
+
+The primary problem is likely that the scalar buffer is used without proper initialization or the DataCopy from global to scalar is not working correctly. Also, the kernel uses AscendC::DataCopy for single element, but the GlobalTensor creation might be wrong. Alternatively, we can implement a tile-based approach using vector instructions to do nearest neighbor sampling and relu more efficiently and correctly.
+
+But we need minimal targeted changes. The previous attempt used a per-element approach which is known to be error-prone. Better to switch to a tile-based approach: for each output tile (contiguous in memory), we need to map each output element to the corresponding input element. Since the output is 4D (NCHW), we can process tiles that are contiguous in the output global memory. However, the nearest neighbor mapping is not uniform across the output dimensions, so a simple vector copy is not possible. But we can compute the base indices and then use DataCopy with stride? Actually, AscendC supports copying from global with a stride (Gather) but it's complex.
+
+Given the context of previous repairs, the issue is likely the per-element approach is flawed. Instead, we can implement a kernel that processes one output row at a time using vector operations. For each block, we can load a row of input (width W) and then replicate each element scale_factor times to produce output row of width W_out. But because scale_factor is integer (2), we can do nearest neighbor by replicating each element. However, the reference uses F.upsample_nearest with scale_factor, which replicates each pixel scale_factor times. So we can vectorize: for each row, load the input row, then for each input pixel, write scale_factor copies.
+
+But implementing that in kernel requires careful indexing. Given the time constraint, a simpler fix: correct the per-element approach. The bug might be that scalarBuf_ is defined as a member but never initialized via pipe_.InitBuffer. In the Init method, we need to initialize the pipe and allocate the scalar buffer. The previous code did not initialize pipe_ or scalarBuf_. Also, the Process method uses scalarBuf_.AllocTensor and FreeTensor, but the pipe_ is not initialized. So all zeros output could be because scalar is all zeros or the DataCopy from global fails.
+
+Let's correct that: In Init, call pipe_.InitBuffer(scalarBuf_, 1, sizeof(float)); Also, we need to use AscendC::TBuf with template but we need to initialize buffer in Pipe. The correct way: 
+AscendC::TBuf<AscendC::TPosition::VECCALC> scalarBuf_; is a buffer that requires pipe_.InitBuffer. So add in Init: pipe_.InitBuffer(scalarBuf_, 1, sizeof(float)); Then in Process, allocate and free correctly. Also, ensure that scalar is a LocalTensor from the buffer.
+
+But also the kernel uses DataCopy for single element: AscendC::DataCopy(scalar, xElem, 1); This should work if the tensors are properly set. However, xElem is a GlobalTensor with buffer set to xGmPtr_ + inIdx, length 1. That should be fine.
+
+But the output is all zeros, which suggests either the mapping is wrong or the DataCopy is not actually copying. Another issue: the kernel uses `AscendC::Max(scalar, scalar, 0.0f, 1);` This may not be supported for scalar size 1? Possibly, but Max should work.
+
+Let's also check the tiling: the host operator's InferShape computes H_out and W_out as H * scale_factor, but scale_factor is float, and the reference uses integer scale_factor=2, so product is integer. However, the shape is set to int64, but the totalLength in tiling is computed as N*C*H_out*W_out, which should be correct.
+
+The kernel's Process loops over output indices in a grid-stride manner, computing inIdx using nearest neighbor with floor: h_in = static_cast<uint32_t>(h_out * invScale_). Since invScale_=0.5, h_out*0.5 is integer for even indices, but for odd indices it's .5, which truncates to integer floor. That matches nearest neighbor (scale_factor 2: output pixel 0 maps to input 0, output 1 maps to input 0, output 2 maps to input 1, etc). So mapping should be correct.
+
+The likely root cause is missing pipe_.InitBuffer for scalarBuf_. Also, the scalarBuf_ should not be a member of the class as a TBuf; it should be a local tensor allocated inside Process from a buffer that is initialized in pipe_. But the code uses pipe_ as a member but never initializes pipe_. In the example leaky_relu, they initialize pipe_.InitBuffer for queues. Here we have a TBuf, which also needs InitBuffer.
+
+Let's fix the Init method to include pipe_.InitBuffer(scalarBuf_, 1, sizeof(float)); and ensure the scalarBuf_ is declared as AscendC::TBuf<AscendC::TPosition::VECCALC> scalarBuf_; and used with scalarBuf_.AllocTensor<float>() and FreeTensor.
+
+Additionally, the kernel uses GET_TILING_DATA which expects tiling data structure to match. The warning "tiling struct [Ca6k00286CustomTilingData] is conflict with one in file ca6k00286_custom_tiling.h, line 5" indicates a naming conflict because we have two files: ca6k00286_custom_tiling.h and ca6k_00286_custom_tiling.h? Actually the project might have both because of different naming. The tiling header should be included as "ca6k_00286_custom_tiling.h" in host_operator_src (note underscore after 6k). The generated files might have a conflict. But in the previous attempt, the build succeeded, so this warning might be harmless. The actual correctness failure is numerical.
+
+Given the memory tips: they all relate to sigmoid, not relevant. So we just need to fix the kernel's usage of scalar buffer.
+
+Let's produce a corrected version. Also, the kernel currently uses `AscendC::GlobalTensor<float> xElem; xElem.SetGlobalBuffer(xGmPtr_ + inIdx, 1);` That is fine. But note that xGmPtr_ is of type __gm__ float*, but AscendC::GlobalTensor<float> needs a pointer of type __gm__ float*. That's okay.
+
+One more thing: we need to ensure that pipe_ is initialized before using scalarBuf_. Also, we should allocate scalar from the buffer only once per Process call? Actually each iteration we allocate and free, which is okay. But we must allocate before the loop and free after? Or allocate inside loop each time? The current code allocates once at start of Process (outside loop) and frees at end, but then inside loop they use the same scalar tensor. That is fine as long as they don't reuse between iterations without sync. But they copy to scalar, then modify, then copy out, then next iteration overwrites. That's okay.
+
+But the allocation of scalar using scalarBuf_.AllocTensor<float>() is done after the loop? No, in the code: after the for loop, they free. Actually the code shows:
+
+```
+AscendC::LocalTensor<float> scalar = scalarBuf_.AllocTensor<float>();
+for (...) { ... }
+scalarBuf_.FreeTensor(scalar);
+```
+
+But the allocation is before the loop, which is correct. However, if pipe_ is not initialized, this will fail.
+
+So minimal fix: add `pipe_.InitBuffer(scalarBuf_, 1, sizeof(float));` in Init method.
+
+Also, the Init method currently only sets pointers and values, but does not initialize the pipe. The pipe_ is a member, but we should explicitly call pipe_.InitBuffer for scalarBuf_. Also, we might need to set the pipe's buffer for scalarBuf_ before allocating.
+
+Let's rewrite the Init method to include that.
+
+Also, the kernel uses `AscendC::GlobalTensor<float> xElem;` which is a local variable; it's fine.
+
+Potential other issue: The DataCopy from global to scalar uses xElem which has length 1. But xElem is a GlobalTensor with buffer set to xGmPtr_ + inIdx. However, the DataCopy expects a contiguously addressed tensor of length 1, which is fine.
+
+Let's produce the corrected code with minimal changes. We'll also ensure that the process loop has proper handling for the scalar buffer allocation.
+
+Also, note that the previous code had a bug: `AscendC::Max(scalar, scalar, 0.0f, 1);` The Max operation takes two input tensors and an output tensor, but the third argument is a scalar value? Actually the ascencC API: `Max(Tensor dst, Tensor src, float scalar, int32_t len)` or similar. Looking at the leaky_relu example, they use `Mins(tLocal, xLocal, 0.0f, len);` so Max should work similarly: `Max(scalar, scalar, 0.0f, 1);` That is fine.
+
+But we need to ensure that scalar is a LocalTensor, not a scalar value. The Max operation modifies scalar in place.
+
+All right, I'll produce the corrected code.
+
+Additionally, the host_operator_src includes a duplicate function? It has `namespace ge { static ge::graphStatus InferShape ... }` but also the op definition class is missing? Wait, the host_operator_src in the previous attempt is incomplete: it only contains the tiling and InferShape/InferDataType, but does not include the OpDef definition. However, the build succeeded because the autogenerated op_proto.cc includes the op registration? Actually the generated code includes an op_proto.cc which defines the op. But the host_operator_src should contain the operator registration using OP_ADD. In the example, they have a class LeakyReluCustom. In our previous attempt, the host_operator_src ended with namspace ge and InferShape/InferDataType, but no OP_ADD. That might be okay if the autogen provides the registration? But the build succeeded, so it's probably fine.
+
+Nevertheless, we need to check if the op definition is missing. The warning about tiling struct conflict suggests there are two tiling data definitions, which could cause issues. To avoid conflict, we should ensure that the tiling header is included correctly. But given the correctness failure, the main issue is the kernel.
+
+Thus, minimal fix: correct the kernel's Init to initialize the scalar buffer.
+
+Let's write the corrected six strings.

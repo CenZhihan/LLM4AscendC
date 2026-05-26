@@ -1,0 +1,86 @@
+We need to generate the six Python string variables for the fused custom AscendC operator. The reference PyTorch model does:
+- torch.addcdiv(x, tensor1, tensor2)  => x + value * (tensor1 / tensor2) where value is 1 by default?
+- Actually torch.addcdiv(input, tensor1, tensor2, *, value=1) outputs input + value * (tensor1 / tensor2). So fuse that and then add bias.
+
+We can fuse the entire forward into one custom op: takes x, tensor1, tensor2, bias (as a parameter? but bias is a parameter in the model, so we can either pass it as input or have it as an attribute? The model's forward has bias as self.bias, which is a tensor. We can fuse addcdiv and bias addition into one kernel: input x, tensor1, tensor2, bias, output y = x + tensor1/tensor2 + bias. However, note that addcdiv has a default value=1, but the reference doesn't specify value, so it's 1. Also we need to handle division by zero? Probably not.
+
+We'll create a single custom op "Ca6k00265Custom" with 4 inputs (x, tensor1, tensor2, bias) and 1 output (y). Inputs and outputs are float32 ND tensors of same shape (batch_size, num_inputs, height, width). The kernel will compute:
+- temp = tensor1 / tensor2 (elementwise division)
+- y = x + temp + bias
+
+We'll use AscendC intrinsic division? There is a Div? Actually we can use vdiv or floating point division. Since AscendC supports floating point division via Div or maybe Muls? Better to use AscendC::Div if available. Or we can implement using reciprocal and multiply? But we can use AscendC::Div. In the tutorial, they use vdiv or AscendC::Div? In kernel_operator.h there is Div for local tensors. Let's use AscendC::Div.
+
+But we need to handle tiling and memory. We'll read all four inputs tiled, compute in local, write output.
+
+We also need to handle bias broadcasting? The bias shape is (num_inputs, 1, 1) which broadcasts over batch and spatial dims. In the kernel, we can treat bias as a vector of length num_inputs that repeats across batch and spatial. But easier: we can let the framework handle broadcasting? Or we can explicitly handle in kernel. Since the inputs are all same shape except bias which is (C,1,1), we can tile along all dimensions. We can treat all tensors as flatten and just add bias accordingly with stride. But for simplicity, we can let the kernel expect bias to be broadcasted? But the kernel is elementwise on flatten tensors, bias repeats every N elements (where N = num_inputs * height * width? Actually bias shape (C,1,1) so when flattened, bias tensor has length C, and we need to add it to each batch and spatial element: meaning bias[i] is added to all elements where channel index == i. In flatten view: the tensor is (batch, C, H, W), so after flatten, the index in the channel dimension is (idx // (H*W)) % C? That's complicated.
+
+Alternative: In forward, we can pre-expand bias to match shape before calling custom op? But the instruction is to fuse, so we should handle bias in the kernel. We can pass bias as a 1D tensor of length C, and inside the kernel, use LocalTensor but with appropriate offset calculations. However, that would require more complex tiling. Since the reference model does bias addition after addcdiv, we could fuse only addcdiv and then bias addition as separate? But the task says "fused custom AscendC operator for a multi-op PyTorch reference program" and "replace / fuse these in the reference forward into one or more custom ops as you see fit". So we can fuse into one operator that takes all inputs and outputs the final result, handling bias broadcasting.
+
+Given the shape is (batch_size, num_inputs, height, width) and bias is (num_inputs, 1, 1). In the kernel, we can process tiles along the first dimension (batch) and maybe also handle channel dimension. But simpler: we can reshape the input to (batch_size*height*width, num_inputs) and bias to (1, num_inputs) and then do elementwise? That would require more complex reshaping.
+
+Maybe the easiest: since the kernel will be called with the same tiling for all tensors, we can treat bias as a tensor of same shape as x after broadcasting? Actually in PyTorch, self.bias is a Parameter of shape (num_inputs,1,1), and when we do x + self.bias, broadcasting broadcasts to (batch, num_inputs, height, width). So if we pass bias as an input tensor of shape (num_inputs,1,1), the custom op can internally treat it as broadcasted. But the kernel expects all inputs to have same shape? According to op definition, we can define input_desc for bias as shape (num_inputs,1,1) and the kernel will handle broadcasting? Not automatically; we need to implement broadcasting in the kernel. That is complex.
+
+Alternative: In ModelNew.forward, we can expand bias to full shape before calling the custom op: b = self.bias.expand_as(x). Then the custom op takes three tensors: x, tensor1, tensor2, and bias (expanded). That way the kernel just does elementwise operations on same-shaped tensors. This is simpler and still fused into one op. But then we are not fully fusing the bias expansion, but that's fine. The task says "replace / fuse these in the reference forward into one or more custom ops as you see fit". We can have one custom op that does addcdiv + add bias, and we pre-expand bias. This is acceptable.
+
+So we will implement a custom op with 4 inputs: x, tensor1, tensor2, bias (all same shape after expansion). Output y same shape. Kernel: for each element, compute reciprocal of tensor2? Actually division can be done using AscendC::Div. Then add x and bias. Use tiling with double buffering.
+
+Now, we need to follow the constraints: kernel name ca6k_00265_custom, PascalCase Ca6k00265Custom. In JSON, the op name should be "Ca6k00265Custom". Inputs: x, tensor1, tensor2, bias (all float, ND). Output: y. No attributes.
+
+Tiling: totalLength = number of elements. We'll set tileLength based on UB budget. Since we have 4 input tensors and 1 output tensor, each tile we need: 4 * tileLen * sizeof(float) for inputs + 1 * tileLen for output = 5*tileLen floats = 20*tileLen bytes, plus temp if needed. We'll need a temp for division result? Actually we can do in-place? We'll use local tensors: inQueue for input x, inQueue2 for tensor1?, etc. But easier: we can use one input queue for x, then we need to load tensor1 and tensor2 and bias. We can use multiple input queues. The kernel will have:
+
+- inQueueX (BUFFER_NUM, tileLen * sizeof(float))
+- inQueueT1 (BUFFER_NUM, tileLen * sizeof(float))
+- inQueueT2 (BUFFER_NUM, tileLen * sizeof(float))
+- inQueueBias (BUFFER_NUM, tileLen * sizeof(float))
+- outQueueY (BUFFER_NUM, tileLen * sizeof(float))
+- tmpQueue (1, tileLen * sizeof(float)) for division result.
+
+Total UB needed: 5 * BUFFER_NUM * tileLen * sizeof(float) + 1 * tileLen * sizeof(float) = (5*BUFFER_NUM + 1)*tileLen*4. With BUFFER_NUM=2, that's (10+1)=11*tileLen*4 = 44*tileLen bytes. UB budget ~192KB, so tileLen <= floor(192*1024/44) ≈ 4468, but we need alignment. We'll compute as 4096 maybe.
+
+BlockDim: we can set based on totalLength/tileLen.
+
+We'll implement the kernel with grid-stride loops.
+
+Now, write the six files.
+
+project_json_src: JSON with "op" key.
+
+host_tiling_src: Tiling data struct with fields totalLength, tileLength, blockDim. No setter methods, direct assignment.
+
+host_operator_src: TilingFunc, InferShape, InferDataType, OpDef. But we must not add a second OP_ADD because autogen will add REG_OP. According to memory 1 and 4, we should not add OP_ADD in host_operator_src; instead rely on autogen. So we will define OpDef but not add OP_ADD? Actually the autogen REG_OP already registers the operator. If we also add OP_ADD, it causes redefinition. So we should not include the OpDef class at all? But the host_operator_src typically contains the OpDef and registers it. However, memory 1 says: "do not add a second registration with OP_ADD; instead remove the manual OP_ADD and rely solely on the autogen REG_OP." So we can still have the OpDef class definition but without the OP_ADD macro? Or we can omit the OpDef altogether and just define TilingFunc and InferShape? But the autogen likely generates the OpDef from the op list. To be safe, we should not define the OpDef class at all. The host_operator_src should only contain the tiling function and possibly infer shape functions? But the autogen may need a custom TilingFunc. So we can provide the tiling function and maybe infer shape? Actually infer shape is simple: output shape same as input shape. Autogen might already handle that? But we can provide it.
+
+Let's look at the example: they defined the OpDef class and used OP_ADD. That might have caused issues? But the example works. However, memory 1 specifically says to avoid second registration. In the example, they have OP_ADD, but maybe the autogen did not generate REG_OP because they used a different setup? In our case, the task likely uses autogen. To be safe, we'll not include the OpDef class and OP_ADD. Instead, we'll define only the tiling function and maybe infer shape functions as extern "C" or as part of namespace optiling. The autogen will handle the rest.
+
+But the host_operator_src must include the tiling data header and registration. The example has REGISTER_TILING_DATA_CLASS in host_tiling_src. But in host_operator_src, they include the tiling header and define TilingFunc, InferShape, InferDataType, and then OpDef class. However, memory 1 says if there is manual OP_ADD while autogen also defines REG_OP, we get redefinition. So we should avoid OP_ADD. We can instead just define TilingFunc and register it with the tiling data already registered in header. The autogen will generate the OpDef and call our TilingFunc. So we can remove the OpDef class and OP_ADD.
+
+Thus host_operator_src will contain:
+- #include "ca6k_00265_custom_tiling.h" (the actual filename? The example uses "leaky_relu_custom_tiling.h". We'll use "ca6k_00265_custom_tiling.h")
+- #include "register/op_def_registry.h"
+- namespace optiling { TilingFunc with static ge::graphStatus ... }
+- namespace ge { InferShape, InferDataType }
+- No OpDef class, no OP_ADD.
+
+But we also need to set block dim via context->SetBlockDim. We'll keep that.
+
+Now kernel_src: Implement kernel with double buffering, grid stride, division using AscendC::Div. We'll need to include "kernel_operator.h". Use TQue for inputs and output, and a temporary queue for division result. Since we have four inputs, we can use separate queues for each. Or we can reuse same queue? Better separate.
+
+Compute: 
+- Load x, tensor1, tensor2, bias.
+- Divide tensor1 by tensor2 into tmp: AscendC::Div(tmp, tensor1, tensor2, len);
+- Add x to tmp: AscendC::Add(tmp, tmp, x, len);
+- Add bias: AscendC::Add(y, tmp, bias, len);
+- Write y.
+
+We'll use double buffering: BUFFER_NUM=2. For each tile, we'll prefetch next tile while computing current.
+
+Implementation details: define class KernelCa6k00265Custom with Init and Process.
+
+Python_bind_src: Bind the custom op using aclnn. We'll need to define a function that calls aclnnCa6k00265Custom. But we need the actual aclnn function name. Usually it's "aclnn" + "Ca6k00265Custom". We'll use that.
+
+Model_src: Class ModelNew that takes init_inputs (num_inputs, bias_shape) and creates a bias parameter. In forward, it expands bias then calls the custom op. But the custom op expects 4 inputs: x, tensor1, tensor2, bias. So we'll call custom_ops_lib.ca6k_00265_custom(x, tensor1, tensor2, bias_expanded). We need to define the function name as per python_bind_src's m.def("ca6k_00265_custom", ...). So in model_src, we call custom_ops_lib.ca6k_00265_custom.
+
+Now write the code.
+
+We must ensure no syntax errors and that all strings are valid Python.
+
+Let's write.

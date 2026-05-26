@@ -1,0 +1,95 @@
+We need to fix the correctness issue. The previous attempt produced all zeros output. That means the kernel didn't actually compute anything, likely because the MatMul usage or data movement is flawed. The logs show "tiling struct [Ca6k00301CustomTilingData] is conflict with one in file ca6k00301_custom_tiling.h, line 5" but that's a warning. The real problem is the kernel output is all zeros.
+
+Given the complexity of matrix multiply, a simpler approach: use AscendC's MatMul built-in correctly. The previous attempt had manual tile loading and MatMul usage that is likely wrong. The AscendC MatMul API expects specific tensor formats and shapes. For a batched matmul, it's often easier to delegate to the built-in BatchMatMul or implement a simpler approach using vectorized multiplication and addition? But that would be slow.
+
+Better: use the AscendC MatMul with proper initialization and data movement. However, the kernel code used manual DataCopy row-by-row and then MatMul with SetOrgShape. That may not work.
+
+Alternatively, implement batched matmul as a series of per-batch MatMul calls using the built-in MatMul API with cube unit. The typical pattern: allocate A, B, C local tensors with proper sizes, use MatMul::Init, set tensor A and B, Calc, then copy out.
+
+But the previous attempt's MatMul usage seems to lack Init and proper setup. The MatMul class needs to be initialized with parameters like format, transpose flags, etc.
+
+However, we need minimal changes. Looking at the error: output all zeros. Possibly the MatMul::Calc overwrites the output instead of accumulating, and we started with zeros and never added anything? Or the DataCopy didn't work because of incorrect indexing into LocalTensor.
+
+The warning about tiling struct conflict suggests there are two tiling definitions? That may be harmless.
+
+Let's examine the kernel: It uses DataCopy to copy rows. But the DataCopy signature: DataCopy(LocalTensor, GlobalTensor, length). The indexing on GlobalTensor must be contiguous. That part seems okay.
+
+But MatMul usage: `mm.Calc(prod, aTile, bTile);` where prod is a separate local tensor. Then Add to cTile. That seems okay.
+
+Potential issue: The local tensors aTile and bTile are allocated from queues, but the queue sizes are based on tileM_*tileK_ and tileK_*tileN_. However, when the tile sizes are smaller (last tile), the allocated buffer size is larger than needed? That's fine as long as we only use the first curM*curK elements.
+
+But the DataCopy for rows: `aTile[r * curK]` - this indexing on LocalTensor is valid? LocalTensor supports operator[] that returns a reference? In AscendC, LocalTensor is like a pointer, and indexing returns a LocalTensor? Actually, LocalTensor has overloaded operator[] that returns a TensorRef? I'm not sure. For element-wise access, you need to use SetValue/GetValue or use DataCopy with offset. DataCopy expects a LocalTensor reference to the start address. To copy into a sub-region, you can use a LocalTensor of sub-length by using `aTile[r*curK]` as the destination, which may not work because DataCopy expects a tensor of length curK, but the offset may not create a valid tensor of that length.
+
+Better approach: Use a single continuous local buffer and copy using DataCopy with correct offsets. But the simplest fix: use vectorized load from global to local using DataCopy with global offset and local offset by using `aLocal` as a flat buffer, then later use MatMul which expects ND format (row-major). For MatMul, the tensors must be contiguous in row-major order. So we can allocate a local tensor of size tileM * tileK, and copy row by row using DataCopy with offset: `DataCopy(aLocal[r * curK], xGm_[aBase + r * K_], curK);` That should work because DataCopy copies from global to local starting at the given local offset.
+
+But we used `aTile[r * curK]` which might not be valid. Instead, we should pass `aTile` as the base tensor and then use a slice? Actually, DataCopy signature: `DataCopy(dst, src, len)`. dst is a LocalTensor. If we want to copy to a specific offset, we can do `DataCopy(aLocal[r * curK], xGm_[srcOffset], curK);` where `aLocal[r * curK]` returns a LocalTensor starting at that index? In AscendC, indexing a LocalTensor returns a LocalTensor of length 1? Or it returns a reference? The documentation is sparse. But the earlier successful example (leaky_relu) used `xLocal = inQueueX_.DeQue<float>();` then `DataCopy(xLocal, xGm_[gmOffset], len);` without indexing. So for copying a full tile, it works. For row-by-row, we need to copy into sub-sections.
+
+A common pattern in AscendC examples is to use `DataCopy(dst, src, len)` where dst is a LocalTensor with offset using the bracket operator. But it's risky.
+
+Given the simplicity, maybe we should avoid manual tiling and just use a single MatMul per batch with the entire matrices? But that would require allocating huge local buffers (2048x2048 floats = 4M floats = 16MB, too large for UB). So tiling is necessary.
+
+Alternate approach: Use the built-in MatMul with tiling support provided by the framework? But we are writing a custom operator.
+
+Given the time, let's adopt a more reliable method: Use AscendC's CubeMatMul with double buffering and proper Init. But that is complex.
+
+Maybe the issue is simpler: The kernel never actually computes because of early return: `if (totalBatch_ == 0) return;` and `if (blockIdx >= totalBatch_) return;` but blockIdx is >=0 and totalBatch_=2, so blockDim=2. That's fine.
+
+But the output is all zeros, meaning the Process function either didn't run or didn't write to global memory. Could be that the DataCopy to global is incorrect because we use `zGm_[dstOffset]` as destination and `cTile[r * curN]` as source, but source indexing might be invalid.
+
+Let's test a simpler approach: Use a single large local tensor for the whole batch? Not possible.
+
+Given the constraints, we need minimal changes. The most likely issue is the data copying and MatMul usage. Maybe we can replace the entire kernel with a call to the built-in BatchMatMul from AscendC, if available? But we are writing custom kernel.
+
+Perhaps the error is that we didn't call `mm.Init()` before SetTensorA/B. In previous successful examples, MatMul usage often includes Init. The MatMul class may require Init with shape and format. Also, MatMul::Calc expects pre-zeroed output tensor? Actually, it sets the output tensor to the product, not accumulate. So we should set cTile to zero, then compute product and add. That seems okay.
+
+But we used `mm.SetOrgShape(curM, curN, curK);` which sets the original shape. However, we also called `mm.Calc(prod, aTile, bTile);` where prod is the output. That should work.
+
+One suspicious part: After loading A and B tiles, we use `MatMul<MatMulType<ND, ND, ND, float>, CubeFormat::ND, false, false> mm;` declared inside the loop. That's fine.
+
+But then we call `mm.SetTensorA(aTile); mm.SetTensorB(bTile);` before Calc? We didn't call SetTensorA/B! In the code, we only set org shape, not the tensors. Actually, we omitted SetTensorA and SetTensorB. That is a critical mistake. The Calc function takes the tensors as arguments, but also we need to set them? Looking at AscendC MatMul API: `MatMul::Calc(dst, srcA, srcB)` is one overload that sets and computes. So that might be fine. But we also called SetTensorA and SetTensorB? No, we didn't. We only did `mm.SetOrgShape(...)`. That might be enough. However, the typical usage is: `MatMul<...> mm; mm.Init(); mm.SetTensorA(a); mm.SetTensorB(b); mm.Calc(c);`. The Calc we used takes three arguments, which is the new API? Actually, in AscendC, there are multiple overloads. The one we used `mm.Calc(prod, aTile, bTile)` might be valid.
+
+Nevertheless, the output being all zeros suggests that the MatMul didn't produce any output. Possibly because the tile sizes are zero? No.
+
+Given the error logs don't show runtime errors, only output mismatch, it's likely that the kernel executed but didn't write correct values. Let's try a simpler kernel: instead of manual tiling, use the built-in MatMul API with proper Init and single tile per batch (but we cannot fit whole matrix). Alternatively, use the vec_calc approach: Since we have batch_size=2, matrix_size=2048, we could compute matmul using vector instructions? That would be very slow.
+
+Given time constraints, I'll propose a fix that avoids the complex manual tiling and instead uses the AscendC MatMul API with a simpler one-batch-per-block approach but with tiling handled by the MatMul API itself? The AscendC MatMul supports internal tiling if we set the shape correctly. Actually, the MatMul API can handle large matrices by automatically tiling using the cube unit. But we need to provide local tensors that fit in UB. However, the MatMul API can read from global memory directly? There is a GlobalTensor overload. Let's explore: `MatMul::SetTensorA(GlobalTensor<float>)` and `SetTensorB(GlobalTensor<float>)` and then `Calc(LocalTensor<float> out)` with L0A/L0B buffers. But that requires proper workspace.
+
+Given limited time, the simplest fix that might work: Use the same pattern as the leaky_relu but for matmul? Not applicable.
+
+Maybe the problem is that the tiling data has conflict warning, but the actual tiling data structure might be incorrect. The tiling data fields are totalBatch, M, N, K, tileM, tileN, tileK, blockDim. That seems fine.
+
+Another possibility: The kernel name in host_operator_src and kernel_src should match. The host_operator_src uses "ca6k_00301_custom_tiling.h" but the tiling header is "ca6k00301_custom_tiling.h"? In the project, file names are based on operator name. The operator name in project_json_src is "Ca6k00301Custom". The autogen will create files like ca6k00301_custom_tiling.h. However, the host_operator_src includes "ca6k_00301_custom_tiling.h" (with underscore after ca6k). That might be a mismatch. The warning "tiling struct [Ca6k00301CustomTilingData] is conflict with one in file ca6k00301_custom_tiling.h, line 5" suggests there are two definitions: one from the autogen and one from our host_tiling_src. That could cause issues. In the build log, we see two source files: ca6k00301_custom.cpp and ca6k_00301_custom.cpp. That suggests the project has both files. So there is a naming inconsistency: the project uses "ca6k00301_custom" as base, but we also have "ca6k_00301_custom". This could lead to duplicate definitions.
+
+In the host_operator_src, we use `#include "ca6k_00301_custom_tiling.h"` but the actual tiling header is likely `ca6k00301_custom_tiling.h`. That mismatch might cause the tiling data to not be properly linked, leading to zero values for all tiling parameters. That would explain all-zero output: if totalBatch, M, etc., are zero, the kernel does nothing.
+
+So the root cause: The include path is wrong. The host_operator_src should include the correct tiling header based on the operator name. The operator name is "Ca6k00301Custom", which leads to tiling header "ca6k00301_custom_tiling.h". In the previous attempt, they used "ca6k_00301_custom_tiling.h". That is the bug.
+
+Additionally, the kernel source name is "ca6k_00301_custom" but the autogen expects "ca6k00301_custom". This mismatch might cause the kernel not to be found? But the build succeeded and kernel was generated. However, the tiling data might be mismatched.
+
+Fix: Change all references from "ca6k_00301_custom" to "ca6k00301_custom" (no underscore after ca6k). In the project_json_src, the "op" name is "Ca6k00301Custom" which is fine. The kernel function name in kernel_src should be "ca6k00301_custom" (lowercase without underscore). The host_operator_src should include "ca6k00301_custom_tiling.h". The python bindings should use the same name.
+
+Also, the kernel function in kernel_src currently named "ca6k_00301_custom". Change to "ca6k00301_custom".
+
+And in python_bind_src, the macro should use that name.
+
+Let's also ensure the tiling data is correctly defined. The current host_tiling_src seems fine.
+
+Now, also check the kernel logic: We need to ensure that the MatMul works. Since we have a minimal change, we can keep the same tiling and logic, but fix the naming.
+
+Additionally, we should ensure that the blockDim is set correctly. In host_operator_src, we set blockDim = B, but B=2, so blockDim=2, which is less than 8? But that's fine.
+
+Given the memory repairs, none directly apply.
+
+So the fix: Change all occurrences of "ca6k_00301_custom" to "ca6k00301_custom" in host_operator_src, kernel_src, python_bind_src, and model_src (the function name in python). Also, ensure the include path in host_operator_src is "ca6k00301_custom_tiling.h".
+
+Also, in kernel_src, the extern "C" function name must match the registered kernel name. The autogen expects kernel name "ca6k00301_custom". So change that.
+
+Let's produce the corrected code. We'll keep the same project_json_src and host_tiling_src (they are fine). The host_operator_src: change include and possibly the namespace? The class in host_operator_src is OpDef class "Ca6k00301Custom" which is correct.
+
+Also, the kernel_src: change the function name and the GET_TILING_DATA macro argument? GET_TILING_DATA takes the tiling struct name from the macro argument. The current is `GET_TILING_DATA(tiling_data, tiling);` which is generic. That should work as long as the tiling struct is correctly defined.
+
+Also, in kernel_src, we used `GetBlockIdx()`; it should be `AscendC::GetBlockIdx()`? Actually, we have `using namespace AscendC;` at top, but we didn't include that in kernel_src. In the previous attempt, kernel_src starts with `#include "kernel_operator.h"` and `using namespace AscendC;`? Actually, the kernel_src does not have `using namespace AscendC;` explicitly, but it uses `AscendC::TPipe` etc. That's fine as it's fully qualified. But `GetBlockIdx()` is not qualified; it should be `AscendC::GetBlockIdx()`. In the previous code, they used `GetBlockIdx()` without namespace, which would be undefined. However, `kernel_operator.h` likely brings in names via `using`? Not sure. But the build succeeded, so it's probably resolved. Still, to be safe, we should qualify.
+
+But for minimal changes, just fix the naming mismatches.
+
+Let's write the corrected code.

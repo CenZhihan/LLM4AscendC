@@ -51,6 +51,12 @@ from tools.cuda_agent_eval.dataset_snapshot import (  # noqa: E402
     snapshot_reference_to_op_dir,
 )
 from tools.cuda_agent_eval.meta import write_meta_task_json  # noqa: E402
+from tools.common.runner import (  # noqa: E402
+    CommandTimeoutError,
+    DEFAULT_EVAL_TIMEOUT_SEC,
+    EVAL_TIMEOUT_ENV,
+    EXIT_CODE_EVAL_TIMEOUT,
+)
 from tools.eval_operator import (  # noqa: E402
     _MAX_TXT_DIR_WORKERS,
     _MAX_VISIBLE_NPU,
@@ -104,6 +110,7 @@ def _run_cuda_agent_txt_bundle(
     clean_policy: str,
     art_root_override: pathlib.Path | None,
     check_reference_only: bool,
+    eval_timeout_sec: int | None = None,
 ) -> int:
     _assert_bundle_txt(txt_path)
     if row_index is None:
@@ -156,12 +163,16 @@ def _run_cuda_agent_txt_bundle(
         print(f"[done] check-reference-only: {txt_path.name}")
         return 0
 
-    _execute_pipeline(
-        op_dir,
-        art_root=art_root,
-        mode=mode,
-        clean_policy=clean_policy,
-    )
+    try:
+        _execute_pipeline(
+            op_dir,
+            art_root=art_root,
+            mode=mode,
+            clean_policy=clean_policy,
+            eval_timeout_sec=eval_timeout_sec,
+        )
+    except CommandTimeoutError:
+        return EXIT_CODE_EVAL_TIMEOUT
     print(f"[done] OK: {txt_path.name}")
     return 0
 
@@ -176,6 +187,7 @@ def _cuda_parallel_worker_main(
     mode: str,
     clean_policy: str,
     npu_count: int,
+    eval_timeout_sec: int | None,
 ) -> None:
     init_parallel_worker_os_environ(worker_id=worker_id, base_opp=base_opp, npu_count=npu_count)
     dataset_path = pathlib.Path(dataset_path_str)
@@ -195,6 +207,7 @@ def _cuda_parallel_worker_main(
                 clean_policy=clean_policy,
                 art_root_override=art_override,
                 check_reference_only=False,
+                eval_timeout_sec=eval_timeout_sec,
             )
             result_q.put((txt_path.name, rc == 0, None))
         except Exception as e:
@@ -254,6 +267,16 @@ def main() -> int:
         action="store_true",
         help="Validate reference only (no compile/eval)",
     )
+    ap.add_argument(
+        "--eval-timeout",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help=(
+            f"Wall-clock timeout for NPU eval (spec.py) only; default {DEFAULT_EVAL_TIMEOUT_SEC}s "
+            f"or env {EVAL_TIMEOUT_ENV}. <=0 disables."
+        ),
+    )
     args = ap.parse_args()
 
     if args.workers < 1:
@@ -297,6 +320,7 @@ def main() -> int:
                         clean_policy=args.clean_policy,
                         art_root_override=args.art_root,
                         check_reference_only=args.check_reference_only,
+                        eval_timeout_sec=args.eval_timeout,
                     )
                     if one != 0:
                         rc = 1
@@ -339,6 +363,7 @@ def main() -> int:
                     args.mode,
                     args.clean_policy,
                     args.npu,
+                    args.eval_timeout,
                 ),
             )
             procs.append(p)
@@ -371,6 +396,7 @@ def main() -> int:
                 clean_policy=args.clean_policy,
                 art_root_override=args.art_root,
                 check_reference_only=args.check_reference_only,
+                eval_timeout_sec=args.eval_timeout,
             )
         except BaseException:
             return 1
@@ -432,12 +458,16 @@ def main() -> int:
         print("[done] check-reference-only; skipping pipeline")
         return 0
 
-    _execute_pipeline(
-        op_dir,
-        art_root=art_root,
-        mode=args.mode,
-        clean_policy=args.clean_policy,
-    )
+    try:
+        _execute_pipeline(
+            op_dir,
+            art_root=art_root,
+            mode=args.mode,
+            clean_policy=args.clean_policy,
+            eval_timeout_sec=args.eval_timeout,
+        )
+    except CommandTimeoutError:
+        return EXIT_CODE_EVAL_TIMEOUT
     return 0
 
 

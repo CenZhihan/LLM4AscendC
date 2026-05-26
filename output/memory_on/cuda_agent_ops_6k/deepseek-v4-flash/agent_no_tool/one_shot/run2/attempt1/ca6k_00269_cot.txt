@@ -1,0 +1,254 @@
+我们被要求生成六个Python字符串变量，用于实现一个自定义AscendC算子，用于替换LPPool2d。任务ID: ca6k_00269，算子名: ca6k_00269_custom，PascalCase: Ca6k00269Custom。
+
+参考PyTorch模型：使用nn.LPPool2d，norm_type=2，kernel_size=(3,5)，stride=1，ceil_mode=False。输入x形状(batch_size, 16, height, width)，height=256, width=512。
+
+LPPool2d是LP池化（Lp pooling），norm_type=2表示L2范数。对于每个窗口，输出是窗口内元素的p范数（p=2），即sqrt(sum(x^2))。该操作可以分解为：对每个窗口内的元素求平方和，再开平方。
+
+我们需要融合成一个自定义算子，在NPU上实现。考虑使用AscendC编写核函数。
+
+需要实现一个kernel，从输入x计算LPPool2d。由于是2D池化，需要考虑NCHW布局，核函数需要处理维度循环和窗口滑动。
+
+设计思路：
+- 输入：x (N, C, H, W)，输出：y (N, C, H_out, W_out)，其中H_out和W_out取决于kernel_size, stride, ceil_mode。
+- 对于每个输出元素，需要计算对应输入窗口内元素的平方和再开平方。
+- 利用AscendC的向量化指令计算。
+
+由于LPPool2d是简单的逐窗口操作，可以高效实现。我们使用tiled方式，将输入分块加载到UB中，计算每个输出块。
+
+需要编写host端tiling和operator，以及kernel代码。
+
+注意约束：避免在host_tiling_src中手动OP_ADD，因为autogen会自动生成。参考记忆：不要使用OP_ADD，只依赖autogen。
+
+另外，注意tiling data结构：使用成员直接赋值（如tiling.totalLength = totalLength），而不是setter方法。参考记忆2和5。
+
+我们定义TilingData结构，包含总元素数、每个tile的大小、blockDim等。由于池化涉及多维，需要传递N,C,H,W以及stride,kernel等参数。
+
+简化：可以将输入视为一维数组，但需要计算索引偏移。或者传递维度信息。更清晰的方式是传递输入shape和输出shape以及步长等。
+
+在kernel中，每个block处理一部分输出。
+
+我们需要仔细设计TilingData以支持并行。
+
+由于时间有限，我们采用一种简单但正确的实现：每个block处理一个输出通道的多个输出行？或者使用grid-stride循环处理所有输出元素。因为输出元素数量可能较大，可以按tile大小分块。
+
+为了通用性，我们将输出视为一维连续元素，然后计算对应的输入窗口索引。但为了性能，最好利用向量化。
+
+由于这是单算子替换，我们可以实现一个核函数，它接受所有必要参数：输入输出指针，批大小，通道，输入高宽，输出高宽，kernel高宽，步长，填充（ceil_mode可能影响输出尺寸，但我们传入计算好的输出尺寸）。
+
+对于ceil_mode=False，输出尺寸：H_out = floor((H_in - kernel_h) / stride + 1)，W_out类似。
+
+我们在host端计算输出尺寸并通过tiling传给kernel。
+
+为了节省参数，可以将所有维度打包到TilingData中。
+
+TilingData字段建议：
+- totalInputLength: N*C*H*W
+- totalOutputLength: N*C*H_out*W_out
+- n: 批大小
+- c: 通道数
+- hIn, wIn
+- hOut, wOut
+- kernelH, kernelW
+- strideH, strideW
+- etc.
+
+但是注意UB尺寸限制，我们每次处理一个小tile的输出（比如一个输出channel的一块连续区域），需要从输入中读取对应的窗口区域。由于窗口可能重叠，输入需要多次读取。可以采用逐输出元素的方式，但是效率低。更优的方法是：对于每个输出元素，需要读取kernelH*kernelW个输入元素。我们可以使用向量化Muls和ReduceAdd？AscendC有向量化指令如VecMul，然后求和。
+
+我们可以利用AscendC的向量化：对于每个输出点，将窗口内元素平方后求和，然后sqrt。但窗口大小较小（3x5=15），向量化优势有限。但依然可以。
+
+另一种方式：利用矩阵乘法？不，不适用。
+
+我们采用简单方法：对于每个tile的输出元素（例如连续tileLen个输出元素），我们依次计算每个输出元素对应的窗口输入区域。为了减少输入加载次数，我们可以尝试一次性加载一个较大的输入块，覆盖多个输出窗口，然后计算。但考虑UB大小，我们先实现逐点计算。
+
+在kernel中，对于每个输出元素（idx），我们计算其对应的输入开始位置，然后从global memory读取kernelH*kernelW个float，计算平方和，再sqrt。这会导致很多小的global读取，性能可能差。
+
+更好的方案：由于kernel较小，可以将每个block负责一行输出（或几行），然后对每个输出行，加载该行对应的输入行（以及邻近行），然后计算。
+
+我们这样设计：每个block处理一个输出通道中的一部分输出行。对于每个输出行，它对应输入中的连续行（从row_start到row_start+kernelH）。输入是NCHW，在通道内，H和W连续。我们可以先加载输入的一个局部块（height：kernelH，width：W_in），然后计算该块对应的输出行（一个输出行需要kernelH行输入，每行需要滑动窗口）。这需要处理col方向。
+
+为了简化，我们使用最直接的方法：每个output element单独计算。使用AscendC的向量化指令可以一次计算多个输出元素吗？可以尝试使用vecmul和reduce，但需要每个窗口独立。
+
+考虑到任务的核心是替换算子，且测试是数值匹配，我们不需要极致优化。可以接受逐点计算（用标量循环），但AscendC不支持标量循环？实际上可以使用for循环，但需要向量化。通常应该用向量指令。
+
+我们可以采用以下策略：对于每个输出元素，使用AscendC的向量指令计算平方和。由于窗口大小很小，我们可以将窗口内元素加载到LocalTensor，然后计算平方和。AscendC有Muls和ReduceSum吗？没有直接的reduce sum，但可以使用VecSum或Muls之后再用Add累积。更好的办法：使用VBUF？不太清楚。
+
+实际上，AscendC提供了一些向量原语：比如VecMul，然后通过VecAdd进行累加。但AscendC的编程模型是SIMD，需要显式地处理向量。
+
+更简单的方法：使用AscendC的reduce操作：AscendC::ReduceAdd。我们可以将窗口内元素平方后，调用ReduceAdd求和。但ReduceAdd对一个向量内的所有元素求和，得到标量。我们可以把窗口内元素放入一个vector，然后计算平方和。
+
+由于窗口大小固定（15），我们可以用标量循环逐个元素计算，这就是标量模式，AscendC允许但不推荐。但为了快速实现，我们先用标量循环（for循环）计算平方和，然后再sqrt。这样代码简单且正确。
+
+注意：AscendC的for循环必须注意性能，但依然可以工作。
+
+我们实现内核：对于每个输出元素，计算其在输入中的起始索引（四维坐标），然后遍历kernelH*kernelW个元素，累加平方，最后sqrt。这需要大量的global memory读取。我们至少应该使用local memory分批加载。
+
+我们可以将输入的一整行加载到local，但不同行需要多次加载。
+
+考虑到我们只需要输出数值匹配，且输入输出大小可能很大（batch=16, C=16, H=256, W=512 -> 输入约16M float），输出尺寸：H_out = floor((256-3)/1+1)=254, W_out = floor((512-5)/1+1)=508, 输出元素：16*16*254*508 ≈ 33M float。每个block处理一部分。
+
+为了简化，我们采用网格跨度（grid-stride）循环，每个block处理多个输出元素。对于每个输出元素，我们计算其全局坐标，然后循环窗口内元素。为了减少global memory访问，我们可以把窗口内元素加载到local tensor（大小最多15），然后计算。这需要多次global load，但每个窗口15次load。
+
+由于窗口小，可能可以接受。
+
+为了更高效，我们可以为每个输出元素加载整个窗口为连续的global读取（如果窗口在内存中连续？实际上在NCHW布局中，一个窗口内的元素在行内连续，但跨行不连续（因为需要跳过W_in的宽度）。所以不能一次连续读取整个窗口。需要按行读取。
+
+更好的方法：使用shared memory？AscendC的local memory就是L1/UB。我们可以用for循环和DataCopy逐行加载。
+
+我们决定使用网格跨度，每个block处理一个tile的输出元素（连续元素），对于每个元素，计算其窗口内的平方和。为了减少global load，我们可以预取下一行？由于每个输出行对应的窗口行是固定的，可以优化。
+
+由于实现复杂性，我们选择逐输出元素计算，但尽可能使用DataCopy加载连续行的一部分到local，然后计算。
+
+但代码量太大。我们编写一个较简洁的kernel，使用标量索引计算。
+
+注意：我们需要在kernel中计算输出尺寸，可以从tiling中获取。
+
+设计TilingData：
+- N, C, H_in, W_in, H_out, W_out, kernelH, kernelW, strideH, strideW, totalInputLength, totalOutputLength, tileLen（每个tile处理的输出元素数）
+
+然后kernel中，每个block根据blockIdx决定处理哪个输出通道？我们让每个block处理一个输出通道内连续的输出元素（tileLen）。blockIdx全局分配，使用grid-stride。
+
+对于每个输出元素idx，计算其对应的通道c、行r、列c_out（输出坐标），然后计算输入区域起始位置（r*stride, c_out*stride），然后遍历窗口。
+
+实现细节：
+
+输出元素索引：out_idx = blockIdx * tileLen + local_idx (0到tileLen-1)。if out_idx >= totalOutputLength: return.
+
+计算输出坐标：
+假设输出shape (N, C, H_out, W_out)，则每channel输出元素数 = H_out * W_out，总输出元素 = N*C*H_out*W_out。
+out_idx 分解：c_channel = out_idx / (H_out*W_out) % C? 注意顺序：NCHW，最内层是W，然后H，然后C，然后N。所以out_idx = ((n*C + c)*H_out + r)*W_out + col。所以：
+n = out_idx / (C*H_out*W_out)
+remainder = out_idx % (C*H_out*W_out)
+c = remainder / (H_out*W_out)
+remainder = remainder % (H_out*W_out)
+r = remainder / W_out
+col = remainder % W_out
+
+输入起始行 = r * strideH
+输入起始列 = col * strideW
+
+对于窗口内i in 0..kernelH-1, j in 0..kernelW-1:
+    input_h = start_h + i
+    input_w = start_w + j
+    输入索引 = ((n*C + c)*H_in + input_h)*W_in + input_w
+
+累计平方和，最后sqrt。
+
+注意边界：stride=1，kernel已知，不需要考虑padding。
+
+由于ceil_mode=False，输入行和列不会越界（H_out = floor((H_in - kernelH)/stride + 1)，保证start_h + kernelH -1 <= H_in-1）。
+
+我们将使用float累加，最后sqrt。
+
+kernel代码中，我们使用标量循环，但需要将输入从global memory读取到local变量。我们可以每次读取一个float，使用DataCopy? 但DataCopy需要连续内存。对于单个float，直接使用*ptr读取可能更方便。AscendC允许通过指针读取global memory吗？通常使用GlobalTensor的索引访问，例如xGm_[idx]，这会自动产生标量访问（可能通过DataCopy实现，但效率低）。我们可以接受。
+
+为了兼容AscendC编程模型，最好使用DataCopy复制一小段到local，然后逐元素计算。对于窗口大小15，我们可以用local tensor存储一行（W_in）？不现实。
+
+我们就使用xGm_[idx]直接读取，然后在local中平方累加。这会产生大量标量访问，但也许可以工作。
+
+注意：AscendC中不允许在kernel代码中直接使用AICore标量load指令？实际上允许，但性能差。我们先确保正确性。
+
+我们还要实现sqrt，使用AscendC::Sqrt或者直接使用sqrtf函数？AscendC有Sqrt指令用于向量，对于标量可以使用sqrtf（标准C数学函数）。在AICore上允许使用math库吗？应该可以，但AscendC提供了Sqrt模板。对于标量，可以使用__builtin_sqrtf？我们使用AscendC::Sqrt，它要求LocalTensor，我们可以构建一个包含一个元素的tensor，但复杂。简单起见，我们使用sqrtf（需要#include <cmath>），在AscendC中可能支持。但AscendC文档建议使用向量指令。我们使用标量sqrtf可能也不太行。另一种方式：用向量Sqrt，但操作一个元素。可以使用AscendC::Sqrt(tmpLocal, tmplocal, 1)。但需要创建临时tensor。
+
+我们使用局部标量sqrt。
+
+为了简化，我们直接在循环中累加平方和到float变量sum，最后result = sqrtf(sum)，然后写回。
+
+注意：AscendC kernel必须用__aicore__函数，并且不能使用普通C标准库？实际上可以，但不确定。为了安全，我们用向量指令Sqrt来处理一个元素的tensor。
+
+对于每个输出元素，我们将sum放入一个长度为1的LocalTensor，然后调用Sqrt，再取出。
+
+现在开始编写代码。
+
+首先，project_json_src：描述算子Ca6k00269Custom，输入x (float, ND)，输出y (float, ND)，属性包括kernel_size, stride, ceil_mode等。但LPPool2d的属性有norm_type, kernel_size, stride, ceil_mode。norm_type是p范数，我们固定p=2，所以不需要作为属性，但为了通用可以保留。但参考示例中将属性作为算子参数，我们将其作为属性传递。输入x，输出y，属性：norm_type (int), kernel_size (列表), stride (int或列表), ceil_mode (bool)。但JSON的attribute格式要求type为基本类型，可以是int, float, bool, string。对于kernel_size，可以传两个int或者一个字符串。为了简单，我们将kernel_size拆成kernel_h和kernel_w两个int属性，stride也可以拆成stride_h, stride_w。ceil_mode作为bool。
+
+但是注意：输入描述中的数据类型是float，输出也是float。
+
+我们参照示例格式。
+
+host_tiling_src：定义TilingData结构。包含所有需要的字段：N, C, H_in, W_in, H_out, W_out, kernelH, kernelW, strideH, strideW, totalInput, totalOutput, tileLen, blockDim。注意用直接赋值。
+
+host_operator_src：实现TilingFunc，InferShape，InferDataType。注意不要使用OP_ADD，依赖autogen。可以继承OpDef？实际上autogen会生成OpDef类。我们只需实现TilingFunc和InferShape，并注册它们。参考示例中host_operator_src包含一个类LeakyReluCustom继承OpDef，但使用了OP_ADD。根据记忆1，不能使用OP_ADD，会导致重复定义。因此我们应该只实现TilingFunc和InferShape，而不定义OpDef类。但是autogen需要知道这些函数。通常的写法是在host_operator_src中通过注册宏来设置tiling和inferShape。考虑使用REGISTER_OP_TILING之类的？实际AscendC算子开发中，通常是使用OP_ADD来添加算子到注册表，但autogen已经生成了OP_ADD，所以我们不能重复。正确的做法是：在host_operator_src中只包含tiling函数和infer函数，并通过extern "C"或通过SetTiling等方式注册？官方示例中，host_operator_src通常包含一个类继承OpDef，并调用OP_ADD。但是根据记忆，OP_ADD会导致重复定义，因此不能使用。那么如何注册呢？可能需要在算子描述中通过REGISTER_CUSTOM_OP等方式？为了简化，我们采用另一种方式：不在host_operator_src中定义OpDef类，而是使用autogen生成的类（在op_proto.h中）。我们只需要提供tiling和infer函数，然后通过一些宏来设置。实际上，参考Memory1的描述，他们移除了手动OP_ADD，依靠autogen的REG_OP。那么我们的host_operator_src中应该只包含tiling函数和infer函数，并且不定义OpDef类。但是如何将tiling和infer函数与算子关联？可能需要使用命名空间和注册宏，例如：
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context) { ... }
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context) { ... }
+}
+然后在外层使用REGISTER_OP_INFER_SHAPE之类的？但是Ascend框架会通过解析项目JSON自动调用InferShape？实际上在host_operator_src中，我们可以通过类似OP_ADD的宏来注册，但有冲突。另一种方法：直接利用autogen生成的算子定义，我们只需实现一个单独的TilingFunc并将其注册到算子。在autogen生成的代码中，会调用一些注册函数。我们可以在host_operator_src中提供如下内容：
+
+namespace optiling {
+REGISTER_TILING_DATA_CLASS(Ca6k00269Custom, Ca6k00269CustomTilingData)
+}
+
+然后定义TilingFunc，并使用REGISTER_OP_TILING(Ca6k00269Custom, TilingFunc)？实际上，正确的注册方式可以参考AscendC官方示例。我现在查一下记忆：Memory1提到手动OP_ADD导致重复，所以应该只使用autogen的REG_OP。那么我们的host_operator_src应该只包含tiling和infer结构，而算子注册由autogen完成。我们需要确保project_json_src正确描述算子，这样autogen会生成必要的注册代码。因此，host_operator_src可以只包含optiling命名空间下的TilingFunc函数，并注册TilingDataClass。参考示例代码中的第二部分，它包含了namespace optiling { REGISTER_TILING_DATA_CLASS ... }。这不会导致冲突。对于InferShape，我们也可以在ge命名空间中定义并注册？我们参照示例的写法，示例中在ge命名空间下定义了InferShape和InferDataType，并在OpDef类中通过SetInferShape注册。但是我们不定义OpDef类，那么如何注册InferShape？或许autogen会从算子描述中推断shape？对于LPPool2d，输出shape可以通过输入shape和kernel/stride计算，所以我们必须提供InferShape。一个常见做法是使用全局函数并注明注册，例如：
+namespace ge {
+REGISTER_INFER_SHAPE_FUNC(Ca6k00269Custom, InferShape);
+REGISTER_INFER_DATATYPE_FUNC(Ca6k00269Custom, InferDataType);
+}
+但我不确定宏名称。为了简化，我们采用与示例中相同的方式，即定义一个类继承OpDef，但是为了避免重复定义，我们可以不使用OP_ADD，而使用一个不同的类名？但是autogen已经生成了Ca6k00269Custom类，所以不能重复定义。我们可以使用extern的方式来扩展？实际上，也许我们可以在host_operator_src中只定义tiling和infer函数，然后在外部通过宏注册到autogen生成的类。例如，在autogen生成的op_proto.h中，会有一个类Ca6k00269Custom，并且包含虚函数SetTiling等。我们可以通过全局函数注册。但具体写法需要知道。
+
+鉴于时间，我们保守地按照示例的方式，但去掉OP_ADD。示例中是在host_operator_src的namespace ops中定义了一个类并用OP_ADD注册。根据记忆，这会与autogen冲突。所以我们必须避免。一种解决方案：在project_json_src中，我们设置"op"的"kernel"等，不创建额外的类。host_operator_src只提供tiling和infer函数，并使用特定的宏注册它们。我回忆AscendC开发指南，通常的host operator代码中，会包含一个类似下面的函数注册：
+
+extern "C" ge::graphStatus TilingFunc(gert::TilingContext *context) { ... }
+extern "C" ge::graphStatus InferShapeFunc(gert::InferShapeContext *context) { ... }
+
+然后在project的json中引用这些函数。但是示例中并未使用extern "C"。
+
+考虑到我们只需要生成可工作的代码，而且测试环境可能使用示例的框架（即允许OP_ADD？但记忆表明冲突）。我决定：host_operator_src按照示例的样式，但避免重复定义类。具体来说，我们不在host_operator_src中定义OpDef类，而是使用extern "C"函数实现TilingFunc和InferShape，同时不定义inference函数在ge命名空间下？或者定义在ge命名空间下但不注册。然后我们在project_json_src中通过"op"的"tiling_func"和"infer_shape_func"引用它们。但是json中如何指定？示例中并没有指定这些函数名，而是通过代码中的名称匹配。所以我宁可保留类似示例的类，但担心冲突。
+
+我重新阅读Memory1：它说"do not add a second registration with OP_ADD; instead remove the manual OP_ADD and rely solely on the autogen REG_OP."所以autogen会生成REG_OP(Ca6k00269Custom)，所以我们不能写OP_ADD。那我们的host_operator_src应该完全移除OpDef类和OP_ADD。我们只提供TilingFunc和InferShape，它们通过全局命名空间暴露。我们需要使用注册宏来告知框架这些函数。也许我们可以在host_operator_src中写：
+
+namespace optiling {
+REGISTER_TILING_DATA_CLASS(Ca6k00269Custom, Ca6k00269CustomTilingData)
+ge::graphStatus TilingFunc(gert::TilingContext *context) { ... }
+}
+namespace ge {
+ge::graphStatus InferShape(gert::InferShapeContext *context) { ... }
+ge::graphStatus InferDataType(gert::InferDataTypeContext *context) { ... }
+}
+
+然后框架会通过符号查找？可能还需要注册。我决定采用与Memory1相似的做法：host_operator_src中不包含OpDef类，只包含TilingFunc和InferShape函数，并加上必要的头文件。我们不对这些函数进行额外的注册，而是让autogen根据project_json的描述来调用它们？实际上，project_json中并没有指定函数名，而是通过算子名自动链接到同名的tiling和infer函数。根据示例，项目中通过"op"的"language"等描述，自动寻找包含算子名（如LeakyReluCustom）的tiling和infer函数。所以只要函数签名正确且位于正确命名空间，框架可以找到。在host_operator_src中，我们放置全局函数，例如：
+
+extern "C" ge::graphStatus InferShape(gert::InferShapeContext *context) {...}
+但示例中不是在extern "C"内。我倾向于使用与示例相同的命名空间结构，但去掉OpDef类和OP_ADD。
+
+在示例的host_operator_src中，有namespace optiling { ... TilingFunc ... } 和 namespace ge { InferShape, InferDataType }，以及 namespace ops { LeakyReluCustom类 }。我们保留前两个namespace，去掉最后一个namespace ops。
+
+这样，框架应该能通过符号找到这些函数，因为函数名是唯一的（如Ca6k00269CustomTilingFunc? 实际示例中函数名为TilingFunc，且通过REGISTER_TILING_DATA_CLASS注册了tiling data类，但函数名是硬编码的？框架是通过自动生成的代码调用这些函数？有点模糊。但Memory1中他们将OP_ADD移除后构建成功，所以host_operator_src仍然保留其他内容，只是去掉了OpDef类和OP_ADD。因此我们可以保留namespace optiling和namespace ge中的函数，去掉namespace ops。
+
+所以我们在host_operator_src中只写这些。
+
+现在开始编写具体代码。
+
+首先，project_json_src: 算子名为Ca6k00269Custom，输入x float ND，输出y float ND，属性：norm_type (int, default 2), kernel_h (int), kernel_w (int), stride_h (int, default 1), stride_w (int, default 1), ceil_mode (bool, default false)。注意kernel_size可以是元组，我们分开成两个。stride也是元组，分开。
+
+host_tiling_src: 定义TilingData结构包含N, C, H_in, W_in, H_out, W_out, kernelH, kernelW, strideH, strideW, totalOutput, tileLen, blockDim。使用TILING_DATA_FIELD_DEF宏。
+
+host_operator_src: 包含头文件，实现TilingFunc，计算输出尺寸，设置tiling fields。注意使用直接赋值（如tiling.N = N）。InferShape中直接设置输出shape为计算后的尺寸。注意输入形状是4D，输出也是4D。我们使用GetInputShape(0)获取输入shape，计算输出shape，设置给输出。
+
+kernel_src: 实现kernel函数。使用前述的逐点方法。注意处理tileLen，UB大小限制。由于每个输出元素计算需要读取kernelH*kernelW个输入元素，UB中至少需要存储一个窗口的元素。为了保守，每个tile的处理元素数不宜太多。我们可以设定每个tile处理128个输出元素？但需要计算UB占用：每个元素需要累加，我们只需要存储窗口（最多15个float）和累加变量。所以UB占用小。但是为了利用向量化，我们可以在UB中缓存一行输入？但复杂。我们设置tileLen根据UB预算：假设每次处理256个输出元素，每个输出需要读取15个输入（不一定连续），所以全局读取次数较多。我们简单设定tileLen为1024或更大，但注意blockDim。
+
+由于AscendC向量处理，我们也许可以尝试将多个输出元素的窗口加载到同一个LocalTensor中，但窗口重叠，难以矢量化。我们先用标量实现，但为了性能，可以尝试使用向量Muls和ReduceSum。对于窗口15，我们可以将15个元素平方后累加。我们可以调用VecSqr? 没有直接指令，可以用Mul。然后用ReduceAdd求和。但需要连续内存。由于窗口不连续，我们只能逐行加载。我们可以将一行窗口元素加载到LocalTensor，然后平方求和。对于每个窗口，我们需要多行加载。这需要多次DataCopy。实现复杂。
+
+我们决定采用简化的标量实现，至少保证正确。
+
+在kernel中，使用for循环。
+
+注意：AscendC中不能在kernel中使用std::sqrt，但可以使用AscendC::Sqrt函数对LocalTensor操作。我们创建长度为1的LocalTensor，赋值为平方和，然后调用Sqrt，再取出写入。
+
+现在，开始编写代码。注意变量名和命名空间。
+
+kernel_src中，函数名需要与算子名一致，但示例中是leaky_relu_custom。我们使用ca6k_00269_custom。但在extern "C" __global__ __aicore__ void ca6k_00269_custom(...)
+
+注意tiling数据结构名称：Ca6k00269CustomTilingData，从host_tiling_src中定义。
+
+kernel中需要include "kernel_operator.h"和tiling头文件。
+
+现在，将输出写入六个字符串。
+
+注意model_src：定义ModelNew，使用自定义算子。需要import custom_ops_lib，并调用函数。函数名与kernel一致。
+
+python_bind_src：提供绑定，调用EXEC_NPU_CMD执行算子。注意算子名是aclnnCa6k00269Custom。
+
+由于我们不需要op类，python_bind中如何调用？通常使用aclnn算子API，由自动生成。所以我们写aclnnCa6k00269Custom。
+
+开始编写。

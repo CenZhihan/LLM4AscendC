@@ -61,6 +61,25 @@ def _normalize_ascend_search_version(value: Optional[str]) -> Optional[str]:
     return t or None
 
 
+def _require_repair_memory_runtime() -> None:
+    """repair-memory imports openai; must run under project conda, not CANN python3.11."""
+    try:
+        import openai  # noqa: F401
+    except ImportError as e:
+        raise SystemExit(
+            "repair-memory requires package 'openai' in the active Python.\n"
+            f"  sys.executable = {sys.executable}\n"
+            "  Use ONLY: source scripts/activate_czh_environ.sh\n"
+            "  Do NOT use bare conda activate after CANN set_env (prepends python3.11).\n"
+            f"  Detail: {e}"
+        ) from e
+    exe = str(pathlib.Path(sys.executable).resolve())
+    if "envs/czh_environ" not in exe:
+        print(
+            f"[WARN] repair-memory expected miniconda env czh_environ; got interpreter {exe}"
+        )
+
+
 def _artifact_group_rel_from_txt_path(txt_path: pathlib.Path) -> Optional[pathlib.Path]:
     txt = txt_path.resolve()
     out_root = OUTPUT_ROOT.resolve()
@@ -91,6 +110,7 @@ def _run_eval_cuda_agent_for_txt(
     clean_policy: str,
     eval_workers: int = 1,
     eval_npu: int = 1,
+    eval_timeout_sec: int | None = None,
 ) -> int:
     if eval_workers != 1:
         raise ValueError(
@@ -112,6 +132,8 @@ def _run_eval_cuda_agent_for_txt(
         "--clean-policy",
         clean_policy,
     ]
+    if eval_timeout_sec is not None:
+        cmd.extend(["--eval-timeout", str(eval_timeout_sec)])
     proc = subprocess.run(cmd, cwd=str(REPO_ROOT), check=False, env=os.environ.copy())
     return int(proc.returncode)
 
@@ -126,11 +148,25 @@ def _synthetic_result_payload_when_eval_json_missing(
     eval_mode: str,
     eval_rc: int,
     result_path: pathlib.Path,
+    eval_timeout_sec: int | None = None,
 ) -> Dict[str, Any]:
-    msg = (
-        f"eval_cuda_agent_operator did not emit result json (subprocess rc={eval_rc}). "
-        f"Expected path: {result_path}"
-    )
+    from tools.common.runner import DEFAULT_EVAL_TIMEOUT_SEC, EXIT_CODE_EVAL_TIMEOUT
+
+    if eval_rc == EXIT_CODE_EVAL_TIMEOUT:
+        limit = (
+            eval_timeout_sec
+            if eval_timeout_sec is not None and eval_timeout_sec > 0
+            else DEFAULT_EVAL_TIMEOUT_SEC
+        )
+        msg = (
+            f"[FAIL] NPU eval timed out after {limit}s (subprocess rc={eval_rc}). "
+            f"No result json at {result_path}"
+        )
+    else:
+        msg = (
+            f"eval_cuda_agent_operator did not emit result json (subprocess rc={eval_rc}). "
+            f"Expected path: {result_path}"
+        )
     return {
         "result": {
             op: {
@@ -271,6 +307,7 @@ def run_multi_attempt_for_cuda_row(
     max_attempts: int,
     eval_workers: int,
     eval_npu: int,
+    eval_timeout_sec: int | None = None,
     ascend_search_version_filter: Optional[str] = None,
     run_slug: str = "",
     memory_root: Optional[pathlib.Path] = None,
@@ -391,6 +428,7 @@ def run_multi_attempt_for_cuda_row(
                 clean_policy=clean_policy,
                 eval_workers=eval_workers,
                 eval_npu=eval_npu,
+                eval_timeout_sec=eval_timeout_sec,
             )
             outcome.eval_ran = True
             result_path = _cuda_agent_eval_result_json_path(gen["txt_path"], op_key)
@@ -400,6 +438,7 @@ def run_multi_attempt_for_cuda_row(
                     eval_mode=eval_mode,
                     eval_rc=eval_rc,
                     result_path=result_path,
+                    eval_timeout_sec=eval_timeout_sec,
                 )
                 result_path.parent.mkdir(parents=True, exist_ok=True)
                 _write_json(result_path, payload)
@@ -497,6 +536,7 @@ def _run_single_cuda_agent_job(
     max_attempts: int,
     eval_workers: int,
     eval_npu: int,
+    eval_timeout_sec: int | None = None,
     op_slot: int,
     parallel_ops: int,
     ascend_search_version_filter: Optional[str] = None,
@@ -532,6 +572,7 @@ def _run_single_cuda_agent_job(
         max_attempts=max_attempts,
         eval_workers=eval_workers,
         eval_npu=eval_npu,
+        eval_timeout_sec=eval_timeout_sec,
         ascend_search_version_filter=ascend_search_version_filter,
         run_slug=run_slug,
         memory_root=memory_root,
@@ -618,6 +659,7 @@ def _continue_single_cuda_worker(
         max_attempts=new_max_attempts,
         eval_workers=args_dict["eval_workers"],
         eval_npu=args_dict["eval_npu"],
+        eval_timeout_sec=args_dict.get("eval_timeout_sec"),
         op_slot=op_slot,
         parallel_ops=args_dict["parallel_ops"],
         ascend_search_version_filter=ascend_vf,
@@ -727,6 +769,7 @@ def _run_continue_session_cuda(
             max_attempts=args.max_attempts,
             eval_workers=args.eval_workers,
             eval_npu=args.eval_npu,
+            eval_timeout_sec=args.eval_timeout,
             op_slot=op_slot,
             parallel_ops=args.parallel_ops,
             ascend_search_version_filter=ascend_vf,
@@ -765,6 +808,7 @@ def _run_continue_session_cuda(
             "max_log_lines": args.max_log_lines,
             "eval_workers": args.eval_workers,
             "eval_npu": args.eval_npu,
+            "eval_timeout_sec": args.eval_timeout,
             "parallel_ops": args.parallel_ops,
             "use_repair_memory": args.use_repair_memory,
         }
@@ -845,6 +889,7 @@ def _run_continue_session_cuda(
         "parallel_ops": args.parallel_ops,
         "eval_workers": args.eval_workers,
         "eval_npu": args.eval_npu,
+        "eval_timeout_sec": args.eval_timeout,
         "run_dir": str(out_run_dir),
         "resolved_indices": resolved_indices,
         "op_counts_filter": prior_agg.get("op_counts_filter"),
@@ -972,6 +1017,16 @@ def main() -> int:
     parser.add_argument("--parallel-ops", type=int, default=1, help="Number of rows to run in parallel.")
     parser.add_argument("--eval-workers", type=int, default=1, help="Pass-through eval workers per attempt.")
     parser.add_argument("--eval-npu", type=int, default=1, help="Pass-through eval NPU count per attempt.")
+    parser.add_argument(
+        "--eval-timeout",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help=(
+            "Pass-through NPU eval (spec.py) wall-clock timeout per attempt; "
+            "default 1200s or env LLM4ASCENDC_EVAL_TIMEOUT_SEC. <=0 disables."
+        ),
+    )
     parser.add_argument(
         "--ascend-search-version",
         default=None,
@@ -1114,6 +1169,9 @@ def main() -> int:
                 f"current run_dir={out_run_dir}"
             )
 
+    if args.use_repair_memory:
+        _require_repair_memory_runtime()
+
     from generator.repair_memory.paths import get_memory_root, run_slug_from_run_dir
 
     memory_run_slug = run_slug_from_run_dir(out_run_dir) if args.use_repair_memory else ""
@@ -1154,6 +1212,7 @@ def main() -> int:
         "parallel_ops": args.parallel_ops,
         "eval_workers": args.eval_workers,
         "eval_npu": args.eval_npu,
+        "eval_timeout_sec": args.eval_timeout,
         "run_dir": str(out_run_dir),
         "resolved_indices": resolved_indices,
         "op_counts_filter": list(args.op_counts) if args.op_counts is not None else None,
@@ -1181,6 +1240,7 @@ def main() -> int:
                 max_attempts=args.max_attempts,
                 eval_workers=args.eval_workers,
                 eval_npu=args.eval_npu,
+                eval_timeout_sec=args.eval_timeout,
                 op_slot=op_slot,
                 parallel_ops=args.parallel_ops,
                 ascend_search_version_filter=ascend_vf,
@@ -1213,6 +1273,7 @@ def main() -> int:
                     max_attempts=args.max_attempts,
                     eval_workers=args.eval_workers,
                     eval_npu=args.eval_npu,
+                    eval_timeout_sec=args.eval_timeout,
                     op_slot=op_slot,
                     parallel_ops=args.parallel_ops,
                     ascend_search_version_filter=ascend_vf,

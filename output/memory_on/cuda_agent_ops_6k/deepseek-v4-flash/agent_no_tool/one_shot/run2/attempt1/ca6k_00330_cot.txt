@@ -1,0 +1,354 @@
+We need to generate a fused custom AscendC operator for torch.baddbmm. The reference model does: torch.baddbmm(self.bias, mat1, mat2). Shape: bias is (batch_size, output_dim, input_dim). mat1: (batch_size, output_dim, 8192). mat2: (batch_size, 8192, input_dim). So output: (batch_size, output_dim, input_dim). This is a batched matrix multiply with broadcast for bias.
+
+We need to implement a single fused operator that performs baddbmm: output = bias + mat1 @ mat2. But note bias shape is (batch_size, output_dim, input_dim) and mat1 @ mat2 shape is same. So no broadcast? Actually bias shape is already same as output shape. So it's just addition after matmul.
+
+We could implement a fused kernel that does the matmul and add in one pass, but baddbmm already does that in PyTorch. However, as a custom op, we can implement it as a single AscendC kernel that performs batched matrix multiply with bias addition. But Ascend has built-in matmul primitives? We can use the Cube unit for matmul. However, writing a custom kernel that uses Cube is complex. The instructions say "Fused API list: torch.baddbmm" meaning we need to replace that single op with a custom one. So we should create a custom op that does exactly baddbmm. But given the complexity, we might implement a simple element-wise add after matmul? No, the custom op must be a single op that replaces the entire call. However, the constraints allow "or a small set", but likely one fused op.
+
+We need to produce the six files. The kernel_src will contain the kernel code. Since baddbmm involves matrix multiplication, we could use the on-chip matmul (AIV) but that is complicated. Alternatively, we can implement a naive triple-loop over batch, M, N with inner K loop? That would be slow but may pass correctness. Given that the harness only checks numerical match, we can implement a straightforward naive kernel that computes the output using a tiled approach with vectorized multiply-add for each inner product. That is acceptable.
+
+But note: The user provided example used a simple LeakyReLU with element-wise operations. For baddbmm, we need to handle 3D tensors. AscendC kernel can use double loops over batch and output dims, with inner vectorized dot product using Muls and ReduceAdd? Actually we can use vector multiply and then reduce-add. But that would be slow. But we need to produce code that compiles and runs. The kernel must be correct.
+
+Given time, we can produce a kernel that does batched matrix multiply using AIV matmul? But the operator type is "MatMul" maybe. However, we are required to produce a single custom op. We can use the "FusedBatchMatMul" or something. But we must match the reference.
+
+Simpler: Write a kernel that loops over batch, i, and j, and for each element computes sum over k of mat1[b,i,k] * mat2[b,k,j] and then adds bias[b,i,j]. This is a triple loop, but we can vectorize the inner loop over k using vector operations. AscendC supports vector multiply and reduce-add? Actually we can use vector multiply (Muls is scalar multiplication, not element-wise). We need element-wise multiplication and then reduction.
+
+Better: Use the Cube unit? But Cube requires specific data formats (e.g., ND vs NZ). Possibly we can use the built-in matmul API? But that would be a separate op. Since we are the kernel developer, we can implement a kernel that uses the vector unit to compute the dot product for each output element. But that might be too slow to be practical, but the correctness is the goal.
+
+We can also use a tiled approach: Load blocks of mat1 and mat2, compute block of output using vectorized outer product? That's complex.
+
+Given that the matrix sizes are moderate (batch=512, M=output_dim=32, K=8192, N=input_dim=64), total output elements: 512*32*64 = 1,048,576. That's not huge. We can launch a grid of threads, each thread computes one output element. But AscendC kernel is single-thread per block? Actually each block is a single thread (AICore). So we need to tile across batch and output dimensions.
+
+We can set blockDim to, say, 8 or 16, and each core processes a chunk of output elements. For each output element, we iterate over K (8192) and compute dot product.
+
+That is feasible.
+
+Plan:
+
+- Define operator "Ca6k00330Custom" (PascalCase) and kernel "ca6k_00330_custom" (lowercase? Example used "leaky_relu_custom" as kernel name. So kernel name: "ca6k_00330_custom").
+
+- Inputs: mat1, mat2, bias (the bias is a parameter, but forward signature includes self.bias which is a Parameter; but in the custom op we need to pass bias as input? The reference's forward takes self.bias as part of the model. The custom op should take three tensors: bias, mat1, mat2. So input_desc includes three tensors: "bias", "mat1", "mat2". Output: "y".
+
+- In host_operator_src, define TilingFunc that computes total elements, tile sizes, and block dim.
+
+- In kernel_src, implement a class that computes baddbmm.
+
+We can use a naive approach: For each output element (batch, i, j), compute sum over k of mat1[b,i,k] * mat2[b,k,j] by loading chunks of mat1 row and mat2 column? But mat2's column access is not contiguous. Better to compute using vectorized approach: For each batch, load a chunk of mat1 rows (say 8 rows) and a chunk of mat2 columns? Actually we can compute by iterating over i and j, and for each (i,j) compute dot product by loading mat1 row i and mat2 column j. That requires random access to mat2 column, which is strided. To keep vectorization, we can compute multiple outputs at once: For fixed batch, we can process a block of output rows (i) and a block of output columns (j). For each i in row block, load mat1[b,i,:] (vector of K). For each j in column block, load mat2[b,:,j] (vector of K). Then for each (i,j), compute dot product using vector multiply and reduce? But Ascend vector reduce-add is available via "ReduceAdd" or "Muls" and "ReduceSum". However, we can do: mul = xLocal * yLocal (element-wise), then use ReduceAdd to sum into scalar. But ReduceAdd returns a scalar, but we need to do for many (i,j). Alternatively, we can use the fact that we can compute the entire output matrix for a given batch using matrix multiplication via Cube. But that's complicated.
+
+Given time, I will implement a straightforward kernel that uses a triple loop with vectorized inner product for each output element, but vectorized over K using one vector load of mat1 row and one vector load of mat2 column, then element-wise multiply and reduce-add. Since K=8192, we can tile K as well.
+
+But to keep kernel code concise, we can implement a naive triple loop with scalar operations, but that would be very slow in AscendC because it's a vector processor. However, the correctness test may not check performance. But we must adhere to compatibility with AscendC. The vector processor supports scalar operations? It might be allowed but inefficient. However, the example used vector operations. It's better to use vector.
+
+I'll design a kernel that processes each batch independently. For each batch, we will compute the output matrix as a product of two matrices. We can use a tiled approach: For a block of output rows (M_tile) and a block of output columns (N_tile), we accumulate over K in tiles. We will use two local tensors for mat1 block and mat2 block, compute partial output using outer product? But outer product would require many scalar muls. Actually we can compute output block as sum over K_tile of mat1_block (M_tile x K_tile) * mat2_block (K_tile x N_tile). This is a small matrix multiplication that can be done using vector operations? AscendC has a function "MatMul" but it's for Cube only. Without Cube, we can implement with nested loops: for each i in block, load mat1 row, load mat2 block, compute dot products.
+
+Given the complexity, I will implement a simpler approach: Each block processes one output element. That is, we assign one element per thread? But we have multiple blocks per core. Actually we can have a grid of blocks that each compute a contiguous range of output elements. For each output element (b,i,j), we compute dot product by loading the entire mat1 row and mat2 column. That is inefficient but correct.
+
+But to satisfy the AscendC paradigm, we can use a single thread that loops over batches and output indices. We can set blockDim to 1 (single core) and compute the whole output. That is simplest.
+
+Plan:
+
+- total output elements = B * M * N.
+- Single core processes all elements (blockDim=1).
+- For each element (b,i,j):
+   - Load mat1[b,i,:] -> vector of K.
+   - Load mat2[b,:,j] -> vector of K (but note mat2 is (B, K, N), so column j is stride K, we can compute offset = b*K*N + j*K + 0..K-1).
+   - Compute dot product using element-wise multiply and reduce-add (or sum).
+   - Write output[b,i,j] = bias[b,i,j] + dot.
+
+But loading entire K vectors for each element is heavy (K=8192). However, with one block, it might work but slow. But correctness is key.
+
+Alternatively, we can tile K: process K in chunks, accumulate partial dot product.
+
+But the kernel code will be long. However, we need to produce it.
+
+I will write the kernel with tiling: For each batch, we will process output rows in chunks (M_tile) and columns in chunks (N_tile) and K in chunks (K_tile). Use local tensors for mat1 block (M_tile x K_tile), mat2 block (K_tile x N_tile), and accumulate partial output (M_tile x N_tile). This is a blocked matrix multiplication.
+
+But implementing that in AscendC with vector operations requires double loops: For each i in M_tile, load mat1 row chunk, then for each j in N_tile, load mat2 column chunk, compute dot product for that tile. This is similar to naive but with tiled inner product.
+
+We can use vector multiply and reduce-add for each pair (i,j) over the tile of K. We'll have two loops: outer i, inner j. For each (i,j), we load mat1[i,:] and mat2[:,j]. But we can load the full mat1 row chunk once and reuse for all j in the N_tile? Actually we need mat2 column chunk for each j. So we can load mat1 row chunk once, then for each j, load mat2 column chunk, compute dot product. That's O(M_tile * N_tile * K_tile). This is fine.
+
+In AscendC, we can use DataCopy to load from global to local. Then use vector Multiply and ReduceAdd (or Muls and Add). There is no ReduceAdd for vector to scalar? Actually there is "ReduceAdd" that takes a local tensor and returns a scalar, but it works on the entire tensor. So we can compute element-wise product into a temporary tensor, then ReduceAdd to get sum. However, ReduceAdd returns a scalar, but we need to store it to output. We can use a scalar variable.
+
+We need to be careful about synchronization.
+
+Given the complexity and time, I will implement a naive kernel that uses a single thread, triple loop with scalar operations but using AscendC's scalar operations. However, AscendC is a vector architecture and scalar operations are not efficient but possible. The compiler may support simple scalar operations. The example used vector operations only.
+
+I think it's safer to stick with vector operations. I'll write a kernel that for each output element, computes the dot product using vector multiply and reduce-add.
+
+The kernel will have a single loop over batch and then two nested loops over i and j. For each (i,j), allocate local tensors for mat1 row (K) and mat2 column (K), copy from global, compute element-wise product, then reduce-add to get sum.
+
+We need to tile K due to UB size. K=8192, each float 4 bytes => 32KB per vector. UB size 192KB, so we can handle multiple vectors. But we need to allocate three local tensors (mat1_row, mat2_col, prod) each of size K. That's 3*32KB=96KB, which fits in UB. So we can load entire K at once. That simplifies.
+
+So for each output element, we load full mat1 row and mat2 column, compute product, reduce-add to get dot, add bias, store.
+
+But loading entire K for each element means many global memory accesses. But it's correct.
+
+We need to set tiling to total elements, tile length 1 (per element), but we can also have a blockDim that matches number of cores to parallelize.
+
+Given that total output elements = 512*32*64 = 1,048,576, we can parallelize across cores. For example, blockDim=8, each core processes ~131072 elements. That's fine.
+
+In the kernel, we use a grid-stride loop: for each core, process elements from core_id to total, stride blockDim. For each element, compute dot product.
+
+But to compute the 3D index from linear index: b = linear / (M*N), remainder = linear % (M*N), i = remainder / N, j = remainder % N.
+
+Then compute dot.
+
+This is straightforward.
+
+We'll implement that.
+
+Now, the tiling data: totalLength = B*M*N. tileLength = 1 (since each element processed independently). But we might want to process multiple elements per iteration to improve efficiency? For simplicity, we can set tileLength to 1, but that will cause many small copies. Alternatively, we can set tileLength to some chunk, say 256, and process elements in a loop within each core, but then we need to handle that in kernel. For simplicity, I'll set tileLength to 1 and have the kernel loop over elements. That's acceptable.
+
+But we need to ensure UB usage per iteration: we need local tensors of size K (8192). That's 8192*4 = 32768 bytes each, three tensors = 98304 bytes, plus pipe overhead, fits UB 192KB. So we can allocate them each iteration. However, allocating and freeing per element would be expensive. We can allocate them once in Init with max size K, and reuse. That is better.
+
+So in Init, we allocate local tensors of size K (8192). Then for each element, we use them.
+
+But the kernel must handle cases where K is not a multiple of vector size; we can just pass the actual K (8192) to vector operations.
+
+Since the kernel loops over many elements, it's fine.
+
+Now, we need to define the operator and kernel.
+
+Let's generate the six strings.
+
+project_json_src: needs "op" key. We'll define an object with multiple entries? Actually the example has a list with one object containing "op" key. That is correct. So we have:
+
+```
+[
+  {
+    "op": "Ca6k00330Custom",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "bias", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "mat1", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "mat2", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "output_desc": [
+      {"name": "y", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "attr": []  // no extra attributes
+  }
+]
+```
+
+But note: the reference also has the bias as a parameter; but we treat it as input tensor.
+
+host_tiling_src: Tiling data structure with fields: totalLength (uint32_t), tileLength (uint32_t), blockDim (uint32_t), and maybe shape dimensions (B, M, N, K). We need B, M, N, K for computing indices. So include B, M, N, K. Also we can compute B*M*N for totalLength. But we can also compute from shapes. Safer to include all.
+
+Define:
+
+```
+BEGIN_TILING_DATA_DEF(Ca6k00330CustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, M);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+```
+
+host_operator_src: TilingFunc that extracts shapes, computes blockDim based on totalLength, sets tileLength to 1 (or something). Also set blockDim between 1 and 24. Use number of cores available. For totalLength=1e6, we can set blockDim=8. Also set batch, M, N, K from input shapes. The input shapes: bias is (B, M, N), mat1 is (B, M, K), mat2 is (B, K, N). So we can get B from bias shape dim0, M from bias dim1, N from bias dim2, K from mat1 dim2.
+
+Also need InferShape and InferDataType.
+
+kernel_src: Implement class with Init (allocate local tensors of size K), Process (loop over elements assigned to core). For each element, compute index, copy mat1 row and mat2 column, compute dot. Use vector multiply and reduce-add. For reduce-add, we can use "AscendC::ReduceAdd" function. Example: float sum = AscendC::ReduceAdd(prod, K); (need to include "reduce_add.h"? Actually reduce functions are in "reduce.h". We'll include "kernel_operator.h" which includes everything.
+
+But careful: ReduceAdd may not exist; there is "AscendC::ReduceSum" or "AscendC::ReduceAdd"? In many examples, they use "AscendC::ReduceAdd". I'll assume it's available.
+
+Alternatively, we can compute dot by summing using a loop? But that's slower. Better to use reduce.
+
+If ReduceAdd is not available, we can implement our own reduce using a while loop halving vector? But that's complex. I'll trust it's available.
+
+We'll use:
+
+```
+AscendC::LocalTensor<float> prod = tmpQueue_.AllocTensor<float>();
+AscendC::Mul(prod, mat1Row, mat2Col, K);
+float dot = AscendC::ReduceAdd(prod, K);
+tmpQueue_.FreeTensor(prod);
+```
+
+But we need to allocate prod each time. To avoid allocation per iteration, we can allocate in Init a temporary tensor of size K that is reused. But then we must ensure no overlap. We'll allocate one temporary tensor in Init.
+
+So Init: allocate xRowLocal_, yColLocal_, prodLocal_ each of size K.
+
+Process: for each element, copy mat1 row to xRowLocal_ using DataCopy, copy mat2 column to yColLocal_, then Mul, then ReduceAdd into scalar.
+
+We need to compute global memory offsets:
+- mat1: shape (B, M, K). For batch b, row i: offset = b*M*K + i*K.
+- mat2: shape (B, K, N). For batch b, column j: offset = b*K*N + j*K? Actually mat2 is (B,K,N), so element (b,k,j) is at offset b*K*N + k*N + j. To load column j (all k), we need to load K elements with stride N. But DataCopy expects contiguous block. We cannot load a column with stride easily. So we need to load the entire mat2 slice (K*N) and then extract column? That's too much.
+
+This is a challenge. For matrix multiplication, it's easier to load rows of mat1 and rows of mat2 transposed? To compute dot product, we need column of mat2. But AscendC DataCopy only supports contiguous copies from global to local. To get a column, we would need to load the entire mat2 slice (K*N) and then use permutation? That's inefficient.
+
+Therefore, the naive approach of loading a single column is not straightforward. We need to reconsider.
+
+To avoid stride issues, we can compute the output using row-wise approach: For each batch, we can compute the output matrix Y = mat1 * mat2 by iterating over rows of mat1 (i) and then for each row, we multiply by all columns of mat2? That would be: for each i, load mat1 row (K), then compute dot with each column j by loading that column. But column load still has stride.
+
+Better: We can load the entire mat2 tensor into local memory? That would be huge (B*K*N floats = 512*8192*64 = 268 million floats, too large). Not possible.
+
+Perhaps we need to use a different strategy: For each batch, we can compute the product by using vector outer product: For each k, we load mat1[:,k] (column of mat1) and mat2[k,:] (row of mat2), and accumulate outer product. That is: Y += mat1_col * mat2_row. Then we would iterate over k, and for each k, load a column of mat1 (size M) and a row of mat2 (size N), perform outer product (M rows x N cols) using vectors? That would be efficient: use VecMul for each element? But outer product requires forming M*N matrix. Can do using vector multiply and broadcast? Possibly: For each element of output, it's sum over k of mat1[b,i,k]*mat2[b,k,j]. That's the same.
+
+To avoid random access, we can tile: For a small block of K (tileK), we load a block of mat1 (M x tileK) and a block of mat2 (tileK x N), then compute the product of these two small matrices using nested loops but with vector loads within the block (since the blocks are contiguous in memory if we store them transposed? mat1 is stored row-major: mat1[b,i,:] is contiguous. So for a given batch, mat1 is M rows of K contiguous. mat2 is K rows of N contiguous. So if we tile K, we can load a submatrix of mat1: for each i in M, load a contiguous chunk of K_tile. Similarly, for each j in N, to get a column chunk of mat2, we need to load K_tile elements that are spaced by N. That's still strided. But if we first transpose mat2 locally? That would require loading entire mat2 block K_tile x N, which is contiguous if we load the whole chunk: mat2[b,:,:] is K rows of N consecutive elements. So to get the submatrix for K_tile rows, we can load K_tile * N floats contiguously from offset b*K*N + k_start*N. That gives us a local tensor of size (K_tile*N) which contains all rows in that k-tile. Then for each j in N, the column j is at positions j, N+j, 2N+j,... within that local buffer, which is strided by N. But we can then use vector gather? AscendC might support "DataCopy" with stride? Not sure.
+
+Given the time, we need a simpler solution.
+
+Perhaps we can use the fact that the reference model is simple and the operator is just baddbmm. The harness may be satisfied if we implement the operator as a series of smaller ops? But the instruction says "Implement a single fused custom op (or a small set) on NPU". So we could implement the fused op as a custom op that internally calls other AscendC built-in ops? But the kernel_src must be a single kernel. We cannot call other kernels.
+
+Alternative: We can implement the kernel using only vector operations but with a different tiling strategy: Process the output in blocks of rows and columns, and for each (i,j) compute the dot product using a loop over k with vector operations on small chunks of k. For the inner loop, we load contiguous mat1 row chunk and mat2 column chunk. But the column chunk is not contiguous; but we can load the entire mat2 row for the given k chunk? Actually for a fixed j, the mat2 column over k is not contiguous; but if we process all j together, we can load a block of mat2 (K_tile x N) contiguously, then for each j, the column is a vector with stride N. We can still load that vector using a gather? Not easy.
+
+However, we can avoid the column issue by transposing the operation: Compute Y = (mat1 * mat2) and then add bias. If we can compute the matmul using a vectorized approach that loads rows of both matrices, but mat2 rows are contiguous. For each i, we can compute a row of Y by doing: Y[i,:] = mat1[i,:] * mat2 (matrix-vector multiply). That is, Y[i,:] = sum over k of mat1[i,k] * mat2[k,:]. This is a linear combination of rows of mat2 weighted by mat1[i,k]. So for each i, we can compute Y[i,:] by iterating over k, scaling mat2[k,:] by mat1[i,k] and accumulating. This can be done with vector operations: For each k, load mat2[k,:] (size N), multiply by scalar mat1[i,k], and add to accumulator vector. That avoids column access. This is efficient! We load mat2 rows (contiguous) and mat1 scalars. Then we need to do this for all i. That is: For each batch, for each i in M, for each k in K, load mat2 row (size N), multiply by scalar, add to accumulator. That is O(M*K*N) but with vector operations on N. Good.
+
+So the kernel can be: For each output element (b,i,j), we compute by accumulating over k: mat1[b,i,k] * mat2[b,k,j]. Using the row-wise accumulation: For fixed b,i, we start with accumulator vector of size N initialized to 0. Then loop over k, load mat2[b,k,:] vector of size N, multiply by mat1[b,i,k] scalar, add to accumulator. After inner loop, we have the entire i-th row of the product Y[b,i,:]. Then we add bias[b,i,:]. This way we compute a row at a time, which reduces the outer loop to M*K*N operations but with vector operations on N. That's much better.
+
+We need to handle N=64, which is small. So we can allocate local tensors of size N for accumulator and for mat2 row. M=32, K=8192.
+
+So the kernel: For each batch, for each i in M, initialize accumulator to bias[b,i,:] (since we need to add bias). Then for k in tiles of K (e.g., tileK=1024), load mat1[b,i, k_start:k_start+tileK] as scalars? Actually they are scalars, but we can load a vector of tileK and then iterate over each scalar? Better to load mat1 row as a vector of size K in chunks? But for accumulation, we need to multiply each scalar mat1[b,i,k] with the entire mat2 row. So we need to iterate over k inside the kernel. We can load mat2 rows one by one. Since K=8192, we can process it in chunks of, say, 1024 to fit in UB. For each k chunk, we load a block of mat2 rows: each row is N contiguous, so we can load tileK * N floats contiguously from mat2 (since rows are consecutive). That gives us a local tensor of tileK*N. Then we iterate over each k in the chunk, multiply the scalar mat1[b,i,k] (extracted from a local copy of mat1 row chunk) with the corresponding mat2 row (which is at offset (k-k_start)*N) and add to accumulator. This is vector-scalar multiply with vector add.
+
+Implementation steps for one batch:
+
+- Load bias[b,:,:] (M rows of N) into a local tensor? Actually we only need one row at a time. Better to load bias[b,i,:] when processing that row. But we can load all bias rows? M=32, N=64 -> 2048 floats, small. So we can load the entire bias slice for this batch into local: bias_local of size M*N.
+
+- For each i in M:
+   - Copy bias row i to accumulator (size N).
+   - Then for k from 0 to K-1 step tileK:
+        - Load mat1[b,i, k_start:k_start+tileK] into local vector of size tileK.
+        - Load mat2[b, k_start:k_start+tileK, :] into local tensor of size tileK * N (contiguous).
+        - For kk from 0 to tileK-1:
+            - scalar = mat1_local[kk]
+            - mat2_row = mat2_local + kk*N (pointer arithmetic)
+            - accumulator = accumulator + scalar * mat2_row (vector multiply and add)
+   - Write accumulator to Y[b,i,:].
+
+This requires nested loops but all operations are vectorized on N.
+
+We need to allocate local tensors: bias_local (M*N), acc_local (N), mat1_chunk (tileK), mat2_chunk (tileK*N). The UB usage: M*N=2048, tileK maybe 1024, tileK*N=1024*64=65536, plus acc=64, total ~68k, fits UB 192k. Good.
+
+We can set tileK to 1024 or 2048.
+
+Now, implement the kernel with this approach.
+
+Tiling data: need batch, M, N, K, and also tileK (maybe computed dynamically). We'll include them.
+
+We'll set blockDim to handle multiple batches. Since each batch is independent, we can assign batches to cores. Each core processes a set of batches. Total batches B=512, blockDim=8, each core processes 64 batches sequentially.
+
+So the kernel will loop over its assigned batches, and for each batch, loop over rows, then over k tiles, etc.
+
+Now, we need to write the kernel code.
+
+I'll write:
+
+```
+#include "kernel_operator.h"
+
+class KernelCa6k00330Custom {
+public:
+    __aicore__ inline KernelCa6k00330Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR bias, GM_ADDR mat1, GM_ADDR mat2, GM_ADDR y,
+                                uint32_t batch, uint32_t M, uint32_t N, uint32_t K,
+                                uint32_t totalLength, uint32_t tileLength, uint32_t blockDim)
+    {
+        batch_ = batch; M_ = M; N_ = N; K_ = K;
+        totalLen_ = totalLength;
+        tileLen_ = tileLength; // not used directly
+        blockDim_ = blockDim;
+        negSlope_ = 0.0f; // not used
+
+        biasGm_.SetGlobalBuffer((__gm__ float*)bias, batch_ * M_ * N_);
+        mat1Gm_.SetGlobalBuffer((__gm__ float*)mat1, batch_ * M_ * K_);
+        mat2Gm_.SetGlobalBuffer((__gm__ float*)mat2, batch_ * K_ * N_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, batch_ * M_ * N_);
+
+        // Allocate local tensors: biasChunk for one batch? Actually we'll load bias per batch.
+        // We'll allocate them in Process for each batch?
+        // Better to allocate with max sizes in Init.
+        // But we need to know max sizes: batch is known, but we only process one batch at a time.
+        // We'll allocate temporary tensors for one batch's bias (M*N), mat1 row chunk (tileK), mat2 chunk (tileK*N), accumulator (N).
+        // Since M,N,K are fixed, we can allocate them in Init with actual sizes.
+        // But tileK is dynamic: we can set maxTileK = 1024 (or compute from UB budget).
+        // For simplicity, set a fixed tileK = 1024.
+        maxTileK_ = 1024;
+        if (maxTileK_ > K_) maxTileK_ = K_;
+
+        pipe_.InitBuffer(biasQue_, BUFFER_NUM, M_ * N_ * sizeof(float));
+        pipe_.InitBuffer(accQue_, BUFFER_NUM, N_ * sizeof(float));
+        pipe_.InitBuffer(mat1RowQue_, BUFFER_NUM, maxTileK_ * sizeof(float));
+        pipe_.InitBuffer(mat2ChunkQue_, BUFFER_NUM, maxTileK_ * N_ * sizeof(float));
+        // also temporary for product? We'll do scalar * row and add directly.
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0) return;
+
+        const uint32_t blockIdx = AscendC::GetBlockIdx();
+        const uint32_t blockNum = blockDim_;
+
+        // Process batches: total batches = batch_
+        for (uint32_t b = blockIdx; b < batch_; b += blockNum) {
+            // Load bias for this batch
+            AscendC::LocalTensor<float> biasLocal = biasQue_.AllocTensor<float>();
+            AscendC::DataCopy(biasLocal, biasGm_[b * M_ * N_], M_ * N_);
+            biasQue_.EnQue(biasLocal);
+
+            // Process each row i
+            for (uint32_t i = 0; i < M_; ++i) {
+                // Get accumulator from bias row? Actually we need to start with bias row.
+                AscendC::LocalTensor<float> accLocal = accQue_.AllocTensor<float>();
+                // Copy bias row into acc
+                AscendC::LocalTensor<float> biasDeq = biasQue_.DeQue<float>();
+                // We need row i of bias. Since biasLocal is a flat tensor of M*N, row i starts at i*N.
+                AscendC::DataCopy(accLocal, biasDeq[i * N_], N_);
+                biasQue_.EnQue(biasDeq); // put back for next row (we dequeue but we still need for other rows? Actually we need bias for each row, so we should not dequeue until done with all rows. Better to not use queue for bias; just keep biasLocal and use it directly. The queue approach is for data movement, but we can just allocate a local tensor and use it without queue? In AscendC, we can directly allocate local tensor with pipe and use it, but to reuse buffers, we need to manage with queues. For simplicity, we can allocate two tensors: one for bias, one for temporary product. But we need to manage memory. However, we can use a simpler approach: Allocate a single local tensor for bias read-only, and another for accumulator. We can avoid queue for bias by just using a local tensor and reading from it multiple times. But we must ensure we don't exceed allocation. We can allocate biasLocal once per batch and then free when done. The pipe buffer is already allocated with BUFFER_NUM=2, so we have two slots. We can use one slot for bias and one for accumulator? But we also need for mat1 and mat2 chunks. Actually we have multiple queues: biasQue, accQue, mat1RowQue, mat2ChunkQue. Each has BUFFER_NUM=2 slots. So we can allocate biasLocal once and use it for all rows, then free after the batch. That is fine.
+
+                // So we allocate biasLocal in Process for the batch, use it, and then free at end.
+                // Let's restructure: 
+                // Actually, we can allocate biasLocal from pipe directly without queue? But queue is required for enque/deque to use buffer. We'll follow the pattern: AllocTensor, use, free.
+                // But if we allocate biasLocal and then use it for all rows, we need to keep it alive. We can allocate it once, and then after the row loop, free it.
+                // We'll modify Process accordingly.
+            }
+        }
+    }
+
+private:
+    // ...
+};
+```
+
+The code is getting lengthy. We need to produce the final output.
+
+Given time, I will produce a simpler but correct kernel that uses the row-wise accumulation approach with local tensors allocated per batch. I'll write the kernel in a more straightforward manner, assuming the pipe buffers are allocated with enough slots.
+
+But to meet the output format, I need to produce the six strings. I'll write them with careful attention to syntax.
+
+I will also follow the memory rules: no OP_ADD in host_operator_src (since auto-generated). So we need to define the operator class with REG_OP? Actually the example uses OP_ADD but the memories warn against it. So we should use REG_OP instead? The memory says "do not add a second registration with OP_ADD; instead remove the manual OP_ADD and rely solely on the autogen REG_OP." So we must not include OP_ADD. Instead, the operator definition should be done via the project JSON and the autogen will generate the registration. So in host_operator_src, we should only provide TilingFunc, InferShape, InferDataType, and the operator class definition with REG_OP? Actually the example had:
+
+```
+namespace ops {
+class LeakyReluCustom : public OpDef {
+    ...
+};
+
+OP_ADD(LeakyReluCustom);
+} // namespace ops
+```
+
+But the memory says remove OP_ADD. So we should define the class but not use OP_ADD. However, the autogen from JSON will generate the registration. The host_operator_src must not duplicate. So we should remove the OP_ADD line and also the class definition? But the class is needed for tiling? Actually the TilingFunc is registered via SetTiling on the operator, which is done inside the class constructor. The autogen likely generates a registration macro for the operator. So we should not define the class again. But the example includes it. The memory suggests it's problematic. Which one to follow? The memory is from previous runs with errors about redefinition. So to avoid errors, we should not include the class definition and OP_ADD. Instead, the host_operator_src should only contain the TilingFunc and InferShape/InferDataType functions, and the tiling data class. The operator registration will come from the autogen based on project JSON. However, the example demonstrates that it works with OP_ADD? But the memory says it fails when also autogen defines it. So we must ensure no duplicate. Since the project JSON triggers autogen, we should not include any manual registration. Therefore, I will remove the whole namespace ops section. I'll only include tiling data class, TilingFunc, InferShape, InferDataType.
+
+But the InferShape and InferDataType are needed; they can be standalone functions. The autogen will call them? Typically the autogen generates the class and calls our functions. So we need to provide them as global functions with specific signatures. The example defined them inside namespace ge. That is fine.
+
+So host_operator_src structure:
+- include "ca6k_00330_custom_tiling.h"
+- TilingData class in optiling namespace
+- TilingFunc
+- InferShape, InferDataType in ge namespace
+- No ops namespace, no REG_OP, no OP_ADD.
+
+I'll adopt that.
+
+Now, write the strings.
+
+I'll write the kernel_src with the row-wise accumulation approach. I'll keep it concise but correct.
+
+Let's produce the final answer.
