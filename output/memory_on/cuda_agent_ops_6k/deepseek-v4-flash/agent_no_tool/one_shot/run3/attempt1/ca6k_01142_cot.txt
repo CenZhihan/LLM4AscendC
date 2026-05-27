@@ -1,0 +1,73 @@
+We need to implement a fused custom AscendC operator for NLLLoss2d. The reference uses nn.NLLLoss2d, which computes negative log likelihood loss for 2D input (e.g., segmentation). The forward: loss = - (y_pred * y_true) averaged across spatial dimensions and batch. y_pred is log_softmax output (log probabilities), y_true are class indices. The output is a scalar loss.
+
+We need to design a custom operator that takes y_pred (float, shape [N, C, H, W]) and y_true (long, shape [N, H, W]) and returns loss (scalar). However, AscendC kernels typically operate on tensors with fixed shapes; we can implement a kernel that computes the loss per element and reduces to scalar. Since the output is scalar, we need to handle reduction. But AscendC kernel must produce a tensor output; we could output a 1-element tensor.
+
+Alternatively, we can implement a kernel that computes per-pixel loss and then does reduction within kernel (e.g., using Cube unit for sum). Simpler: compute per-element loss (negative of log probability at the true class) and then reduce using block reduction and then atomic add? But AscendC kernel is per-core, need to communicate across blocks. Usually, reduction is done in two steps: each core computes partial sum, then a post-process reduction. But the harness expects a single operator that outputs scalar. In practice, we can output a 1D tensor of size 1 (or scalar shape []). We can implement the kernel to compute loss and use a workqueue to reduce? Maybe we can use the AscendC Cube unit for reduction? Not straightforward.
+
+Given the constraints, I'll design a kernel that computes per-element loss and writes to output a 1-element tensor. However, the reduction must be done across all elements. Since the input size is large (512*512*512 ~ 134M elements), each core can compute its own partial sum, then use a global memory to accumulate? But without synchronization across blocks, we cannot. Common approach: use two kernels: first kernel computes partial sums per block, second kernel reduces them. But we are limited to one operator? Actually we can define one operator that internally launches multiple kernels? In AscendC, operator can have multiple kernels? Typically one kernel per operator. But we can implement reduction in host code using separate kernel calls? The current framework expects one kernel source. The tiling/host can manage multiple kernel launches? Not typical.
+
+Given the memory retrieval suggests we need to keep operator registration and avoid manual OP_ADD if autogen exists. I'll follow typical pattern: define operator with one input, one output (scalar). The kernel will compute per-element loss and use a local reduction? Actually we can compute sum locally per block, then write to output that block's partial sum, then after kernel, CPU does final reduction? But harness expects model output from forward, we can do the final reduction in python binding by summing the output tensor? That would be cheating because the reference returns scalar, but we could have ModelNew that calls the custom op which outputs a tensor of size 1, then we take .sum() to get scalar. However, the task says "numerical match is verified by the offline harness using the same code as golden." So model output must match exactly. So our custom op must output scalar.
+
+Alternative: In host operator, we can set output shape to [1] (scalar) and implement kernel that uses all cores to compute partial sums and then use an atomic add to a single global location. AscendC supports atomic operations? Possibly via pipe. But atomic adds on float are supported on Ascend? Not sure.
+
+Given the complexity, I'll design a kernel that computes per-element loss and writes each element's loss to a temporary buffer, then in host operator we do a separate reduction kernel? But the operator source is one file. We can add a second kernel in same file for reduction. Actually host_operator_src can include multiple kernels? Typically kernel_src contains one __global__ kernel. But we can have two kernel functions and launch them in the operator's TilingFunc? No, TilingFunc just sets tiling data. The actual kernel launch is handled by the framework. We can have a single kernel that does both computation and reduction using block-level reduction and then one core does final reduction via atomic. But that is complex.
+
+Given the input size, we can compute per-element loss and accumulate into a local variable per block (using local sums), then use a shared memory to reduce across threads? In AscendC, each core runs independently. We can use a trick: after computing local sum, write it to a global array of size blockDim, then after kernel, the CPU fetches that array and sums. But then ModelNew would need to sum after kernel. That could be done in python_bind_src: after calling EXEC_NPU_CMD, we can convert to scalar and return. But EXEC_NPU_CMD returns a tensor; we can squeeze and return .item()? That would break the model's forward expecting tensor? The reference returns a tensor (scalar tensor). So we can return a tensor with shape [] (scalar). We can have the kernel write to a scalar output by having each core write its partial sum to a different index, then in host we sum them and write to output. That requires host-side post-processing, which is allowed within the operator? The operator code can include host processing after kernel? Possibly. In the provided example, the operator just launches kernel and returns output. The kernel writes directly to output. So we need kernel to write the final scalar.
+
+I think the most feasible approach: implement kernel that does per-element loss and uses AscendC's built-in reduction? There is no. Given time, I'll assume that the fused op can output a 1D tensor of size 1 and ModelNew will squeeze it to scalar. But that would change shape? The reference returns scalar, so ModelNew must also return scalar. In model_src, we can get the output and call .sum() to get scalar, because the custom op outputs all losses? No, we want a scalar.
+
+Maybe I'm overthinking. Let's look at typical AscendC custom ops for reduction: they often output a tensor with same shape as input and then the final loss is computed by another kernel. But the instruction says "replace / fuse these in the reference forward into one or more custom ops as you see fit". So we can use multiple custom ops. We can implement two ops: one for per-element NLLLoss and one for reduction (sum). But we need to output final scalar. Alternatively, we can fuse both into one kernel that does reduction.
+
+Given the complexity and time constraints, I'll produce a simple implementation that computes per-element loss and writes to output a 1D tensor of size total elements, then in ModelNew we sum. That would not match shape. So not.
+
+I'll design the kernel to output a scalar using block-wise sum and then atomic add to a single location. Use a workaround: use a global memory address for atomic add. AscendC supports atomicAdd via DataCopy with atomic mode? Possibly use `AscendC::AtomicAdd`. The API: `AtomicAdd(dst, src, len)`. We can have all cores accumulate into a single location. That should work. So kernel: each core iterates over its elements, computes loss = -logp[true_class], and accumulates in local variable, then does an atomic add to a global float location. Finally, write that global value to output. Actually, we need to initialize the output to zero. We can do that in host before kernel launch. In the kernel, each core does atomic add to output. So output shape [] (scalar). This should work.
+
+Let's design:
+
+Operator name: Ca6k01142Custom (PascalCase). Kernel name: ca6k_01142_custom.
+
+Inputs: y_pred (float, ND [N, C, H, W]), y_true (int64, ND [N, H, W]).
+Output: loss (float, scalar shape [] or [1]).
+
+Tiling data: totalElements = N*C*H*W? Actually we need N*H*W for batch elements, and per element we need to look up. We'll compute totalLossElements = N*H*W (number of pixels). We'll tile over these. For each pixel, we need to read the true class, then read the corresponding log prob from y_pred (offset = batch*C*H*W + true_class*H*W + h*W + w). So we need to compute index. Kernel will need to handle strided access.
+
+Given complexity, I'll simplify: compute per-pixel loss and accumulate locally, then atomic add to global.
+
+Kernel details:
+
+- totalPixels = N*H*W (uint32)
+- tileLength (number of pixels per iteration)
+- negativeLogProb: we compute loss = -y_pred[ index_of(pixel, true_class) ]
+- Use atomic add: AscendC::AtomicAdd(output, localSum, 1) where localSum is the accumulated float for this tile. Actually we can accumulate all pixels in a tile into a local float, then atomic add that.
+
+But note: each core processes a subset of pixels, so local sum per core. Then atomic add to output.
+
+In Init, we get pointers to y_pred, y_true, output. Output should be initialized to 0. We can do that in host operator by setting output tensor data to 0 before kernel? Or kernel can set it once. We'll initialize in kernel: if blockIdx==0, set output to 0. But atomic add requires initialization.
+
+Better: host operator sets output tensor to zero using aclnnFill? But we are not using aclnn. We can set in kernel: if blockIdx==0, write 0 to output. Then all cores atomically add.
+
+Now, implement.
+
+Project JSON: define inputs, output. output type float, shape unknown (scalar). I'll set shape to [1] as ND.
+
+Host tiling: define tiling data with totalPixels, tileLength, blockDim, etc.
+
+Host operator: register operator, InferShape setting output shape to [1] (scalar). TilingFunc compute totalPixels, tile length. blockDim = min(24, numTiles).
+
+Kernel: implement class Ca6k01142CustomKernel with Init, Process. Compute per-pixel loss and atomic add to output.
+
+Python binding: custom op that calls kernel, returns output tensor.
+
+ModelNew: call custom op and return result (scalar tensor). Since output is [1], we can reshape to [] or just return as is, but reference returns scalar tensor shape []? Let's check: nn.NLLLoss2d returns a scalar tensor (shape ()). So we need to squeeze. In model_src, we can do `return result.squeeze()` or `result.view([])`.
+
+I'll implement.
+
+Note: Use atomicAdd with AscendC::AtomicAdd. Need to include appropriate headers.
+
+Write code accordingly.
+
+Also, ensure no manual OP_ADD if autogen handles, but we need registration. We'll keep manual registration as in example, but be cautious of duplicate. Memory 4 says not to add second registration. So we must rely on autogen? In our case, the project JSON will define operator, and the build system will auto-generate registration. So we should NOT add OP_ADD in host_operator_src. Instead, we let the build system generate it. In the example, they added a class LeakyReluCustom with OP_ADD, but that may cause duplicate if autogen already defines. However, many examples use manual registration. To avoid issues, I'll include the class definition but not OP_ADD, and rely on autogen. But memory 2 says not to delete operator registration. Actually we need to have the operator defined. The safest is to follow the example: define class and OP_ADD. But memory 4 says that causes redefinition error. However, memory 4 is for a specific case where autogen already adds. The build system might not add if we don't have proper project.json? Actually, the build system parses project.json and generates op_proto.h which defines a class. If we also define a manual class with OP_ADD, it will duplicate. So to be safe, we should NOT define a manual class and OP_ADD; instead, rely on the autogen registration. But then we need to provide InferShape and TilingFunc in a way that is used by the autogen. How to hook them? Usually you can define them as static functions and register them via REGISTER_CUSTOM_OP? Not sure. Given the instruction "Your answer must use the same assignment style as this example", the example includes a manual class with OP_ADD. So I will include it, assuming the build system does not generate duplicate. To be safe, I'll name the operator differently? The kernel name is ca6k_01142_custom, but the op type in JSON must match. I'll use "Ca6k01142Custom" as op type. The manual class will also be Ca6k01142Custom. If autogen generates a class with the same name, conflict. But in the example, they used "LeakyReluCustom" and they also have a manual class with OP_ADD. That worked for them. So likely it's fine. I'll proceed.
+
+Write code.
+
+Now produce six strings.

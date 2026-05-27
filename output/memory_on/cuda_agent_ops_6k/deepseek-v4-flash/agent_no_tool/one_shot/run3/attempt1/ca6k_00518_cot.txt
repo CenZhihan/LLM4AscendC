@@ -1,0 +1,340 @@
+我们被要求生成一个融合的自定义AscendC算子，用于替换PyTorch中的nn.Softmin。Softmin是softmax的变体，公式为: softmin(x, dim) = softmax(-x, dim)。因此，我们实际上可以计算 -x 然后应用softmax。由于我们需要在AscendC上实现，需要编写一个自定义算子。
+
+任务id: ca6k_00518，所以算子名称应为 ca6k_00518_custom，PascalCase为Ca6k00518Custom。在JSON中使用这个名称。注意：JSON中op字段的name应为"Ca6k00518Custom"，但C++函数名（kernel）应是ca6k_00518_custom。实际上，project_json_src中的"op"应该是{"op": "Ca6k00518Custom", ...}（根据要求，顶级必须是"op"）。注意示例中project_json_src是一个列表，但根据要求应该是JSON字符串，但示例中是一个包含单个字典的列表。按照示例，我们也使用列表？仔细阅读：示例中project_json_src是一个包含单个字典的列表，并且字典有"op"键。但新的要求说“The parsed JSON must have a top-level key "op" (required by the Ascend build toolchain). Under "op" put operator metadata”。这意味着JSON顶层应该是{"op": ...}，而不是一个列表。但示例中却是列表。矛盾？查看示例：project_json_src='''\n\n[\n  {\n    "op": "LeakyReluCustom", ...} \n]\n'''。这是包含一个元素的列表，每个元素有"op"键。这可能是因为opbuild期望一个数组？为了保险，我遵循示例的格式：一个包含单个字典的列表，字典的顶层键"op"。
+
+所以project_json_src应该是一个列表，里面一个字典，字典有"op"键。
+
+现在需要定义算子输入输出、属性等。Softmin需要一个属性dim（整数），输入x（float32），输出y（float32）。形状与输入相同。所以输入格式为ND，类型float。
+
+现在实现：我们实现一个融合算子，直接计算softmin。由于softmin = softmax(-x)，我们可以通过计算负值然后调用softmax来实现。但AscendC库可能不直接提供softmax？我们需要自己实现一个高效的softmax。注意约束：实现一个融合算子，可以使用一个或一组算子。但最好是单个算子。由于softmax涉及指数、求和、除法，我们可以实现。必须考虑数值稳定性：通常softmax要减去最大值再指数。我们实现一个稳定的softmin（即softmax(-x)）。但注意，对于softmax(-x)，可以等价于计算softmax(x)然后反转？因为softmax(-x)_i = exp(-x_i) / sum_j exp(-x_j) = exp(-x_i) / sum_j exp(-x_j)。如果直接实现，我们需要在dim维度上做reduction。注意输入形状是(batch_size, sequence_length, features)，dim=1（在参考代码中dim=1）。我们的算子需要支持任意dim吗？由于参考代码是固定的dim=1，但我们的算子应该泛化？为了简洁，我们可以假设dim是属性，但我们只处理dim=1的情况？但最好支持一般。但为了简化，我们可以只支持dim=1？但约束是我们要匹配Model的输出，dim是参数（从get_init_inputs返回[1]）。我们可以在算子内直接使用dim属性，然后在kernel中处理。
+
+但是实现任意dim的softmax在AscendC中比较复杂，因为tensor操作可能不直接支持沿轴reduction。我们可能需要将输入reshape成2D？或者我们可以让tiling和kernel对最后一维（features）做softmin？注意dim=1是关于sequence_length维度的。如果dim=1，我们实际上对每个batch的每个feature，对sequence_length维度做softmin。也就是形状[B, S, F]，dim=1，那么对于每个batch b和feature f，我们计算向量x[b,:,f]的softmin。这可以看成是很多独立的向量（S长度）。我们可以按最后一个维度组织，但reduction轴是中间的。在kernel中，我们可以将输入视为2D：第一维是batch*features，第二维是sequence_length。因为我们可以在tiling时重新解释。但考虑到数据是连续的？注意PyTorch中tensor是连续的，dim=1意味着沿着第二个维度，但数据布局是[batch][sequence][features]。所以对于固定的b,f，向量x[b,:,f]在内存中不是连续的（步长为features）。连续访问需要按batch*features作为外层。为了高效，我们可以将输入复制到连续缓冲区？但那样会浪费。由于S=70000，F=10，batch=64，总共64*70000*10=44,800,000个元素。我们可以把每个向量长度S=70000，数量N=B*F=640。所以每个向量长度为70000，我们在S维度上做softmin。我们可以在kernel中通过global tensor步长访问。但AscendC的DataCopy需要连续的数据，所以可能需要先搬移到local tensor中进行连续处理。我们可以每个tile只处理一个向量的一部分，但reduction需要整个向量。实现softmax需要两次遍历：一次找最大值，一次计算指数和归一化。我们可以对每个向量单独处理，向量长度S可能很大（70000），所以一次tile可能包含多个向量？由于UB大小限制，我们只能处理部分元素。我们需要在每个向量内迭代。
+
+因此，更简单的做法：利用AscendC的TQue和pipeline，对每个向量从头到尾计算。我们可以设定tileLength为S的倍数？但S=70000，可能大于UB，所以需要分块处理。但softmax需要整体的最大值和sum，所以无法简单分块。我们可以采用经典的two-pass方法：先遍历所有块找最大值，再遍历所有块计算exp(x-max)并累加sum，最后遍历每个块归一化。这需要三次遍历。但每次遍历需要全局同步？因为我们是在单个block内处理（每个block处理一组向量）。所以我们可以先在一个队列中计算每个块的部分，然后整合。因为每个向量是独立的，每个block可以处理多个向量，但向量内部不能分给多个block。所以我们可以每个block处理一组向量，对一个向量顺序处理多个tile。由于一个向量长度70000，而tile可能32768（根据UB），所以需要2-3个tile。我们可以用两个tile（前tile和后tile），在最后一个tile中完成。我们可以用以下方法：计算max时，遍历所有tile，保持最大值；然后计算sum时，再次遍历所有tile，计算exp(x-max)并累加；最后遍历所有tile，将每个元素除以sum。这需要三次遍历，但可以使用流水线重叠？简单起见，每个向量我们做三次pass，但这样计算量会大，但可以接受。我们可以使用更大的tile来减少pass次数。UB大小我们可以设为192KB，每个float4字节，那么192KB/4=48K个float。但根据Memory 1的示例，他们计算UB_BUDGET_BYTES=192*1024，tileLen = UB_BUDGET_BYTES/20（因为他们用了5*tile的缓冲区）。我们的算子需要多少缓冲区？我们需要x的输入缓冲区，y的输出缓冲区，以及一些临时（max, sum）。我们可以尝试优化缓冲区用量。最坏情况下，我们需要同时持有x、exp(x-max)、以及部分累加。我们可以使用双缓冲。但为了简单，我们采用三pass，但每个pass只使用一个tile的输入和输出。我们可以在第一个pass中计算并存储最大值，第二个pass计算exp和sum，第三个pass归一化。这样缓冲区只需要一个tile的输入、一个tile的exp临时、输出。我们可以利用之前的示例框架。
+
+为了简化实现，我们参考Memory 3的提示：使用GetValue/SetValue避免直接索引。但我们的kernel会使用AscendC的高级API如Exp, ReduceMax, ReduceSum？AscendC提供了向量化的Exp、ReduceMax、ReduceSum等指令，可能能直接在LocalTensor上操作。如果我们能在一个tile内完成整个向量的softmax（如果tile长度等于向量长度），那么问题就简单了。但S=70000 > UB容量，所以我们不能一次处理整个向量。但是，我们可以利用AscendC的ReduceMax和ReduceSum沿dim=0？不对，这些reduce是在一个tensor上沿轴计算。但我们的向量是1D的，所以可以计算全局reduce。但是，ReduceMax只能在一个LocalTensor上计算所有元素的最大值？AscendC提供了Muls, Add, ReduceMax, ReduceSum等指令。例如，我们可以对LocalTensor使用ReduceMax，它会返回一个标量？在AscendC中，ReduceMax得到的是标量，但是需要等待所有数据。在流水线中，由于数据可能分批到达，我们不能直接对整个向量使用一次ReduceMax。但是我们可以手动做一个分块累加。
+
+考虑到实现复杂度，并且参考Memory 2的失败案例（缺少blocks），我必须产生完整的六个字符串，并且保证编译通过。为了可靠性，我选择实现一个较为简单的版本：不实现真正的softmax，而是使用一个近似或直接调用已有的库函数？但我们需要用自定义AscendC实现，不能调用PyTorch。但我们可以使用AscendC的内置函数如Exp, Add, Div等。最好的办法是参考示例，设计一个两阶段的kernel：首先计算每行的最大值和指数和，然后计算归一化。我们可以采用与示例类似的结构：使用双缓冲，对每个向量进行两次处理。
+
+具体设计：
+- 算子：Ca6k00518Custom
+- 输入：x (ND, float32)
+- 输出：y (ND, float32)
+- 属性：dim (int64, default=1)
+- 算法：softmin(x, dim) = softmax(-x, dim)。我们直接在kernel中实现softmax(-x)。由于dim是属性，我们可以在tiling时确定如何解释数据。为了简化，我们假设输入是三维[batch, seq, feat]，dim=1。我们实际上可以忽略dim，总是沿着最后一个维度？但参考dim=1，所以我们需要沿第二个维度。如果强制最后一个维度，错误。所以我们必须支持一般dim。但为了简化，我们可以假设dim=1并在tiling中重新组织。我们可以在host tiling中根据dim和shape计算外层循环数（batches和features），内层向量长度（seq）。我们可以将输入视为2D：num_vectors * seq_length。向量长度=seq_length。这样，每个向量的计算是独立的。
+
+我们设定算子的输入形状为任意维度，dim为属性。在host tiling中，我们计算输入形状的总元素个数、dim的size，以及步长等。然后我们设置tiling数据，告诉kernel每个向量的长度（dim的大小）、向量的个数（总元素/dim大小）、以及数据访问的步长（dim_stride和batch_stride等）。kernel使用全局地址通过步长访问。这可以支持任意dim。
+
+但考虑到kernel复杂度，我们采用一个更保守的方法：在host tiling中将输入reshape为2D，即把dim维度展平到最后一维？不，实际上对于dim=1，我们可以将张量视为形状[64*10, 70000]（即640个向量，每个70000个float）。这可以通过在host端重新解释shape得到。在host_operator_src中，我们可以设置输入/output的形状为[total_elements] (ND)，但在tiling中我们计算正确的向量信息。
+
+kernel的实现：使用流水线，对每个向量进行三次遍历：第一次求max，第二次求exp(x-max)和sum，第三次归一化。由于每个向量长度70000，tile长度设为70000? 太大。我们可以设置tile长度为一个较小的值（比如32768），然后在一个向量内循环多次。这需要记录每个向量的最大值和总和，这些值必须跨tile保持。我们可以使用LocalTensor的标量（例如在tiling中分配标量空间）。由于我们有多个向量，我们需要为每个向量维护一个最大值和总和的标量。我们可以使用一个全局临时缓冲区（workspace）来存储每个向量的max和sum。但这样需要额外的全局内存。或者我们可以每个block只处理一个向量，这样可以使用局部变量。但是一个block处理多个向量需要跨向量。我们可以每个block处理一组向量，但每个向量内部的tile数量可能不同。为了简单，我们设定每个block只处理一个向量。那么blockDim应设置为向量数（640）。每个block处理一个完整的向量。在kernel中，我们使用循环遍历向量的所有tile，并在每个tile中处理。这样我们可以在局部变量中维护max和sum，因为每个block只处理一个向量。这样更简单。并且这符合grid-stride模式：每个block处理一个向量，向量索引为blockIdx。向量长度seq_len。tile_len是每个tile的元素数，我们沿着向量循环，每个tile处理一部分。
+
+对于每个tile，我们需要：
+- 将所有x加载到队列。
+- 第一次遍历：计算该tile部分的max，并更新全局max（比较后）。
+- 第二次遍历：再次遍历所有tile，计算exp(x-globalMax)并累加sum。
+- 第三次遍历：再次遍历所有tile，计算y = exp(x-globalMax)/sum。
+
+但是，这样需要三次全局遍历，并且需要在多个tile之间保持全局max和sum。由于每个tile的处理是顺序的，我们可以在第一次遍历中在循环内维护max变量，并在每个tile后更新。同样，第二次遍历中累加sum。第三次遍历中直接计算y。这需要我们在同一个kernel函数中三次循环整个向量，但我们可以将三次循环合并？由于每次需要前一次的结果，不能完全合并。但这可以工作：在每个block内，我们三次循环向量（使用不同的计算模式）。我们可以使用双缓冲，在第一次循环中，我们加载x、计算部分max，然后释放。第二次循环中，我们再次加载x（从全局），计算exp和sum。第三次加载x，计算y并输出。这样，虽然读全局三次，但避免了额外的存储，可以接受。并且没有跨block同步需求。
+
+由于S=70000很小，三次读取全局是可行的。tile长度设为32768，则每个向量需要3个tile，三次循环共9个tile操作。每次tile操作都会触发DMA传输。整体开销尚可。
+
+细节：为了利用流水线重叠，我们可以使用双缓冲。但三次循环是顺序的，我们可以用简单的单缓冲，但必须保证DMA完成。使用AscendC的DataCopy和同步。
+
+我们将使用类似于示例的结构：KernelLeakyReluCustom稍作修改。我们定义KernelSoftminCustom。
+
+在kernel类中：
+- Init：接收总长度（实际是向量长度seq_len）、向量数量num_vectors（=blockDim）、以及dim属性等信息。但我们只需要每个block知道自己的向量索引。在Process中，每个block只处理一个向量（blockIdx对应向量索引）。所以我们通过blockIdx获取全局tensor中的偏移。输入tensor xGm_是平坦的全局地址，总长度为totalElems = num_vectors * seq_len。偏移量 = blockIdx * seq_len。
+
+- tileLen: 每个tile加载的元素个数（设为UB允许的大小，例如32768）。seq_len必须能被tileLen整除？不必须，最后一个tile可能短。我们处理短tile。
+
+- 三次pass: 每个pass内部，我们使用for循环遍历tile，从0到seq_len，步长tileLen。在每个tile中，我们调用CopyIn加载数据，然后ComputePassX，然后CopyOut（对于第三次需要输出）。我们定义一个枚举pass。
+
+但为了简化，我们可以直接在Process中使用三个while循环，每个循环遍历向量，调用一个ComputeMax、ComputeExpSum、ComputeNormalize函数。
+
+由于需要重用x数据，我们可以每次从全局读取。注意：因为三次读取同样数据，我们可以考虑将x缓存在一个额外的缓冲区中，但那样占用UB。我们选择直接从全局读取三次，有三次DMA。
+
+为了减少DMA，我们可以第一次读取x后，先计算max和exp并归一化？不行，因为需要全局max。我们可以先找max，然后第二次读取x时计算exp并归一化。这只有两次读取。是的，我们可以合并第二次和第三次：第二次读取x，计算exp(x-max)并累加sum，然后将结果写回临时缓冲区？但我们仍需要第三次读取临时缓冲区。但由于我们需要将结果写回全局，我们可以将exp(x-max)计算出来并立即除以sum？不行，因为sum在tile结束时才知道。我们可以第二次遍历时，计算exp(x-max)并写出到临时全局缓冲区？这需要额外的全局内存。我们放弃，简单三次读取。
+
+考虑到性能，我们使用两次读取：第一次读取x，计算max；第二次读取x，计算exp(x-max)同时在一个tile内累计局部sum，并在每个tile后更新全局sum，然后立即归一化并写入y？但sum需要所有tile的累加，无法立即归一化。我们可以在第二次遍历中，先计算exp(x-max)并写入一个临时LocalTensor，同时累计sum，但tile内不能归一化，因为sum没有完全确定。所以需要在第二次遍历结束后再进行一次遍历归一化。仍然需要三次。
+
+我们采用三次pass方案。
+
+为了简化，我们还可以利用AscendC的VectorReciprocal等函数。
+
+现在编写代码。
+
+注意事项：
+- 根据Memory 1，不要使用StorageShape，使用gert::Shape*。在InferShape中使用SetDimNum和SetDim。
+- 根据Memory 4，不要手动OP_ADD，依赖自动生成。
+- 根据Memory 5，使用Reciprocal避免精度损失。但softmax中我们直接Div即可。
+
+tiling数据：我们需要传递totalLength（总元素数）、tileLength、dimSize（向量长度）、numVectors（向量数量）、blockDim（=numVectors）。由于每个block处理一个向量，blockDim = numVectors。但我们需要控制不超过硬件限制。假设numVectors=640，blockDim=640。这是允许的（最多24？示例中限制24，但我们可以根据向量数动态设置）。如果向量数太多，我们可以让每个block处理多个向量。但这里只有640，小于24？等等，blockDim通常指物理核心数（AI Core），每个核心可以运行多个block？blockDim是调度到同一个core上的block数量？实际上AscendC的GetBlockNum返回实际硬件核心数（比如24），我们不应该设置超过物理核心数。在我们的方案中，每个block处理一个向量，需要640个block，但只有24个核心，所以实际并行度是24，每个核心顺序处理多个向量。我们可以使用grid-stride方式：每个block处理多个向量，步长为blockNum。这样更灵活。我们可以设定tiling中的blockDim为实际核心数（如24），然后每个block在Process中使用循环跳步处理多个向量。这样更符合示例。我们采用示例中的grid-stride模式：strideElems = blockNum * tileLen? 不，示例是针对单元素操作。对于我们的向量处理，每个block需要处理多个完整的向量。我们可以用两个级别的循环：外层循环向量索引，内层循环向量内的tile。但为了简化，我们可以让每个block每次处理一个实体（一个向量），但使用grid-stride跳到下一个向量：baseIdx = blockIdx * vector_stride_in_tiles? 实际上，我们想让每个block处理多个向量，步长为blockNum。每个向量长度为seqLen，所以每个tile处理seqLen/tileLen个tile。我们可以把向量总数分成多个blocks，每个block处理一个连续的向量块。但这样需要知道每个向量的边界。由于向量是等长的，我们可以计算每个block负责的向量范围：startVec = blockIdx * numVectors_per_block，但numVectors_per_block可能不是整数。更简单：让每个block处理一个向量，但通过循环步长blockNum来实现：blockIdx处理向量index = blockIdx，然后步长blockNum，直到超出numVectors。这样每个block处理ceil(numVectors/blockNum)个向量。这很容易。
+
+在kernel中，我们先计算向量数numVectors = totalLength / dimSize，以及向量长度dimSize。然后使用循环：for (vecIdx = blockIdx; vecIdx < numVectors; vecIdx += blockNum) { 处理一个向量 }。每个向量内使用三次pass。
+
+注意：为了保持tiling和kernel的一致性，我们传递dimSize、numVectors、tileLength。此外，我们可以让tileLength等于dimSize（如果dimSize较小），但这里dimSize=70000>UB，所以tileLength设为合适值。
+
+计算UB预算：我们需要的缓冲区：输入x一个tile，输出y一个tile（第三次），临时exp一个tile（用于第三次或不需要）。由于我们三次pass，每个pass只需要一个输入缓冲区和一个输出缓冲区（或临时）。可以使用双缓冲，但三次pass之间不重叠，我们可以使用单缓冲，并在每个pass结束时同步。使用单缓冲更简单：用一个输入队列和一个输出队列，每个队列只有一个缓冲区（BUFFER_NUM=1）。但示例中使用BUFFER_NUM=2实现流水线。我们也可以使用2，但为了简化，我们使用双缓冲使得每个pass内部可以重叠DMA和计算。由于三次pass是顺序的，每个pass内部可以使用双缓冲将一个tile的计算与下一个tile的加载重叠。这样性能更好。所以我们保留BUFFER_NUM=2，在每个pass的循环中使用CopyIn、Compute、CopyOut的流水线。
+
+具体：对于每个pass，我们有一个循环，从0到dimSize，步长tileLen。我们借鉴示例的grid-stride模式，但这里是遍历向量的tile。我们同样可以使用两个tile的流水线。
+
+关键代码：
+
+Process() {
+    uint32_t blockNum = GetBlockNum();
+    uint32_t blockIdx = GetBlockIdx();
+    uint32_t vecIdx = blockIdx;
+    while (vecIdx < numVectors_) {
+        // 处理第vecIdx个向量
+        // 三次pass: max, sum, norm
+        // 每个pass都是类似的循环
+        // 但第一次需要计算max，第二次需要已经知道的max，第三次需要已经知道的sum。
+        // 在第二次和第三次之间需要存储max和sum。由于每个向量独立，我们可以在局部变量中维护它们。
+        float globalMax = -FLT_MAX;
+        float globalSum = 0.0f;
+        // 第一次pass
+        {
+            // 类似CopyIn->ComputeMax->Free，更新globalMax
+            uint32_t offset = 0;
+            while (offset < dimSize_) {
+                uint32_t curLen = min(tileLen_, dimSize_ - offset);
+                // 读取xLocal, 计算局部max, 更新globalMax
+                // ...
+            }
+        }
+        // 第二次pass
+        {
+            // 读取xLocal, 计算exp(x-globalMax), 累加局部sum, 更新globalSum
+        }
+        // 第三次pass
+        {
+            // 读取xLocal, 计算yLocal=exp(x-globalMax)/globalSum, 写入全局y
+        }
+        vecIdx += blockNum;
+    }
+}
+
+但是，三次pass需要重复读取相同数据，可能导致性能下降。但可靠。
+
+注意：exp(x-globalMax)可能很大？globalMax是向量最大值，所以x-globalMax<=0，exp值在0到1之间。数值稳定。
+
+现在具体实现kernel。使用AscendC的Exp、Add、Mul、Div等。对于最大值，我们可以使用Max（元素比较）然后ReduceMax？但需要跨tile。我们可以手动比较。在计算局部max时，可以用AscendC::Max(localMax, xLocal, curLen)然后与之前的max比较。但AscendC的Max是逐元素求两个tensor的max。我们只需要标量max。我们可以用ReduceMax得到局部max（返回一个Scalar），然后更新全局。AscendC的ReduceMax返回一个标量float。我们可以使用它。类似地，Sum用ReduceSum。
+
+在kernel中，我们使用：
+AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+AscendC::DataCopy(xLocal, xGm_[baseOffset], curLen);
+AscendC::ReduceMax<float, float>(localMaxScalar, xLocal, true); // true表示沿所有元素？
+但ReduceMax需要指定axis？对于1D tensor，axis=0。返回一个标量。我们可以使用。然后localMaxVal = localMaxScalar.GetValue(0)。然后与全局max比较。
+同样，Sum: ReduceSum得到标量。
+
+然后第二次pass: 对每个元素计算 xLocal[i] = exp(xLocal[i] - globalMax) 使用AscendC::Sub和Exp。注意我们需要就地修改xLocal？我们可以使用临时tensor。由于我们有三个pass，我们可以重用xLocal，但需要在计算后保存结果？第三次pass需要原始x，所以第二次pass不能覆盖xLocal。我们可以在第二次pass使用新tensor存储exp值。同样，第三次pass需要重新读取x。因此我们每个pass从全局读取x，计算并输出。
+
+在第二次pass中，计算exp(x-globalMax)并累加局部sum（使用ReduceSum），同时可以将exp值写入临时local_tensor？但不需要，我们只需要sum。所以可以不保存exp值。第三次pass时，重新计算exp(x-globalMax)并除以globalSum。这样，每个元素计算两次exp，冗余。可以接受。
+
+但是第一次pass只需要max，不需要exp；第二次pass求exp和sum；第三次pass求exp和归一化。总共每个元素计算两次exp，一次div。可以接受。
+
+注意我们需要globalMax和globalSum在pass之间保持。在kernel中用局部变量。
+
+对于tile流水线，每个pass内部都类似示例中的Process，但每次只处理一个向量的tile，并且是顺序的。我们可以为每个pass写一个循环，使用双缓冲。但为了简化，我们不在每个pass内使用双缓冲，而是使用单缓冲（BUFFER_NUM=1），因为三次pass已经顺序，单缓冲已经足够。但为了性能，我们还是使用双缓冲，但实现更复杂。我们选择单缓冲，实现简单：每个pass中，分配一个local tensor，CopyIn，Compute，释放，然后处理下一个tile。这样没有重叠，但向量长度不大，可以接受。
+
+最终决定：使用单缓冲，每个pass内循环tile。
+
+现在编写所有六个字符串。
+
+注意project_json_src: 根据示例格式，应包含输入输出attr的描述。输入参数x，输出y，属性dim（int）。type用float32，格式ND。
+
+host_tiling_src: 定义TilingData，包含totalLength, dimSize, tileLength, blockDim。注意blockDim设置为物理核心数（比如24），但需要从上下文获取？通常我们设置最大并行度，但在tiling中直接写24？可以动态设置为totalLength / dimSize吗？但totalLength/dimSize是向量数，如果向量数小于24则设置向量数，否则24。我们实现一个简单的：根据向量数设置blockDim，但设置一个上限如24。参考示例。我们也将negativeSlope替换为dim。这里dim是int64，但tiling数据中可以使用int32。
+
+注意：dim属性是int64，但我们在tiling中使用uint32_t。需要转换。
+
+host_operator_src: 包括InferShape, InferDataType, 以及TilingFunc。实现。
+
+kernel_src: 实现kernel函数。
+
+python_bind_src: Pytorch绑定，注册自定义算子，并暴露一个函数ca6k_00518_custom。注意函数名应与kernel extern函数名一致。
+
+model_src: 定义ModelNew，使用自定义算子。
+
+让我们逐步编写。
+
+首先确定所有命名：
+- 算子名称: Ca6k00518Custom
+- C++ kernel函数: ca6k_00518_custom
+- 模块名: custom_ops_lib
+- TORCH_LIBRARY_IMPL命名空间: myops
+
+注意：根据约束，kernel/JSON/operator名称应基于ca6k_00518_custom和PascalCase Ca6k00518Custom。
+
+现在写代码。由于是六段字符串，我们要确保正确引号。使用三个双引号。
+
+我们小心地设计host_tiling_src。
+
+Tiling数据：
+struct Ca6k00518CustomTilingData {
+    uint32_t totalLength;
+    uint32_t dimSize;
+    uint32_t tileLength;
+    uint32_t blockDim;
+};
+
+在TilingFunc中，根据输入shape计算totalLength和dimSize（从dim属性获取）。dim属性是int64，我们转为uint32_t。tileLength根据UB预算计算。blockDim设为min(numVectors, 24)但也要考虑numVectors=0的情况。也可以设置固定为24，然后kernel使用grid-stride。但设置blockDim为实际核心数（如24）更好。
+
+在host_operator_src中，注意包含头文件和命名空间。需要REGISTER_TILING_DATA_CLASS。
+
+在OP定义中，使用OpDef类并注册。注意OP_ADD由自动生成，我们不要手动添加，所以host_operator_src中不应该有OP_ADD。但示例中host_operator_src包含了OP_ADD。根据Memory 4，不要重复OP_ADD。所以我们应该移除OP_ADD，依赖autogen。但示例中有OP_ADD，可能因为示例中project_json_src是一个列表，自动生成会基于JSON生成op_def？不确定。为了保险，我们参考示例但去掉OP_ADD？记忆说“do not add a second registration with OP_ADD; instead remove the manual OP_ADD and rely solely on the autogen REG_OP.”所以host_operator_src中不应该有OP_ADD。但示例中有，因为它没有自动生成？我们的project_json_src也包含同样的op信息，可能会自动生成。为了避免冲突，我们不在host_operator_src中写OP_ADD。但示例中写了，为了安全，我们仍然保留？但是Memory 4明确说不要。所以我们移除OP_ADD。同时，InferShape和InferDataType在namespace ge下定义，而op类可能在namespace ops下。我们按照示例结构，但去掉了OP_ADD。
+
+现在写python_bind_src: 使用PYBIND11_MODULE和TORCH_LIBRARY_IMPL。注意头文件#include "pytorch_npu_helper.hpp"可能需要，我们保留。函数名ca6k_00518_custom。
+
+model_src: 导入torch, torch_npu, custom_ops_lib。
+
+开始逐个写。
+
+注意：dim属性在project_json中，类型应该是"int"而不是"float"。
+
+我们还要考虑tiling中计算dimSize：从输入shape获取dim维度的长度。假设输入shape为[64,70000,10]，dim=1，那么dimSize=70000。我们将shape传递给tiling吗？我们直接从context获取shape。
+
+实现TilingFunc:
+
+auto shape = context->GetInputShape(0);
+int64_t totalElems = shape->GetOriginShape().GetShapeSize();
+int dim = ... 从属性获取。注意属性名是"dim"，我们通过 attrs->GetAttrPointer<int64_t>(0) 获取。
+
+dimSize = shape->GetOriginShape().GetDim(static_cast<uint32_t>(dim));
+
+如果dim是负数，需要处理？简单认为非负。
+
+计算numVectors = totalElems / dimSize.
+
+blockDim = std::min(static_cast<uint32_t>(numVectors), 24u);
+
+tileLength = 从UB计算，与示例类似。
+
+现在kernel实现：
+
+需要注意：我们需要在Init中获取全局tensor的基地址和元数据。传递totalLength, dimSize, tileLength, blockDim。在Process中，我们使用blockIdx和blockNum循环向量。
+
+由于每个向量内部我们使用单缓冲，我们可以重用变量。
+
+对于最大值：我们使用float maxVal = -std::numeric_limits<float>::max(); 然后循环tile，使用AscendC::ReduceMax计算局部max，然后比较更新。
+
+注意：AscendC::ReduceMax返回一个LocalTensor<float> of size 1。我们可以使用.GetValue(0)获取值。
+
+同样，求和用ReduceSum。
+
+具体实现：
+
+void Process() {
+    uint32_t blockNum = GetBlockNum();
+    uint32_t blockIdx = GetBlockIdx();
+    uint32_t numVectors = totalLength_ / dimSize_;
+    for (uint32_t vecIdx = blockIdx; vecIdx < numVectors; vecIdx += blockNum) {
+        uint32_t baseOffset = vecIdx * dimSize_;
+        // Pass 1: find max
+        float maxVal = -FLT_MAX;
+        for (uint32_t tileOff = 0; tileOff < dimSize_; tileOff += tileLen_) {
+            uint32_t curLen = min(tileLen_, dimSize_ - tileOff);
+            // 加载x
+            LocalTensor<float> xLocal = pipe_.AllocTensor<float>(tileLen_ * sizeof(float)); // 需要tileLen_个元素
+            DataCopy(xLocal, xGm_[baseOffset + tileOff], curLen);
+            // 计算局部max
+            LocalTensor<float> localMax = pipe_.AllocTensor<float>(sizeof(float));
+            ReduceMax<float, float>(localMax, xLocal, true); // 沿所有元素减少
+            float localMaxVal = localMax.GetValue(0);
+            if (localMaxVal > maxVal) maxVal = localMaxVal;
+            pipe_.FreeTensor(localMax);
+            pipe_.FreeTensor(xLocal);
+        }
+        // pass 2: compute sum
+        float sumVal = 0.0f;
+        for (uint32_t tileOff = 0; tileOff < dimSize_; tileOff += tileLen_) {
+            uint32_t curLen = min(tileLen_, dimSize_ - tileOff);
+            LocalTensor<float> xLocal = pipe_.AllocTensor<float>(tileLen_ * sizeof(float));
+            DataCopy(xLocal, xGm_[baseOffset + tileOff], curLen);
+            // yLocal = exp(x - maxVal)
+            LocalTensor<float> diff = pipe_.AllocTensor<float>(tileLen_ * sizeof(float));
+            Sub(diff, xLocal, maxVal, curLen);
+            LocalTensor<float> expLocal = pipe_.AllocTensor<float>(tileLen_ * sizeof(float));
+            Exp(expLocal, diff, curLen);
+            LocalTensor<float> localSum = pipe_.AllocTensor<float>(sizeof(float));
+            ReduceSum<float, float>(localSum, expLocal, true);
+            sumVal += localSum.GetValue(0);
+            pipe_.FreeTensor(localSum);
+            pipe_.FreeTensor(expLocal);
+            pipe_.FreeTensor(diff);
+            pipe_.FreeTensor(xLocal);
+        }
+        // pass 3: normalize and write out
+        for (uint32_t tileOff = 0; tileOff < dimSize_; tileOff += tileLen_) {
+            uint32_t curLen = min(tileLen_, dimSize_ - tileOff);
+            LocalTensor<float> xLocal = pipe_.AllocTensor<float>(tileLen_ * sizeof(float));
+            DataCopy(xLocal, xGm_[baseOffset + tileOff], curLen);
+            LocalTensor<float> diff = pipe_.AllocTensor<float>(tileLen_ * sizeof(float));
+            Sub(diff, xLocal, maxVal, curLen);
+            LocalTensor<float> expLocal = pipe_.AllocTensor<float>(tileLen_ * sizeof(float));
+            Exp(expLocal, diff, curLen);
+            LocalTensor<float> yLocal = pipe_.AllocTensor<float>(tileLen_ * sizeof(float));
+            // 除以sum
+            Muls(yLocal, expLocal, 1.0f / sumVal, curLen);  // 使用Muls乘倒数
+            // 或者使用Div，但Muls更高效
+            DataCopy(yGm_[baseOffset + tileOff], yLocal, curLen);
+            pipe_.FreeTensor(yLocal);
+            pipe_.FreeTensor(expLocal);
+            pipe_.FreeTensor(diff);
+            pipe_.FreeTensor(xLocal);
+        }
+    }
+}
+
+注意：我们使用了pipe_.AllocTensor<float>(size) 动态分配。需要确保UB足够。我们预先知道UB容量。我们在分配时可能会超过预算。最好在Init中一次性分配所有缓冲区。但为了简单，我们使用动态分配。但可能会超出UB。我们可以使用类似示例的方式，用Que。但这里的实现没有使用Que，只是简单AllocTensor。为了可靠性，我们可以改用TQue和双缓冲，但复杂度高。我们尝试使用TQue实现类似示例的流水线，但每个pass内部使用双缓冲，同时复制下一个tile。
+
+考虑到篇幅，我们采用更简单的单缓冲、顺序分配。但要注意UB大小：我们每个tile分配xLocal（tileLen*4），diff（同上），expLocal（同上），yLocal（同上），以及localSum和localMax（4B）。总共大约4*tileLen*4 + 2*4 = 16*tileLen+8字节。tileLen设为32768时，约524KB，超过UB。所以我们需要减小tileLen。我们计算每个pass分配的最大缓冲区：在pass1中只分配了xLocal和localMax（很小）；pass2中分配了xLocal, diff, expLocal, localSum（共3*tileLen+小）；pass3分配xLocal, diff, expLocal, yLocal（4*tileLen+小）。所以最大同时有pass3的4*tileLen个float（16*tileLen字节）。UB假设192KB，则16*tileLen <= 192*1024 => tileLen <= 12288。我们取tileLen=12288。但为了对齐，我们可以设为8192。或者我们调整缓冲区数量，例如在pass3中我们可以重用diff和expLocal，但分配顺序是逐个分配，可以复用，但我们是顺序分配，所以最大同时存在可能达到4*tileLen，因为我们在分配yLocal之前还没有释放之前的。我们可以优化分配顺序：先分配xLocal, diff, expLocal，然后计算yLocal前释放diff和expLocal？不，需要它们计算yLocal。我们可以计算yLocal时使用expLocal作为输出，然后释放diff和xLocal。然后分配yLocal？实际上我们可以让yLocal覆盖diff的空间？但AscendC不支持直接覆盖。更简单的是我们在分配时控制峰值：在pass3中，我们可以先分配xLocal和diff，计算diff后释放xLocal，分配expLocal，计算expLocal后释放diff，分配yLocal，计算yLocal（用expLocal），释放expLocal，最后DataCopy并释放yLocal。这样峰值是max(2*tileLen, 2*tileLen, 等)约2*tileLen。我们重新设计分配顺序。
+
+修改pass3的分配顺序：
+for each tile:
+    auto xLocal = AllocTensor<float>(tileLen);
+    DataCopy(...)
+    auto diff = AllocTensor<float>(tileLen);
+    Sub(diff, xLocal, maxVal, curLen);
+    FreeTensor(xLocal);
+    auto expLocal = AllocTensor<float>(tileLen);
+    Exp(expLocal, diff, curLen);
+    FreeTensor(diff);
+    auto yLocal = AllocTensor<float>(tileLen);
+    Muls(yLocal, expLocal, 1.0f/sumVal, curLen);
+    FreeTensor(expLocal);
+    DataCopy(yGm_[offset], yLocal, curLen);
+    FreeTensor(yLocal);
+这样峰值是2个tileLen（diff和expLocal同时存在时是2个）。同样在pass2中，我们可以类似优化：先分配xLocal，然后分配diff，Sub后释放xLocal，分配expLocal，Exp后释放diff，分配localSum，ReduceSum后释放expLocal和localSum。峰值也是2个tileLen。pass1峰值只有1个tileLen。所以最大2*tileLen*4=8*tileLen字节。tileLen=12288时，8*12288*4=393216字节=384KB，仍然超（192KB）。所以需要进一步减小。如果峰值是2个tileLen，则2*tileLen*4<=192KB => tileLen<=24576。但2*tileLen*4? 每个float 4B，2个tensor共2*tileLen个float，所以是8*tileLen字节。应满足8*tileLen <= 192*1024 => tileLen <= 24576。所以我们可以取tileLen=16384（2^14）。这可以保证峰值在UB内。我们在代码中保守计算。
+
+在tiling中，我们计算maxTile = UB_BUDGET_BYTES / (8*4)?? 实际上需要根据我们的分配模式计算。为了安全，我们根据最大同时占用（2*tileLen*4 + 少量标量）来计算。所以我们设置maxTile = UB_BUDGET_BYTES / 8。因为每个float4字节，2个tensor共8字节每元素？不对，每个tensor存储float，每个float 4字节，所以2*tileLen个float占用8*tileLen字节。所以UB_BUDGET_BYTES / 8 是元素数。我们取AlignDown到2048。
+
+然后还要考虑blockDim等。
+
+编写所有代码。
+
+注意：kernel中需要包含<limits>获取FLT_MAX。或者直接使用999999.0f。
+
+注意：AscendC的Exp、Sub、Muls等函数位于AscendC命名空间下，我们直接使用，但需要包含头文件。
+
+现在编写最终的六个字符串。
+
+为了确保正确，我准备输出如下：
+
+project_json_src: 一个列表，包含一个字典。注意op name使用"Ca6k00518Custom"。输入x，输出y，attr dim（int）。
+
+host_tiling_src: 标准格式。
+
+host_operator_src: 包括TilingFunc、InferShape、InferDataType、OpDef注册。注意不要OP_ADD。
+
+kernel_src: 如上述。
+
+python_bind_src: 使用PYBIND11_MODULE和TORCH_LIBRARY_IMPL。
+
+model_src: 导入，定义ModelNew，use custom_ops_lib.ca6k_00518_custom。
+
+注意：参考代码中model_src的forward使用了*inputs，我们只接受一个x，但可能需要接受多个输入？参考Model forward只接受x。所以我们forward只取第一个参数。
+
+确保类型匹配：输入x是float tensor，不需要其他参数。
+
+现在输出。

@@ -1,0 +1,101 @@
+We need to generate six Python string variables for a fused custom AscendC operator replacing LazyInstanceNorm3d. The operator name derived from task id: ca6k_04593_custom, PascalCase: Ca6k04593Custom.
+
+We must follow the example structure: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src.
+
+Constraints: single fused custom op. The forward of LazyInstanceNorm3d computes instance normalization, which for each sample and each channel (feature dimension, but instance norm normalizes per sample per channel across spatial dimensions (depth, height, width)). The reference uses LazyInstanceNorm3d, meaning the number of features is inferred from the first input. But the user provides num_features in init_inputs? Actually the model's __init__ receives num_features, eps, momentum, affine. But LazyInstanceNorm3d defers initialization; the first forward will set num_features. In the reference, the model is created with those init inputs. So the custom op should take the input tensor plus the other parameters (affine=False means no learnable parameters; if affine=False, just compute normalization without scale/shift). Since momentum is for running stats, but LazyInstanceNorm3d tracks running mean/var only if training, but the model forward doesn't specify training mode. The reference likely uses the module in eval mode? But not specified. Typically instance norm does not track running stats in evaluation? LazyInstanceNorm3d in PyTorch is a concrete instance of _InstanceNorm; it tracks running mean/var during training. However, the harness might not care about training; we can implement just the forward computation without tracking running stats. The harness compares outputs given same inputs. We can implement a simple instance norm: for each N and each C (num_features), compute mean and variance across spatial dimensions (D,H,W) and normalize. Since num_features is known from input shape, we can pass it or infer. We can make the op take input x and optional epsilon (default 1e-5). But we also need to handle the case where num_features is not known in op signature? Actually LazyInstanceNorm3d initializes after first forward; we can have the op accept the full tensor and compute per-channel statistics. We'll design a custom op that computes instance normalization. We'll include eps as an attribute.
+
+We need to decide on the kernel: instance norm 3D. Input shape: [batch, channels, depth, height, width]. We need to compute per sample per channel mean and variance across spatial dims. This is challenging on AscendC; we need efficient reduction. Could use Cube unit or vector. But to keep it simple, we can use a tile-based approach: process each sample and channel separately? That would be heavy. Better to leverage AscendC's built-in reduction operations? Alternatively, we can implement a kernel that uses a two-pass approach: first compute sum, then compute sum of squares. Since AscendC vector unit supports element-wise operations, we can compute mean and variance using reduction APIs like ReduceAdd. But we need to be careful with tiling over the spatial dimensions. Since spatial dimensions can be large, we can tile over the spatial dimension. But instance norm requires reducing over the entire spatial dimension per channel. We can use a combination of reduction across the tile and then combine. Might be complex.
+
+Given time constraints, we could implement a simpler version: treat the input as a 2D tensor where each row is a channel of a sample? Actually shape is [N, C, D, H, W]. We can reshape to [N*C, D*H*W] and compute per-row mean and variance. That reduces to a 2D problem: each row has length S = D*H*W. Then normalization: (x - mean) / sqrt(var + eps). If affine=False, no scaling. So the kernel can take a flat 2D input where rows = N*C, columns = spatial product. We can use a reduction along columns. AscendC supports ReduceAdd along a dimension with mask. We can implement a kernel that processes a contiguous region of rows? But we need per-row statistics. Could compute using tensor operations: for each row, compute sum and sum of squares by reducing using vector reductions? Possibly using the ReduceAdd API with a mask of all ones across spatial dimension? Not trivial.
+
+Maybe we can use a simpler approach: use the AscendC MatMul? No. Another idea: use built-in operator? But we need to write custom kernel. Since this is a replacement, we need numerical match. Given the complexity, we might consider using a combination of AscendC primitives: for a tile of rows, compute sum using ReduceAdd by loading the entire spatial dimension at once? But memory constraints: spatial product can be large (e.g., 16*32*32=16384, times batch*channels 512*32=16384, so total elements ~268M? Actually batch_size=512, channels=32 => 16384 rows, each row 16384 elements -> about 1GB. That's too large for on-chip memory. We need to tile both rows and columns. We can process rows in batches and for each row, tile the spatial dimension to accumulate sum and sum of squares. This requires per-row accumulation across tiles. Could use local memory for each row's mean and var accumulators. This is doable but complex.
+
+Given the example from memory, the kernel for leaky_relu was simple vector operations. For normalization, we need reductions. We can implement a kernel that uses the AscendC's "BatchNorm" style? But instance norm is per sample per channel; no batch dimension. However, we can treat each sample separately.
+
+Given the complexity, perhaps we can implement a fused op that internally uses multiple kernel invocations? But the instruction says "single fused custom op (or a small set)". We can implement one op that does the whole normalization. But the kernel code will be large. We'll attempt a tile-based implementation:
+
+- Input: GM x [N, C, D, H, W]
+- For each n and c, need mean and variance across D*H*W.
+- We can process for a loop over n and c, but that would be sequential per core? Better to parallelize across cores: assign each core a set of (n,c) pairs. Then for each assigned pair, the core reads the spatial tile by tile, computes partial sums, then final mean and var, then writes normalized output.
+
+We can compute sum and sumSq in local memory for each channel, but there could be many channels. We can allocate a temporary buffer in local memory for the current channel's sums? But we need to accumulate across tiles. We can use a reduction loop: for a given (n,c), we loop over the spatial dimension in tiles, accumulate sum and sumSq, then after the loop compute mean and var and normalize the entire row. That requires reading the row twice (first for accumulation, second for normalization). To save memory, we could store the tile of x in local memory, update sums, and then later re-read the same tile? That would be double bandwidth but simpler. We can use double buffering: read one tile, accumulate sums, then later after accumulation, read the same tile again from global memory? But we can avoid second read by storing the tile in local memory if it fits. The spatial product per row is up to 16384 elements (65536 bytes) which fits in UB (192KB). So we can load the entire row at once into local memory, compute mean/var, then normalize in-place. But we cannot load all rows at once because UB is limited. We can process one row at a time per core, i.e., for each assigned (n,c), load the whole row (spatial) into UB, compute sum, sumSq, mean, var, then transform the local buffer and write back. This is feasible: each row's spatial size <= 16384 floats = 64KB, fits in UB (192KB). So we can handle one row per core at a time. Then we can parallelize across cores by splitting the (n,c) pairs. That simplifies the kernel.
+
+Thus, algorithm per core:
+- Compute total rows = N*C.
+- blockDim = number of cores.
+- Each core processes rows at stride blockDim, starting at core_id.
+- For each row index idx = core_id + k*blockDim:
+  - Compute row offset in global memory: spatial size S = D*H*W.
+  - Read the entire row (S elements) into local buffer.
+  - Compute sum = reduce_add(x_local, all elements)
+  - Compute sumSq = reduce_add(x_local * x_local, all elements)
+  - mean = sum / S
+  - var = sumSq/S - mean*mean  (or use unbiased? Instance norm uses biased variance? PyTorch uses biased by default? Actually torch.nn.InstanceNorm uses biased variance (divides by number of elements) for the normalization. The formula: (x - mean) / sqrt(var + eps), var = 1/N * sum((x-mean)^2). So biased.
+  - Compute normalized: y_local = (x_local - mean) * rsqrt(var + eps)
+  - Write y_local back to global memory.
+
+This requires a reduction operation on the local vector. AscendC provides ReduceAdd with a mask that sums all elements? Typically ReduceAdd on a vector returns a scalar? Actually AscendC's Tensor operations: we can use ReduceAdd with a scalar reduction? There is AscendC::ReduceSum, which reduces along a dimension. But for a 1D tensor, we can do: float sum = ReduceAdd<float, float>(x_local, true) maybe? Need to check API. Alternatively, we can manually compute sum using vector operations: we can use a loop to add pairs, but that would be slow. Better to use the reduction API.
+
+AscendC has:
+- `ReduceSum` (for reduction along dimensions)
+- `VecReduceSum` for vector reduction to scalar.
+
+Given complexity, we can implement a simple loop that accumulates sum by iterating over the spatial dimension tile by tile? But we already have the whole row in local memory; we can use a simple loop over elements to compute sum? That would be O(S) but vectorized? We can use AscendC's vector addition: we can use a combination of ReduceAdd? Actually we can use `AscendC::ReduceSum` on the local tensor with axis = 0? But it returns a tensor of shape [1]. We can then get the scalar.
+
+I think it's acceptable to use a reduction loop in the kernel: for i in range(len) sum += x_local(i). Since the kernel runs on vector core, scalar code is still pipelined. But it's better to use vector reductions.
+
+Given the complexity of correct implementation and time, perhaps we can generate a kernel that uses a simpler approach but still works. However, the harness will test numerical match. We must ensure correctness.
+
+Let's design the kernel with the following steps per row:
+1. Load entire row into local tensor of size S.
+2. Compute sum using `AscendC::Muls` and `AscendC::ReduceAdd`? Actually we can compute sum by using `AscendC::ReduceSum` on the local tensor.
+3. Compute mean.
+4. Compute variance: first subtract mean from each element: `Sub(tmp, x_local, mean)`; then compute `Square(tmp)`, then `ReduceSum` to get sumSq (or we can compute sumSq separately). But we already computed sumSq from earlier? We can compute sumSq directly: `Mul(tmp, x_local, x_local)` then `ReduceSum`. But that would require two reduction calls. Alternatively compute mean then compute variance by subtracting mean and squaring and reducing again. Both okay.
+5. Compute denominator: `SqrtAdd` or use `Rsqrt(Add(Var, eps))`.
+6. Compute normalized: `Mul(Sub(x_local, mean), r_std)`.
+
+All these operations are vector operations of length S, which is fine.
+
+Reduction to scalar can be done using `AscendC::ReduceSum` which returns a vector of length 1. Then we can retrieve the scalar using `GetValue`.
+
+We'll need to handle the case where affine=False, so no scaling.
+
+Now, write the host tiling: tiling data includes totalLength (total number of elements), batch, channels, spatialSize, blockDim, eps.
+
+But since we are processing per row, we might not need totalLength in kernel; we need batch, channels, depth, height, width. Tiling should provide those. But we can compute from shape in kernel? The kernel receives totalLength and tileLength from tiling? In the example, they used totalLength and tileLength for 1D. For 3D, we need to pass the dimensions. We can pass batch, channels, depth, height, width as uint32_t in tiling. Also eps.
+
+We'll design TilingData with:
+- uint32_t batch
+- uint32_t channels
+- uint32_t depth
+- uint32_t height
+- uint32_t width
+- float eps
+
+Also we can compute blockDim from total rows / rows per block? But we can set blockDim arbitrarily (like number of cores available). For simplicity, we can use blockDim = 8 or 16.
+
+We also need to handle the case where the input may have zero-sized dimension? Not likely.
+
+Now, write the project JSON: define op with name "Ca6k04593Custom", inputs: x (float, ND), outputs: y (float, ND), attr: eps (float, default 1e-5), and optionally affine (bool, default false) but since affine=False in model, we can ignore.
+
+The kernel name in kernel_src should be "ca6k_04593_custom" as per task id.
+
+Now, produce the six strings.
+
+Let's start writing.
+
+First, project_json_src: list of one op object with fields: op (string), language (cpp), input_desc, output_desc, attr. We'll use the format from example but adjust.
+
+Second, host_tiling_src: define tiling data struct with fields.
+
+Third, host_operator_src: include tiling header, define InferShape, InferDataType, TilingFunc, and register op. Use REG_OP to avoid duplicate OP_ADD (as per memory 2). The TilingFunc should compute dimensions from shape and set tiling fields, set blockDim. We'll use GetInputShape(0) but use StorageShape to avoid errors (memory 1). We'll access shape dimensions via GetDim(). The shape is 5D: [N, C, D, H, W]. We'll set tiling.batch = N, etc. Also compute blockDim as number of rows (N*C) but cap to 24. We'll also set tiling.eps from attr.
+
+Fourth, kernel_src: include kernel_operator.h, define class with Init (receives tiling from GET_TILING_DATA), Process loops over rows. Use AscendC::GetBlockNum, GetBlockIdx. Use LocalTensor for row buffer. Use vec reduction functions. We'll need to include "kernel_operator.h" and maybe "reduce.h". We'll use AscendC::ReduceSum. We'll define a function to reduce a vector to scalar.
+
+Fifth, python_bind_src: wrap op using pytorch_npu_helper; call aclnnCa6k04593Custom.
+
+Sixth, model_src: import custom_ops_lib, define ModelNew that calls the custom op function.
+
+Now, produce code. Ensure variables are triple-quoted strings exactly.
+
+Let's write.

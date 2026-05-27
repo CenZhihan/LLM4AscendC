@@ -1,0 +1,146 @@
+We need to generate a fused AscendC custom operator to replace torch.affine_grid_generator operation in the reference model, with multiplication by scale. The operator should take theta (N x 2 x 3) and output a grid of shape (size) [N, 2, H, W] (since affine_grid_generator produces grid of shape (N, H, W, 2), but the reference multiplies by scale and returns that. Actually in reference:
+- Input theta: shape (num_batches, 2, 3) = (N,2,3)
+- size: list [num_batches, 2, height, width] but wait: affine_grid_generator expects size argument as (N, C, H, W) for 2D? Actually torch.affine_grid_generator(theta, size, align_corners) expects size as a list/tuple [N, C, H, W]? Documentation: size (torch.Size) – the target output image size. It should be of form (N, C, H, W) for 2D affine transformations. So size = [num_batches, 2, height, width] is valid. The output grid shape is (N, H, W, 2).
+Then grid = grid * scale (scalar multiplication).
+
+So the fused custom op: Input: theta (float, ND, shape (N,2,3)), scalar scale (float attribute), scalar align_corners (bool attribute). Output: grid (float, ND, shape (N, H, W, 2)). The kernel will compute affine grid generation in AscendC, then multiply by scale.
+
+We use kernel name: ca6k_00257_custom, operator name Ca6k00257Custom.
+
+We must follow the constraints and example format.
+
+Project JSON: define op with inputs: theta, and optional attributes: scale, align_corners, size? Actually size is not an attribute in the op definition; it's a parameter from init_inputs in the model. In the model, we can pass size via tiling data or store in the op? Usually the op itself doesn't need size, because the kernel computes based on output shape computed by InferShape. However, affine_grid_generator requires size (N, C, H, W) to know output grid dimensions. We could pass size as an attribute or compute from output shape. InferShape can set output shape to (N, H, W, 2) based on input theta and the size attribute. So we need size as an attribute: a list of 4 ints? But attributes in AscendC op definition are single values. We can define size as a list attribute? Actually the op definition supports "attr" of type "list_int" maybe? In the example, it showed float attribute. We can use a composite attribute? Possibly we can pass size via tiling data. Better approach: In model, we know size from init_inputs. We can set size as a field in tiling struct, passed from host tiling. But the kernel needs the size to compute grid. The tiling data will include N, H, W, scale, align_corners. Then InferShape can set output shape based on size attribute passed as list? Actually InferShape doesn't have access to tiling; it only has shape inference. We could set size as an attribute of type list_int with 4 elements. In op definition, we can declare size as an attr of type list of ints. Let's check AscendC op registry: it supports "list_int" for attributes. We'll use "size" as attr with type "list_int" and default value [8,2,256,256] maybe. But the model passes size from init_inputs, so we need to pass it to the op. Alternatively, we can define the op to take size as input? But the example only had one input. To keep it simple, we can make size an attribute of type list of ints. In host_operator, we'll define InferShape to get size attribute and set output shape accordingly: output shape (N, H, W, 2). In tiling, we'll also include N, H, W, C? Actually we only need H and W for output grid dimensions, and N from input theta shape. We'll compute grid in kernel.
+
+So we define attr: "size" (list int), "scale" (float), "align_corners" (bool). In TilingFunc, we read size attribute and set tiling fields: batch, height, width, scale, align_corners.
+
+Kernel: compute affine grid generation. The formula: For each output pixel (y,x), we compute source coordinates: x_src = theta[0][0]*x + theta[0][1]*y + theta[0][2], y_src = theta[1][0]*x + theta[1][1]*y + theta[1][2] (if align_corners is True, coordinates are normalized to [-1,1]? Actually standard affine_grid_generator in PyTorch: When align_corners=True, the grid coordinates are in [-1,1] for each dimension, mapping from output image coordinates. The transformation is: For output pixel (x_out, y_out) where x_out from 0..W-1, y_out from 0..H-1, we compute normalized coordinates: if align_corners: x_norm = (x_out/(W-1))*2 - 1, y_norm = (y_out/(H-1))*2 - 1; else: x_norm = ((x_out+0.5)/W)*2 - 1, y_norm = ((y_out+0.5)/H)*2 - 1. Then apply affine transform: x_src = theta[0][0]*x_norm + theta[0][1]*y_norm + theta[0][2]; y_src = theta[1][0]*x_norm + theta[1][1]*y_norm + theta[1][2]. The output grid is [x_src, y_src] for each pixel. So kernel must compute these for all H*W pixels per batch. Multiply by scale after generating grid.
+
+We'll implement kernel with tiling over H*W per batch to fit UB.
+
+Now we need to write all six strings.
+
+Let's start.
+
+Note: In the example, they used tensor names "x", "y". We'll use "theta" and "grid". Input descriptor: "theta" type float, format ND. Output: "grid" type float, format ND. Also need to provide shape inference: output shape (N, H, W, 2) where H,W from size attribute. But note: The reference model uses size = [num_batches, 2, height, width] as the size argument to affine_grid_generator, and the output grid shape is (N, H, W, 2). So we must set output shape accordingly.
+
+In host_operator, we'll use InferShape to read size attribute and set output shape. Also set blockDim and tiling.
+
+Tiling fields: batch (int32), height (int32), width (int32), totalPixels (int32 = batch*height*width*2? Actually we generate grid per pixel (2 floats), but we can process per pixel per batch. We'll split by pixel blocks. Tile size in terms of floats: each pixel produces 2 floats, so totalFloats = batch * height * width * 2. But we can tile over pixels (height*width) per batch. We'll have tiling fields: batch, height, width, scale, align_corners, tileLen (number of pixels per tile), totalPixels = batch*height*width.
+
+Kernel: For each block, we iterate over its assigned pixels, compute normalized coordinates, apply affine transform, then multiply by scale. Use Vector instructions? Most operations are element-wise arithmetic; we can use `VecMulScalar`, `VecAdd`, etc. But we need to compute normalized coordinates. We can precompute xnormalized and ynormalized arrays? That would be large. Better to compute per pixel sequentially using scalar arithmetic? But AscendC is vector processor; we can operate on tiles: load theta (2x3 = 6 floats) into local memory, then for each pixel compute source coordinates. But vectorization: we can compute for multiple pixels in parallel using vector operations. For a tile of pixels, we need arrays of x_out, y_out coordinates. We can generate x_out and y_out indices using a loop and store in local tensors. Then compute normalized coordinates: (x_out/(W-1))*2-1 using vector multiply/add. Then apply affine transform: result_x = theta00 * x_norm + theta01 * y_norm + theta02, similarly for y. This involves element-wise multiply and add. So we can do vector operations.
+
+But we must be careful with UB size. Tile length in pixels (N_pix) should be chosen such that we can store x_norm, y_norm, result arrays (each float). With double buffering, we need 2 tiles for input and output? Actually we only need input theta (constant per batch) and output grid. We can process pixel by pixel: For each batch, we load theta, then for each pixel compute and store directly to output. With tiling over pixels, we can stream pixels. Use one input queue for? We don't need to load from global for pixel coordinates; we generate locally. So we can just compute and write out. No need for CopyIn except maybe theta. Better: For each batch, load theta once, then for each tile of pixels, compute and store. We can use two buffers for output (double buffering) to hide latency. But since we generate data and write out, we can use a single output queue with double buffering.
+
+Simplify: kernel for each batch, loop over tiles of pixels. For each tile, we allocate local tensors for x_out values, y_out values, normalized x, normalized y, and result x,y. We'll compute sequentially using vec operations. We'll use `AscendC::DataCopy` for output.
+
+To reduce memory, we can compute one row at a time? But we need flexibility.
+
+Given the task is meant to be a custom kernel, we can implement a straightforward approach: for each pixel (h,w) compute in a nested loop using scalar operations? That might be slow but correct. However, we should use vector instructions where possible. We'll generate x_coords and y_coords using vec duplication: For a tile of K pixels, we can generate linear index array and compute coordinates. Since H*W can be large (256*256=65536), we can tile into chunks of e.g., 2048 pixels.
+
+We'll implement kernel as:
+
+- For each batchIdx (blockIdx < blockNum? but we'll distribute batches across blocks). Actually total work is batch*height*width. We can let each block handle a subset of pixels (grid-stride). BlockIdx selects a pixel range. Then for each pixel, compute.
+
+But to simplify, we can assign each block to a batch (if blockNum >= batch) or multiple batches per block. We'll use grid-stride over totalPixels.
+
+Let's design:
+
+Tiling data: totalPixels (batch*h*w), height, width, scale, align_corners. BlockDim: number of blocks used. Kernel: each block handles pixels from blockIdx * tileLen to ... using grid-stride. For each pixel, compute (batch index, h, w) from pixel index. Then compute normalized coordinates, apply affine transform, multiply by scale, store to grid[ (batch * H * W + h * W + w) * 2 + 0 ] = x_src*scale, grid[1] = y_src*scale.
+
+To avoid many global writes, we can buffer a local tile of pixels and write out in one shot using DataCopy.
+
+We'll implement with tileLen from tiling. Process tile: for i in 0..tileLen-1 (but we need pixel indices per tile). Use a loop to fill local arrays.
+
+Alternative: Use vector operations to compute all normalized coordinates for a tile at once. We can generate a ramp of pixel indices from 0 to tileLen-1 and compute h and w from that using modulo: h = (pixelIdx / width), w = pixelIdx % width. But that requires division, which is slow. Maybe better to loop over h and w rows? For each row, we can compute x_norm as a vector (w from 0..W-1). That might be more vector-friendly.
+
+We'll implement row-wise: For each block, iterate over batches assigned, then for each row h, compute all w in that row using vector operations. The tile size could be a row (width). So tileLen = width. That's simple. Then each block processes multiple rows/batches.
+
+So tiling: per row processing. blockNum = totalRows / some chunk. We'll set tileLen = width (number of columns). Then totalRows = batch * height. Each block handles some rows.
+
+Let's adopt row-wise approach.
+
+Thus kernel:
+
+- Get blockIdx, blockNum.
+- For rowIdx = blockIdx; rowIdx < totalRows; rowIdx += blockNum:
+    batch = rowIdx / height
+    h = rowIdx % height
+    Load theta for that batch (6 floats) from global.
+    For w in 0..W-1:
+        compute normalized coordinates (x_norm, y_norm) using scalar arithmetic.
+        compute x_src = theta00*x_norm + theta01*y_norm + theta02; similarly y_src.
+        multiply by scale.
+        store to output grid at positions (batch, h, w, 0) and (batch, h, w, 1).
+
+We can load theta as a small array of 6 floats from global memory.
+
+For better performance, we could precompute theta per batch but avoid repeated global reads. We'll cache in registers.
+
+Now implement.
+
+We must ensure the kernel compiles without floating-unsigned integer cast issues (memory 1). Use static_cast<float> when needed.
+
+Now write the code.
+
+Project JSON:
+
+```json
+[
+  {
+    "op": "Ca6k00257Custom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "theta",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "grid",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "size",
+        "param_type": "optional",
+        "type": "list_int",
+        "default_value": [8,2,256,256]
+      },
+      {
+        "name": "scale",
+        "param_type": "optional",
+        "type": "float",
+        "default_value": 0.5
+      },
+      {
+        "name": "align_corners",
+        "param_type": "optional",
+        "type": "bool",
+        "default_value": true
+      }
+    ]
+  }
+]
+```
+
+Host tiling: define struct with fields: totalRows (uint32_t), height (uint32_t), width (uint32_t), batch (uint32_t), scale (float), align_corners (int32_t, 0/1). Use direct member assignment (memory 2,3,4,5). Also include blockDim.
+
+Host operator: TilingFunc reads size attr, sets tiling fields. Also set blockDim based on totalRows.
+
+InferShape: set output shape (N, H, W, 2). N from input theta shape[0]? Actually input theta shape is (N,2,3). So N = shape[0]. Then H, W from size attribute. So output shape: [N, H, W, 2].
+
+Kernel: implement as described.
+
+Python bind: similar to example but for our op. Model: pass size as list, scale, align_corners as arguments to op. Use custom_ops_lib.
+
+Now write the six strings. Ensure no syntax errors. Use 4-space indentation in Python strings.
+
+We'll output exactly the code block.
+
+Let's write the complete answer.

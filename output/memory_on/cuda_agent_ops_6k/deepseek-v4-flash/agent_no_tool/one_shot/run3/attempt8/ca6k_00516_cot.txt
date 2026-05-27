@@ -1,0 +1,81 @@
+We need to fix the correctness failure where the kernel produces all-zero output. The logs show a warning "tiling struct [Ca6k00516CustomTilingData] is conflict with one in file ca6k00516_custom_tiling.h, line 5". This indicates a duplicate definition of the tiling struct. Also the output is all zeros, meaning the kernel is likely not executing correctly (maybe blockDim not set properly, or the kernel never runs due to tiling issues).
+
+From Memory 1: When correctness fails with all-zero output and a tiling struct conflict warning, do not define the tiling struct in both host and kernel files; instead define it in a single shared header and include consistently. But here we have a single kernel source file that includes "kernel_operator.h" and not the tiling header. The tiling struct is defined in the host_tiling_src (which is the tiling header) and also used in the kernel via GET_TILING_DATA macro. The warning suggests there might be a conflict because the same struct is defined in two translation units? Actually the warning from opc tool says "tiling struct [Ca6k00516CustomTilingData] is conflict with one in file ca6k00516_custom_tiling.h, line 5". That might be because the tiling header is included in multiple places. But the build succeeded.
+
+The main issue is correctness: all-zero output. That suggests either the kernel is not launched, or the kernel does nothing, or the tiling data is wrong. The kernel uses double loops over batch and groups, but uses scalar operations inside loops (reading each element via xLocal(i)). That is extremely slow and may cause timeout or incorrect behavior. But more importantly, the kernel does not properly handle tiling within a group: it computes sum and sumSq by iterating over spatial tiles, but it uses scalar access to LocalTensor which is not correct for AscendC. AscendC LocalTensor doesn't support index operator like that. You must use vectorized operations. The kernel uses xLocal(i) which is not valid. This would cause compilation error? The build succeeded, so maybe the compiler didn't catch it? Actually the kernel source is compiled as .cpp for kernel, and it might have compiled because the kernel operator framework may allow such indexing? I'm not sure. But the all-zero output suggests the kernel may not be producing output.
+
+Better approach: Use intrinsic vector operations for group normalization. However, given the constraints, we need a minimal fix. The previous attempt likely fails because the scalar indexing is unsupported at runtime. We need to rewrite the kernel to use AscendC vector instructions: compute mean and variance using vector reduction (Sum, ReduceMax? Actually we need sum of elements and sum of squares). AscendC provides vector reduction operations like ReduceSum. But to be safe and simple, we could perform group normalization by processing each group in a single pass using vectorized operations: first compute mean and variance by summation over spatial dimension, then normalize. However, the kernel as written uses scalar loops which would be extremely slow and might cause timeout or incorrect results due to unaligned access.
+
+Given the complexity, a more reliable approach: Use a simpler implementation that divides the work across blocks. But the reference kernel had blockDim=1. That might be okay.
+
+However, the error log shows all-zero output, which indicates the kernel's output buffer is never written. The kernel's Process() has loops but if tileLen_ is set to groupChannels_ * tileSpatial_ and groupChannels_ is maybe 1? But the kernel uses xGm_ with offset = (n * numChannels_ * spatialSize_) + (g * groupChannels_ * spatialSize_) + sp. That seems correct for data layout (NCHW). But the offset calculation might be wrong if sp is in spatial index, not byte offset? The DataCopy expects a start index in elements, not bytes. The offset in elements should be: n * C * H * W + g * groupChannels * H * W + c * H * W + h * W + w? No, the spatial index sp goes over all spatial positions. For each group, we need to access all channels and all spatial positions. The layout is NCHW: channel-major. So for a given group g, the channels are g*groupChannels to (g+1)*groupChannels-1. For each channel, we have H*W spatial positions. So the total number of elements for a group is groupChannels * H * W. The offset for group g in batch n should be: n * C * H * W + g * groupChannels * H * W. Then within that group, we need to tile over spatial positions? But the kernel tiled over spatial positions only, with tileSpatial_ being number of spatial elements (H*W). However, the group data is interleaved across channels: for each spatial position, the groupChannels are contiguous. So a tile of tileSpatial_ spatial positions will have groupChannels * tileSpatial_ elements. The offset within the group for spatial tile start sp is: g_offset + sp * groupChannels? No, because layout is (C, H, W), so for a fixed channel, spatial positions are contiguous. To get a block of groupChannels channels at a given spatial position, we need to extract non-contiguous data (channel stride = H*W). So the approach of tiling over spatial positions only is incorrect: the data for a given spatial position across channels is not contiguous. The correct tiling should be over channels within a group, and then over spatial elements. But the kernel attempts to copy groupChannels * tileSpatial_ contiguous elements starting at g_offset + sp. That would only be correct if spatial dimension is flattened after channels, which it's not. Actually, in NCHW, for a fixed batch and group, the data layout is: for each channel c in group, we have H*W elements. So the offset for channel index c within group is: base + c * H * W. So if we want to access a contiguous block of groupChannels * tileSpatial_ elements starting at some point, it would only be contiguous if we are taking a block from one channel's spatial area. The offset computation is wrong.
+
+Therefore, the kernel has a fundamental layout misunderstanding. The group normalization should be done per group per batch, but the data access pattern needs to account for channel-major layout. A simpler approach: use a single kernel that processes each element and normalizes using precomputed mean and variance per group. But that requires two passes or use of shared memory. Given the constraints, we might implement group normalization by first computing per-group statistics using a separate kernel? But the task is to fuse into one op.
+
+Given the complexity, I think the most practical fix is to use a single-pass kernel using AscendC's built-in vector operations, but that requires careful tiling. Instead, we could use a simpler kernel that processes one group at a time, computing mean and variance using vector reduction (e.g., ReduceAdd). However, AscendC's vector reduction is not straightforward.
+
+Alternative: We can use the host operator to call aclnnGroupNorm? No, the task is to implement a custom op.
+
+Given the circumstances, I suspect the main cause of all-zero output is the invalid scalar indexing (xLocal(i)). The AscendC kernel might silently produce zeros because the compiler generates incorrect code. Or the DataCopy might be copying incorrect lengths.
+
+Let's examine the tiling: tileSpatial_ is computed from UB budget divided by groupChannels. That gives number of spatial elements per tile. Then tileLen_ = groupChannels_ * tileSpatial_. In the first pass, we copy curTileLen elements from gmOffset. gmOffset is (n * numChannels_ * spatialSize_) + (g * groupChannels_ * spatialSize_) + sp. But note that sp is the spatial index, not multiplied by groupChannels. This offset is wrong: it should be n*C*spatial + g*groupChannels*spatial + sp? But that would be offset for the first channel of the group at spatial index sp? Actually, for a given batch, group, and spatial position sp (0...spatialSize-1), the element at channel c within group is at offset: n*C*spatial + (g*groupChannels + c)*spatial + (sp % spatialW? No, it's linearized as (channel * spatialSize + position). So for a fixed batch and group, the data for all spatial positions of a given channel is contiguous. To get a tile that covers multiple channels and multiple spatial positions, we need to copy a rectangular region, which is not contiguous in memory. So the current approach is fundamentally incorrect.
+
+Thus, the kernel must be completely rewritten to correctly handle group normalization on AscendC.
+
+Given the constraints of minimal and targeted changes, but considering the correctness failure is severe, we need to overhaul the kernel. However, the user wants minimal and targeted changes. Perhaps we can use a different approach: Instead of trying to tile across spatial and channels, we can process each group independently with a single vectorized pass that first computes mean/variance using a vector reduction (using ReduceAdd) and then normalizes. But we need to manage UB buffers.
+
+Let's think: For each group, we have groupChannels * spatialSize elements. We can load the entire group into a single buffer if it fits in UB. If not, we need to tile. Given N=512, C=3, H=320, W=320, groupChannels = 1 (since numGroups=3, C=3, each group has 1 channel). Wait, the reference: num_channels=3, num_groups=3, so groupChannels=1. That means each group is a single channel of size 320*320=102400. That's 102400 floats per group. UB budget is 192KB = 49152 floats. So a group's data (102400 floats) is larger than UB. We need to tile spatially. Since groupChannels=1, the data for a group is just one channel, contiguous in memory. So tiling over spatial positions is correct when groupChannels=1. But the kernel's offset logic was wrong because it added sp directly without considering channel stride. With groupChannels=1, the offset for channel index c within group: base + c * spatialSize. Since c = 0, the group data is exactly at base = n*C*spatial + g*1*spatial. Then for spatial tile start sp, the offset is base + sp. That is correct. So for groupChannels=1, the kernel's offset is fine: gmOffset = (n*C*spatial) + (g*1*spatial) + sp = n*C*spatial + g*spatial + sp. That reads contiguous block of tileSpatial elements. But the kernel copies groupChannels * tileSpatial = 1 * tileSpatial elements. That is correct. However, the scalar indexing xLocal(i) is still invalid.
+
+So the main issue is scalar indexing. We can replace scalar loops with vector operations. For sum and sumSq, we can use AscendC's ReduceSum to compute sum along a vector. But ReduceSum returns a scalar, we can use it.
+
+We can rewrite the first pass to use DataCopy into local tensor, then use ReduceAdd to compute sum and sumSq. But ReduceAdd works on vector of elements. We need sum of squares as well. We can compute element-wise square and then reduce.
+
+AscendC provides vector operations: Mul, Add, ReduceSum. We can do:
+
+AscendC::LocalTensor<float> xLocal = ...;
+// compute sum
+float tileSum = AscendC::ReduceSum(xLocal, curTileLen);
+sum += tileSum;
+// compute sumSq
+AscendC::LocalTensor<float> sqLocal = ...; // need temporary for squares
+AscendC::Mul(sqLocal, xLocal, xLocal, curTileLen);
+float tileSumSq = AscendC::ReduceSum(sqLocal, curTileLen);
+sumSq += tileSumSq;
+
+But we need a separate buffer for squares. We already have inQueueX and outQueueY. We can use an additional local temporary.
+
+Given the kernel uses only one buffer each for in and out, we can add a tmp buffer.
+
+Also, the second pass can use vectorized Sub and Mul, which we already have.
+
+Additionally, the kernel uses inQueueX for both passes, but after first pass we should free the tensor. The current code frees after each tile, which is okay.
+
+But note that in the first pass, we allocate xLocal, do scalar loop, then free. With vector ops, we need to allocate a separate tensor for squares. We can add a tmp queue.
+
+Also, the kernel uses GetBlockNum and GetBlockIdx? No, blockDim is 1. So it's single-core. That's fine for correctness.
+
+Now, let's fix the host_operator_src to set blockDim appropriately. Currently it sets blockDim=1. That's okay, but we might want to set higher for performance. However, we must ensure correctness first.
+
+The tiling structure: we need to include the header consistently. The warning about conflict suggests the tiling struct is defined in both host and kernel? Actually, the tiling header is included in the host operator cpp via "ca6k_00516_custom_tiling.h" (note underscore vs hyphen). The kernel does not include the tiling header; it uses GET_TILING_DATA macro which generates the struct definition from the tiling buffer. So there is no double definition. The warning might be from the opc tool seeing the same struct name in different files? It's not critical for correctness.
+
+The core fix is to rewrite the kernel's Compute method to use vector operations instead of scalar indexing. We must also correct the offset and tile lengths. Since groupChannels may be 1, the current offset is fine. But we should make it generic.
+
+Also, we need to recompute mean and variance using float arithmetic. The kernel currently uses float sum, sumSq, mean, var, invStd. That's fine.
+
+Now, we need to ensure the kernel compiles and runs correctly. We'll modify kernel_src to use vector operations.
+
+We'll also adjust the host_operator_src to set blockDim based on number of groups maybe, but keep 1 for simplicity.
+
+Let's produce the corrected six strings.
+
+Note: The previous attempt had host_operator_src missing the namespace closure for ge? It ends with "} // namespace ge" but there is no opening namespace? Actually it has "namespace ge { ... } // namespace ge". That is fine.
+
+One more issue: The host_operator_src includes "ca6k_00516_custom_tiling.h" but the tiling header defines Ca6k00516CustomTilingData (note capital C). The GET_TILING_DATA macro uses the same name. That is consistent.
+
+Now, we'll rewrite kernel_src with vectorized operations. We'll add a tmp buffer for squares. We'll use pipe_.InitBuffer for tmp queue.
+
+Let's write the new kernel.
+
+Also, we need to ensure epsilon is passed as float. The tiling_data.epsilon is float.
+
+Now, let's generate the final answer.

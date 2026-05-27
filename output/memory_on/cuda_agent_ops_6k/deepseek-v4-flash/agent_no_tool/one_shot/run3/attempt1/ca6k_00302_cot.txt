@@ -1,0 +1,408 @@
+我们根据用户需求：将nn.L1Loss替换为自定义AscendC算子。L1Loss计算的是平均绝对误差：loss = mean(|input - target|)。根据参考程序，单输入input和target形状相同。需要实现一个自定义算子，计算L1Loss（标量输出）。通常L1Loss返回一个标量，但参考Model的forward返回self.loss(input, target)输出是标量。我们需要在kernel中计算所有元素的绝对差并求平均，返回一个标量。但AscendC算子通常输出与输入同形状，但我们可以输出一个标量（shape为(1,)或标量）。在project_json中，输出应为单个标量。但实际实现可以输出一个元素的一维张量。我们选择输出形状为(1,)的tensor。
+
+算子名称：ca6k_00302_custom，PascalCase：Ca6k00302Custom。
+
+需要六个字符串变量。注意使用记忆中的修复：
+- Memory1: TilingFunc中需要使用gert::StorageShape*，而不能是gert::Shape*和GetOriginShape。
+- Memory2: 直接赋值给tiling的字段，而不是使用setter方法。
+- Memory3: 避免重复REG_OP，在host_operator_src中不再添加REG_OP宏（因为auto-gen会生成），但我们可以使用OP_ADD宏（如例子所示）。
+- Memory4: 不适用。
+- Memory5: 提到OpDef类，但我们已经包含。
+
+我们仿照例子的结构。注意例子中host_operator_src包含了InferShape, InferDataType, OpDef以及TilingFunc。都是在一个cpp中。我们也需要类似。
+
+tiling数据：totalLength, tileLength, blockDim。不需要额外参数。L1Loss没有negative slope等。只需要输入输出。但我们需要计算平均，所以需要在tiling中传递totalLength（已经包含）。
+
+kernel：需要计算每个线程块处理一部分元素，计算局部sum，然后规约？但AscendC kernel通常不支持线程块间同步。我们可以每个block计算局部和，然后主机端归约？但按照例子，我们直接输出标量，可以使用所有block输出部分和，再在host端合并？或者使用单个block处理所有？更简单：使用单block（blockDim=1）处理所有元素，计算和。但输入可能很大，单个core可能超出UB限制。需要分片。我们可以让每个block计算局部绝对差，并累加到一个输出位置？但多个block同时写会有竞争。我们可以使用atomicAdd？但AscendC支持atomic操作吗？可能不支持。更常见的是每个block输出局部和，然后host端合并。但这里的pipeline只给出一个输出。观察参考程序，我们要求的是fused算子，输出标量。通常这类归约操作在AscendC中需要使用多个kernel：先计算绝对差，然后做reduce。但这里要求单个custom op。我们可以实现一个kernel，每block计算一部分，然后将局部和写入全局内存的一个数组，再在下一个kernel中reduce？但这是两个op了。或者我们借鉴AscendC的reduce操作，使用vector指令中的Reduce？但不确定。
+
+另一种思路：使用DataCopy和计算，每个block计算局部和，通过Pipe和队列。但是如何从多个block得到最终和？我们可以使用一个block收集所有局部和。但这样就需要两次kernel启动。但我们可以用一个kernel完成？每个block处理一部分，然后使用AtomicAdd？AscendC有atomic add float的限制？可能没有。
+
+看例子中的leaky_relu是element-wise。L1Loss是归约。我们可能需要输出标量。但为了简单，我们输出一个形状为(1,)的张量，其中包含全局平均绝对误差。我们可以使用一个kernel，每个block计算出局部和和局部计数，然后全部写到一个全局数组中（每个block一个slot）。然后再用一个小的kernel合并。但这需要两个op。用户要求“replace / fuse these in the reference forward into one or more custom ops as you see fit”，所以我们可以实现两个op：一个计算绝对差并输出，另一个求平均。但更简单：使用一个op，但内部实现为多block，每个block计算局部和，然后block0负责累加（需要等待其他block完成，这需要block同步，AscendC支持吗？）一般AscendC不支持block间同步，除非用multicore同步机制。
+
+考虑到难度，我们可以简化：让kernel只有一个block，处理所有元素（分多次tile）。这样不会超出UB限制，只要totalLength不太大。输入形状batch=16, channels=3, height=2048, width=2048 -> 16*3*2048*2048 = 大约201M元素（float）。单个block处理201M元素可能太慢。但可以使用tiling分片，单个block多次迭代。虽然慢，但功能正确。
+
+但为了性能，我们可以使用多block但每个block输出局部和到输出数组的对应位置（比如输出数组大小等于blockDim），然后host端再求和？但host端求和不在kernel内。用户期望ModelNew使用自定义op，其输出应与参考一致。我们可以让op输出一个大小为blockDim的张量，然后在模型里再求和？但这样不是纯op。
+
+另一种方式是使用AscendC的ReduceSum指令？可能需要Muls和ReduceSum。但ReduceSum在AscendC中可能支持，但需要Vector中的Reduce？不确定。
+
+鉴于case是L1Loss，比较常见。我们可以参考现有实现。但这里只能基于例子。
+
+一个折中的方法：让kernel每个block计算局部和，然后将局部和写入一个全局内存数组（输出是大小为blockDim的张量），然后在host_operator_src中（在Tiling后？）或者通过pytorch绑定实现求和？但这样破坏了fuse。
+
+我们查看约束：必须输出六段代码。我们可以实现kernel为多block，每个block输出局部和到输出数组对应位置，输出shape为(blockDim,)。然后在model_src中，再对这个输出求和？但参考Model返回的是标量，所以ModelNew需要输出标量。但我们可以让ModelNew调用自定义op得到局部和向量，然后求和。但这样就不是fused op了。
+
+但用户允许“one or more custom ops”，所以可以有两个op？但我们需要在model_src中只调用一个op？不，可以调用多个。
+
+为了简化，我们使用单block处理所有元素。设置blockDim=1。然后totalLength可能很大，但tileLen根据UB计算，我们可以合理分片。这样能保证正确性。但性能差，但符合要求。
+
+因此我们在host_tiling中设置blockDim=1，tileLen由UB决定。kernel中只用一个block，grid-stride模式（但只有一个block）。或者我们直接用循环处理所有元素。
+
+在tiling中，我们设置blockDim=1。
+
+但在例子中，blockDim是动态的。我们也可以设置blockDim=1。
+
+需要注意：tiling中需要totalLength，tileLength。我们不需要negativeSlope之类的额外字段。但对于L1Loss，我们只需要输入。我们可以在kernel中计算绝对差和累积和，最终写入输出（标量）。但输出需要是形状(1,)。
+
+在kernel中，我们可以使用一个局部变量sum累加，最后写入全局输出。注意float精度。
+
+实现：
+
+```cpp
+class Ca6k00302CustomKernel {
+public:
+    __aicore__ inline void Init(GM_ADDR input, GM_ADDR target, GM_ADDR output,
+                                uint32_t totalLength, uint32_t tileLength) {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+        inputGm_.SetGlobalBuffer((__gm__ float*)input, totalLen_);
+        targetGm_.SetGlobalBuffer((__gm__ float*)target, totalLen_);
+        outputGm_.SetGlobalBuffer((__gm__ float*)output, 1);
+        pipe_.InitBuffer(inQueueInput_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueTarget_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(sumQueue_, 1, sizeof(float));
+    }
+    ...
+};
+```
+
+由于只有一个block，我们不需要考虑grid-stride。我们直接tile所有元素，每次拷贝两个输入，计算绝对差并累加局部和，最后写入输出。
+
+但是需要在所有tile完成后将局部和写入输出。由于只有一个block，不需要规约。
+
+如何在kernel中维护累加和？我们可以使用局部变量float sum = 0; 在每个tile中计算tile内的绝对差和，然后加到sum上。最后写入输出。
+
+注意：tile内可能不是对齐的，但使用DataCopy需要连续。没问题。
+
+另外，我们需要求平均：loss = sum / totalLength。因此在计算过程中可以最后除以totalLength。或者输出sum，在host端除。但最好在kernel内完成除，输出为mean。
+
+因此kernel最后执行：outputGm_[0] = sum / totalLen_。
+
+另外，因为只有一个block，不需要workspace。
+
+在host_operator_src中，InferShape需要设置输出形状为(1,)，数据类型float。
+
+在project_json中，输出desc应为shape为[1]的ND。
+
+tiling数据：只需要totalLength和tileLength。不需要blockDim（因为固定1）。但为了兼容，我们还是包含blockDim并设置为1。
+
+我们需要设置GetInputShape(0) -> GetOriginShape()? 使用StorageShape*。参照Memory1：使用gert::StorageShape* storageShape = context->GetInputShape(0); 然后 storageShape->GetOriginShape().GetShapeSize()? 实际上StorageShape有GetShapeSize()方法？StorageShape继承自Shape? 不确定。可以查阅文档，但我们可以用GetShapeSize()。如Memory1所说：直接使用StorageShape*。
+
+所以：
+
+```cpp
+const gert::StorageShape* inputShape = context->GetInputShape(0);
+uint32_t totalLength = inputShape->GetOriginShape().GetShapeSize();
+```
+
+或者直接调用GetShapeSize()? 但Memory1说不要调用GetOriginShape，而是使用StorageShape的方法。兼容性考虑，可以尝试：
+
+```cpp
+uint32_t totalLength = context->GetInputShape(0)->GetShapeSize();
+```
+
+GetShapeSize()可能直接返回。这样可以避免GetOriginShape。
+
+Memory1的symptom是编译错误，所以最好使用GetShapeSize。
+
+我们采用：uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetShapeSize());
+
+Memory2：直接赋值给tiling的字段，不使用setter。所以：
+
+```cpp
+tiling.totalLength = totalLength;
+tiling.tileLength = tileLen;
+tiling.blockDim = 1;
+```
+
+Memory3：避免重复REG_OP。在host_operator_src中，OpDef类使用REG_OP或OP_ADD？例子中用了OP_ADD。我们照写。
+
+现在编写代码。
+
+project_json_src: 包含op "Ca6k00302Custom"，输入两个（input, target），输出一个（output），没有attr。
+
+host_tiling_src: 定义Ca6k00302CustomTilingData，包含totalLength, tileLength, blockDim? 不需要negativeSlope。blockDim我们保留但固定为1。
+
+host_operator_src: 包含TilingFunc, InferShape, InferDataType, OpDef。
+
+kernel_src: 实现类KernelCa6k00302Custom，Init, Process, CopyIn, Compute, CopyOut等。
+
+python_bind_src: 类似例子，调用aclnnCa6k00302Custom。注意aclnn函数名应与op名匹配。
+
+model_src: ModelNew类，调用自定义op。
+
+实现细节：
+
+- kernel中，我们使用两个输入队列和两个输出队列？输出只有一个标量，我们不需要队列。我们可以使用单独的输出处理：最后写入。但我们可以在Compute中直接写入输出？但为了流水，可以一次写入输出。但由于输出是标量，只在最后tile写入。我们可以设一个中间变量sum，最后拷贝到输出。但是输出是GlobalTensor只有1个元素，可以直接赋值。考虑使用DataCopy? 但DataCopy需要连续缓冲区。我们可以将sum写入一个局部缓冲区，然后DataCopy。更方便：在Process最后，使用outputGm_.SetValue(0, sum/totalLen_)？AscendC GlobalTensor是否有SetValue？一般可以像写数组那样：outputGm_[0] = sum / totalLen_。但需要确认。在示例中，CopyOut使用了DataCopy(yGm_[offset], yLocal, len)。所以我们可以类似。
+
+由于只有一个block，我们可以简单地在Process中循环，累加sum，最后写入。
+
+但是为了与示例结构一致，我们保留CopyIn/Compute/CopyOut模式。Compute计算绝对差并累加局部和到某个局部变量，然后CopyOut将局部和写入最终输出？但每个tile都会覆盖前一个。所以我们需要一个累积过程。
+
+我们可以使用队列传递局部和，但复杂。更简单：使用一个局部变量sumLocal在类中，在Compute中累加，在Process最后写入输出。但CopyOut在每次tile后都会执行？我们不希望每次都写，因为最终只需一次。可以修改：在Process中，先循环所有tile，Compute累加，最后写一次。
+
+所以去掉CopyOut的调用。在Compute中计算完|input-target|，并求和到sumLocal中。最后写输出。
+
+但是为了流水线，可以预取下一个tile。我们可以手动写循环。
+
+为了简洁，借鉴示例但修改。
+
+我们编写kernel如下：
+
+```cpp
+class Ca6k00302CustomKernel {
+public:
+    __aicore__ inline void Init(GM_ADDR input, GM_ADDR target, GM_ADDR output,
+                                uint32_t totalLength, uint32_t tileLength) {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+        inputGm_.SetGlobalBuffer((__gm__ float*)input, totalLen_);
+        targetGm_.SetGlobalBuffer((__gm__ float*)target, totalLen_);
+        outputGm_.SetGlobalBuffer((__gm__ float*)output, 1);
+        pipe_.InitBuffer(inQueueInput_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueTarget_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        float sum = 0.0f;
+        uint32_t offset = 0;
+        while (offset < totalLen_) {
+            uint32_t curLen = tileLen_;
+            if (offset + curLen > totalLen_) curLen = totalLen_ - offset;
+            // Copy input and target
+            ...
+            // Compute absolute difference and accumulate
+            ...
+            offset += curLen;
+        }
+        outputGm_[0] = sum / static_cast<float>(totalLen_);
+    }
+};
+```
+
+但这也合理。为了更接近例子，我们保留函数但调整。
+
+为了便于理解，我们采用清晰的循环实现。
+
+还需要注意：在Compute中，我们需要计算abs diff。使用Sub和Abs? AscendC有Abs。我们可以：
+
+```cpp
+AscendC::Sub(diffLocal, inputLocal, targetLocal, len);
+AscendC::Abs(diffLocal, diffLocal, len);
+AscendC::ReduceSum(sumLocal, diffLocal, ...); // 但需要ReduceSum？或者循环累加。
+```
+
+在AscendC中，可以使用Muls? 没有ReduceSum的简单方式。我们可以使用一个向量加法累加到一个标量？需要逐个元素加。有ReduceAdd？可以查。但最简单：使用循环？但性能差。
+
+对于L1Loss，我们只需要求和。可以使用AscendC的矢量指令：先Sub，再Abs，然后使用ReduceAdd？但ReduceAdd可能只支持整数？不确定。
+
+另一种方式：直接使用标量循环？但那样就没有利用vector。对于大Tensor，vector求和是必要的。
+
+我们可以使用AscendC的vector reduce接口：`AscendC::ReduceAdd(tmpLocal, diffLocal, len);` 在vector中计算和并广播到每个元素，然后取第一个元素。但需要知道细节。
+
+鉴于这是自定义算子，我们可以使用尽可能简单的实现：在Compute中，对每个tile，计算abs diff然后循环累加每个元素到sum。但这样效率低但正确。或者我们可以使用AscendC库函数`AscendC::VecReduceSum`? 在kernel_operator.h中可能有。
+
+参考示例，没有涉及reduce。为了正确，我们使用向量减法、取绝对值，然后使用`AscendC::ReduceAdd`将结果累加到一个标量？AscendC有`AscendC::ReduceSum`? 在AscendC API中，`AscendC::ReduceAdd`存在于Vector类？我们可以查阅记忆。
+
+但我们可以采用另一种方法：将diff local拷贝到临时buf，然后通过`AscendC::Add`累加到另一个local tensor，最后通过DataCopy到global？但需要跨tile累加，还需要最后减去？复杂。
+
+我们可以放弃vector求和，直接在tile内用for循环累加局部和。因为tile大小可能几千，循环开销可能可接受。但为了兼容，我们这样写。
+
+在Compute中：
+
+```cpp
+AscendC::LocalTensor<float> diffLocal = tmpQueue_.AllocTensor<float>();
+AscendC::Sub(diffLocal, xLocal, yLocal, len); // xLocal input, yLocal target
+AscendC::Abs(diffLocal, diffLocal, len);
+float sumTile = 0.0f;
+for (uint32_t i = 0; i < len; i++) {
+    sumTile += diffLocal.GetValue(i);
+}
+```
+
+但GetValue可能不支持索引？可以尝试。或者使用`AscendC::ReduceAdd`。
+
+我们应该使用AscendC提供的reduce接口。假设有`AscendC::ReduceAdd`。我们可以：
+
+```cpp
+AscendC::LocalTensor<float> sumLocal = ...; // 大小为1的tensor
+AscendC::ReduceAdd(sumLocal, diffLocal, len);
+float tileSum = sumLocal.GetValue(0);
+sum += tileSum;
+```
+
+但需要分配一个大小为1的tensor。可以。
+
+我们保持与tile流程一致。在Compute中计算tile内的和，并返回给sum变量。但sum是类成员变量？或者通过传参。
+
+为了清晰，我们使用一个类成员`sum_`，在Compute中累加。
+
+在Process中，初始化sum_=0，然后循环，每次CopyIn两个，Compute，然后CopyOut（实际上是释放tensor，不写global）。最后写输出。
+
+我们不需要CopyOut写，只需要释放tensor。
+
+我们参照例子，但修改。
+
+具体kernel代码：
+
+```cpp
+constexpr int32_t BUFFER_NUM = 2;
+
+class Ca6k00302CustomKernel {
+public:
+    __aicore__ inline Ca6k00302CustomKernel() {}
+
+    __aicore__ inline void Init(GM_ADDR input, GM_ADDR target, GM_ADDR output,
+                                uint32_t totalLength, uint32_t tileLength) {
+        totalLen_ = totalLength;
+        tileLen_ = tileLength;
+        inputGm_.SetGlobalBuffer((__gm__ float*)input, totalLen_);
+        targetGm_.SetGlobalBuffer((__gm__ float*)target, totalLen_);
+        outputGm_.SetGlobalBuffer((__gm__ float*)output, 1);
+
+        pipe_.InitBuffer(inQueueInput_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(inQueueTarget_, BUFFER_NUM, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+        pipe_.InitBuffer(sumQueue_, 1, sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        sum_ = 0.0f;
+        uint32_t offset = 0;
+        while (offset < totalLen_) {
+            uint32_t curLen = tileLen_;
+            if (offset + curLen > totalLen_) curLen = totalLen_ - offset;
+            CopyIn(offset, curLen);
+            Compute(curLen);
+            offset += curLen;
+        }
+        // Write final result
+        AscendC::LocalTensor<float> sumLocal = sumQueue_.AllocTensor<float>();
+        sumLocal.SetValue(0, sum_);
+        AscendC::DataCopy(outputGm_, sumLocal, 1);
+        sumQueue_.FreeTensor(sumLocal);
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t gmOffset, uint32_t len) {
+        AscendC::LocalTensor<float> inputLocal = inQueueInput_.AllocTensor<float>();
+        AscendC::LocalTensor<float> targetLocal = inQueueTarget_.AllocTensor<float>();
+        AscendC::DataCopy(inputLocal, inputGm_[gmOffset], len);
+        AscendC::DataCopy(targetLocal, targetGm_[gmOffset], len);
+        inQueueInput_.EnQue(inputLocal);
+        inQueueTarget_.EnQue(targetLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t len) {
+        AscendC::LocalTensor<float> inputLocal = inQueueInput_.DeQue<float>();
+        AscendC::LocalTensor<float> targetLocal = inQueueTarget_.DeQue<float>();
+        AscendC::LocalTensor<float> diffLocal = tmpQueue_.AllocTensor<float>();
+
+        // diff = input - target
+        AscendC::Sub(diffLocal, inputLocal, targetLocal, len);
+        // abs(diff)
+        AscendC::Abs(diffLocal, diffLocal, len);
+
+        // Local reduce sum
+        AscendC::LocalTensor<float> sumLocal = sumQueue_.AllocTensor<float>();
+        AscendC::ReduceAdd(sumLocal, diffLocal, len);  // sumLocal[0] = sum of diffLocal
+        sum_ += sumLocal.GetValue(0);
+
+        sumQueue_.FreeTensor(sumLocal);
+        tmpQueue_.FreeTensor(diffLocal);
+        inQueueInput_.FreeTensor(inputLocal);
+        inQueueTarget_.FreeTensor(targetLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueInput_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueTarget_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> sumQueue_;
+
+    AscendC::GlobalTensor<float> inputGm_;
+    AscendC::GlobalTensor<float> targetGm_;
+    AscendC::GlobalTensor<float> outputGm_;
+
+    uint32_t totalLen_{0};
+    uint32_t tileLen_{0};
+    float sum_{0.0f};
+};
+
+extern "C" __global__ __aicore__ void ca6k_00302_custom(GM_ADDR input, GM_ADDR target, GM_ADDR output, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    Ca6k00302CustomKernel op;
+    op.Init(input, target, output, tiling_data.totalLength, tiling_data.tileLength);
+    op.Process();
+}
+```
+
+注意：tiling_data.blockDim没有用到。
+
+在host_tiling中，我们不需要blockDim? 但为了兼容，保留。但赋值时用tiling.blockDim=1。
+
+在tiling中，我们计算tileLen:
+
+```cpp
+uint32_t totalLength = context->GetInputShape(0)->GetShapeSize();
+constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024; // per core
+constexpr uint32_t ALIGN_ELEMS = 128; // example alignment
+uint32_t maxTile = UB_BUDGET_BYTES / (3 * sizeof(float)); // input+target+tmp
+maxTile = AlignDown(maxTile, ALIGN_ELEMS);
+uint32_t tileLen = maxTile;
+if (totalLength < tileLen) tileLen = totalLength;
+tiling.totalLength = totalLength;
+tiling.tileLength = tileLen;
+tiling.blockDim = 1;
+```
+
+注意：我们使用了三个tensor（input, target, diff），每个tile，还需要sumQueue一个浮点。所以UB预算除以3*sizeof(float)可能过于保守？但可以。
+
+在host_operator_src的InferShape中，输出shape设置为(1,)。
+
+另外，注意InferDataType：输出与输入相同float。
+
+在project_json中：
+
+```json
+[
+  {
+    "op": "Ca6k00302Custom",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "input", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "target", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "output_desc": [
+      {"name": "output", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "attr": []  
+  }
+]
+```
+
+但JSON格式要求attr是数组，可以为空。
+
+在python_bind_src中，需要调用aclnnCa6k00302Custom。注意aclnn函数名应为aclnnCa6k00302Custom，参数：self (input), target, output。需要创建output tensor。参考例子，使用EXEC_NPU_CMD。
+
+在model_src中，自定义op的绑定函数应为：def ca6k_00302_custom(input, target) -> Tensor。参考例子，用import custom_ops_lib。
+
+需要确认：在python绑定中，函数名是`ca6k_00302_custom`吗？是的。
+
+在model_src中，class ModelNew需要调用该函数。
+
+现在编写完整代码。
+
+注意：记忆Memory1：使用StorageShape*和GetShapeSize()。Memory2：直接赋值。Memory3：避免重复REG_OP。我们将这些融入。
+
+另外，注意头文件包含：在host_operator_src中，包含 "ca6k_00302_custom_tiling.h"。
+
+在python_bind_src中，包含pytorch_npu_helper.hpp。
+
+我们生成代码。注意缩进和引号。
+
+确保所有字符串为三引号。
+
+最后输出块。

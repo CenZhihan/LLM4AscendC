@@ -13,8 +13,12 @@ from dataclasses import dataclass
 
 DEFAULT_EVAL_TIMEOUT_SEC = 1200
 EVAL_TIMEOUT_ENV = "LLM4ASCENDC_EVAL_TIMEOUT_SEC"
+DEFAULT_EVAL_PIPELINE_TIMEOUT_SEC = 3600
+EVAL_PIPELINE_TIMEOUT_ENV = "LLM4ASCENDC_EVAL_PIPELINE_TIMEOUT_SEC"
 # Align with GNU timeout(1) exit code for agent synthetic JSON.
 EXIT_CODE_EVAL_TIMEOUT = 124
+# Agent outer subprocess (eval_operator / eval_cuda_agent_operator whole pipeline).
+EXIT_CODE_PIPELINE_TIMEOUT = 125
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,82 @@ def resolve_eval_timeout_sec(cli_value: int | None = None) -> float | None:
     if raw <= 0:
         return None
     return float(raw)
+
+
+def resolve_eval_pipeline_timeout_sec(cli_value: int | None = None) -> float | None:
+    """
+    Resolve whole eval-operator subprocess wall-clock timeout (seconds).
+
+    Covers msopgen/build/install/pybind/eval inside eval_*_operator.py.
+
+    Priority: CLI --eval-pipeline-timeout > LLM4ASCENDC_EVAL_PIPELINE_TIMEOUT_SEC > DEFAULT (3600).
+    Values <= 0 disable the outer timeout (debug only).
+    """
+    if cli_value is not None:
+        raw = cli_value
+    else:
+        env_raw = os.environ.get(EVAL_PIPELINE_TIMEOUT_ENV, "").strip()
+        if env_raw:
+            try:
+                raw = int(env_raw)
+            except ValueError:
+                raw = DEFAULT_EVAL_PIPELINE_TIMEOUT_SEC
+        else:
+            raw = DEFAULT_EVAL_PIPELINE_TIMEOUT_SEC
+    if raw <= 0:
+        return None
+    return float(raw)
+
+
+def warn_if_pipeline_timeout_lt_eval(
+    *,
+    eval_timeout_sec: int | None,
+    eval_pipeline_timeout_sec: int | None,
+) -> None:
+    eval_t = resolve_eval_timeout_sec(eval_timeout_sec)
+    pipe_t = resolve_eval_pipeline_timeout_sec(eval_pipeline_timeout_sec)
+    if eval_t is not None and pipe_t is not None and pipe_t < eval_t:
+        print(
+            f"[WARN] eval-pipeline-timeout ({pipe_t}s) < eval-timeout ({eval_t}s); "
+            "outer timeout may fire before inner spec.py eval timeout."
+        )
+
+
+def run_subprocess_rc(
+    cmd: list[str],
+    *,
+    cwd: str | pathlib.Path,
+    env: dict[str, str] | None = None,
+    timeout_sec: float | None = None,
+) -> int:
+    """
+    Run a subprocess and return its exit code (no exception on non-zero rc).
+
+    When timeout_sec is set, uses start_new_session + killpg so grandchildren
+  (msopgen, cmake, TBE) are terminated. On timeout returns EXIT_CODE_PIPELINE_TIMEOUT.
+    """
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    use_timeout = timeout_sec is not None and timeout_sec > 0
+    popen_kw: dict = {
+        "cwd": str(cwd),
+        "env": merged_env,
+    }
+    if use_timeout:
+        popen_kw["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **popen_kw)
+    try:
+        if use_timeout:
+            try:
+                return int(proc.wait(timeout=float(timeout_sec)))
+            except subprocess.TimeoutExpired:
+                _kill_process_group(proc)
+                return EXIT_CODE_PIPELINE_TIMEOUT
+        return int(proc.wait())
+    finally:
+        if proc.poll() is None:
+            _kill_process_group(proc)
 
 
 def _kill_process_group(proc: subprocess.Popen[str]) -> None:

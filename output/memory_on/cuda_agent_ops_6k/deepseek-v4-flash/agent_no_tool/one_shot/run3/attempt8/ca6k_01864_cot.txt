@@ -1,0 +1,97 @@
+我们分析一下问题：之前的尝试编译成功，但输出全零，表示kernel没有正确执行。从eval log中看到："New output: tensor([[[0., 0., 0., ..., 0., 0., 0.], ...]]", 意味着kernel输出全零。可能原因：kernel没有正确读取输入或计算；或者tiling数据没有正确传递。
+
+注意到kernel签名是`extern "C" __global__ __aicore__ void ca6k_01864_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR bias_conv, GM_ADDR bias_ext, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)`，但Init中使用了`GET_TILING_DATA(td, tiling);`这是正确的。但问题可能在于kernel没有正确访问GM_ADDR指针？或者GetBlockIdx()没有得到正确的值？或者计算逻辑本身有错误。
+
+另外注意到一个细节：在kernel中，我们使用`GetBlockIdx()`来分配不同的输出通道c_out_。但在host tiling中设置了`blockDim = C_out`，即每个核处理一个输出通道。但是循环里`for (uint32_t n = 0; n < N_; ++n)`，意味着每个核处理所有batch？不对，应该是每个核处理该输出通道的所有batch。这是合理的：每个核处理一个输出通道的所有batch，但是这会使得每个核的工作量较大。但问题不在这。
+
+可能的问题：host operator的TilingFunc中，`context->SetBlockDim(blockDim);`设置blockDim为C_out，但是kernel中`GetBlockIdx()`返回的值可能大于C_out？不一定，因为blockDim就是C_out，所以每个核处理一个通道，但如果C_out大于实际可用的核数怎么办？Ascend会根据硬件调度，blockDim是建议的核数，实际可能少于blockDim。但这里我们期望通过stride pattern实现每个核处理一个通道，但若实际核数少于C_out，有些通道会未被处理，造成输出全零？但输出全零，可能是所有核都不工作？
+
+另一种可能是tiling data传递有问题：在kernel Init中使用了`GET_TILING_DATA(td, tiling);`，但tiling结构体在host和kernel的命名要一致，注意warning: "tiling struct [Ca6k01864CustomTilingData] is conflict with one in file ca6k01864_custom_tiling.h, line 5"。这个warning表明存在重复定义。实际上在host_tiling_src中定义了tiling data类，在kernel_src中又include了同一个头文件，但可能因为链接重复导致问题？不过warning只是警告，通常不会引起全零输出。
+
+更可能的问题是：我们使用了`AscendC::LocalTensor<float> yLocal = outBuf_.AllocTensor<float>();`，然后通过`SetValue`和`GetValue`逐个元素操作。这种方式效率低但功能上应该正确。但是AscendC的LocalTensor的SetValue/GetValue每次访问可能没有内存同步？但应该没问题。
+
+另一个可疑点：kernel中计算`int32_t pos = static_cast<int32_t>(tileStart + p) * stride_ - padding_ + static_cast<int32_t>(k);`，如果pos超出范围则跳过。但可能所有pos都超出导致没有累加？需要检查L_in, L_out, stride, padding等参数。在Model中，conv_transpose的参数：in_channels=3, out_channels=16, kernel_size=3, stride=2, padding=1, output_padding=1, L_in=16384。计算L_out = (16384-1)*2 - 2*1 + (3-1) + 1 + 1 = 16383*2 -2 +2 +1+1 = 32766 -2 +2 +1+1 = 32768? 计算：16383*2=32766, -2=32764, +2=32766, +1=32767, +1=32768。所以L_out=32768。对于每个输出位置tileStart+p，pos = (tileStart+p)*2 -1 + k，k从0到2。pos范围从-1到L_in-1? 实际上padding=1，所以pos = 2*(tileStart+p) -1 + k。tileStart+p从0到L_out-1=32767。当tileStart+p=0时pos = -1 + k，k=0,1,2 => pos = -1,0,1。所以只有pos=0和1在范围内。所以应该能采集到输入。所以计算应该没问题。
+
+但输出全零，可能因为某些原因根本没有进入循环？例如c_out_ >= C_out_时直接return。但blockDim=C_out=16，每个核的c_out_由GetBlockIdx()分配，如果实际核数大于等于16，则所有通道都被覆盖；如果实际核数小于16，则有些通道未被覆盖，但输出全零意味着完全没有输出（因为输出tensor初始化为0？但我们在kernel中写入了yGm_，如果某些核没运行，那些位置保持0。但全零输出表明没有任何核写入。可能实际核数大于0，但所有核的c_out_都误判为>=C_out_？不太可能。
+
+另一个可能：AscendC的GM_ADDR指针是直接物理地址，但我们在Init中分配GlobalTensor时假设了总大小，但可能因为tiling数据未正确传递导致totalLength等计算错误。但我们在Init中从tiling读取了所有字段，应该没问题。
+
+还有一种可能：在kernel中，我们使用了`AscendC::LocalTensor<float> yLocal = outBuf_.AllocTensor<float>();`，然后循环中SetValue和GetValue，最后FreeTensor。但`outBuf_`是一个`TQue<TPosition::VECCALC, 1>`，只能存放一个tensor，我们每次循环Alloc和Free，可能由于没有正确EnQue/DeQue导致问题。实际上，对于VECCALC位置的queue，通常用于计算中间变量，AllocTensor直接从缓存分配，FreeTensor释放。但这种方式是否允许在同一个queue上多次Alloc/Free？应该是可以的，但每次Alloc会分配新的内存，如果之前Free了，应该可以。但注意`outBuf_`的Init只分配了`tileLen_ * sizeof(float)`的缓冲区，但`AllocTensor`每次返回相同地址？AscendC的TQue用法：通常对于VECCALC，只使用一个缓冲区，直接AllocTensor后使用，FreeTensor后可以再次Alloc。所以这里没有问题。
+
+也许更根本的原因是kernel没有正确导出？编译成功但运行时加载失败？但eval中显示new output全零，说明kernel被调用了但输出全零。
+
+考虑可能是bias_conv和bias_ext的shape问题：在Model中，bias_conv是nn.ConvTranspose1d自带的bias，默认为True？检查nn.ConvTranspose1d默认bias=True，但Model中未设置bias=False，所以卷积层有一个bias参数，shape为(out_channels,)。另外还有一个额外的bias_ext = nn.Parameter(torch.randn(bias_shape))，其中bias_shape=(out_channels,1)。所以总共有两个bias。在fused op中，我们将它们作为两个输入。但是在模型forward中，我们调用了`self.conv_transpose(x)`后再加`self.bias`。conv_transpose的输出shape为(batch_size, out_channels, L_out)，然后加上bias，bias shape为(out_channels,1)，广播。所以fused op应该实现：y = conv_transpose(x, weight, bias_conv) + bias_ext。注意bias_ext的shape是(out_channels,1)，但我们将其展平为(out_channels,)。在python_bind中我们传入bias_conv和bias_ext，kernel内计算biasSum = biasConvGm_.GetValue(c_out_) + biasExtGm_.GetValue(c_out_)。这是正确的。
+
+但问题可能出在输入tensor的layout：在Ascend上，ND格式是NCHW？对于1D，相当于NCL。我们的输入x shape是(N, C, L)，权重weight shape是(C_in, C_out, kernel_size)（注意nn.ConvTranspose1d的weight shape是(out_channels, in_channels, kernel_size)，但我们在Model中创建的是nn.ConvTranspose1d，默认weight shape是(out_channels, in_channels, kernel_size)。但之前我们自己在model_src中创建了weight parameter shape为(in_channels, out_channels, kernel_size)，这不对！torch.nn.ConvTranspose1d的weight shape是(out_channels, in_channels, kernel_size)。我们手动创建的weight参数形状必须匹配。在model_src中，我们写的是`self.weight = torch.nn.Parameter(torch.randn(in_channels, out_channels, kernel_size))`，这颠倒了。应该是`out_channels, in_channels, kernel_size`。这会导致kernel访问weight时维度错误，从而输出全零或错误。但eval log显示reference output有非零值，而new output全零，说明自定义kernel输出全零，可能由于weight读取错误导致计算错误。
+
+另外，在host operator的InferShape中，我们使用`weight_shape->GetDim(1)`作为C_out，而weight_shape在project JSON中定义为ND，假设shape是(C_in, C_out, kernel_size)？实际上，我们需要统一约定：在project JSON中，weight的shape是什么？根据我们的project_json，weight的输入描述是ND，type float，但没有指定shape。通常host operator可以根据实际输入shape推断。但我们在InferShape中假设weight的dim是[0]是C_in, [1]是C_out, [2]是kernel_size？但是torch的conv_transpose weight shape是(out_channels, in_channels, kernel_size)。所以我们需要保持一致。在host operator中，我们使用weight_shape->GetDim(1)作为C_out，但在权重shape中，dim 1应该是in_channels。所以推断错误。但InferShape主要用于输出shape，但我们的InferShape中计算L_out时用到了C_out和kernel_size。如果权重shape传递的是(out_channels, in_channels, kernel_size)，那么weight_shape->GetDim(0)是out_channels, GetDim(1)是in_channels, GetDim(2)是kernel_size。但我们错误地将GetDim(1)当作C_out，导致C_out为in_channels=3，而不是16。同时L_out计算中用到kernel_size正确，但C_out错了可能影响后续？但输出shape的C_out来自权重shape的dim 1? 实际上输出shape应该是(N, C_out, L_out)，而C_out = out_channels = weight_shape->GetDim(0)。所以这里我们犯错了。
+
+综上，根本原因是对weight shape的维度和conv_transpose的约定不一致。在AscendC中，我们需要明确weight的shape是(C_out, C_in, kernel_size)。我们在host operator和kernel中必须按此约定访问。
+
+此外，在kernel中我们使用`weightGm_.SetGlobalBuffer((__gm__ float*)weight, C_in_ * C_out_ * kernel_size_);`，这里顺序是C_in*C_out*kernel_size，但权重实际存储是C_out*C_in*kernel_size。所以索引需要调整。在kernel循环中，我们获取权重值：`weightGm_.GetValue(c_in * C_out_ * kernel_size_ + c_out_ * kernel_size_ + k)`。假设权重存储是C_out * C_in * kernel_size，那么索引应该是`(c_out_ * C_in_ + c_in) * kernel_size_ + k`。所以我们的索引公式错误。
+
+还有bias_conv的shape是(C_out,)，我们使用biasConvGm_.GetValue(c_out_)正确。
+
+bias_ext我们展平后也是(C_out,)，也正确。
+
+但weight索引错误会导致计算结果为噪声，甚至全零（如果全部超出范围）。由于权重存储顺序错误，我们可能读取到错误的权重值（可能为零或其他值），但输出全零说明可能读取到的权重都为零？也可能是因为C_in_和C_out_混淆导致循环范围错误。例如，c_in循环从0到C_in_，但C_in_可能被设为3（因为之前错误地取了weight的dim 1），而实际C_in应该是3（因为输入x的C_in是3），但这个一致？实际上，输入x的C_in是3，weight的C_in也是3（因为out_channels=16 ）。所以C_in_=3正确（来自x的dim1）。而C_out_应该是16，但我们在Init中从tiling读取的C_out_是使用weight_shape->GetDim(1)得到的，可能错误地设为3（因为weight_shape dim1是C_in）。所以C_out_=3，导致总输出通道只有3个而不是16。而每个核的c_out_索引范围0~2，只处理前3个通道，其他通道保持0。同时因为C_out_=3，但实际输出tensor的C_out维度是16，我们只写了前3个通道的前几个位置？但是kernel中`yGm_.SetGlobalBuffer((__gm__ float*)y, N_ * C_out_ * L_out_);`这里使用了错误的C_out_=3，导致yGm_缓冲区大小只有N*3*L_out，而实际y tensor是N*16*L_out。当我们在循环中写入`yGm_.SetValue(batchOffset + c_out_ * L_out_ + tileStart + p, ...)`时，batchOffset = n * C_out_ * L_out_，因为C_out_=3，所以batchOffset非常小，而c_out_*L_out_也会很小，但实际输出tensor的内存布局是N*16*L_out，我们只写入了前3个通道的部分位置，而且偏移计算错误（因为C_out_=3，但实际tensor stride是16*L_out），导致写入位置错乱，可能覆盖到其他地方，但最终得到全零？不确定。
+
+更可能的是，由于InferShape返回错误的输出shape，导致输出tensor大小错误（例如只有N*3*L_out），但实际ACL调用时分配的result shape是(N,16,L_out)，而我们的kernel写入的地址是按照C_out_=3计算的，可能会访问越界或写错位置。但输出全零可能因为result tensor被分配为0，而kernel写入的位置都不在result的范围内（越界写入可能被忽略或崩溃）？
+
+总之，需要修正weight shape的维度顺序，确保host operator的InferShape正确，kernel中的索引正确。
+
+另外，检查model_src中的weight形状：应该改为`(out_channels, in_channels, kernel_size)`。
+
+同时，我们还需要确保tiling data传递的C_out和C_in正确。host operator中从weight_shape获取C_out应该为weight_shape->GetDim(0)，C_in为weight_shape->GetDim(1)。在kernel中权重索引也要相应调整。
+
+此外，kernel的实现使用了单线程顺序计算每个batch、每个输出位置的内积，效率低下但功能正确。不过问题在于yLocal的分配：我们每次tile分配yLocal，然后SetValue初始化为biasSum，然后累加，最后写回。这应该没问题。
+
+另一个潜在问题：在kernel Init中，我们使用了`pipe_.InitBuffer(outBuf_, 1, tileLen_ * sizeof(float));`只初始化了一个buffer。但我们在循环中AllocTensor/FreeTensor多次，这应该是可以的。
+
+我们需要生成修复后的代码。注意要遵循原来的结构，只修改必要的部分：修正weight shape顺序、修正host operator中C_out和C_in的获取、修正kernel中权重索引、修正model_src中weight shape定义。同时保持其他不变。
+
+注意：还要检查project_json中weight的type是否为float，以及bias_conv和bias_ext的shape。bias_conv shape是(C_out,)，bias_ext shape是(C_out,)（展平后）。我们保持。
+
+另外，关于tiling data中的C_in和C_out，我们使用uint32_t，注意host operator中从weight_shape获取时需要强制转换，确保类型匹配。
+
+最后，注意kernel_src中的`extern "C" __global__ __aicore__ void ca6k_01864_custom`，参数顺序应与python_bind_src中的EXEC_NPU_CMD匹配。目前python_bind_src传入参数顺序：x, weight, bias_conv, bias_ext, stride, padding, output_padding, result。注意最后一个是result输出。在EXEC_NPU_CMD中，通常acl算子调用时输入输出顺序与host注册一致。我们需确保project_json中定义的输入输出顺序与python_bind一致。project_json中定义输入为x, weight, bias_conv, bias_ext，输出y。属性有stride, padding, output_padding。所以顺序正确。
+
+这里我们要保持EXEC_NPU_CMD中参数顺序与project_json中定义一致。
+
+在python_bind_src中，我们使用了`EXEC_NPU_CMD(aclnnCa6k01864Custom, x, weight, bias_conv, bias_ext, stride, padding, output_padding, result);`。注意aclnn函数名由框架自动生成，应为aclnnCa6k01864Custom。但参数顺序要与host operator注册时一致。在host_operator_src中，注册OpDef时输入顺序是x, weight, bias_conv, bias_ext，输出y。属性stride, padding, output_padding。所以EXEC_NPU_CMD参数顺序正确。
+
+但注意，在host_operator_src中，我们还需要在InferShape中使用weight_shape->GetDim(0)作为C_out，GetDim(1)作为C_in。同时kernel_size来自weight_shape->GetDim(2)。确保这些。
+
+另外，在kernel中，我们需要将C_out_从tiling中正确读出。在host tiling中，我们需要设置C_out为weight_shape->GetDim(0)。在之前host_tiling_src中，我们有TILING_DATA_FIELD_DEF(uint32_t, C_out);等。我们在TilingFunc中设置tiling.set_C_out(C_out)时，要从weight_shape获取正确值。
+
+总结修改点：
+
+1. host_operator_src: TilingFunc中获取C_out = weight_shape->GetOriginShape().GetDim(0)；C_in = weight_shape->GetOriginShape().GetDim(1)。之前是GetDim(1)作为C_out。InferShape中同理。
+
+2. kernel_src: 修改权重索引。假设权重存储顺序为C_out * C_in * kernel_size（即weightGm_总大小也是C_out * C_in * kernel_size）。在Init中，权重总大小应为 C_out_ * C_in_ * kernel_size_。之前是C_in * C_out * kernel_size，需要改为C_out_ * C_in_ * kernel_size_。在循环中，获取权重值：`weightGm_.GetValue(c_out_ * C_in_ * kernel_size_ + c_in * kernel_size_ + k)`。同时注意，biasConvGm_和biasExtGm_都是C_out_大小，保持不变。
+
+3. model_src: 修正weight参数形状：`self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, kernel_size))`。另外，注意bias_conv是卷积自带的bias，我们需要在model_src中将其作为参数？在ModelNew中，我们自定义了self.bias_conv和self.bias_ext，但这两个bias都需要是可训练参数。在参考Model中，卷积层有bias=True，所以我们自定义时应创建两个参数：一个对应卷积的bias（shape out_channels），一个对应额外的bias（shape out_channels）。在model_src中，我们已经定义了`self.bias_conv = torch.nn.Parameter(torch.randn(out_channels))` 和 `self.bias_ext = torch.nn.Parameter(torch.randn(bias_shape))`。注意bias_shape是(out_channels,1)，但我们展平了。所以正确。但需要确保`self.bias_conv`初始化为随机数，但参考模型中的bias也是随机初始化的（因为nn.ConvTranspose1d默认bias初始随机），所以一致。但是我们需要将bias_ext view成(out_channels,)再传入。model_src中已经做了。
+
+4. 注意在model_src的forward中，我们调用`fn(x, self.weight, self.bias_conv, bias_ext_flat, self.stride, self.padding, self.output_padding)`，这没问题。
+
+5. 还有一个小细节：在kernel中，我们使用`int32_t pos = static_cast<int32_t>(tileStart + p) * stride_ - padding_ + static_cast<int32_t>(k);`，这里的stride_和padding_是int32_t，但tileStart是uint32_t，p是uint32_t，转换为int32_t没问题。注意当stride=2, padding=1时，起始pos为-1，跳过。没问题。
+
+6. 确保kernel中的`c_out_ = GetBlockIdx();`返回的uint32_t与C_out_比较，C_out_是uint32_t。但GetBlockIdx()返回uint32_t。
+
+7. 还需要考虑，如果C_out_较大，每个核处理一个通道，但实际核数可能少于C_out_，那么有些通道不会被处理，输出保持0。但我们的output_padding不为零？但参考模型中C_out=16，核数通常远大于16，所以没问题。但为了健壮性，我们可以在host operator中根据C_out设置blockDim，但实际可获得的核数未知。不过这不是当前失败原因。
+
+现在生成新的六段代码。
+
+注意：保持格式，用三引号字符串。
+
+另外，修复warning：tiling struct冲突。在之前的尝试中，我们在kernel_src中包含了`#include "ca6k_01864_custom_tiling.h"`，这个头文件就是host_tiling_src定义的内容，然后kernel中又使用了GET_TILING_DATA，这会导致tiling struct在kernel和host中重复定义，但AscendC的编译会处理？warning可能引起问题吗？根据memory1，建议不要重复定义，而是只在一个地方定义并包含。但当前我们的代码是分别定义的，所以内存中建议共用。但是因为host_tiling_src和kernel_src是独立的字符串，它们各自包含定义，编译时会出现两个定义。虽然warning，但应该不会导致全零输出。但我们可以尝试用另一种方法：在host_tiling_src中定义tiling data，并在kernel_src中直接包含该头文件（通过`#include "ca6k_01864_custom_tiling.h"`），而kernel_src中不再定义。当前kernel_src中没有定义tiling struct，而是包含头文件，所以不会重复。但warning来自哪里？可能是host_operator_src也包含了同一个头文件，然后opbuild生成额外的定义？不管怎样，我们先解决功能问题。
+
+但为了保险，我们可以按照memory1的建议：在host_tiling_src中定义，host_operator_src包含，kernel_src包含。但注意kernel_src中已经包含了该头文件，所以不应该有重复定义。warning可能来自框架自动生成的文件。我们忽略。
+
+现在生成代码。
+
+注意：project_json_src保持不变（输入输出定义正确）。host_tiling_src保持不变（字段定义正确）。host_operator_src需要修改，kernel_src需要修改，python_bind_src保持不变（因为参数顺序正确，bias_conv和bias_ext都是Tensor，类型float）。model_src需要修改weight shape。
+
+还要注意：在python_bind_src中，我们使用了`EXEC_NPU_CMD(aclnnCa6k01864Custom, ...);` 这个宏展开需要与生成的aclnn函数签名匹配。aclnn函数签名由autogen根据project_json生成，其参数顺序应与project_json一致。我们确保一致即可。
+
+让我们写出修复后的代码。

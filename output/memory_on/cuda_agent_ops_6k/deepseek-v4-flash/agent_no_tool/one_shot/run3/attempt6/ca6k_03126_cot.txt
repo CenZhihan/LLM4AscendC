@@ -1,0 +1,96 @@
+We need to fix the kernel runtime error (vector core exception, UB address out of bounds). The error indicates that the kernel is accessing Unified Buffer (UB) memory out of bounds. This is likely due to tiling computation issues: either tileLen is too large, or the totalLength/tileLen alignment leads to overflow, or the DataCopy length mismatch.
+
+From the previous attempt, the kernel uses double buffering (BUFFER_NUM=2) and a grid-stride loop. The tiling computes tileLen based on UB budget (192KB). For 4 tiles (inQueue 2 + outQueue 2) each of float, that's 4 * tileLen * 4 = 16 * tileLen bytes. So maxTile = 192*1024/16 = 12288 elements. But then AlignDown to 2048 gives 12288 (since 12288/2048=6, *2048=12288). That's fine.
+
+But the input shape is (128, 2048, 2048) = 128*2048*2048 = 536,870,912 floats. That's huge. The tileLen is 12288, so number of tiles = ceil(536870912/12288) = 43691 (approx). blockDim is set to numTiles capped between 8 and 24. So blockDim=24. Each block processes strideElems = 24 * 12288 = 294912 elements. That's fine.
+
+But the kernel's while loop uses a double-buffer pre-fetch. In the compute phase, it does:
+- Compute(curLen) on the tile from inQueueX (dequeued), then calls CopyIn(nextBase, nextLen) for the next tile. But note: the Compute uses the dequeued tensor from inQueueX, and after Compute it frees that tensor with inQueueX_.FreeTensor(). That's correct.
+
+Potential issue: In the while loop, after computing and copying out, it checks if nextLen == 0 to break. If break, the next tile's data was already copied in but not processed? Actually the pre-fetch copies into inQueueX, but if nextLen==0, there is no next tile, so the pre-fetch is skipped. So no issue.
+
+But the error "UB address out of bounds" suggests that during DataCopy or vector operations, the local tensor size might be too large. Possibly the tileLen is not correctly aligned to the actual data length? Or the Compute's len becomes larger than tileLen? In the loop, curLen is set to min(tileLen, remaining). That should be safe.
+
+Another possibility: the kernel uses GET_TILING_DATA(tiling_data, tiling) which expects the tiling struct. The host tiling defines totalLength, tileLength, blockDim. But the kernel's Init takes only totalLength and tileLength, not blockDim. That's fine.
+
+But check the kernel's Process: it uses blockNum and blockIdx to compute base. That's standard.
+
+Maybe the issue is that the UB budget is too optimistic? For tanh, we need only inQueueX and outQueueY, no tmp. So 2 buffers each of size tileLen*4 bytes = 8 * tileLen. But we budgeted 16 * tileLen (assuming 4 tiles). That's double, so safe. But the actual UB available per AI Core is 192KB minus overhead. 12288 * 4 = 49152 bytes per buffer, times 2 = 98304 bytes, plus some overhead, should fit in 192KB.
+
+But the error says "VEC instruction error: the ub address out of bounds." That often comes from DataCopy or vector operations with wrong length. The DataCopy length is in elements, not bytes? Actually AscendC::DataCopy takes number of elements (float count). So len should be number of floats. In the code, we call DataCopy(xLocal, xGm_[gmOffset], len). That's correct.
+
+Maybe the issue is that the input tensor has shape (128, 2048, 2048) but the operator expects ND format. However, the shape size is computed correctly.
+
+Let's think about the threading: the kernel uses grid-stride, so each block processes a stride of blockNum * tileLen. The while loop uses base and strideElems. But note: the pre-fetch copies into inQueueX for the next tile of the same block. That's fine.
+
+But there is a subtle bug: In the while loop, after pre-fetching the next tile, we compute the current tile and copy out. Then if nextLen == 0, we break. But if nextLen > 0, we set base = nextBase, curLen = nextLen, and loop again. However, the pre-fetch already copied the next tile into inQueueX, and then the loop will try to copy the same tile again? Actually, the loop structure is:
+
+CopyIn(base, curLen);  // first tile
+while (true) {
+    // pre-fetch next tile
+    nextBase = base + strideElems;
+    if (nextBase < totalLen_) {
+        nextLen = ...;
+        CopyIn(nextBase, nextLen);  // copies next tile into inQueueX
+    }
+    Compute(curLen);  // uses the first tile (dequeued from inQueueX)
+    CopyOut(base, curLen);
+    if (nextLen == 0) break;
+    base = nextBase;
+    curLen = nextLen;
+}
+
+So after the first iteration, the first tile's data is consumed and freed. Then for the second iteration, it will again pre-fetch the next tile (but the next tile is already in the queue? Actually, the pre-fetch for the second iteration was done in the first iteration. But then the loop will call CopyIn again for the same next tile? Let's trace:
+
+First iteration:
+- base=0, curLen=tileLen.
+- CopyIn(0, tileLen) -> enqueued.
+- nextBase = strideElems. If strideElems < totalLen_, nextLen = min(tileLen, totalLen_ - strideElems). CopyIn(nextBase, nextLen) -> enqueues a second tile.
+- Compute(curLen) -> dequeues first tile, computes tanh, enqueues yLocal.
+- CopyOut(0, curLen) -> dequeues yLocal, copies out.
+- nextLen != 0, so base = strideElems, curLen = nextLen.
+Loop second iteration:
+- pre-fetch nextBase = base + strideElems = 2*strideElems. If < totalLen_, enqueue third tile.
+- Compute(curLen) -> dequeues second tile (which was pre-fetched in first iteration). That's correct.
+- CopyOut(strideElems, curLen) -> dequeues yLocal (from compute of second tile) and copies out.
+- Continue.
+
+So the double buffering works correctly. The queue is double-buffered, so there should be enough space.
+
+But what if tileLen is not aligned? The code does AlignDown to 2048, ensuring it's a multiple of 2048. That's fine.
+
+Maybe the issue is that the totalLength is huge and the while loop might have an off-by-one that causes base to exceed totalLen_? The condition if (base >= totalLen_) return at the beginning prevents starting if base out of range. But inside loop, nextBase could exceed totalLen_ and nextLen becomes 0, then break. So safe.
+
+Another possibility: the kernel uses AscendC::Tanh, which might require additional workspace? But no.
+
+Given the error is consistent across many cores (0-17, 44-49), it's likely a systematic issue like tiling mismatch causing wrong tileLen or DataCopy out of bounds.
+
+Let's examine the host tiling: UB_BUDGET_BYTES = 192 * 1024 = 196608 bytes. 4 tiles of floats = 4 * tileLen * 4 = 16 * tileLen. So maxTile = 196608 / 16 = 12288. AlignDown to 2048 gives 12288 (since 12288 is divisible by 2048? 12288/2048 = 6, so yes). Good.
+
+But what if the actual UB size is smaller? It might be 128KB or something. But the error suggests out-of-bounds, which could be due to allocating more than available. However, the pipe_.InitBuffer with size = tileLen_ * sizeof(float) = 12288 * 4 = 49152 bytes. Two such buffers = 98304 bytes, plus overhead, should be under 192KB. But maybe the actual UB per AI Core is less? For ascnd910b, typical UB is 192KB per core. But maybe some other usage reduces it. The runtime error says "VEC instruction error: the ub address out of bounds." Could also be due to using a local tensor that is not properly allocated.
+
+Another common mistake: the DataCopy length must be a multiple of 64 bytes (16 floats) for vector memory copy? Actually, AscendC's DataCopy requires length to be a multiple of 16 floats? I recall that for DataCopy, the number of elements must be a multiple of 16 (for float32) because each DMA transaction is 64 bytes (16 floats). The code uses AlignDown to 2048, which is multiple of 16, so that's fine. But what if totalLength or remaining length is not a multiple of 16? In the kernel, when curLen = totalLen_ - base, if that remainder is not multiple of 16, DataCopy might fail. The host tiling does AlignDown for tileLen, but for the last tile, curLen might not be aligned. The host tiling does: if totalLength < tileLen, set tileLen = AlignDown(totalLength, ALIGN_ELEMS); else keep tileLen as maxTile. But for the last tile, each block will have curLen = min(tileLen, remaining). That remaining could be anything, not aligned to 16. That could cause DataCopy to fail because the length is not a multiple of 16? Actually, DataCopy can handle arbitrary lengths? According to docs, it requires alignment to 32-byte (8 floats) or 64-byte (16 floats). I think for DataCopy on AscendC, the number of elements must be a multiple of 8 or 16? Let's check: In many examples, they use multiples of 8 or 16. The error "ub address out of bounds" could be due to misaligned length causing access beyond allocated buffer? Or the vector unit requires addresses to be aligned.
+
+But the previous attempt for leaky_relu used similar approach and worked. However, that kernel also used AlignDown and had similar structure. So maybe the issue is that the tanh intrinsic requires more temporary buffers? Or that the double-buffer with single tmp queue? No.
+
+Given the memory tip: "When Ca6k00163Custom kernel runtime fails with vector core exception (error 507035) in double-buffered Process loop, do not use BUFFER_NUM=2 and pre-fetch next tile; instead use BUFFER_NUM=1 and process each tile sequentially." That matches our case! So we should change to BUFFER_NUM=1 and process each tile one by one without pre-fetch. That will simplify and avoid potential double-buffer issues. Also, we need to ensure tileLen alignment and check that DataCopy length is multiple of 8 or 16. We'll also add a fallback to ensure curLen is a multiple of 16 by truncating if needed? But better to keep it simple.
+
+Thus, the fix: change BUFFER_NUM to 1, remove the pre-fetch logic, and process one tile at a time. Also ensure that tileLen is a multiple of 16 (already 2048 is multiple of 16). Also, for the last tile, if the remaining length is not a multiple of 16, we should adjust it? But that might cause data loss. However, the DataCopy might work with non-multiple lengths? To be safe, we can enforce that tileLen and all lengths are multiples of 16 by aligning down remaining length. But the totalLength might not be a multiple of 16? Actually, 128*2048*2048 = 536,870,912, which is a multiple of 16? 512 MB is multiple of 16? 536870912 / 16 = 33554432, yes integer. So it's fine. But for general safety, we should keep the alignment.
+
+We'll also modify the host tiling to ensure tileLen is a multiple of 16 (already). And in the kernel, we will handle the last tile's length as multiple of 16 by truncating to the largest multiple <= remaining. But that would lose data. Better to keep it as is, but then DataCopy might fail. Many official examples use DataCopy with lengths that are multiples of 16. So we should ensure that the tile length and all copies are multiples of 16. In the kernel, when we compute curLen = totalLen_ - base, we should truncate to the nearest multiple of 16. But that would leave some elements unprocessed. However, if we iterate with stride, the last tile will be whatever remains, which might not be multiple of 16. To avoid that, we can pad? Not possible. Alternatively, we can keep the tiling such that the last tile is also a multiple of 16 by aligning down the totalLength in the host? But totalLength is fixed.
+
+Maybe the DataCopy can handle non-multiple lengths? Let's check the error: "VEC instruction error: the ub address out of bounds." This might not be about alignment but about overall size. But given the memory tip suggests switching to BUFFER_NUM=1 fixed a similar issue, I'll do that and also ensure that in the kernel, we do not use pre-fetch.
+
+Let's also check the host operator: it sets blockDim based on numTiles, but numTiles might be very large (43691). It caps at 24, so blockDim=24. That's fine. The kernel uses blockNum and blockIdx.
+
+Now, modify the kernel to use BUFFER_NUM=1 and process sequentially per block. Also, we might need to add a tmp buffer? No, Tanh is in-place? Actually, Tanh(yLocal, xLocal, len) computes tanh of xLocal and writes to yLocal. So we need separate buffers. With BUFFER_NUM=1, we allocate one inQueueX and one outQueueY. The process: for each tile assigned to this block, copy in, compute, copy out, free. No pre-fetch. That simplifies.
+
+We'll also keep the grid-stride loop but without double buffering.
+
+Let's rewrite kernel_src accordingly. Also ensure that the kernel's Init takes tiling_data parameters same as before (totalLength, tileLength). We'll keep the same.
+
+We'll also check the host tiling: we used UB budget for 4 tiles, but now we only need 2 tiles (one in, one out). So we can increase tileLen accordingly. But to keep conservative, we can keep the same budget calculation for 4 tiles is fine, but we might increase. However, to avoid changing behavior, we can keep the same tileLen calculation. It will still work.
+
+But to be safe, let's keep the same.
+
+Now, implement the corrected code.

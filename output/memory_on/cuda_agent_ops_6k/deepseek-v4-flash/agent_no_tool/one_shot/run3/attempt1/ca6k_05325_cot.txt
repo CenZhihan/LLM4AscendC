@@ -1,0 +1,115 @@
+We need to generate six Python strings for a fused custom AscendC operator that replaces nn.GLU and nn.Linear in the reference model. The reference model has GLU (dim=1) followed by a linear layer. GLU splits input along dim=1 into two halves, applies sigmoid to first half, multiplies element-wise with second half. Output size is half of input channels. Then linear layer with in_features//2 to in_features//2.
+
+We can fuse the GLU and linear into a single operator: compute GLU result, then apply linear weight and bias. The linear weight is a matrix of shape (out_features, in_features) where in_features = out_features = D (where D = in_features//2). So we need to pass weight and bias as inputs.
+
+We'll define operator Ca6k05325Custom with inputs: x (float ND), weight (float ND), bias (float ND). Output: y (float ND). Attributes: none needed (dim fixed to 1). Tiling data includes totalLength, tileLength, blockDim, and also the channel dimension features etc. Actually we need to know the shape: input is (B, C, H, W) with C=512, output is (B, C//2, H, W). Then linear transforms (B, C//2*H*W) -> (B, C//2*H*W) but weight is (C//2, C//2). Implementation: In kernel, we compute GLU first: split x into two halves along C dimension. Each half has D = C//2 elements per spatial location. For each element (b, h, w), compute: left = x[b, d, h, w], right = x[b, d+D, h, w], glu = sigmoid(left) * right. Then we need to apply linear: for each output element (b, out_d, h, w): result[b, out_d, h, w] = sum_{in_d=0}^{D-1} weight[out_d, in_d] * glu[b, in_d, h, w] + bias[out_d]. This is a depthwise separable? Actually it's a per-pixel fully connected: same weight applied to each spatial location. So we can compute: for each spatial location (h,w), we have a vector glu_vec of size D. Then output_vec = weight * glu_vec + bias. So in kernel, we iterate over spatial locations, load D elements of glu, compute matrix-vector multiply with weight (DxD), store output.
+
+We need to manage memory: load tile of input, compute partial. Since total elements = B*D*H*W for glu, and output same. We'll tile along spatial dimensions (batch * spatial). Let totalLength = B * D * H * W. tileLength based on UB budget. The kernel will have additional global weight and bias tensors. We'll pass weight and bias as GM_ADDR.
+
+Tiling: need totalLength, tileLength, blockDim, and also D (half of original C), and perhaps H*W? But we can compute D from input shape? Simpler: pass D and spatial size (N) separately. But tiling data can include additional fields: halfChannels, spatialSize. We'll add halfChannels (D) and spatialSize (H*W) to tiling. Then kernel computes.
+
+In Process, for each block, grid stride over tiles. Each tile contains a contiguous chunk of elements along batch*spatial*channel? Actually data layout is NCHW: channel dimension is contiguous for each spatial location. When we do GLU, we need both halves of the same pixel. So it's easier to process one spatial location at a time, loading D left, D right, compute glu, then compute linear. So we can tile by spatial locations: tileLength = number of spatial locations per tile? That would be spatialSize? But total elements = B * D * H * W. So if we tile by number of spatial locations (each location has D elements), then totalTiles = B * H * W / T where T is number of spatial locations per tile. But we need to handle channel dimension contiguously. Better: treat the tensor as (B*H*W, D) for left and (B*H*W, D) for right. Actually GLU splits along channel dim: original shape (B, C, H, W) with C=2D. So each spatial position (b,h,w) has a contiguous block of 2D floats: first D left, next D right. After GLU, we get D floats per position. Then linear applies weight (DxD). So we can process per spatial position: load 2D floats, compute glu (D floats), then compute output (D floats) via matrix multiply with weight (DxD). So we can treat the input as an array of size B*H*W of 2D-chunks. Output array of size B*H*W of D-chunks. Weight is DxD. So total number of positions N = B*H*W. We'll tile by positions: tileLength = number of positions per tile (each position has 2D input, D output, D * D weight? But weight is constant, loaded once. So UB usage per tile: input: 2D * tileLength, output: D * tileLength, weight: D*D (if we load whole weight per block, but weight is common, better to load once per block and reuse). We'll allocate weight in UB as local buffer of D*D floats. Also we may need temporary for dot products.
+
+Simplify: we'll implement a straightforward kernel: for each tile of positions, load input chunks, for each position compute glu (elementwise multiply after sigmoid), then for each output channel compute dot product with weight. This requires nested loops. But we can optimize by doing matrix multiply per position using vectorized operations? AscendC has Matmul API, but we can do simple loops using vector muls and adds.
+
+Given the complexity, we can also split into two ops: GLU + Linear as separate custom ops. But the instruction says "fused custom AscendC operator for a multi-op... replace / fuse these in the reference forward into one or more custom ops as you see fit." So we can implement a single fused op.
+
+We need to ensure numerical match. We'll use float. Weight and bias are parameters of the model, so they are fixed at init. They will be passed as inputs to the operator.
+
+Now generate the six strings.
+
+project_json_src: JSON with op "Ca6k05325Custom", inputs: x (float ND), weight (float ND), bias (float ND). Output: y (float ND). No attrs.
+
+host_tiling_src: TilingData struct with fields: totalLength (uint32_t), tileLength (uint32_t), blockDim (uint32_t), halfChannels (uint32_t), spatialSize (uint32_t). Also maybe negative? But no negative slope. We'll set fields as needed for kernel.
+
+host_operator_src: Include tiling header. TilingFunc: get input shape, compute N = B*D*H*W, stride etc. Compute tileLength based on UB budget: we need to estimate per position memory: input: 2D floats, output: D floats, plus weight: D*D floats if we cache. Let D up to 256 (since in_features=512, D=256). So weight is 256*256=65536 floats = 256KB, which may exceed UB (usually 192KB? Actually 256*256*4=256KB > 192KB). So we cannot load whole weight in UB per block. Instead, we can load weight in parts: we'll do the linear computation by looping over output channels, and for each output channel we load the corresponding row of weight (D floats) and compute dot product with glu vector. That way we only need D floats for weight row and D floats for glu, plus input chunks. So per position we need: input 2D, glu D, weight row D, plus output D. That's 5D floats. For D=256, that's 1280 floats = 5KB. So we can tile positions. UB budget maybe 192KB, so tileLength positions = floor(UB_BUDGET / (5*D*4)). Compute accordingly. We'll also need some temp for dot product. We'll assume UB_BUDGET = 192 * 1024 bytes.
+
+Thus in tiling we need D (halfChannels) and also spatialSize (N = batch * H * W). Actually we can compute totalLength = N * D. But we need D in kernel. We'll pass halfChannels. spatialSize = N.
+
+Kernel: For each block, grid stride over tiles of positions. Each tile: load input for tileLength positions (2D per position). Then for each position in tile, compute glu (sigmoid on left, multiply with right). Then compute linear: for each output channel j: dot product of glu with weight row j, add bias. We'll have weight and bias in global memory, but we can preload a row when computing. Since we loop over output channels, we can load weight row per iteration. But that's many global loads. Alternatively, we can load the entire weight matrix into UB if D is small enough? For D=256, weight matrix is 65536 floats = 256KB, still larger than UB. So we must tile weight rows across output channels. We'll loop over output channels in outer loop, but that would require multiple passes over input tile. Better: Process for each output channel separately: For each output channel j, load weight row j, then for each position in tile compute dot product and store partial result. But we need to accumulate across input channels, not across output channels. Actually linear output per position is a vector of size D, each element is dot product of glu with weight row. For a fixed output channel, the dot product is sum over k=0..D-1 of weight[j][k] * glu[k]. We can compute this for all positions in tile simultaneously using vector operations: broadcast weight row to length tileLength*D? That's messy.
+
+Maybe simpler: For each position, compute glu vector, then compute output vector via matrix-vector multiply using a loop over output channels: dot product with each weight row. This is per position, and we can do it sequentially for each output channel. That means for each position, we will load D floats of glu, then for each output channel load D floats of weight row, compute dot product, store to output. That's D weight loads per position per output channel, total D*D weight loads per position, which is heavy. But we can preload the entire weight matrix if D is small? For D=256, 65536 floats, too large for UB. But we can use cache. AscendC has GlobalTensor and DataCopy. We can copy weight matrix once per block into L1? Not standard.
+
+Another approach: Since D is up to 256, we can compute linear as a matrix multiply using the AscendC Matmul API if we treat data as batched matrix. Actually we have N positions, each with a vector of D, and weight matrix DxD. The output is N vectors of D. So we have a batched matrix-vector multiply: Y = X * W^T (where X is NxD, W is DxD). We can use Matmul with batch. But that requires handling data layout. Could be complex.
+
+Given the harness will test correctness, and we are to provide a single fused kernel, we can implement a simpler but correct kernel that handles small D. But the reference has in_features=512, D=256. That's moderate. We can still implement the per-position loops with weight in global memory, relying on cache. Performance may not be critical, just correctness.
+
+We'll implement in kernel: For each position in tile, load left and right (2D floats), compute glu (multiply left sigmoid with right). Then compute output vector by looping over output channels j from 0 to D-1: load weight row j (D floats) from global (or weight[j] = weight tensor of shape (D, D) row-major). Compute dot = sum_{k=0}^{D-1} weight_row[k] * glu[k]. Add bias[j]. Store to output position j. This is O(D^2) per position. For D=256, that's 65536 multiply-adds per position, but we have many positions (N = B*H*W = 16*256*256 = 1,048,576). That is huge, but acceptable for correctness test.
+
+We'll use vector operations: for each output channel, we can compute dot product using AscendC::Mul and ReduceSum? Or use vector multiply and vector reduce. AscendC has vector multiply (Muls) and ReduceAdd? There is AscendC::ReduceSum? Actually in kernel_operator.h, there are functions like AscendC::Add, AscendC::Mul, etc., but for dot product we can do elementwise multiplication between weight row and glu vector, then sum. The sum can be done using vector ReduceAdd? AscendC has a function `AscendC::ReduceSum`. But we need to be careful with dtype. Since we need to accumulate, we can use a scalar and loop over channels k. That would be D scalar iterations, which is serial. Or we can use vector multiply and then vector reduce sum across the vector, which is efficient. We'll allocate a temp vector of D floats, multiply glu with weight row, then call AscendC::ReduceSum to get a scalar, add bias, store. That's efficient.
+
+Thus kernel: per output channel j:
+- Load weight row j (D floats) from global to local.
+- Elementwise multiply: tmp = weightRow * gluVec (vector of D).
+- vecSum = ReduceSum(tmp, D) -> scalar.
+- output[j] = vecSum + bias[j].
+
+We'll need to preload gluVec (D floats) per position. Also we need local buffers for weightRow and tmp. We can reuse buffers.
+
+Memory per position: gluVec (D), weightRow (D), tmp (D), output (D). That's 4D floats. With D=256, 1024 floats = 4KB. For tile of positions, we can process one position at a time to keep UB usage low. But we can also process multiple positions in parallel using vector operations across channels? Not easily. We'll process one position per iteration within tile. So tileLength positions, each position we use temporary buffers. We can allocate temporary buffers of size D for gluVec, weightRow, tmp, output. And we need to load input chunks: pairs of left and right (2D floats per position). We can load left and right directly into temporary and compute glu immediately.
+
+Simplify: For each position in tile:
+- Load left (D floats) from global.
+- Load right (D floats) from global (offset by D from left's location).
+- Compute glu: sigmoidLeft = Sigmoid(left); glu = sigmoidLeft * right.
+- For each output channel j:
+    Load weight row j.
+    Multiply glu with weightRow -> tmp.
+    ReduceSum -> scalar.
+    Add bias[j], store to output position j (offset in output global).
+- Write output (D floats) to global.
+
+This is straightforward. We'll use AscendC vector functions: Sigmoid (AscendC::Sigmoid), Mul (AscendC::Mul), ReduceSum (AscendC::ReduceSum). Need to import <kernel_operator.h>.
+
+Now produce the six strings. We'll follow naming: ca6k_05325_custom in kernel, Ca6k05325Custom in JSON/host.
+
+Let's write them step by step.
+
+First, project_json_src: JSON string with "op" key.
+
+Second, host_tiling_src: define tiling data struct with fields. We'll use the name Ca6k05325CustomTilingData.
+
+Third, host_operator_src: include tiling header, implement TilingFunc, InferShape, InferDataType, OpDef class with REG_OP. Note memory: avoid duplicate REG_OP.
+
+Fourth, kernel_src: include kernel_operator.h, define class KernelCa6k05325Custom with Init and Process, and extern "C" kernel function.
+
+Fifth, python_bind_src: binding with pybind11, using EXEC_NPU_CMD macro.
+
+Sixth, model_src: ModelNew that calls custom_ops_lib.ca6k_05325_custom.
+
+We need to ensure correct handling of weight and bias tensors as inputs. In operator, they are inputs with shape (D, D) and (D). In the binding, we need to pass them. In ModelNew, we need to get weight and bias from the linear layer. Since GLU and linear are fused, but the weight and bias are parameters of the original model. The reference Model has nn.Linear, which initializes weight and bias. In ModelNew, we need to create those parameters. We'll define a custom op that takes x, weight, bias as inputs. In ModelNew forward, we get weight and bias from self.linear.weight and self.linear.bias (but we also need to apply GLU first? Actually we fuse, so we directly compute from x). So ModelNew should have a Linear layer with same shape, but in forward we call custom op with x, linear.weight, linear.bias. The custom op internally does GLU then linear. So output shape is same as linear output.
+
+Thus ModelNew initializes a linear module (though not used directly, but for parameter storage). We'll pass the parameters.
+
+Implementation details:
+
+- Tiling: totalLength = output elements = B * D * H * W, but we need D, spatialSize = B*H*W.
+- In kernel, we'll compute input pointers: x points to input (B * 2*D * H * W). We'll compute spatial offset: For position idx (0 to N-1), spatial offset in input = idx * 2*D (since each position has 2D contiguous floats). Actually in NCHW, channel is inner dimension: for a given batch and spatial, channels are contiguous. So for a given batch b, spatial (h,w), the data for that position is a vector of 2D floats. So the layout when flattened as N positions of 2D is correct: first position (b=0,h=0,w=0) has first 2D floats, next position (b=0,h=0,w=1) has next 2D floats, etc. Similarly, output is N positions of D floats. Weight is (D, D) stored row-major: D*D floats. Bias is D floats.
+
+So in kernel, we take x, weight, bias, y as GM_ADDR. Init with these pointers.
+
+Process: for each block, grid stride over positions (N total). For each tile of positions, load input for that tile. Since we process one position at a time within tile, we can just iterate positions within tile and load each position's input from global (using offset). But that would be many global loads. Better to load a whole chunk of input contiguously? The input arrangement is contiguous in memory: for positions tileStart to tileStart+len-1, the input data for those positions is a contiguous block of len * 2D floats. So we can copy that block into UB and then read from there. Similarly, we can write output in contiguous block. So we'll use DataCopy for input tile and output tile.
+
+So we'll allocate inBuf of size tileLength * 2*D floats, and outBuf of size tileLength * D floats. Also need weightRow and bias as separate global tensors; we can load weight row per channel as needed from global.
+
+In Process:
+- Compute posStart = blockIdx * stridePositions (grid-stride step: blockNum * tileLength positions per iteration? Actually we use grid-stride: each block processes tiles of positions, step = blockNum * tileLength positions. So posBase = blockIdx * tileLength; if posBase >= N, return.
+- For each tile: copyIn: copy tileLength * 2*D floats from x[posBase*2D] to inBuf.
+- Then for each position i in 0..tileLength-1:
+    left = inBuf[i*2D : i*2D + D]
+    right = inBuf[i*2D + D : i*2D + 2*D]
+    compute glu: sigLeft = Sigmoid(left, D); then glu = left * right? Actually glu = sigmoid(left) * right. So we can do: for k in 0..D-1: glu[k] = sigmoid(left[k]) * right[k]. We'll use AscendC::Sigmoid and AscendC::Mul.
+    Then for each output channel j:
+        load weight row j from weight[j*D] to weightRowLocal.
+        for k: tmp[k] = glu[k] * weightRowLocal[k]; then scalar = ReduceSum(tmp, D); scalar += bias[j]; store to outBuf[i*D + j].
+- Copy out: write outBuf to y[posBase*D].
+
+We need to manage UB buffers: inBuf, outBuf, and temporary for glu, weightRow, tmp. We can allocate gluBuf of D, weightRowBuf of D, tmpBuf of D. That's 3*D floats. Also we need inBuf of tileLength*2D and outBuf of tileLength*D. So total UB usage: inBuf (2D * tl) + outBuf (D * tl) + 3*D. With D=256, tl determined by UB budget. Let's compute: UB_BUDGET = 192*1024 bytes = 49152 floats. For D=256, inBuf per position: 512 floats, outBuf per position: 256 floats, total 768 floats per position. Plus 768 floats for temp (3*256). So per position 768+768? Actually temp is fixed overhead. So we can set tl = floor((UB_BUDGET - 3*D) / (3*D * 4)? Let's compute: bytes: inBuf: 2*D*4*tl, outBuf: D*4*tl, temp: 3*D*4. So total bytes = 4*tl*(3D) + 12D. Set max bytes = 192*1024. Solve tl = (192*1024 - 12*256) / (12*256*4) = approx (196608 - 3072) / 12288 = 193536/12288 ≈ 15.75. So tl <= 15. We'll align to multiple of 8 maybe. Let's use 16. TileLength=16 positions. That gives good utilization.
+
+We'll compute maxPositionsPerTile = (UB_BUDGET - 3*D*4) / ( (2*D + D)*4 )? Actually total bytes = inBuf (2*D*4*tl) + outBuf (D*4*tl) + temp (3*D*4). So tl <= (UB_BUDGET - 12*D) / (12*D). With D=256, (196608 - 3072) / (3072) = 193536/3072 = 63. But wait we used 12*D = 12*256=3072? Actually 12*D = 3072. But we have factor 4 for bytes: so tl = floor((UB_BUDGET - 12*D*4) / (12*D*4))? Let's recalc: UB_BUDGET = 196608 bytes. inBuf: 2*D*4*tl, outBuf: D*4*tl, temp: 3*D*4. So tl = (196608 - 12*D*4) / ( (2*D*4 + D*4) ) = (196608 - 12*D*4) / (12*D*4) = (196608/(12*D*4)) - 1. 12*D*4=12*256*4=12288. 196608/12288=16. So tl = 15. So we can set tileLength = 15 positions. But we need to be careful with alignment: DataCopy may require 32-byte alignment? We'll align tileLength such that buffer sizes are multiples of 32 bytes. Each position: inBuf per position = 2*D = 512 floats = 2048 bytes (multiple of 32). outBuf per position = 256 floats = 1024 bytes (multiple of 32). So tileLength=15 gives 15*2048=30720 bytes (multiple of 32). Good.
+
+We'll set tileLength = 15 in tiling, or compute dynamically. We'll make tiling compute it.
+
+Now write the strings.
+
+I'll produce the final answer now.

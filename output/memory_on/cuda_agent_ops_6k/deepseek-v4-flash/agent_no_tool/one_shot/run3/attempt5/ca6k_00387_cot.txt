@@ -1,0 +1,87 @@
+We need to fix the kernel compilation errors. The errors are:
+
+1. `expf` and `logf` are host functions, not available in aicore kernel. In AscendC, we must use built-in math functions like `AscendC::Exp` and `AscendC::Log` or use the vectorized versions. However, for scalar operations, we can use `AscendC::Exp` and `AscendC::Log` which work on LocalTensor, but for a single value we can use `AscendC::Exp` on a tensor of size 1, or we can use the scalar version? Actually, the AscendC API provides `AscendC::Exp` that takes a LocalTensor and length. For scalar, we can create a small tensor with one element and use that. Or we can use the `exp` function from the `math.h` but that is host only. The proper way in aicore is to use the built-in functions from `kernel_operator.h` like `AscendC::Exp` and `AscendC::Log`. But these operate on LocalTensor, not scalar. So we need to create a temporary tensor of size 1 for each scalar operation. However, that is inefficient. Alternatively, we can compute the log and exp using the vectorized operations on the entire tensor. Since we have only two values (alphaCurr(U-1) and alphaCurr(U-2)), we can load them into a small local tensor of size 2, apply Exp and Log accordingly.
+
+2. `AscendC::AtomicAdd` does not exist. In AscendC, atomic operations are done via `AscendC::AtomicAdd` on a `GlobalTensor`. The error indicates no member named `AtomicAdd` in `AscendC`. Actually, the correct API is `AscendC::AtomicAdd(global_tensor, local_value)`. Wait, the error says "no member named 'AtomicAdd' in namespace 'AscendC'". Perhaps it's not available on this version. We need to avoid atomic operations altogether. Instead, we can have each block write its loss sample to a separate global memory location (loss per batch) and then the host (or a subsequent kernel) can reduce. But the output is a single loss value. The reference implementation uses reduction='mean', so we need to sum all batch samples and divide by batch size. The kernel can write each sample's loss to a global array of size batchSize, and then we can have a separate kernel to sum and divide. Or we can do the reduction in the tiling/host? But the operator itself must produce the final loss scalar.
+
+Simpler approach: Instead of trying to do atomic add, we can have each block write its loss to a global array at index blockIdx, and then after all blocks finish, the host (or a small kernel) sums them. But that requires additional workspace. We can incorporate a second pass? However, we need to produce a single scalar output. The operator's output is a tensor of shape (1). We can allocate a global workspace of size batchSize * sizeof(float) for per-sample losses, then have blocks write to it, and then have a final block (block 0) sum them and write to output.
+
+But that would require synchronization between blocks. In AscendC, all blocks run in parallel on different cores; there is no barrier across blocks. So we cannot do a reduction within the same kernel launch. We would need to launch two kernels: one for per-sample loss, one for sum. However, the instruction says "Implement a single fused custom op (or a small set) on NPU". It might be acceptable to have one custom operator that internally does two kernel launches? That is more complex.
+
+Alternatively, we can modify the algorithm so that each block writes its loss to a global array, and then we use a separate reduction kernel. But that would be two ops. Perhaps we can simplify: Since the reference program does `F.ctc_loss` which returns a scalar, we can implement the fused operator to do exactly that: compute the loss per sample and then reduce. We can define the operator to output a scalar, and we can use the host to perform the final reduction if needed? No, the operator must compute the final loss.
+
+Given the constraints, maybe we can avoid per-block atomic add by having each block write to its own position in a global buffer, and then after all blocks complete, the host sums them. But the host cannot access device memory directly from the kernel. We need the operator to produce the final loss.
+
+Maybe we can use a different approach: do the CTC loss computation entirely on one block (using blockDim=1). That would avoid the need for reduction. Since the batch size is typically small (16), we could process each sample sequentially on one block. That would be slower but simpler and avoids atomic. However, the tiling used blockDim = batchSize, meaning each block handles one sample. To avoid atomic, we could set blockDim = 1 and process all samples in a loop. That would be a valid implementation. Let's do that. We'll set blockDim = 1 in tiling, and in Process() we loop over batchSize samples, compute loss for each, sum locally, and then write the final loss (divided by batchSize for mean) to the output. That eliminates the need for atomic and for cross-block communication.
+
+Also, we must replace `expf` and `logf` with AscendC equivalents. For scalar, we can create a LocalTensor of size 1, assign the value, call AscendC::Exp on it, and then read back. Or we can use the `AscendC::Exp` on a small tensor of size 2 (the two alpha values), then do summation etc.
+
+Let's implement a simple approach: create a LocalTensor of size 1 for each scalar operation. But we need to be careful with memory. Since we are on a single block, we have UB budget. We can allocate temporary tensors of size 1 or 2.
+
+Alternatively, compute the log-sum-exp directly using vectorized operations on the two values. We can treat them as a tensor of size 2, compute max, subtract, exp, sum, log.
+
+I'll rewrite kernel_src with the following fixes:
+
+- Use AscendC::Exp and AscendC::Log (they exist? Yes, they are in kernel_operator.h as part of the math API). Actually, the correct names are `AscendC::Exp` and `AscendC::Log`. They operate on LocalTensor.
+
+- Remove atomic add, instead sum per-sample losses locally in a variable, then after all samples, write final loss (with division for mean) to output.
+
+- Set blockDim = 1 in tiling, and loop over batchSize in the single block.
+
+- Adjust tiling data accordingly (no need for batchSize in blockDim, keep batchSize for loop).
+
+- Ensure we handle tiling data correctly, including reductionMean flag.
+
+- Also, the kernel currently uses `lp.GetValue(t * numClasses_ + extended[u])`. That is correct for accessing log_probs tensor which is [T, batch, C] in memory. With blockDim=1, we need to correctly index the batch dimension. The log_probs tensor shape is (maxTime, batchSize, numClasses). For sample b, the offset is b * numClasses in the time step? Actually, memory layout is [maxTime][batchSize][numClasses] (row-major). So for time t, batch b, the index is t * batchSize * numClasses + b * numClasses. In the previous code with per-block per-batch, they used baseLogProbs = blockIdx * maxTime_ * numClasses_ which skips batch? That was incorrect: for batch b, the starting offset is b * numClasses (since batch dimension is second?). Wait: Shape (maxTime, batchSize, numClasses). Storage order: maxTime (T) is outermost, then batch (N), then classes (C). So element (t, n, c) is at offset: t * (N*C) + n * C + c. For a fixed batch n, the slice is not contiguous: it's strided. The previous approach incorrectly used base = n * T * C, which would give the first time step of batch n? Actually, that would be offset 0 for batch 0, offset T*C for batch 1? That is wrong because batch dimension is second, so offset for batch n is n * C (since within each time step, batch n starts at n*C). To get all time steps for batch n, you cannot simply take a contiguous block because the batch dimension is interleaved with time. The log_probs for a specific batch across time is not contiguous. The reference code expects log_probs to be already log_softmaxed, shape (T, N, C). In the forward of Model, logits are (T, N, C) and log_softmax is applied along dim=-1 (i.e., classes dim). So the tensor remains (T, N, C). For CTC loss, the input is a sequence of length T for each batch. The PyTorch implementation expects input to be (T, N, C). So the memory layout is as described.
+
+To access log probabilities for batch n at time t, we need to compute index = t * batchSize * numClasses + n * numClasses + class. That is not a contiguous block for all t of a given n. So we cannot just DataCopy a contiguous chunk of size T*C for one batch. The previous attempt used `lp.GetValue(t * numClasses_ + extended[u])` which assumed the data is contiguous per batch. That was incorrect. This is a major bug. We need to correctly index the log_probs tensor.
+
+Given the complexity, maybe we should not fuse the entire CTC loss into one kernel. But we are asked to implement a fused custom op. However, the reference model does log_softmax + ctc_loss. We can implement a custom op that takes logits (raw) and does log_softmax inside the kernel, but that adds more complexity. Simpler: we can implement a custom op that assumes the input is already log_softmaxed, i.e., log_probs. Then the kernel only computes CTC loss. That matches the contract: the model does log_softmax first, then passes to custom op. The model_src already does log_softmax in Python before calling the custom op. So the custom op's input is log_probs. That's fine.
+
+But the indexing issue remains: we need to access log_probs for a given batch across all time steps. Since the tensor is not contiguous per batch, we cannot copy a large contiguous block per batch. We could copy the entire log_probs tensor into local memory and then index it. That would be huge (T*N*C floats). For T=2048, N=16, C=30, that's ~1M floats, too large for UB. So we need to access global memory directly. In the kernel, we can use global tensor indexing. The previous code used `xGm_[gmOffset]` in DataCopy which assumes contiguous. We need to change to read individual values by computing the global index each time. Since we are inside a loop over t and u, we can compute the global offset each time. That is okay, though it will have many global loads, which is inefficient but acceptable for a kernel.
+
+Alternatively, we can reorganize the input to be contiguous per batch: the host could transpose the tensor before passing to the operator. But we cannot modify the calling code. The model_src passes log_probs with shape (T,N,C). So we must handle the strided access.
+
+Thus, in the kernel, instead of copying a contiguous chunk, we will use the GlobalTensor's operator[] to access individual elements. For each sample, we iterate over t, and for each t we compute offset = t * batchSize * numClasses + batchIdx * numClasses + class. This is straightforward.
+
+Also, we need to handle the case where the number of classes may be up to 30 (given num_classes=30 in example). The extended target sequence length U max is 2*L+1, where L max target length = target_seq_length=30, so U <= 61. That's fine.
+
+We'll keep blockDim=1, loop over batchSize, compute per-sample loss, sum into a local float variable, then at the end write lossSum/batchSize to loss[0] (if reduction=mean). For reduction='none', we would write individual losses, but we only support 'mean' for simplicity as the reference uses mean.
+
+Now, for scalar math: we need to compute maxVal, then compute sumExp = exp(a-maxVal)+exp(b-maxVal), then loss = -(maxVal + log(sumExp)). We'll create a LocalTensor of size 2 for the two alpha values, compute max, subtract, exp, sum, log. Or we can do it manually using AscendC::Max, etc. Simpler: use AscendC::Exp on a tensor of size 2, then reduce. We'll allocate a temporary tensor of size 2.
+
+Let's write the corrected kernel.
+
+Also, the tiling data: we still need batchSize, maxTime, maxTargetLen, numClasses, blank, reductionMean. But now blockDim is 1, so we set blockDim=1 in TilingFunc. Also, we don't need tileLen and totalLen from tiling as we access directly. But the infrastructure may still require them; we can set them to 0 or keep.
+
+We also need to fix the host_operator_src: set blockDim = 1.
+
+Now, compile errors: the previous also had an error about `expf` and `logf` and `AtomicAdd`. We'll replace with proper AscendC API.
+
+Potential other issues: `#include <cmath>` is not needed and may cause issues. We can remove it.
+
+Also, the kernel uses `AscendC::DataCopy` for small tensors like inputLengths and targetLengths which are scalars. That's okay. But we may just use `GetValue` directly from global tensor, eliminating the need to copy. However, using LocalTensor for scalars is fine.
+
+Let's rewrite the kernel_src with these changes.
+
+Also, ensure that the `lp` tensor is not needed since we will use global tensor directly. We can remove the inQueueLogProbs_ and related. We'll just use logProbsGm_ to access values. Similarly for targets, we can copy them to local once per sample because targets for a batch are contiguous (maxTargetLen). That's fine.
+
+So per sample:
+- Copy target sequence to local targetsLocal (contiguous).
+- Read inputLength and targetLength as scalars (we can copy or just get from global).
+- For t in 0..T-1, for u in 0..U-1, compute index and read logProb from global.
+- After loops, compute lossSample and add to running sum.
+
+That's the plan.
+
+Let's produce the corrected code.
+
+We'll keep the same project_json, host_tiling, host_operator (except blockDim=1), python_bind (unchanged), model_src (unchanged except maybe pass reduction='mean').
+
+But note: In python_bind, the function signature expects `reduction` as std::string. We need to ensure it is passed correctly. The model_src passes `reduction="mean"`. That's fine.
+
+Now, write the updated kernel_src.
+
+We also need to ensure the kernel function name matches: `ca6k00387_custom`.
+
+Let's write the full corrected code.

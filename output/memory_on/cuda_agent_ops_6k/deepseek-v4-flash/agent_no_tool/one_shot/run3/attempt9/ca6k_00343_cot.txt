@@ -1,0 +1,69 @@
+We need to fix the correctness issue. The output is all zeros. The kernel computes adaptive max pooling but the output is zeros, likely because the kernel logic is flawed: the per-element loop with bin computation uses integer division and may not correctly map indices, and also the local tensor updates via `maxLocal(bin) = val` might not work correctly on AscendC because local tensor access using operator() for write might not be supported in the same way; we need to use vectorized operations. Also the tiling logic and buffer sizes may be wrong.
+
+Looking at the error logs: the build succeeded but eval shows output all zeros. The kernel uses a scalar loop over curLen elements, and for each element it computes bin and does a conditional update. This is extremely inefficient on AscendC and also the local tensor assignment might be wrong. We need to implement AdaptiveMaxPool1d properly using AscendC vector intrinsics where possible, but because it's a reduction with variable-sized windows, we need a different approach. Perhaps we can use a two-pass approach: first compute indices, then gather? But simpler: we can process each slice independently and for each output element, we compute the start and end indices of the corresponding input window and then perform a max reduction over that window. However, that would require variable-length loops and might be slow but correct.
+
+Alternative: use AscendC's built-in pooling operations? But they may not be available or match exactly. Since the reference uses nn.AdaptiveMaxPool1d, which for output size smaller than input selects uniformly spaced indices? Actually AdaptiveMaxPool1d with output_size < input length divides the input into output_size bins (approximately equal size) and takes the max in each bin. The bins are computed via floor((i * L) / outputSize) and ceil? The formula: for each output index j, the window is [floor(j * L / N), floor((j+1) * L / N)). So we need to compute these intervals and take max.
+
+We can implement a kernel that for each slice (N*C), iterates over j from 0 to outputSize-1, computes start and end, and then loops over input elements from start to end-1 to find max. That's O(L * outputSize) per slice. For large L=100000, output_size=32, that's 3.2 million operations per slice, which is acceptable. But we need to avoid scalar code and use vectorized max. However, we can use a scalar loop inside the kernel because the per-slice computation is small and can be done in UB. The kernel can load the entire slice's input into UB (up to L=100000 floats = 400KB, which may exceed UB budget 192KB? Actually UB per block is 192KB, but multiple blocks share, but we can limit to 192KB total per block. L=100000*4=400KB > 192KB, so we cannot load entire slice. So we need tiling.
+
+Thus we need to tile the input per slice. We already have tiling in previous attempt but the scalar loop with bin computation is wrong because it assumes each input element maps to exactly one output bin, which is true for max pooling? Actually for adaptive max pooling, each input element belongs to exactly one bin when output_size divides L? No, the bins may be overlapping? They are disjoint. So our previous approach of mapping each element to a bin is correct in principle, but the bin computation using integer arithmetic `(globalIdx * outputSize) / L` should give the output index. However, the output is all zeros, meaning the max values were never updated from initial NEG_INF. Possibly because the local tensor assignment `maxLocal(bin) = val` is not permissible in AscendC? In AscendC, local tensors can be read/written via operator(), but there might be restrictions or it might not work as expected. Also we need to ensure that after the loop, we copy the output. The output queue is used but the sequence: AllocTensor for maxLocal, then use it directly (not via queue), then EnQue, then DeQue, then DataCopy. That might cause issues because the tensor is used before being enqueued? Actually in AscendC, to write to a local tensor, we should allocate it from the queue or use pipe's allocate? The code AllocTensor from outQueueY_ is correct, but then we modify it directly. However, after we finish, we EnQue(maxLocal) and then DeQue to get it back and CopyOut. This should work. But the fact that output is all zeros suggests the NEG_INF initial value remains, meaning the inner loop's update never executed or the condition never true. Possibly because the tiling for loop over remaining does not correctly handle the slice offset? Or the DataCopy copies curLen elements but later in the loop we read xLocal(i) for i up to curLen-1, that should work.
+
+Another issue: the buffer sizes: outQueueY_ is initialized with outputSize_ * sizeof(float) per buffer, and tmpQueue_ with outputSize_ * sizeof(float). That's fine. But inProcessSlice, we allocate maxLocal from outQueueY_, then later we EnQue it, then DeQue, then CopyOut. Meanwhile, the inQueueX_ is used for each tile of input. That seems okay.
+
+But the output is all zeros. Could it be that the kernel is not actually being executed? Or the tiling data is wrong? In the eval log, we see that reference output is non-zero, new output is zeros. The build succeeded, so it ran. The kernel was compiled. Possibly the tiling data fields are not correctly set because the tiling struct has fields N, C, L, outputSize, tilingLength, blockDim. But in the host_operator_src, the tiling is defined as Ca6k00343CustomTilingData, and we set these fields. However, in kernel, we use GET_TILING_DATA and then access tiling_data.N, etc. That should work.
+
+Maybe the issue is that the inner loop's `if (val > maxLocal(bin))` comparison doesn't work because NEG_INF is -1e38, and the input values are around 3-4, so val > NEG_INF is true, so maxLocal(bin) should be updated. But the output is zeros, so perhaps the write `maxLocal(bin) = val` is not affecting memory. In AscendC, local tensor assignment using operator() should work; it's a scalar assignment. But we should ensure that bin is within [0, outputSize_-1]. The formula `(globalIdx * outputSize_) / L_` can produce outputSize_ when globalIdx == L_? Not exactly; for globalIdx from 0 to L_-1, bin ranges from 0 to ( (L_-1)*outputSize_/L_ ) which is at most outputSize_-1. So okay.
+
+Perhaps the problem is that the inner loop is being optimized out? Or the tiling length is huge? In host_operator, tileLen is computed as `AlignDown((UB_BUDGET_BYTES - outputSize * sizeof(float)) / sizeof(float), ALIGN_ELEMS);` which subtracts outputSize from UB budget. But UB_BUDGET_BYTES is 192*1024 = 196608 bytes. outputSize=32, so subtract 128 bytes, remaining 196480 bytes for input tile, so tileLen = 196480/4=49120, but then AlignDown to 2048 -> 49120/2048=24, 24*2048=49152? Actually 49120/2048=24.0? 24*2048=49152, so AlignDown returns 49152? That's larger than actual (49120 < 49152), so AlignDown would give 49152? Wait: AlignDown(x, a) = (x / a) * a. 49120/2048 = 23.988, integer division gives 23, 23*2048=47104. So tileLen = 47104. That's fine. Then in kernel, we iterate over remaining with curLen = min(tileLen_, remaining). So for L=100000, we will have about 3 iterations. The globalIdx in the inner loop is readPos + i, which goes from 0 to curLen-1, etc. That should be correct.
+
+But the output is zeros. Maybe the issue is that we are using `outQueueY_.AllocTensor<float>()` to allocate maxLocal, but later we do `outQueueY_.EnQue<float>(maxLocal)`, then `outQueueY_.DeQue<float>()` to get it back. However, we also have `tmpQueue_` allocated but not used, which is fine. But after we enqueue maxLocal, we immediately dequeue it; that's fine. But the problem might be that the queue is initialized with BUFFER_NUM=2, each buffer size = outputSize_ * sizeof(float). So we allocate one buffer, use it, then enqueue, then dequeue. That should be okay.
+
+Maybe the bug is that the kernel's Process() function does not handle multiple blocks correctly. In host_operator, blockDim is set to min(totalSlices, 24). For batch_size=16, in_channels=64, totalSlices=1024, blockDim=24. Then in kernel, we compute slicesPerBlock = CeilDiv(1024, 24)=43, so block0 handles slices 0-42, etc. That's fine.
+
+Wait, the eval log shows output all zeros. Could be that the kernel is not writing to global memory at all. Perhaps the DataCopy for output is not working because the local tensor is too large? But outputSize=32 is small.
+
+Another possibility: The kernel uses `AscendC::Duplicate<float>(maxLocal, NEG_INF, outputSize_);` but ASCENCD duplicate takes a scalar value; does it work with float? Should be fine.
+
+I suspect the issue might be with the macro `GET_TILING_DATA`. In the previous working leaky_relu example, they used `GET_TILING_DATA(tiling_data, tiling)` which expands to declare a struct and cast. In our kernel, we use `GET_TILING_DATA(tiling_data, tiling);` That should work.
+
+Given the output is zeros, it's likely that the kernel either crashes or never executes the inner loop. Given the build succeeded and no runtime error, the kernel ran but produced zeros. Let's try a different approach: use a simpler, more vectorized algorithm. Since AdaptiveMaxPool1d is a reduction, we can use AscendC's `ReduceMax` maybe? But we need to handle variable window sizes.
+
+Better approach: For each slice, we can load the entire input into UB if possible, but L=100000 > UB capacity, so we need tiling. However, for a single output element, its window spans a contiguous range of input. We can process output elements one by one, loading the corresponding window from global memory and computing max. The window size is approximately L/outputSize = 3125 elements, which fits in UB (3125*4=12500 bytes < 192KB). So we can avoid tiling across the entire slice and instead for each output element, load its window (whose size varies but maximum is about 3125+1). That is much simpler and avoids complex bin mapping. And we can parallelize across slices.
+
+So new kernel: For each slice (N*C) assigned to a block, iterate over output index j from 0 to outputSize-1:
+- Compute start = floor(j * L / outputSize)
+- Compute end = floor((j+1) * L / outputSize)
+- Load the input elements from start to end-1 into a local tensor (window size <= ceil(L/outputSize) ~ 3125)
+- Use AscendC::ReduceMax or a loop to compute max (we can use vectorized max via scalar loop or use AscendC::Max? There's no ReduceMax for local tensor directly, but we can use a scalar loop with a scalar variable, or use AscendC::Max between two tensors. We can initialize a scalar local tensor with -inf, then iterate over window elements and use AscendC::Max with scalar? Easier: allocate a local tensor of size 1, initialize with NEG_INF, then for each element, use AscendC::Max with that element and store result back into the scalar tensor. After loop, copy that scalar to output.
+
+But that's still a scalar loop over window elements. For window size ~3125, that's fine. We can also vectorize by splitting into chunks and doing pairwise max, but not necessary for correctness.
+
+Given time, we can rewrite the kernel to use this per-output-element window approach. Also we need to adjust tiling data: we only need N, C, L, outputSize, blockDim. The tile length is not needed for input because we load each window separately. The UB budget for a single window plus output buffer is small. So we can remove tilingLength from tiling data and kernel.
+
+We also need to ensure the blocks handle slices: totalSlices = N*C. blockDim = min(totalSlices, available cores). Each block processes multiple slices if necessary.
+
+Let's revise the kernel accordingly. Also update host_operator to simplify tiling.
+
+Additionally, we need to handle the case where outputSize > L? But in the reference, outputSize=32, L=100000, so fine.
+
+Now, produce the corrected code.
+
+We'll keep the project_json and host_tiling_src mostly the same, but remove tilingLength field from tiling data. Actually we can keep it but not use it. Simpler: remove it.
+
+We'll rewrite kernel_src and host_operator_src.
+
+Also fix python_bind_src: it uses EXEC_NPU_CMD with aclnn function, but we need to ensure the aclnn function exists. In the previous attempt, the aclnn function is generated from the autogen script based on project_json. The project_json defines op name "Ca6k00343Custom" with input x, output y, attr output_size. The autogen should generate aclnnCa6k00343Custom with signature (const at::Tensor& self, int64_t output_size, at::Tensor& result). That should be fine.
+
+But note: in the reference, the op is called adaptive_max_pool1d, but we are using custom op. The model_src uses custom_ops_lib. That's fine.
+
+Now, let's generate the new code.
+
+Key changes:
+- kernel_src: implement per-output-element window max.
+- host_operator_src: simplify tiling, remove tilingLength.
+- host_tiling_src: remove tilingLength field.
+- kernel_src: remove tilingLength usage.
+
+Also ensure that the kernel function name matches the one in the autogen (ca6k_00343_custom). The previous attempt used ca6k_00343_custom as kernel name, and the autogen expects that.
+
+Now write the new strings.

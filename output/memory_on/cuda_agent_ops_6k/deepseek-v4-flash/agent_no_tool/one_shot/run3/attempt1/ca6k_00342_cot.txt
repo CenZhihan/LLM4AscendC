@@ -1,0 +1,125 @@
+We need to generate Ascend C artifacts for a fused MaxPool1d operator. The reference uses nn.MaxPool2d, but the instruction says "nn.MaxPool1d" in the fused API list. However, the reference program uses nn.MaxPool2d. Possibly a mis-match? The task id is ca6k_00342, and the fused API list says "nn.MaxPool1d". But the reference uses MaxPool2d. Likely the user wants to replace MaxPool2d with a custom AscendC kernel that performs max pooling. But the instruction says "Fused API list (replace / fuse these in the reference forward into one or more custom ops as you see fit): - nn.MaxPool1d". Possibly it's a typo; the reference is 2D. I'll assume it's intended to be MaxPool2d, but the custom op will handle 2D max pooling. The kernel name should be ca6k_00342_custom, PascalCase Ca6k00342Custom.
+
+Constraints: single fused custom op. Input shape: (batch, channels, height, width). MaxPool2d with kernel_size=2, stride=2. Output is (batch, channels, H//2, W//2). We need to implement max pooling in AscendC.
+
+We must output six strings. Let's design the kernel.
+
+We need to handle 2D max pooling. Usually it's done by sliding window. Since kernel size and stride are 2, it's a simple downsampling with 2x2 pooling. Could implement as: for each output pixel, take max over a 2x2 region. We'll assume layout is NCHW. We'll tile along H and W dimensions.
+
+We'll need tiling data: totalLength (number of output elements?), but typical tiling is for contiguous data. However, max pooling is not element-wise; it's a reduction over windows. We need to manage input and output tensors with different shapes. We'll use a kernel that processes one output element at a time, but we need to handle data movement efficiently. Given the constraints are not extremely large, we can write a straightforward kernel that loads a 2x2 window and computes max, then writes output. For simplicity, we can treat the input as a 4D tensor and output as 4D tensor. We'll use a loop over all output elements. The kernel will be slower but simple.
+
+Alternatively, we can leverage AscendC's pooling API? But we are to implement custom operator, so we can write our own.
+
+We'll define tiling: we can tile along the batch*channels dimension? Or along output spatial dimensions. Let's decide to process one output element at a time, but we can vectorize by processing multiple output elements in one tile. Actually, we can treat the output as a 1D array of size N*C*H_out*W_out, and compute each output element by loading the corresponding 2x2 input window. The input is contiguous in memory? For NCHW, each channel is contiguous, but spatial dimensions are contiguous within channel. So output element at (n,c,h,w) corresponds to input region from (n,c, 2*h, 2*w) to (n,c, 2*h+1, 2*w+1). That's 4 floats. We can load them using DataCopy with a discontinuous pattern? We need to copy from global to local with a stride? Or we can load a whole tile of input and then compute? That would be more efficient but more complex.
+
+Given the reference input size: batch 16, channels 3, height 3072, width 1536 => total input elements = 16*3*3072*1536 ≈ 226 million floats; output elements = 16*3*1536*768 ≈ 56 million floats. So significant. We need a reasonably efficient kernel.
+
+We can use AscendC's matrix or vector processing? Possibly use a 2D reduction. We can load a block of input data (e.g., several rows) and compute max pooling with 2x2 windows.
+
+Simpler approach: treat the pooling as a 2D convolution with max pooling. But we can implement a tile-based approach:
+
+- For each output element, we compute the max of 4 input elements. We can vectorize along the channel dimension? Actually, pooling is per-channel, so we can process all channels simultaneously for a given spatial location.
+
+Let's design kernel:
+
+- Input shape: N, C, H, W.
+- Output shape: N, C, H/2, W/2.
+- We'll iterate over output spatial dimensions H_out and W_out. For each output position (h,w), we need to load the 2x2 window from input for all channels. We can load a block of input data that covers multiple output positions to amortize memory access.
+
+Given the large sizes, we should tile along H and W dimensions. Each tile will process a block of output rows and columns. For simplicity, let's set tile size such that we can load a contiguous block of input data (including the needed overlap). For kernel_size=2 and stride=2, the input block for a contiguous output region of size (Ht, Wt) will be of size (Ht*2+1, Wt*2+1)? Actually, because stride=2, each output row corresponds to two input rows (index 2h and 2h+1). So if we process Ht output rows, we need input rows from startRow*2 to startRow*2 + 2*Ht. That's 2*Ht+1 rows (since inclusive). Similarly for columns: 2*Wt+1 columns. So input block size is (2*Ht+1)*(2*Wt+1). That might be too large. Better to process one output row at a time? For each output row, we need two input rows. So we can load two input rows at a time and process all output columns for that row. Then move to next output row.
+
+Let's design kernel to process one output row at a time. For each output row index h_out (0 <= h_out < H_out), we need input rows 2*h_out and 2*h_out+1. We'll load these two rows (full width) into local memory. Then for each output column w_out, we take the max over the two rows and two columns (2x2 window). That is straightforward.
+
+We'll allocate local buffers for two input rows and one output row? Actually we can process one output row at a time, compute max in place. We'll need to store the intermediate results for each column. We can use a single buffer of size W_out for output row, and compute one output element at a time.
+
+But we also have the channel dimension: we need to do this for all channels. Since channels are independent, we can loop over channels as well. So the kernel will have nested loops: over batch, over channels, over output rows, over output columns. That is slow but will work.
+
+Given the large size, we need to parallelize. We can use block grid: assign blocks to handle a subset of batch*channel pairs. For example, each block handles a specific (batch, channel) pair. Then within that, we process all output rows and columns. We can also split spatial dimensions across blocks if needed, but for simplicity, let each block handle one (n,c). Then we have N*C = 16*3=48 blocks, which is fine.
+
+We need tiling data: blockDim, total batches/channels, etc. But we can also just set blockDim to N*C.
+
+We also need to handle output size: H_out = H//2, W_out = W//2.
+
+Let's write the kernel.
+
+We'll use AscendC's DataCopy to load input rows. We'll need to compute the offset of input row for given n,c and row index. Input memory layout: row-major within each channel. Input stride: W (width). So for input at (n,c,h), the offset = n*C*H*W + c*H*W + h*W. For output at (n,c,h_out,w_out), offset = n*C*H_out*W_out + c*H_out*W_out + h_out*W_out + w_out.
+
+We'll use four-dimensional indices.
+
+Kernel steps:
+1. Get blockIdx and blockNum. We'll set blockNum = N*C, and assign blockIdx to a (n,c) pair.
+2. For that (n,c), loop over h_out from 0 to H_out-1.
+   - For each h_out, load input rows row1 = 2*h_out and row2 = 2*h_out+1 from global to local.
+   - Then loop over w_out from 0 to W_out-1:
+        compute localMax = max(x_local1[w], x_local1[w+1], x_local2[w], x_local2[w+1])? Actually, careful: the window columns: left column = 2*w_out, right column = 2*w_out+1. So we need elements at positions 2*w_out and 2*w_out+1 from both rows. So we need to access x_local1[2*w_out], x_local1[2*w_out+1], etc. But we loaded the entire rows of length W. So indexing is straightforward.
+   - Write the one output element to global.
+
+But this is many global writes per output element. We can write a whole output row at once: after computing all output columns for a given output row, we have an output row buffer of length W_out. We can then write that row to global. That reduces global writes.
+
+So we need an output row buffer of size W_out in local memory. We'll allocate it.
+
+We'll need to manage buffer sizes. W_out = 1536/2 = 768, which is fine.
+
+We'll use TQue for data movement? For simplicity, we can use DataCopy directly without queues, but we need to ensure synchronization. Since we are loading two rows per output row, we can use a double buffer to overlap compute and copy. We'll implement with queues.
+
+Let's design tiling: we'll have tiling data: total output elements (N*C*H_out*W_out), input stride (W), output stride (W_out), H, W, H_out, W_out, etc. Actually, we can pass the shape parameters through tiling.
+
+Given the constraints of the example, we'll pass necessary dimensions via tiling.
+
+Let's define tiling data struct:
+- batchSize (N)
+- channels (C)
+- height (H)
+- width (W)
+- kernelSize (2)
+- stride (2)
+- outputHeight (H_out)
+- outputWidth (W_out)
+- blockDim (set to N*C)
+
+But we can also compute from input dimensions.
+
+We'll keep it simple: pass all needed scalars.
+
+Now, write the six strings.
+
+We'll follow the pattern of the example.
+
+Note: The example uses a single kernel that processes all elements. For pooling, we need a different approach.
+
+We'll write host_tiling_src with necessary fields.
+
+Important: The project_json_src must have top-level "op" key. The JSON in example had an array as top-level? Actually the example had: 
+```
+[
+  {
+    "op": "LeakyReluCustom",
+    ...
+  }
+]
+```
+It's an array of one object. The instruction says: "The parsed JSON must have a top-level key 'op' (required by the Ascend build toolchain). Under 'op' put operator metadata". But the example has an array? Possibly the example's JSON is an array of operator descriptors. Usually the project json is a list of operator definitions. So it's fine: top-level array, each element has "op" key. We'll do similarly.
+
+Let's create the operator name: "Ca6k00342Custom" (PascalCase). Kernel function name: "ca6k_00342_custom".
+
+We'll implement the kernel as described.
+
+Make sure to use the correct AscendC APIs: DataCopy, LocalTensor, GlobalTensor, etc.
+
+We'll need to handle the case where height and width are even (they are 3072 and 1536, both even, so output dimensions are exact). Assume they are always divisible by stride.
+
+Now produce the code.
+
+We'll write the six strings in the code block.
+
+Note: The model_src should define class ModelNew with __init__ and forward, using the custom op. But the custom op expects inputs as per our kernel. We need to match the signature: forward takes x and returns y. The kernel is a single op that does max pooling. So ModelNew.forward will just call the custom op.
+
+We also need to provide python_bind_src for the custom op. We'll follow the example pattern.
+
+Let's write the code.
+
+We'll need to be careful with the host_operator_src to include proper headers and register the op.
+
+We'll also need to implement InferShape and InferDataType.
+
+Now, produce the final answer.

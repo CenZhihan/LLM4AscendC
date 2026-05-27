@@ -1,0 +1,80 @@
+We need to fix the previous attempt. The error logs show a runtime error: "vector core execution is abnormal" with symptom "The MPU address access is invalid." This is typical of accessing global memory out of bounds or using local tensors incorrectly. The previous kernel used a per-element loop inside ProcessTile that accesses global memory via xGm_.GetValue and sets local tensor with yLocal.SetValue, but also does DataCopy from local to global. The issue is likely that the kernel is not using vectorized operations; it's doing scalar per-element processing which is fine, but the local tensors are accessed with SetValue/GetValue which might cause issues if the index is out of bounds. Also the tile length may be misaligned or the UB budget calculation might be wrong.
+
+Looking at the kernel: it allocates a local tensor yLocal of size tileLen_, then loops for len (which is curLen) and sets each element. But after the loop, it does DataCopy(yGm_[outOffset], yLocal, len). That is fine. However, there's also tmpQueue_ allocated but never used, which is okay but wastes UB. The main problem is likely that the kernel uses per-element scalar operations which are slow but not incorrect. The error "MPU address access is invalid" often occurs when accessing global memory beyond the allocated buffer. Check the global buffer sizes: xGm_ is set to origN*origC*origD*origH*origW, which is the input size. But in the loop, we compute an index into xGm_ using the original dimensions. That should be correct. However, the biasGm_ is set to bias (size origC), and we access biasGm_.GetValue(c5) where c5 is the channel index. That should be within bounds. The yGm_ is set to totalOutLen, and we write with DataCopy using outOffset which is within totalOutLen_. So likely the global buffer access is fine.
+
+But there's another issue: the kernel uses a while loop with ProcessTile for each tile, but it does not use double buffering. It allocates a local tensor yLocal each tile and frees it. That's okay. However, the tmpQueue_ is allocated but never freed (only freed inside ProcessTile but it is allocated there as tLocal and freed, but the queue is never used). That might cause UB overflow? Actually tmpQueue_ is declared with 1 buffer, and we allocate tLocal each call and free it. That's fine.
+
+The error message says "The MPU address access is invalid" which often relates to using DataCopy with a length that is not aligned. The tileLen_ is aligned to 2048, but the actual curLen may not be aligned. DataCopy expects the length in elements (float) and likely requires 32-byte alignment (8 floats). AlignDown to 2048 ensures 2048 * 4 = 8192 bytes, which is 256-element alignment? Actually 2048 floats = 8192 bytes = 2KB. That's fine. But the actual curLen may be less than tileLen_ and may not be a multiple of 8. DataCopy in AscendC requires the number of elements to be a multiple of 8 for float32? Typically it requires 32-byte alignment, so number of floats must be multiple of 8. If totalOutLen is not a multiple of 8, the last tile's len may not be a multiple of 8, causing an MPU error. That is likely the problem: the last tile length may not be aligned to 8.
+
+Also the kernel uses a while loop with strideElems = blockNum * tileLen_, but each tile processes len which may be less than tileLen_ for the last tile. The DataCopy to global uses len, which may not be aligned. Need to ensure that DataCopy lengths are aligned to 32 bytes (8 floats). The simplest fix: when copying out, we can pad the local tensor with zeros? But we need to copy only valid elements. Another approach: use a smaller alignment for tileLen_ that ensures all tile lengths are multiples of 8. Since totalOutLen may not be a multiple of 8, we can adjust tileLen_ to be the largest multiple of 8 such that the last tile also has length multiple of 8. Or we can handle the final unaligned elements separately using scalar access instead of DataCopy.
+
+From the memory: "When Ca6k00163Custom kernel runtime fails with vector core exception (error 507035) in double-buffered Process loop, do not use BUFFER_NUM=2 and pre-fetch next tile; instead use BUFFER_NUM=1 and process each tile sequentially." We already use BUFFER_NUM=2 but we are not using double buffering properly: we allocate local tensors, fill them, copy out, and free. That's sequential. The issue might be simply the alignment.
+
+Also note the kernel does not use the inQueueX_ at all; it directly accesses global memory with GetValue. That's fine but inefficient. However, the MPU error might also come from the global tensor access if the index calculation goes out of bounds due to integer overflow or negative. The orig_d, orig_h, orig_w are computed as int32_t, and we check bounds. That seems safe.
+
+Let's also check the tiling: UB_BUDGET_BYTES = 192*1024, divided by 2*sizeof(float) = 8 bytes? Actually 2*sizeof(float) is 8 bytes per element? Wait: The kernel uses two local tensors: yLocal and tLocal, each of size tileLen_ floats. So total UB needed = 2 * tileLen_ * 4 bytes = 8 * tileLen_ bytes. Also the pipe buffers: inQueueX_ uses 2 buffers of tileLen_ floats each, but they are not used. That's waste. So UB budget calculation should consider only the actual used local tensors. In the current kernel, we allocate yLocal and tLocal (though tLocal is unused). So effectively 2 * tileLen_ floats. The UB budget should be 192*1024 / 8 = 24576 elements, aligned to 2048 gives 24576 -> AlignDown(24576, 2048) = 24576? 24576/2048=12 exactly, so 24576. Then capped at 32768, so maxTile=24576. That's okay.
+
+But the issue is the alignment of curLen in DataCopy. We need to ensure that the length passed to DataCopy is a multiple of 8. In the host tiling, we align tileLen to ALIGN_ELEMS=2048, which is a multiple of 8. But the actual curLen for the last tile might be less than tileLen and not a multiple of 8. The typical solution: when setting tileLen in host, we ensure that tileLen is a multiple of 8, and also that the total length is handled by ensuring that the last tile is padded? Actually, we can clip tileLen to be the largest multiple of 8 that is <= maxTile, and then when computing the last tile length, we can ensure it's also a multiple of 8 by adjusting the tile size. But the simplest and common approach: use a DataCopy length that is always aligned (multiple of 8) even if it means copying extra elements beyond the valid output (and then not writing those). However, we must guarantee that the global memory beyond the output size is not accessed? Actually, DataCopy copies from local to global, so writing extra elements would corrupt memory. So we need to ensure the length is exactly the valid elements and is aligned to 8. That requires that the total output size be a multiple of 8, or we handle the remainder separately.
+
+In this case, totalOutLen = N * C * outD * outH * outW. Since N=512, C=3, outD=64+1+2=67? Wait pad_size = (1,2,1,2,1,2) so D: pad_front=1, pad_back=2 => outD=64+1+2=67, outH=64+1+2=67, outW=64+1+2=67. So totalOutLen = 512*3*67*67*67 = 512*3*300763 = 512 * 902289 = 461,972,? Actually compute: 3*67*67*67 = 3 * (67^3) = 3 * 300763 = 902289. Then *512 = 461,972,? 902289 * 512 = 902289 * 512 = 902289 * 500 + 902289*12 = 451144500 + 10827468 = 461,971,968. That number is divisible by 8? 461,971,968 / 8 = 57,746,496. So it's a multiple of 8. So the total length is aligned. However, the last tile's length, when we do totalOutLen - base with stride = blockNum*tileLen, might not be aligned if tileLen is a multiple of 8 and blockNum*tileLen is also a multiple of 8? Since tileLen is multiple of 8, blockNum*tileLen is multiple of 8. Then totalOutLen - base is also a multiple of 8 because base is multiple of tileLen (since base = blockIdx*tileLen) and tileLen is multiple of 8, so base is multiple of 8. Thus curLen is multiple of 8. So that should be fine. But wait: in the while loop, base is incremented by strideElems, which is blockNum * tileLen. That is also a multiple of 8. So each tile's start is multiple of 8, and the remaining length is multiple of 8. So the length should always be a multiple of 8. So alignment is likely fine.
+
+So what else could cause the MPU error? Perhaps the local tensor index using SetValue with i going from 0 to len-1, but yLocal is allocated with tileLen_ elements, which is >= len, so fine. The DataCopy from yLocal to global should be okay. Another possible issue: the while loop uses ProcessTile which allocates yLocal and tLocal each iteration. The pipe_.InitBuffer for outQueueY_ and tmpQueue_ with BUFFER_NUM=2 and 1 respectively. But we are directly allocating from the queues with AllocTensor, then freeing. That should work.
+
+But note: we allocate yLocal from outQueueY_ and tLocal from tmpQueue_. However, we never enqueue anything into inQueueX_, so that buffer is unused but still initialized. That shouldn't cause error.
+
+The root cause might be the way we access biasGm_.GetValue(c5). The bias tensor is a parameter with shape (C,1,1,1) but in the host operator we declared bias as an input of type float with format ND. The bias tensor's actual shape is (C,1,1,1) which is 4D. But the global buffer for bias is set with length origC (which is 3). However, the bias tensor's storage might be contiguous with size C. GetValue with index c5 (0,1,2) should be fine.
+
+Maybe the issue is that we use too many local tensors: yLocal and tLocal, plus the pipe buffers for inQueueX_ (2 buffers of tileLen_ each) and outQueueY_ (2 buffers of tileLen_ each) and tmpQueue_ (1 buffer). That totals 5 buffers of tileLen_ floats, which is 5 * tileLen_ * 4 bytes. With tileLen_ up to 24576, that's 5*24576*4 = 491520 bytes = 480KB, which exceeds the 192KB UB budget! That's likely the problem. The UB budget is 192KB per core, but we are using 480KB, causing out-of-memory errors. The kernel allocates 5 buffers: inQueueX_ has 2 buffers, outQueueY_ has 2 buffers, tmpQueue_ has 1 buffer, plus the local tensors yLocal and tLocal are also allocated from those queues. So total UB usage is (2+2+1) * tileLen_ * sizeof(float) = 5 * tileLen_ * 4 = 20 * tileLen_ bytes. With tileLen_=24576, that's 491520 bytes = 480KB, far exceeding 192KB. That causes the MPU access error because the local memory is insufficient. The host tiling calculation for UB budget assumed 2 * tileLen (since it used 20 bytes per element? Actually in the example, they used 20 bytes per element: "Total floats = 5 * tile => bytes = 20 * tile". That matches: 5 floats per element (2 for in, 2 for out, 1 for tmp). They used UB_BUDGET_BYTES / 20 to get maxTile. But in our kernel, we have 5 buffers as well, so we should use 20 bytes per element. But the host tiling in our previous attempt used UB_BUDGET_BYTES / (2 * sizeof(float)) = 192*1024 / 8 = 24576, which assumes only 2 floats per element, but we actually have 5. So the tileLen_ is too large, causing UB overflow.
+
+Therefore, the fix: correct the UB budget calculation in host_tiling_src to use 5 floats per element (20 bytes per element). Also, we should reduce the number of buffers to match the actual usage. Since we are not using inQueueX_ for data copy (we use direct GetValue), we can remove the inQueueX_ buffer entirely and just use global reads via GetValue. That reduces UB usage. Similarly, tmpQueue_ is unused, so we can remove it. Then we only need outQueueY_ for the output local tensor. That would use only 1 buffer (or 2 for double buffering) but we are not double buffering. So we can use a single local tensor directly without a queue. The simplest: allocate a single local tensor for yLocal and do DataCopy to global.
+
+Thus the fix: simplify the kernel to use a single local tensor for output, no queues, and compute xVal by reading global memory directly (or using a small local buffer for input). But to keep vectorization, we could read a tile of input from global to local, then process, then copy out. But the current approach reads each element individually from global which is fine but slow. To fix the UB overflow, we need to reduce UB usage.
+
+Given the memory about using BUFFER_NUM=1, we can use a single queue with 1 buffer for output, and no input queue (read directly from global). That would use only 1 buffer of tileLen_ floats = 4 * tileLen_ bytes. UB budget: 192KB / 4 = 49152 elements, which is plenty. But we also need a temporary for computation? We can compute yVal = xVal + biasVal directly without a temporary. So one local tensor is enough.
+
+Thus:
+
+- Remove inQueueX_, tmpQueue_.
+- Use only outQueueY_ with BUFFER_NUM=1.
+- In Init, init pipe with only outQueueY_ buffer.
+- In ProcessTile, allocate yLocal from outQueueY_, fill it, then DataCopy out, then free.
+- No need for tLocal.
+
+- Adjust host tiling UB budget to reflect only 1 float per element (output local tensor). But careful: we also might need a small temporary for copying? Actually, reading from global per element doesn't require local tensor for input. So only 1 local tensor. So maxTile = UB_BUDGET_BYTES / sizeof(float) = 192*1024 / 4 = 49152, aligned down to 2048 gives 49152? 49152/2048=24, so 49152. Cap at 32768 gives 32768. So tileLen can be up to 32768. That's fine.
+
+Also, we need to ensure that the DataCopy length is aligned to 8. But as argued, total length is multiple of 8, and tileLen is multiple of 2048, so fine.
+
+Also, we must handle the case where the tile length (curLen) is less than tileLen_ (last tile) but still multiple of 8. Since totalOutLen is multiple of 8, and base is multiple of 8, curLen should be multiple of 8.
+
+Now, the kernel should also be more efficient by reading input in bulk using DataCopy for the input tile as well. But given time, we can keep the per-element global read, but ensure the local output buffer is used.
+
+We also need to adjust the host operator's tiling function to set tileLen based on 1 buffer (4 bytes per element). The previous calculation used 20 bytes per element, so we need to change it.
+
+Also, the pipe_.InitBuffer for outQueueY_ should use BUFFER_NUM=1.
+
+Additionally, the bias read is per-element, but we can read bias from global each time; that's fine.
+
+Now, update the code accordingly.
+
+Also note: the error logs show "vector core execution abnormal" with MPU address invalid. This strongly points to UB overrun. So fixing UB budget should resolve.
+
+We also need to ensure the kernel does not use any temporary queue that is not allocated.
+
+Let's implement the fix.
+
+We'll produce the corrected six strings.
+
+In kernel_src:
+- Remove inQueueX_ and tmpQueue_ declarations and usage.
+- Change outQueueY_ to BUFFER_NUM=1.
+- Remove tLocal allocation.
+- In ProcessTile, allocate yLocal, fill with scalar loop, then DataCopy to global, then free.
+
+In host_tiling_src:
+- Correct UB_BUDGET_BYTES calculation: now only 1 local tensor (but we also have the output queue buffer which is the same tensor, so 1 float per element). Actually the local tensor is allocated from the queue, so the queue has 1 buffer of tileLen floats. So total UB = tileLen * sizeof(float) = 4 bytes per element. Alternatively, we might want a small temporary for the input tile? Not needed. So maxTile = UB_BUDGET_BYTES / sizeof(float) = 192*1024 / 4 = 49152. Align down to 2048 gives 49152 (since 49152 is multiple of 2048). Then cap at 32768 -> 32768. So maxTile = 32768. But we should also consider that we might want to double buffer output? Not necessary.
+
+We could also keep a larger tileLen but ensure it doesn't exceed UB.
+
+Also, we must ensure that the host operator's InferShape works correctly.
+
+Now, produce the corrected code.

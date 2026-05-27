@@ -1,0 +1,324 @@
+We need to fix the previous attempt. The error is: "casting '__gm__ uint8_t *' (aka '__gm__ unsigned char *') to type 'float *' is not allowed in aicore function". The previous kernel had a fallback scalar loop that cast the GM_ADDR (which is uint8_t*) to float*. That's not allowed in AscendC kernel. We must use the proper AscendC types: GlobalTensor<float> or use SetGlobalBuffer with the GM_ADDR directly. The kernel needs to be rewritten using proper AscendC API, not raw pointer casts.
+
+We have memory repair tips: use SetGlobalBuffer with GM_ADDR (which is already handled in the class KernelCa6k02874Custom, but the fallback scalar loop bypassed that). The error lines 149-152 are from the scalar loop. We need to remove that scalar loop and implement a proper vectorized addmm kernel.
+
+The previous attempt had a skeleton class but the Process() was incomplete and the extern "C" function had a fallback scalar loop. We need to complete the kernel properly.
+
+Given the task: fused addmm. Inputs: bias (1D), x (2D), weight (2D). Output: y = x @ weight + bias. x shape: [batch_size, input_features], weight shape: [input_features, input_features], bias shape: [input_features]. Output shape same as x.
+
+We need a kernel that does matrix multiplication efficiently. For AscendC, we should use vectorized operations. Since Cube (matrix multiplication) is not available in simple kernels, we need to implement using vector operations: for each row of x, compute y = bias + x * weight. That can be done by tiling columns: for each row, load x row, then for each column j in the output, compute dot product with weight[:, j] (vector-vector). However, that's O(cols^2) per row. Better approach: use vectorized outer product? Not directly.
+
+But we can use the following: For each row i, we want y[i,:] = bias + sum_k x[i,k] * weight[k,:]. This is a matrix-vector multiply: y = bias + weight^T * x_i? Actually x_i is row vector shape [1,cols], weight [cols, cols], so y[i,:] = x_i @ weight + bias. That's a vector-matrix multiply. In AscendC, we can do: for each row, load x_i, then for each column j, compute dot product of x_i and weight[:, j] using vector multiply and reduce. But we need to tile weight columns.
+
+Simpler: Since the sizes are moderate (4096), we could do the entire multiplication in one go using a single block? But that would be sequential and slow. Better to parallelize over rows: each block handles a subset of rows. For each row, we need to compute output row. We can load weight into UB? No, weight is 4096x4096 = 16M floats -> too large. So we have to tile weight columns.
+
+We can tile output columns (j) as well. For a tile of columns [c, c+tileCol), we load the corresponding columns of weight (all rows) and compute the contribution from x_i. That requires loading a column slice of weight matrix. Weight is stored row-major, so weight[:, c:c+tileCol] is not contiguous; each row of weight contributes tileCol elements contiguous. But weight rows are contiguous columns, so weight row k has columns [k*cols + c, k*cols + c+tileCol). That's not a contiguous block in memory unless we transpose. To load efficiently, we might need to transpose or use DataCopy with strides? Not trivial.
+
+Given the complexity and time, we can fall back to a simpler but correct implementation: use the Cube API (MatMul) which is available on Ascend. The requirement didn't forbid using Cube. The 'kernel_operator.h' includes the necessary headers. We can use the MatMul class. That would be much simpler and efficient.
+
+Let's redesign: Use MatMul to compute y = x * weight + bias. We'll have three inputs: x, weight, bias. The kernel will call MatMul and then add bias. Since MatMul expects specific tensor shapes and types, we'll need to set up the MatMul parameters. This is a standard approach.
+
+But note: AscendC kernel for MatMul requires the Cube tensor types. The kernel signature must be modified to accept the tiling data and use MatMul. The tiling data should provide MatMul tiling info (block sizes, etc.). We can keep the same tiling data structure but add the necessary parameters for MatMul.
+
+Alternatively, we can implement a simpler vectorized approach using only vector operations but with a tiling strategy that loads a tile of weight columns contiguously. Since weight is stored row-major, weight[k, c:c+tileCol] is contiguous in memory (each row 4096 elements, so offset = k*totalCols + c). So we can load a tile of weight columns by iterating over rows of weight (k) and loading a contiguous segment from each row. That's not vectorized across k, but we can load multiple weight columns at once? Actually we can load a chunk of weight rows? Hmm.
+
+Better: We can treat the problem as: y[i,j] = bias[j] + sum_k x[i,k] * weight[k,j]. For each row i, we can compute the entire output row by iterating over k and accumulating scaled weight rows: for each k, we add x[i,k] * weight[k,:] to the output. That is vector addition of a scaled vector. So for row i, we initialize output = bias. Then for k from 0 to totalCols-1: output += x[i,k] * weight[k,:]. This requires loading weight[k,:] (a full row) each time, which is 4096 floats. That's okay if we tile weight rows? Actually we need to iterate over all k. We can tile weight rows as well.
+
+Simplify: Since totalCols=4096, a full row is 16KB. UB is 192KB, so we can hold several rows. We can tile weight rows: process k in chunks of tileK. For each tile of k, we load a chunk of weight rows (tileK x totalCols) and the corresponding x[i, k:k+tileK] and compute the outer product accumulation. That's like a blocked matrix-vector multiply.
+
+Given the instruction to fix with minimal changes, we should keep the kernel structure but replace the scalar loop with a proper vectorized implementation using the existing queues and buffers. The previous attempt's class had Init with queues but Process was incomplete. We can complete it using a tiled approach: for each row, load full x row into a local buffer (xRowBuf), then iterate over columns in tiles of tileCol, and for each tile, iterate over k (full columns) to accumulate. That is O(cols^2) per row, which is the same as sequential. But we can parallelize across blocks for rows.
+
+Given time, I'll implement a kernel that for each block, processes a chunk of rows, and for each row, does a double loop over k and j with vectorized operations using the queues. However, we must avoid the scalar loop that caused the error.
+
+Alternatively, we can implement a simple kernel that uses the MatMul API. That is likely the intended solution.
+
+Let's go with MatMul. The kernel will use MatMul<float> to compute C = A * B + C, where A is x (MxK), B is weight (KxN), and bias is vector broadcast. But MatMul in AscendC does not support bias addition inside the kernel? We can add bias after MatMul.
+
+We need to set up the MatMul parameters: transA, transB, etc. We'll do x * weight (no transpose). x shape: [batch_size, input_features], weight: [input_features, input_features]. So M=batch, K=input_features, N=input_features. After MatMul, we add bias.
+
+The MatMul API requires setting up the Cube block dimensions. We'll need tiling data for MatMul: block sizes for M, N, K. We can use the same tiling func to compute these.
+
+Since the previous attempt had a complex tiling, we can simplify: use a fixed block size for MatMul (e.g., 128 or 64). Or let the framework decide? We'll set blockDim to 1 and let MatMul handle parallelism internally? Not exactly; MatMul uses all cores. Actually, the MatMul kernel is designed to be called with a single block, but internally it uses the whole AI core. We should set blockDim=1 and use the Cube.
+
+But we need to ensure compilation. The kernel_operator.h includes the necessary Cube headers? We need to include "matmul_api.h" or similar. For AscendC, MatMul is available via "matmul_api.h". We'll include that.
+
+Given the risk of missing headers, maybe it's safer to implement a vectorized but correct kernel without Cube, but using only vector operations. We can mimic the pattern from the example leaky_relu: use DataCopy, local tensors, and vector operations.
+
+We can implement a tiled matrix-vector multiply: For each row i, we compute output row y_i. We'll iterate over columns j in tiles of tileCol. For each tile, we compute y_i[j:j+tileCol] = bias[j:j+tileCol] + sum_k x[i,k] * weight[k, j:j+tileCol]. We can compute this by: for each k, load weight[k, j:j+tileCol] (tileCol floats), multiply by scalar x[i,k], and add to accumulator. That requires iterating over k for each column tile. Complexity O(totalCols^2) per row but vectorized per tile. We can tile k as well: for a block of k (tileK), we load a chunk of weight rows and the corresponding x[i, k:k+tileK] and accumulate. That's like a blocked algorithm.
+
+But to keep code manageable, I'll implement a simpler version: for each row, load the entire x row into a local buffer (size totalCols). Then, for each column tile, load the entire weight columns for that tile? That would require loading weight matrix column-wise, which is not contiguous. Instead, we iterate over k: for each k, load weight k row (totalCols) and add x[i,k] * weight_k to output. That is O(totalCols^2) per row but each step is loading a full weight row (16KB) and doing vector multiply and add. This is vectorized and can be done with queues. We can tile weight rows: load a chunk of weight rows (tileK rows) and compute outer product.
+
+Given the complexity and the need to produce a working kernel quickly, I'll implement a kernel that uses a single pass: for each row, use a local buffer for the output row (size totalCols), initialize with bias. Then for k from 0 to totalCols-1: load weight row k, multiply by scalar x[i,k], add to output. This requires two queues: one for weight row, one for output. We'll need to load weight row from global (contiguous) and compute. This is O(totalCols) vector operations per row, each loading 16KB, which is okay.
+
+But we must tile the columns of the output? No, because output row is full. We can process the entire row at once if we have enough UB. totalCols=4096, so output row is 16KB. Weight row is also 16KB. Plus scalar, plus temporary. Total ~48KB < 192KB. So we can process a full row in one go. For each row, we load weight row, do vector multiply and add, loop over k. That's one row at a time. But we have many rows (batch_size=1024). We'll parallelize over blocks: each block handles a chunk of rows (tileRow). For each row in its chunk, it does the full computation.
+
+Implementation plan:
+- In Init, set up global tensors, and allocate local tensors: outRowBuf (size totalCols), weightRowBuf (size totalCols), and a temp buffer for scalar multiplication.
+- For each assigned row:
+  - Copy bias from global to outRowBuf (using DataCopy, since bias is same for all rows, we can load once per block and reuse? Bias is same for all rows, so we can load it once per block and reuse for each row.)
+  - For k from 0 to totalCols-1:
+    - Load weight row k into weightRowBuf.
+    - Get scalar x[row, k] (scalar). We can load x row once and then index locally? Better: load x row into a local buffer (xRowBuf) once per row.
+    - Compute: for each j, outRowBuf[j] += xRowBuf[k] * weightRowBuf[j]. This is a vector scalar multiply and add.
+  - After loop, copy outRowBuf to y global row.
+- Use queues for double buffering? Simpler: use single buffering and synchronize.
+
+To avoid complexity, we can implement this directly without queues if we ensure that DataCopy operations are sequential. But we need to be careful with DMA. We can use DataCopy with sync.
+
+Given time, I'll write a clean kernel that uses local tensors and loops, avoiding the previous cast error.
+
+Key points:
+- Remove the scalar loop that used raw pointer casts.
+- Use SetGlobalBuffer with GM_ADDR (the kernel entry already receives GM_ADDR, which is uint8_t*, but we don't cast it; we pass it directly to SetGlobalBuffer, which expects GM_ADDR).
+- The kernel entry point `extern "C" __global__ __aicore__ void ca6k02874_custom(GM_ADDR bias, GM_ADDR x, GM_ADDR weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)` is correct. The previous error came from the scalar loop where we did `(float*)bias`. We must not do that.
+- Instead, use the kernel class that uses GlobalTensor and SetGlobalBuffer.
+
+Thus, we need to complete the KernelCa6k02874Custom class with proper implementation.
+
+Let's rewrite kernel_src with a complete vectorized implementation. We'll also adjust tiling data to include tileRow (number of rows per block). The blockDim should be set appropriately.
+
+We'll also need to ensure that the tiling data includes all needed fields: totalRows, totalCols, tileRow, tileCol (maybe not needed if we process full columns). But we need tileCol for the output row buffer size? Actually we process full columns, so buffer size = totalCols. We'll allocate local tensors of size totalCols. But totalCols can be up to 4096, which is fine.
+
+We'll modify the host_operator_src to have a simpler tiling: set blockDim = min(batch_size, 24), tileRow = ceil(batch_size / blockDim). No column tiling needed. But we must ensure UB budget: we need 3 local tensors of totalCols each: outRowBuf, weightRowBuf, xRowBuf. That's 3 * 4096 * 4 = 49152 bytes, plus overhead, within 192KB. So okay.
+
+But we also need a temp buffer for scalar multiplication? We can multiply directly using vector operation: `AscendC::Muls(weightRowBuf, weightRowBuf, xVal, totalCols)` then add to outRowBuf. That uses weightRowBuf as temp, but we need to reload weight row for each k. So we can do: load weight, multiply by scalar, add to out, then proceed. We need a separate temp? No, we can modify weightRowBuf in place. But we need original weight row for next k, so we need to reload each time. That's fine.
+
+Implementation details:
+- We'll use AscendC::DataCopy to load global to local.
+- We'll use AscendC::Muls(local, local, scalar, len) to multiply.
+- We'll use AscendC::Add(local, local, local, len) to add.
+- Since we are not using double buffering, we need to ensure DataCopy completes before compute. We can use `AscendC::Barrier` or `DataCopy` is synchronous? In AscendC, DataCopy is typically asynchronous unless using queues. But we can use queues for simple synchronization. Simpler: use pipe and queues as in the example. We'll have one input queue for weight rows and x row, and output queue for out row. But to keep it simple, we can use synchronous DataCopy with `SetFlag`? Actually the standard pattern is to use `AscendC::DataCopy` which is blocking? I think it's asynchronous and requires synchronization via `AscendC::Barrier` or pipeline. The example leaky_relu used queues. So I'll use queues.
+
+Let's design:
+- For each row in the block's assigned range:
+  - Load x row into xRowBuf (queue).
+  - Load bias into outRowBuf (one time, reuse for all rows if we keep it). But bias is same for all rows, we can load once.
+  - For k from 0 to totalCols-1:
+    - Load weight row k into wRowBuf.
+    - Multiply wRowBuf by scalar xRowBuf[k].
+    - Add wRowBuf to outRowBuf.
+  - After loop, store outRowBuf to y row.
+
+But we need queues: we can have input queue for weight rows and x row, output queue for out row. However, we need to iterate over k, so we need to load many weight rows sequentially. We can use a single input queue with double buffering for weight rows, and a separate queue for x row. Since we only need one x row per row, we can load it once.
+
+Given complexity, I'll implement a simpler synchronous version using `AscendC::DataCopy` and `AscendC::Barrier` as in some examples. But to be safe, I'll use the queue pattern similar to the leaky_relu example, but adapt for multiple iterations.
+
+Alternate approach: Use a single function that does all rows sequentially within a block, without double buffering, but using local tensors and barriers. I'll look for a pattern: often manual tiling with synchronous DataCopy works if we call `AscendC::SetFlag` and `AscendC::WaitFlag`. But the leaky_relu example used queues.
+
+Given the time, I'll implement a kernel that uses the MatMul API. That is likely the most robust and efficient. Let's do that.
+
+We need to include `matmul_api.h` and define the MatMul parameters. The kernel signature remains the same, but we will call the MatMul function. However, the MatMul kernel usually expects a different setup: it requires the input tensors to be in specific formats (e.g., ND or NZ). We'll assume ND format.
+
+We'll write:
+```cpp
+#include "kernel_operator.h"
+#include "matmul_api.h"
+
+using namespace AscendC;
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCa6k02874Custom {
+public:
+    __aicore__ inline KernelCa6k02874Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR bias, GM_ADDR x, GM_ADDR weight, GM_ADDR y,
+                                uint32_t totalRows, uint32_t totalCols)
+    {
+        biasGm_.SetGlobalBuffer((__gm__ float*)bias, totalCols);
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalRows * totalCols);
+        weightGm_.SetGlobalBuffer((__gm__ float*)weight, totalCols * totalCols);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalRows * totalCols);
+        M_ = totalRows;
+        N_ = totalCols;
+        K_ = totalCols;
+    }
+
+    __aicore__ inline void Process() {
+        // Use MatMul to compute x * weight
+        // Then add bias
+        // Not trivial to do in a single block? Actually MatMul can be called with single block.
+        // We'll set up MatMul parameters.
+        // For simplicity, we'll fall back to a simple vectorized implementation if MatMul not available.
+        // Let's implement vectorized version below.
+    }
+};
+```
+
+Given the risk of missing MatMul header, I'll implement a vectorized version that is correct and compile.
+
+Let's write a clean vectorized kernel without raw pointer casts. Use GlobalTensor and local tensors.
+
+I'll produce the final answer with all six strings, fixing the kernel to avoid casting errors and implementing a correct but not necessarily optimized vectorized addmm. Since the error was only about casting, the main fix is to use the proper AscendC types. The previous attempt already had a class, but the extern "C" function had the bad scalar loop. We need to remove that scalar loop and use the class properly. So we can complete the class Process method with a simple row-by-row vectorized implementation.
+
+Given the memory repair about "cast between floating and unsigned integer" not relevant here. We just need to remove the pointer casts.
+
+Let's write the corrected kernel_src:
+
+```cpp
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCa6k02874Custom {
+public:
+    __aicore__ inline KernelCa6k02874Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR bias, GM_ADDR x, GM_ADDR weight, GM_ADDR y,
+                                uint32_t totalRows, uint32_t totalCols,
+                                uint32_t tileRow, uint32_t tileCol)
+    {
+        totalRows_ = totalRows;
+        totalCols_ = totalCols;
+        tileRow_ = tileRow;
+        tileCol_ = tileCol;
+
+        biasGm_.SetGlobalBuffer((__gm__ float*)bias, totalCols_);
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalRows_ * totalCols_);
+        weightGm_.SetGlobalBuffer((__gm__ float*)weight, totalCols_ * totalCols_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalRows_ * totalCols_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileCol_ * sizeof(float));
+        pipe_.InitBuffer(inQueueW_, BUFFER_NUM, tileCol_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileCol_ * sizeof(float));
+        pipe_.InitBuffer(tmpQueue_, 1, tileCol_ * sizeof(float));
+        pipe_.InitBuffer(biasBuf_, 1, totalCols_ * sizeof(float));
+        pipe_.InitBuffer(xRowBuf_, 1, totalCols_ * sizeof(float));
+        pipe_.InitBuffer(weightRowBuf_, 1, totalCols_ * sizeof(float));
+        pipe_.InitBuffer(outRowBuf_, 1, totalCols_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalRows_ == 0 || totalCols_ == 0) return;
+
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t startRow = blockIdx * tileRow_;
+        uint32_t endRow = startRow + tileRow_;
+        if (startRow >= totalRows_) return;
+        if (endRow > totalRows_) endRow = totalRows_;
+
+        // Load bias once into local buffer (same for all rows)
+        AscendC::LocalTensor<float> biasLocal = biasBuf_.Get<float>();
+        AscendC::DataCopy(biasLocal, biasGm_, totalCols_);
+        // No need to enqueue, just use directly.
+
+        for (uint32_t r = startRow; r < endRow; r++) {
+            // Load x row into xRowBuf_
+            AscendC::LocalTensor<float> xRowLocal = xRowBuf_.Get<float>();
+            AscendC::DataCopy(xRowLocal, xGm_[r * totalCols_], totalCols_);
+
+            // Initialize output row with bias
+            AscendC::LocalTensor<float> outRowLocal = outRowBuf_.Get<float>();
+            AscendC::DataCopy(outRowLocal, biasLocal, totalCols_);
+
+            // For each k, compute contribution
+            for (uint32_t k = 0; k < totalCols_; k++) {
+                // Load weight row k
+                AscendC::LocalTensor<float> weightRowLocal = weightRowBuf_.Get<float>();
+                AscendC::DataCopy(weightRowLocal, weightGm_[k * totalCols_], totalCols_);
+                // Multiply by scalar x[r,k]
+                float xVal = xRowLocal(k);
+                AscendC::Muls(weightRowLocal, weightRowLocal, xVal, totalCols_);
+                // Add to output row
+                AscendC::Add(outRowLocal, outRowLocal, weightRowLocal, totalCols_);
+            }
+
+            // Write output row to global
+            AscendC::DataCopy(yGm_[r * totalCols_], outRowLocal, totalCols_);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueW_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> biasBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> xRowBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> weightRowBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> outRowBuf_;
+
+    AscendC::GlobalTensor<float> biasGm_;
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> weightGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalRows_ {0};
+    uint32_t totalCols_ {0};
+    uint32_t tileRow_ {0};
+    uint32_t tileCol_ {0};
+};
+
+extern "C" __global__ __aicore__ void ca6k02874_custom(GM_ADDR bias, GM_ADDR x, GM_ADDR weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCa6k02874Custom op;
+    op.Init(bias, x, weight, y,
+            tiling_data.totalRows, tiling_data.totalCols,
+            tiling_data.tileRow, tiling_data.tileCol);
+    op.Process();
+}
+```
+
+But note: using `biasBuf_.Get<float>()` requires that the buffer is allocated with InitBuffer. We need to call pipe_.InitBuffer for those TBuf. We already added. Also, we need to ensure that DataCopy is synchronous. In AscendC, DataCopy to/from global is often block copy and may be asynchronous, but using `DataCopy` without queue might be okay if we use `AscendC::SetFlag`? The simple approach may work if we use `AscendC::DataCopy` which is synchronous relative to the thread? I think it's blocking. To be safe, we can use `pipe_.InitBuffer` for these buffers and then use `Get` and then `DataCopy`. This is a common pattern in simple kernels.
+
+We also removed the unused queues inQueueX_, etc. But we declared them; we can either keep them or remove. To minimize changes, keep them but not use. That's fine.
+
+Now we need to adjust the host_operator_src tiling to provide tileRow and tileCol. The previous tiling had tileRow and tileCol; we can keep them. But in the kernel we don't use tileCol for local buffers? We allocate buffers of totalCols_ size, not tileCol_. So we can set tileCol = totalCols_ (no tiling). Actually to save UB, we could tile columns, but then we would need to iterate over column tiles. For simplicity, we set tileCol = totalCols_ (i.e., no column tiling). The tiling should set tileCol such that we have enough UB. Since totalCols=4096, we are fine. So in tiling function, set tileCol = totalCols.
+
+Also, we need to ensure that the local buffers (biasBuf_, xRowBuf_, weightRowBuf_, outRowBuf_) are allocated with sizes totalCols. That's fine.
+
+Now we must also update the host_operator_src to set tileCol = totalCols (since we use full columns). The tiling function previously computed tileCol based on UB. We'll change it to use totalCols directly, but we must ensure it fits in UB. Since we have 4 buffers of 4096 floats each = 64KB, plus overhead, still within 192KB. So okay.
+
+We'll modify the TilingFunc:
+
+```cpp
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    Ca6k02874CustomTilingData tiling;
+    const gert::StorageShape *x_shape = context->GetInputShape(1);
+    uint32_t totalRows = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t totalCols = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+
+    // Set tileCol = totalCols (no column tiling)
+    uint32_t tileCol = totalCols;
+
+    // Compute blockDim based on rows
+    uint32_t blockDim = totalRows < 8 ? totalRows : 8;
+    if (blockDim < 1) blockDim = 1;
+    if (blockDim > 24) blockDim = 24;
+
+    uint32_t tileRow = (totalRows + blockDim - 1) / blockDim;
+    if (tileRow == 0) tileRow = 1;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_totalRows(totalRows);
+    tiling.set_totalCols(totalCols);
+    tiling.set_tileRow(tileRow);
+    tiling.set_tileCol(tileCol);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(...);
+    ...
+}
+```
+
+We also need to ensure that the tiling data structure has blockDim field. We already have it.
+
+Now, we also need to fix the python_bind_src and model_src. They seem fine.
+
+One more thing: The kernel uses `AscendC::Muls` and `AscendC::Add` which are in kernel_operator.h. Good.
+
+Potential issue: The local tensors from `buf_.Get<float>()` may not be valid after allocation? We need to call `pipe_.InitBuffer` for those TBuf. We did. But we also need to ensure we don't exceed the UB. We are allocating 4 buffers of totalCols, plus the queue buffers (which we don't use) but they are still allocated. To save UB, we can remove the queue buffers or set their size to 1 (they won't be used). But for simplicity, keep them but set tileLen to something small? Actually they are allocated with tileCol_ * sizeof(float), and tileCol_ is totalCols (4096), so that adds more UB. We have 4 queues (inQueueX, inQueueW, outQueueY, tmpQueue) each with BUFFER_NUM=2, so each queue allocates 2 * tileCol_ * sizeof(float) = 2*4096*4 = 32KB each. That's too much (128KB total) plus our 4 buffers (64KB) = 192KB exactly, maybe overflow. We should either remove those unused queues or set their tile sizes to 1. Since we are not using them, we can set tileLen to 1 element. Better: remove them entirely. But to keep changes minimal, we can comment them out or set tileLen to 1. However, the pipe_.InitBuffer is called for each; we can simply not declare those Queues and not initialize them. Let's remove them from the class and Init.
+
+Thus, final kernel class will only have the four TBuf buffers and no queues. That simplifies.
+
+We'll also remove the tmpQueue_ and inQueueX, etc. Keep only the needed ones.
+
+Let's produce the final corrected code.
+
+Now, write the six strings.

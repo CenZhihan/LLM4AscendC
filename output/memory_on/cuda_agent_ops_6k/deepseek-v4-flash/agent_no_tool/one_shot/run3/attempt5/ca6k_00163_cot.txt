@@ -1,0 +1,73 @@
+We need to fix the kernel. The error logs indicate a vector core execution failure ("CCU instruction address check error") likely due to issues in the kernel code. The previous attempt had a kernel implementing softplus: y = log(1 + exp(x)). But the kernel tried to use Exp, Adds, Log on the same tensor (tLocal) in a way that might cause memory issues. Also, the tiling data didn't include negativeSlope but that's fine. The error seems to be a hardware exception. Possibly due to misaligned access or invalid tensor operations. Looking at the kernel, it uses tmpQueue for intermediate results. The Compute function: it allocates tLocal from tmpQueue, then does Exp on tLocal (overwrites xLocal? Actually Exp(tLocal, xLocal, len) writes to tLocal, reads from xLocal. Then Adds(tLocal, tLocal, 1.0f, len) modifies tLocal. Then Log(yLocal, tLocal, len) writes to yLocal. That seems correct. But maybe the issue is that tmpQueue has only one buffer, and we are reusing it incorrectly? Actually we alloc and free within the same iteration, that's okay. Another possible issue: the kernel uses grid-stride loop but the pre-fetching of next tile before computing current might cause overlap issues with the queues. In the while loop, after first CopyIn, it does CopyIn for next tile, then Compute, then CopyOut, then repeats. This could cause the queue to be used out of order because we have multiple tiles in flight. But the pattern is: first tile: CopyIn -> EnQue; then we check next tile: CopyIn -> EnQue again (so two tiles in inQueueX). Then Compute (DeQue first tile), produces yLocal, EnQue to outQueueY. Then CopyOut (DeQue from outQueueY, write to GM). Then check next tile: if nextLen>0, base=nextBase, curLen=nextLen, and loop continues: it will CopyIn for the tile after next (since nextBase already computed), then Compute (DeQue the second tile), etc. This pattern is actually correct for double buffering. However, we must ensure that the queue depths are enough. BUFFER_NUM=2, inQueueX has 2 buffers. In the first iteration, we CopyIn two tiles (so both buffers used). Then we Compute one, freeing one slot in inQueueX. Then we can CopyIn another tile. That's fine. The issue might be with tmpQueue: it has only 1 buffer, but we allocate and free within Compute, so that's fine. 
+
+But the error "CCU instruction address check error" often indicates a memory access violation due to incorrect addressing in DataCopy or tensor operations. Possibly the input size is very large: batch_size=4096, height=128, width=512 => total elements = 4096*128*512 = 268,435,456 floats. That's about 1GB. The tiling might be mis-computed. In host_operator_src, they compute totalLength as GetOriginShape().GetShapeSize(). That should be correct. But maybe the tiling alignment or maxTile calculation leads to a tileLen that is 0 or unaligned, causing DataCopy to fail. The UB budget is 192KB, for 3 floats (12 bytes per element) gives maxTile=16384 (192*1024/12=16384). AlignDown to 2048 gives 16384? Actually 16384 is a multiple of 2048. HARD_CAP_ELEMS=32768, so tileLen=16384. That's fine. But if totalLength < tileLen, they compute aligned = AlignDown(totalLength, 2048). For totalLength=268435456, that's fine. Possibly the blockDim calculation leads to a tileLen that is 0? No.
+
+Another potential issue: the kernel uses `AscendC::Exp`, `AscendC::Adds`, `AscendC::Log`. These functions expect the length parameter to be the number of elements, and the tensors must be in VECCALC position? Actually Exp and Log are vector instructions and can operate on local tensors. They are fine.
+
+The memory repair (Memory 1) says: "do not remove the OpDef class or REG_OP macro from the operator description; instead keep the operator registration to ensure correct inference, tiling, and non-zero output." In the previous attempt, the host_operator_src did include the OpDef class and OP_ADD macro. So that's fine. Memory 2 and 3 are not relevant.
+
+The error likely stems from the kernel's handling of large tiles or the grid-stride loop. The error happens on multiple cores (0-49). The CCU instruction address check error suggests a misaligned memory access or illegal address in vector instructions. Possibly the `DataCopy` call with a length that is not a multiple of some alignment? DataCopy usually requires the length to be a multiple of 32 bytes (8 floats)? But the ALIGN_ELEMS is 2048, which is fine. But what about the stride calculation? The `xGm_[gmOffset]` indexing: `xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_)` sets the base pointer. Then `xGm_[gmOffset]` returns a GlobalTensor starting at offset. `DataCopy` copies from that position. The offset is in elements. That should be fine.
+
+Maybe the issue is that `totalLen_` is very large (268M) and the global tensor is defined with that size, but the hardware might have limitations? Not likely.
+
+Another possibility: The kernel uses `AscendC::Exp` and `AscendC::Log` which might have constraints on input range. For very large positive x, exp(x) can overflow to infinity, and log(inf) is inf, which is fine. But maybe the hardware has issues with NaN or Inf? But softplus should be stable.
+
+Maybe the using of tmpQueue for both Exp and Log causes some conflict because Log writes to yLocal, not tLocal, so that's fine.
+
+Perhaps the problem is that the kernel uses `AscendC::Muls`? No, it's using Adds, Exp, Log.
+
+Let's look at the actual error: "CCU instruction address check error" - CCU is the control unit. It may be due to an invalid instruction encoding or misaligned address. 
+
+Given the constraints to fix with minimal changes, and the memory says "do not remove OpDef class" which is already there, but maybe the host_operator_src is missing something? It includes tiling data but the kernel does not use negativeSlope (since softplus has no parameter). That's fine.
+
+But perhaps the issue is that the host_operator_src uses `Ca6k00163CustomTilingData` but in the tiling header we defined it with totalLength, tileLength, blockDim. In the kernel, we call `op.Init(x, y, tiling_data.totalLength, tiling_data.tileLength)` (without blockDim). That's fine.
+
+Maybe the problem is that the kernel uses `AscendC::Exp`, `AscendC::Adds`, `AscendC::Log` which are correct but the ordering of operations might be wrong: we need to compute exp(x), then add 1, then log. That's what we do.
+
+I suspect the issue might be with the `tmpQueue_` being used for both Exp and Adds but then we don't free it before next iteration? Actually we free it at the end of Compute. But note: we have `AscendC::Exp(tLocal, xLocal, len);` - this writes to tLocal, reads from xLocal. Then `AscendC::Adds(tLocal, tLocal, 1.0f, len);` - modifies tLocal. Then `AscendC::Log(yLocal, tLocal, len);` - reads from tLocal, writes to yLocal. That's fine.
+
+Maybe the problem is that the kernel does not handle the case where `tileLen_` is not a multiple of something for these vector instructions. Exp and Log might require alignment to 32 bytes? But the data is float, 4 bytes each. We already align tileLen to 2048 (8192 bytes) which is a multiple of 32. Good.
+
+Another thought: The grid-stride loop might cause a race condition because multiple blocks are writing to the same output? No, each block writes to different regions (based on blockIdx*strideElems). The strideElems = blockNum * tileLen_. That ensures non-overlapping. However, the "Prefetch next tile early" might cause issues: we are enqueuing two tiles into inQueueX before consuming any, which is fine. But in the first iteration, we enqueue two tiles, then compute and dequeue one, then enqueue another, then compute and dequeue, etc. That works.
+
+Given the error is "vector core execution abnormal" with CCU instruction address check error on many cores, it might be due to a software issue with the generated code for this specific size. Perhaps we need to ensure that the `pipe_.InitBuffer` calls are correct? They are: tileLen_ * sizeof(float). That should be fine.
+
+Maybe the fix is to simplify the kernel: remove the grid-stride double buffering and use a straightforward single-buffer approach per block. But the memory repair is about keeping the OpDef class, not about kernel changes.
+
+Wait, the memory repair 1 says: "When generating the operator txt file for Ca6k00163Custom, do not remove the OpDef class or REG_OP macro from the operator description; instead keep the operator registration to ensure correct inference, tiling, and non-zero output." That suggests that in some previous attempt, the OpDef class was missing. But in this attempt, it's present. So maybe the host_operator_src is missing something else? The error shows compilation succeeded, but runtime failed. The OpDef class is there. So the memory may not apply.
+
+Maybe the issue is that the kernel uses `AscendC::Exp` and `AscendC::Log` which are not available on ascend910b? No, they are standard.
+
+Let's look at the tiling function: It computes totalLength from GetOriginShape().GetShapeSize(). For a 3D shape, this should be correct. However, the host_operator_src uses `context->GetInputShape(0)->GetOriginShape().GetShapeSize()`. That returns the number of elements? Yes.
+
+Maybe the problem is that the tiling data structure does not include blockDim, but we set it. That's fine.
+
+I notice that the `host_tiling_src` defines `blockDim` but the kernel doesn't use it. That's okay.
+
+Given the error is related to vector core, likely the kernel is causing a hardware exception. Perhaps the tensor operations require that the local tensors are aligned to 32 bytes? But we allocate with `pipe_.InitBuffer` which should handle alignment.
+
+Another possibility: The `tmpQueue_` is declared with `TQue<TPosition::VECCALC, 1>`. But we use it for Exp, Adds, Log which are vector operations. That should be fine.
+
+Maybe the issue is that we are using `AscendC::Adds` on tLocal after Exp, but the output of Exp might be very large (infinity) and then Adds might cause overflow? Float can handle inf. Log of inf is inf. That shouldn't cause hardware error.
+
+I think the safest fix is to simplify the kernel to avoid the double-buffering prefetch pattern that might be causing issues. Instead, we can do a straightforward per-block processing: for each tile, copy in, compute, copy out, sequentially, without prefetch. That reduces complexity. Also, we can use a single buffer for in and out (no double buffering) to avoid queue issues. Since the error occurs on many cores, maybe the double-buffering is causing a race condition or memory corruption.
+
+Let's rewrite the kernel with a simpler loop: For each block's assigned range, process one tile at a time. Use only one buffer for input and output (BUFFER_NUM=1). But we need at least 2 buffers for double buffering to overlap copy and compute, but we can just do serial. That should still work and be less error-prone.
+
+Also, we need to ensure that the `tmpQueue_` is used correctly. We'll keep it.
+
+We'll change BUFFER_NUM to 1, remove the prefetch, and just loop over stride steps.
+
+Additionally, we'll adjust the tiling to use a safe tile length. Maybe the previous tile length of 16384 is too large? But it should be fine.
+
+Given the memory repair 1 is about keeping OpDef, but it's already there, we don't change host_operator_src.
+
+But we must also ensure that the host_operator_src includes the cpp file name correctly? The build logs show it compiled "ca6k00163_custom.cpp". That's correct.
+
+Maybe the problem is that the host_operator_src does not include the namespace for ops, and the OP_ADD macro might not be working because the class name must match? It does.
+
+I'll proceed with a simplified kernel that avoids double buffering and uses a straightforward approach. Also, I'll add a check to ensure tileLen is not zero and that we handle the last tile correctly.
+
+Also, we should consider that the `AscendC::Exp` and `AscendC::Log` might have performance issues but not correctness.
+
+Let's produce the corrected code.

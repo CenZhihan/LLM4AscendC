@@ -1,0 +1,298 @@
+```python
+project_json_src = '''
+[
+  {
+    "op": "Ca6k00262Custom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "src",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "dim1",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "1"
+      },
+      {
+        "name": "dim2",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "2"
+      },
+      {
+        "name": "offset",
+        "param_type": "optional",
+        "type": "int",
+        "default_value": "0"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src = """
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Ca6k00262CustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint32_t, diagLen);
+  TILING_DATA_FIELD_DEF(int32_t, offset);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Ca6k00262Custom, Ca6k00262CustomTilingData)
+}  // namespace optiling
+"""
+
+host_operator_src = """
+#include "ca6k00262_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    Ca6k00262CustomTilingData tiling;
+
+    const uint32_t totalLength =
+        static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+    const auto &xShape = context->GetInputShape(0)->GetOriginShape();
+    const uint32_t batch = static_cast<uint32_t>(xShape.GetDim(0));
+    const uint32_t H = static_cast<uint32_t>(xShape.GetDim(1));
+    const uint32_t W = static_cast<uint32_t>(xShape.GetDim(2));
+    const uint32_t diagLen = static_cast<uint32_t>(context->GetInputShape(1)->GetOriginShape().GetShapeSize()) / batch;
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int32_t offset = *(attrs->GetAttrPointer<int32_t>(2));
+
+    tiling.totalLength = totalLength;
+    tiling.batch = batch;
+    tiling.H = H;
+    tiling.W = W;
+    tiling.diagLen = diagLen;
+    tiling.offset = offset;
+
+    constexpr uint32_t MAX_BLOCK_DIM = 24u;
+    uint32_t blockDim = MAX_BLOCK_DIM;
+    context->SetBlockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+"""
+
+kernel_src = """
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t ALIGN_ELEMS = 2048;
+constexpr int32_t UB_BUDGET_BYTES = 192 * 1024;
+
+class KernelCa6k00262Custom {
+public:
+    __aicore__ inline KernelCa6k00262Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR src, GM_ADDR y,
+                                uint32_t totalLength, uint32_t batch,
+                                uint32_t H, uint32_t W,
+                                uint32_t diagLen, int32_t offset)
+    {
+        totalLen_ = totalLength;
+        batch_ = batch;
+        H_ = H;
+        W_ = W;
+        diagLen_ = diagLen;
+        offset_ = offset;
+        startRow_ = (offset_ >= 0) ? 0 : (uint32_t)(-offset_);
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        srcGm_.SetGlobalBuffer((__gm__ float*)src, batch_ * diagLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        // Tile rows: 2 * tileRows * W * sizeof(float) + diagLen * sizeof(float) <= UB_BUDGET_BYTES
+        uint32_t maxRows = (UB_BUDGET_BYTES - diagLen_ * sizeof(float)) / (2 * W_ * sizeof(float));
+        maxRows = (maxRows / 8) * 8;  // align to 8
+        if (maxRows < 1) maxRows = 1;
+        tileRows_ = maxRows;
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileRows_ * W_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, tileRows_ * W_ * sizeof(float));
+        pipe_.InitBuffer(srcLocal_, 1, diagLen_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0 || batch_ == 0) return;
+
+        const uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        const uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        for (uint32_t b = blockIdx; b < batch_; b += blockNum) {
+            uint32_t batchOffset = b * H_ * W_;
+            uint32_t diagOffset = b * diagLen_;
+
+            // Load src for this batch into local
+            AscendC::LocalTensor<float> srcLocal = srcLocal_.AllocTensor<float>();
+            AscendC::DataCopy(srcLocal, srcGm_[diagOffset], diagLen_);
+
+            uint32_t rowsProcessed = 0;
+            while (rowsProcessed < H_) {
+                uint32_t curRows = (tileRows_ < (H_ - rowsProcessed)) ? tileRows_ : (H_ - rowsProcessed);
+                uint32_t curLen = curRows * W_;
+                curLen = AscendC::RoundUp(curLen, ALIGN_ELEMS);
+                if (curLen > curRows * W_) curLen = curRows * W_;
+
+                // Load x tile
+                AscendC::LocalTensor<float> xTile = inQueueX_.AllocTensor<float>();
+                AscendC::DataCopy(xTile, xGm_[batchOffset + rowsProcessed * W_], curLen);
+
+                // Replace diagonal elements in local tile
+                for (uint32_t r = 0; r < curRows; r++) {
+                    uint32_t globalRow = rowsProcessed + r;
+                    if (globalRow >= startRow_ && globalRow - startRow_ < diagLen_) {
+                        uint32_t srcIdx = globalRow - startRow_;
+                        int32_t col = (int32_t)globalRow + offset_;
+                        if (col >= 0 && (uint32_t)col < W_) {
+                            xTile.SetValue(r * W_ + (uint32_t)col, srcLocal.GetValue(srcIdx));
+                        }
+                    }
+                }
+
+                // Write to y
+                AscendC::LocalTensor<float> yTile = outQueueY_.AllocTensor<float>();
+                AscendC::DataCopy(yTile, xTile, curLen);
+                AscendC::DataCopy(yGm_[batchOffset + rowsProcessed * W_], yTile, curLen);
+
+                outQueueY_.FreeTensor(yTile);
+                inQueueX_.FreeTensor(xTile);
+
+                rowsProcessed += curRows;
+            }
+
+            srcLocal_.FreeTensor(srcLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> srcLocal_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> srcGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalLen_ {0};
+    uint32_t batch_ {0};
+    uint32_t H_ {0};
+    uint32_t W_ {0};
+    uint32_t diagLen_ {0};
+    int32_t offset_ {0};
+    uint32_t startRow_ {0};
+    uint32_t tileRows_ {0};
+};
+
+extern "C" __global__ __aicore__ void ca6k00262_custom(GM_ADDR x, GM_ADDR src, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCa6k00262Custom op;
+    op.Init(x, src, y,
+            tiling_data.totalLength, tiling_data.batch,
+            tiling_data.H, tiling_data.W,
+            tiling_data.diagLen, tiling_data.offset);
+    op.Process();
+}
+"""
+
+python_bind_src = """
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor ca6k00262_impl_npu(const at::Tensor& self, const at::Tensor& src,
+                               int64_t dim1, int64_t dim2, int64_t offset) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnCa6k00262Custom, self, src, dim1, dim2, offset, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("ca6k00262_custom", &ca6k00262_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("ca6k00262_custom", &ca6k00262_impl_npu,
+          "Custom diagonal scatter (Ca6k00262Custom on NPU)");
+}
+"""
+
+model_src = '''
+import torch
+import torch.nn as nn
+import torch_npu
+import custom_ops_lib
+
+_FN = 'ca6k00262_custom'
+
+class ModelNew(nn.Module):
+    def __init__(self, *init_inputs):
+        super(ModelNew, self).__init__()
+        # init_inputs: [input_shape, src_shape, dim1, dim2, offset]
+        self.src = nn.Parameter(torch.randn(init_inputs[1]))
+        self.dim1 = init_inputs[2]
+        self.dim2 = init_inputs[3]
+        self.offset = init_inputs[4]
+
+    def forward(self, x):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, self.src, self.dim1, self.dim2, self.offset)
+'''
+```

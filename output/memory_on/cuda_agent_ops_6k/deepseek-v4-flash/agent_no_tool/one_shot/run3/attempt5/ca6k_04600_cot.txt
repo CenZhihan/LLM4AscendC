@@ -1,0 +1,193 @@
+We need to fix the previous attempt based on the error logs. The build succeeded (compiled: True) but correctness failed (correctness: False). The output mismatch shows all zeros from the custom op, indicating the kernel computation is incorrect or the tiling/parameters are wrong.
+
+Key issues:
+1. The kernel does not compute instance_norm correctly. The previous kernel attempted a naive per-element linear transformation using per-channel mean/var/weight/bias. But the `meanLocal_` and `varLocal_` are loaded with `DataCopy` but they are not used in initialization as LocalTensor. The code uses `meanLocal_(channel)` which suggests it's an array access, but it's declared as `LocalTensor<float>` which doesn't support random indexing. AscendC LocalTensor does not support random access like `meanLocal_(channel)`. We need to use `Scalar` or compute per-channel within each tile.
+
+2. The instance_norm formula: y = weight * (x - mean) / sqrt(var + eps) + bias. The kernel attempted a simplified version: y = scale * x + shift, but the scale and shift were computed using preloaded mean and var. However, the instance_norm requires running_mean and running_var? In the reference model, running_mean and running_var are buffers (not updated in forward), and they are passed as inputs. In instance_norm, if training=False, use given running_mean/var. If training=True, compute batch statistics. The reference Model uses F.instance_norm with all arguments. However, the original user instruction for the fused op says "Replace relevant PyTorch operators" and the dataset field 'torch#1' indicates instance_norm.
+
+The previous attempt defines inputs: x, running_mean, running_var, weight, bias, and attr eps. But in the model_src, it passes all those to the op. However, the kernel never actually computes the mean/var from the input; it uses the passed running_mean and running_var. In the reference, F.instance_norm expects running_mean and running_var (which can be None). In the Model class, they are parameters (tensors), so they are passed. The custom op should treat them as inputs.
+
+But the main problem causing all zeros: The tiling includes `numFeatures` and `spatialSize`, but the kernel uses `meanLocal_(channel)` which is invalid because LocalTensor doesn't support indexing. Also the kernel uses `LocalTensor` for per-channel arrays but initializes with `DataCopy(meanLocal_, meanGm_, numFeatures_)` which is a raw copy into local memory. But then it tries to access elements as `meanLocal_(channel)`. In AscendC, LocalTensor does not have operator() for random access; you need to use `SetValue`/`GetValue` or use mask/vector operations. For per-channel scaling, you can broadcast a scalar across a vector. Since each channel has its own mean/var, and each row corresponds to a channel, we can process per channel by loading the scalar values into a vector.
+
+Simpler approach: Instead of random access, we can load the scaling factors per channel into a scalar and then apply to the entire spatial dimension of that channel. Since the data layout is NCHW, each channel is contiguous along spatial dimension. We can tile over spatial dimension per channel. The kernel can load the per-channel parameters as scalar from global memory for the current channel.
+
+Better: Load per-channel parameters into a small local array using `SetGlobalBuffer` and then access by index using `GetValue`. Or use `LocalTensor` as a buffer and then use `GetValue` to retrieve scalar.
+
+But the error: output all zeros suggests the kernel didn't execute properly. Possibly the DataCopy from global to local failed because meanGm_ etc. are not set correctly. The kernel's Init receives running_mean, running_var, weight, bias as GM_ADDR, but they are passed as individual addresses. In the kernel, we set `meanGm_.SetGlobalBuffer((__gm__ float*)running_mean, numFeatures_);` and then `DataCopy(meanLocal_, meanGm_, numFeatures_);`. That should work. Then the attempt to use `meanLocal_(channel)` is illegal and may cause runtime error.
+
+To fix, we need to change the kernel to properly use local tensors or use scalar reads. Since the kernel only needs per-channel values (mean, var, weight, bias) for each channel, we can read them directly from global memory using `*((__gm__ float*)running_mean + channel)` inside the loop, which is current best practice for AscendC. That avoids the need for local buffer. However, accessing global memory multiple times may be slower but correctness first.
+
+Alternatively, we can load the entire arrays into local memory and then use vector operations to scale and shift. But simpler: read scalar per channel.
+
+We also need to correctly compute the instance_norm output. Note: In the reference, `self.training` is passed to F.instance_norm. But in ModelNew forward, we are not passing training mode; we are using the custom op which should behave like instance_norm. In the original Model, training is a method attribute (self.training). In forward, they use `self.training`. The fused custom op must match that behavior. However, the user instruction: "Use kernel/JSON/operator names derived from `ca6k_04600_custom`". There's no mention of training vs eval mode; but the reference uses `self.training`. Since the custom op is to replace F.instance_norm, it should support both training and eval? The reference model passes self.training, so the custom op needs to handle both cases. But the previous attempt didn't include training flag. In the model_src, they didn't pass training to the op. That's a potential mismatch.
+
+Looking at the model_src of previous attempt: `fn(x, self.running_mean, self.running_var, self.weight, self.bias, self.eps)`. They omitted the training flag. The original reference forward: `F.instance_norm(x, self.running_mean, self.running_var, self.weight, self.bias, self.training, self.momentum, self.eps)`. The custom op must accept training as an input or attribute. Since we are fusing, we need to include training. But the project_json only has inputs x, running_mean, running_var, weight, bias, and attr eps. Missing training and momentum. But momentum is only used for running statistics update during training, which we might ignore if we don't update running stats. The reference Model has running_mean and running_var as nn.Parameter with requires_grad=False, meaning they are buffers. In forward, they are passed to F.instance_norm. F.instance_norm does not update them if training=False; if training=True, it computes batch statistics and updates running_mean and running_var (with momentum). But since running_mean and running_var are inputs to the op, we cannot update them in-place in a pure functional op without returning them. So we need to decide: In fused custom op, we will treat the op as inference-only (training=False) and ignore the training flag. However, the reference Model may be used in eval mode only? The get_inputs does not set training; Model default is train=True. But the harness compares outputs; it likely sets model.eval() or doesn't matter because the custom op is used as a replacement. But we need to match the exact output. The F.instance_norm with given running_mean/var and training=False uses those running stats. With training=True, it computes batch statistics, ignoring running_mean/var. So we need to know which mode.
+
+Looking at the error output: The output from custom op is all zeros. The reference output would not be all zeros. So the kernel is definitely wrong.
+
+To fix, we need to:
+- Implement instance_norm correctly: For each sample N, for each channel C, compute mean = (1/(H*W)) * sum(x), var = (1/(H*W)) * sum((x-mean)^2) if training else use provided running_mean/var.
+- But the custom op currently receives running_mean and running_var as inputs but doesn't use them in computation (only used for initialization). The kernel attempted to use them but incorrectly. Also, it never computes batch statistics.
+
+Given the complexity, and the requirement to fix with minimal changes, we can adjust the kernel to:
+- Read per-channel parameters correctly using global memory scalar reads.
+- Apply the normalization: y = weight * (x - mean) / sqrt(var + eps) + bias.
+- Since the op receives mean and var from inputs (assumed to be pre-computed), we don't need to compute them. But that will only match eval mode where running_mean/var are used. If training mode, we need to compute them. However, the reference code uses self.training which is True by default. But the harness may or may not set model.eval(). The error shows all zeros, so probably the op is not matching either mode.
+
+Better approach: Make the custom op compute instance statistics (mean and var) on the fly, ignoring the provided running_mean and var except as placeholders. But then we must not use them in computation. However, the model_src passes them, so they are present. Perhaps the harness expects the op to compute instance norm using batch statistics (training=True) and ignore the running_mean/var. To be safe, we can compute internal mean and var from the data and ignore the passed mean/var. But then the op signature will still accept them for compatibility.
+
+But the model_src currently passes them, so the op must accept them. We can compute our own mean/var internally without using them.
+
+Given that the previous attempt attempted to use them and failed, we can simplify: Compute mean and variance per channel per sample in the kernel. Then apply normalization.
+
+However, that's a significant rewrite. The instruction says "fix the previous attempt with minimal and targeted changes." So we should try to correct the existing implementation.
+
+Observing the previous kernel code: It loads per-channel arrays into local tensors, but then uses `meanLocal_(channel)` which is invalid. We can replace that by reading the scalar directly from global memory using pointer arithmetic. That is a minimal change.
+
+Also, the kernel uses `DataCopy(meanLocal_, meanGm_, numFeatures_)` which copies the entire array into local memory. Then we can access using `meanLocal_.GetValue(channel)`. Actually AscendC LocalTensor has `GetValue` method. For `TPosition::VECCALC` or `VECIN`? The local tensors here are not queued; they are regular local tensors from pipe buffer. They should be accessible via `GetValue(index)`. So we can use `meanLocal_.GetValue(channel)`.
+
+But note: `meanLocal_` is a `LocalTensor<float>` obtained from `pipe_.InitBuffer(meanLocal_, numFeatures_ * sizeof(float));` which allocates a local tensor of size numFeatures_. Then `DataCopy(meanLocal_, meanGm_, numFeatures_);` copies data. After that, we can access via `meanLocal_.GetValue(channel)`. That is legal.
+
+So minimal fix: Change `meanLocal_(channel)` to `meanLocal_.GetValue(channel)`. Similarly for var, weight, bias.
+
+Additionally, the kernel's data copy for meanLocal_ etc. is done inside Init, which means it runs for every block (since each block runs Process independently). That's fine.
+
+Now, the kernel also needs to handle the case where `blockIdx == 0` only? Actually each block will copy the entire arrays into local memory; that's redundant but okay.
+
+But there is another issue: The kernel's `Process` loops over rows with stride = blockNum. For each row, it computes channel index and applies linear transformation. However, it uses `inQueueX_` and `outQueueY_` but inside the while loop for a single row, it does DataCopy and compute per tile. The queue usage is correct.
+
+Potential problem with all zeros: The kernel does not compute anything if `meanLocal_.GetValue(channel)` returns something wrong. But if the DataCopy succeeded, the values should be correct.
+
+However, another issue: The `pipe_.InitBuffer(meanLocal_, numFeatures_ * sizeof(float));` is wrong because `meanLocal_` is not a queued buffer; it's a local tensor. The method `InitBuffer` expects a template parameter for the position? Actually `TPipe::InitBuffer` has overloads for `LocalTensor`. The correct usage is `pipe_.InitBuffer(meanBuf_, numFeatures_ * sizeof(float));` then `meanLocal_ = meanBuf_.Get<float>();`. In the original code, they directly passed `meanLocal_` to `InitBuffer`, which might be incorrect. The example in the leaky_relu used `pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));` which is for a queue. For a static local buffer (non-queue), we need to allocate a `TBuf` and then get tensor.
+
+We need to allocate a local buffer without queue. Use:
+```
+TBuf<TPosition::VECCALC> meanBuf_;
+pipe_.InitBuffer(meanBuf_, numFeatures_ * sizeof(float));
+meanLocal_ = meanBuf_.Get<float>();
+```
+Then DataCopy.
+
+So the fix:
+- Change the declaration of `meanLocal_` etc. to be simple `LocalTensor<float>` but allocate via `TBuf`.
+- Or alternatively, read scalars from global memory directly per channel, which is simpler and avoids local tensor index issues.
+
+Simplest minimal change: Instead of loading entire arrays into local, read scalars per channel directly from global memory inside the loop. For AscendC, reading from global memory each time may be acceptable for correctness. But we need to use `*(__gm__ float*)`. The kernel already has global tensors, we can get raw pointer: `meanGm_.GetPtr(channel)`? Actually `GlobalTensor` has `operator[]`? In AscendC, `GlobalTensor` supports `[index]` to return a scalar? Actually `xGm_[offset]` returns a reference to the element at that index. But that is for contiguous memory. For `meanGm_` with size numFeatures_, we can use `meanGm_[channel]` to get a scalar. However, `meanGm_` is a GlobalTensor<float>. The expression `meanGm_[channel]` should yield a float reference. But AscendC GlobalTensor overloads `[]` to return a `GlobalTensor::index_reference`. To get the value, we might need to use `*((__gm__ float*)meanGm_.GetPtr() + channel)`. Simpler: use the raw GM_ADDR passed as parameter. But we have already stored the address in `meanGm_`. We can just read using `*(float __gm__*)(meanGm_.GetPtr() + channel)`? Not straightforward.
+
+Given time, the most reliable is to keep the local buffer but fix the allocation.
+
+Also, the kernel uses `meanLocal_(channel)` inside the loop. We'll change to `meanLocal_.GetValue(channel)`.
+
+Also, the Init function uses `DataCopy(meanLocal_, meanGm_, numFeatures_)` but `DataCopy` expects a destination LocalTensor and src GlobalTensor. That's correct if `meanLocal_` is properly allocated.
+
+So the plan:
+- Keep the existing structure.
+- Change the buffer allocation for meanLocal_ etc. to use TBuf.
+- Replace `meanLocal_(channel)` with `meanLocal_.GetValue(channel)`.
+
+Also, the model_src should pass `self.training` to the op, because the reference passes it. However, the op doesn't have a training input. We need to add a boolean attribute or input. Since the instruction says "fused" but we can add an attribute `training` as bool. But the project_json currently only has eps as attr. We can add `training` as attr. Alternatively, we can just hardcode training=False and not bother. But the reference uses self.training which could be True. The harness may set model.eval() before comparison? Not sure. The error shows all zeros, which is not matching reference. So maybe the kernel is not producing output at all. Possibly the kernel didn't run because tilingdata blockDim mismatch or other.
+
+Looking at the build log: There is a warning: "tiling struct [Ca6k04600CustomTilingData] is conflict with one in file ca6k04600_custom_tiling.h, line 5". That suggests there are two definitions of the tiling struct (likely from host_operator_src generating its own tiling header and the auto-generated one). The host_operator_src #includes "ca6k_04600_custom_tiling.h" which is the correct autogen name? The project uses `ca6k_04600_custom` as op name, so the tiling header would be `ca6k_04600_custom_tiling.h`. But in host_operator_src, we included `"ca6k_04600_custom_tiling.h"` which matches. The warning indicates duplication. That shouldn't cause all zeros.
+
+Another issue: In kernel_src, the kernel function name is `ca6k_04600_custom`. That's correct.
+
+The python_bind_src uses `aclnnCa6k04600Custom` which should match the generated API.
+
+In model_src, they call `fn(x, self.running_mean, self.running_var, self.weight, self.bias, self.eps)`. But the python custom op expects the inputs in order: x, running_mean, running_var, weight, bias, eps. That seems correct.
+
+But the op signature in project_json doesn't include eps as input; it's an attribute. In the python bind, they are calling the custom op with eps as a positional argument, but the autogen aclnn API expects eps as an attribute (probably as a double parameter). The EXEC_NPU_CMD macro likely passes it correctly. But the number of arguments must match. The previous build succeeded, so the API matches.
+
+Now, the output being all zeros suggests the kernel didn't write any output. Possibly the Process loop didn't execute because `numRows_` is 0. `numRows_ = totalLength / spatialSize`. If `spatialSize_` is computed from dims, but if dims are not correct (e.g., totalLength not divisible), it could be zero. But the input shape is [512,128,32,32]. totalLength=512*128*32*32=67108864. spatialSize = 32*32=1024. numRows_ = 65536, which is correct. So loop should run.
+
+But maybe the blockDim is set to 16, and the number of blocks may be less than 16? The tiling sets blockDim=16. If the device has fewer cores, it would still work.
+
+Another possibility: The kernel's Init is called, but the `GET_TILING_DATA` macro may have failed. The warning about tiling struct conflict might indicate that the tiling data layout is mismatched. The autogen tiling struct definition might have different field order. In host_operator_src, we define tiling fields: totalLength, tileLength, blockDim, eps, numFeatures, spatialSize. The autogen code may define a different order. The warning says "tiling struct [Ca6k04600CustomTilingData] is conflict with one in file ca6k04600_custom_tiling.h, line 5". That suggests that our hand-coded struct in host_tiling_src conflicts with the auto-generated one from the opbuild. The opbuild generates a tiling header based on the fields we defined in host_tiling_src? Actually the host_tiling_src is the tiling header we provide. But the autogen also generates a tiling header from the opdesc? The conflict warning indicates two definitions exist, and perhaps the wrong one is used. The build process: The opbuild generates tiling data structures based on the op_info. It likely parses the host_tiling_src and generates a separate header? Or it uses the one we provide? Actually, the standard approach is to provide a tiling header (like we do) and then in host_operator_src we include it. The autogen may also generate a tiling struct based on the op_info? I'm not fully sure. But the warning could be benign.
+
+Given the complexity and limited time, a robust fix: implement instance_norm by computing mean and variance on the fly (since we can't rely on external mean/var). That would guarantee correct output regardless of training mode. But that requires more changes.
+
+Given the instruction "minimal and targeted changes", we should fix the kernel indexing and buffer allocation. Also, we need to ensure the kernel actually computes the correct formula. The current formula: `Muls(yLocal, xDeque, scale, curLen); Adds(yLocal, yLocal, shift, curLen);` where scale = weight / sqrt(var+eps), shift = bias - scale * mean. That is correct for normalizing with precomputed mean/var. So if mean/var are correct, it should produce correct output.
+
+But the all zero output suggests either the mean/var are zero causing scale = weight/ sqrt(eps) which is large, but shift would be -scale*mean, and if mean is zero, shift is bias. That would still produce non-zero. Unless weight and bias are zero. But weight is ones, bias zeros. So output should be non-zero. So perhaps the kernel never writes to yGm_ because the DataCopy from yDeque to yGm_ is not executed? Or the queue handling is wrong?
+
+Looking at the kernel's Process: It does:
+```
+while (remaining > 0) {
+    uint32_t curLen = (remaining > tileLen_) ? tileLen_ : remaining;
+    LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+    DataCopy(xLocal, xGm_[base], curLen);
+    inQueueX_.EnQue(xLocal);
+    LocalTensor<float> xDeque = inQueueX_.DeQue<float>();
+    ...
+    inQueueX_.FreeTensor(xDeque);
+    ...
+    LocalTensor<float> yDeque = outQueueY_.DeQue<float>();
+    DataCopy(yGm_[base], yDeque, curLen);
+    outQueueY_.FreeTensor(yDeque);
+    base += curLen;
+    remaining -= curLen;
+}
+```
+This looks correct, but note: `xGm_[base]` returns a reference, but `DataCopy` expects a source GlobalTensor address. Actually `DataCopy` signature is `DataCopy(LocalTensor& dst, const GlobalTensor& src, uint32_t count)`. So `xGm_[base]` is not a GlobalTensor; it's a reference to the element. To pass a sub-tensor, we need to use `xGm_[base]` as a GlobalTensor reference? Actually, in AscendC, `operator[]` on GlobalTensor returns a `GlobalTensor::reference` which can be implicitly converted to a GlobalTensor starting at that address. So `xGm_[base]` is valid for DataCopy. Similarly for write: `DataCopy(yGm_[base], yDeque, curLen);`. That should work.
+
+But the `src` for DataCopy in CopyOut is `yDeque`, which is correct.
+
+Potential issue: The queue operations: `inQueueX_` is defined as `TQue<TPosition::VECIN, BUFFER_NUM>`, but we are using it for both read and write? Actually, VECIN is for input to vector unit. Using it as a temporary queue for data movement might be okay. However, the queue depth is 2. In the loop, we allocate and enqueue for each tile, then dequeue and free. That is fine.
+
+But there is no explicit synchronization between EnQue and DeQue. The AscendC queue model is FIFO within the same thread.
+
+Maybe the problem is that the kernel is compiled for the correct core but the output is all zeros because the local memory is not initialized? The pipe_.InitBuffer for meanLocal_ etc. is done in Init, but the buffers are not queued, so they persist across Process calls. That should be fine.
+
+Given the error log shows the output tensor is all zeros, and the reference would produce non-zero, the kernel likely didn't execute any computation. Could be that `tileLen_` is zero or `spatialSize_` is zero, causing the while loop to never execute. But tiling sets `tileLength = spatialSize` (1024), which is non-zero.
+
+Maybe the blockDim mismatch: in host_operator, we set blockDim=16, but the device may have fewer cores? The kernel uses GetBlockNum() which should return the actual number of blocks assigned. If blockDim is larger than available, the runtime may assign fewer blocks, but still each block will have a valid blockIdx. However, if blockDim is 16 and the device has 8 cores, only 8 blocks will be used, but each block will run, and the loop will cover all rows.
+
+Another clue: The warning "tiling struct conflict" might indicate that the tiling data read by the kernel via GET_TILING_DATA is corrupted or uses a different layout, causing totalLength, tileLength, etc. to be zero. That would cause the kernel to return early. Indeed, in Process, if `numRows_ == 0` it returns. Also in Process, there is no check for `tileLen_ == 0`. But the Init code sets `tileLen_ = tiling_data.tileLength`. If tiling_data is misaligned, tileLen_ could be zero, causing the while loop to never execute because `remaining > 0` but `curLen = remaining > 0 ? 0 : remaining`? Actually if tileLen_ is zero, then `curLen = (remaining > tileLen_) ? tileLen_ : remaining` would be `0` only if remaining > 0? Wait: if tileLen_ == 0, then `(remaining > 0)` is true, so `curLen = tileLen_ = 0`. Then DataCopy with count 0 might be no-op. Then base advances by 0, remaining doesn't change, infinite loop? But likely the kernel would hang or produce no output. The output all zeros suggests no data was written.
+
+Thus the most likely cause is tiling data mismatch leading to zero values. To fix, we need to ensure the host_tiling_src matches exactly what the autogen expects. The autogen might generate fields in a different order based on the op_info. The host_tiling_src we provided uses custom field names. The auto-generated tiling struct likely has the same fields because it parses the header? Actually, the opbuild generates the tiling data struct based on the definitions in host_tiling_src? I think it reads the source files. If there is a conflict, it might ignore our custom header and use its own, which may have different fields. That would cause misalignment.
+
+The easy fix: Instead of using a custom tiling struct with many fields, we can use a simpler tiling with just the necessary parameters that are known to the kernel, and avoid fields that could be auto-generated differently. For instance, we can pass the mean and variance precomputed? But we already pass them as inputs.
+
+Given the constraints, I'll produce a corrected version with the following changes:
+- Ensure the tiling struct fields are exactly what the autogen expects. The warning says "conflict with one in file ca6k04600_custom_tiling.h, line 5". That suggests the auto-generated file has a duplicate definition. To avoid duplication, we can remove our custom tiling header and instead rely on the auto-generated one (by not providing host_tiling_src? But we must provide it). Actually, the build system includes both our custom tiling header and auto-generates one, causing conflict. To fix, we can define the tiling struct inside the host_operator_src as a local struct, not as a separate header. But the pattern from the leaky_relu example used a separate tiling header included in host_operator_src. That worked. But here there is a conflict because the opbuild is also generating the tiling struct based on the op_info. Perhaps our host_tiling_src should be empty? No.
+
+Looking at the leaky_relu example, the host_tiling_src was provided and included in host_operator_src. The build succeeded without conflict warnings. Why here there is conflict? Possibly because the op_info (project_json) defines the op with inputs and outputs but not the tiling fields explicitly. The opbuild may generate a default tiling struct based on the op info. If we also provide a custom tiling header, they conflict. To avoid conflict, we should make sure the host_tiling_src is not included separately; instead, we can include the tiling header in host_operator_src as `#include "ca6k_04600_custom_tiling.h"` which is the auto-generated one, and not provide a custom one. But the assignment requires host_tiling_src variable. We could leave it empty or provide a minimal dummy that matches the auto-generated one. However, the auto-generated one is based on the project_json? Actually, the auto-generated tiling struct is from the opbuild and uses fields like `totalLength`, `tileLength`, `blockDim`, etc. defined in the op_info? Not sure.
+
+Simplest: Remove the custom tiling fields unrelated to the kernel. We only need totalLength, tileLength, blockDim, and eps? The kernel also needs spatialSize and numFeatures for per-channel access. But we can compute those from totalLength and shape? The kernel doesn't have shape info; it gets tiling data. So we need them in tiling.
+
+To reduce conflict, we can combine all needed fields into a single struct and ensure it matches what the autogen expects. The autogen likely generates the same fields if we don't define our own. Maybe the conflict comes from our host_tiling_src defining the same struct twice? No, it's one definition.
+
+A safe approach: Don't use a custom tiling header; instead, define the tiling struct directly in host_operator_src and override the GET_TILING_DATA macro? But the kernel includes "kernel_operator.h" and uses GET_TILING_DATA which expects the tiling struct from the header. If we don't provide the header, the build would fail.
+
+Given the time, I'll keep the tiling struct but ensure it is consistent with the order used in the kernel. Also, add the `training` attribute to the op to match the reference. And fix the kernel index access.
+
+Let's craft the corrected strings.
+
+Important: The project_json must have a top-level key "op". The example used an array with one object. That's fine. We'll add `"training"` as an optional bool attribute.
+
+We'll modify host_tiling_src to include `training` field (bool). But bool in tiling? TILING_DATA_FIELD_DEF only supports uint? Actually it supports bool? We can use uint32_t for training flag (0/1). That's fine.
+
+Then host_operator_src reads training attr and sets tiling field.
+
+Kernel: use training flag to decide whether to compute statistics or use passed mean/var. But for simplicity, we can force training=False (use passed mean/var) as before, but then we need to ensure the passed mean/var are correct. The reference passes running_mean (zeros) and running_var (ones). That would produce output = weight * (x - 0) / sqrt(1 + eps) + bias = weight * x / sqrt(1+eps) which is not the correct instance_norm (which would compute batch statistics). However, the reference uses F.instance_norm with training=True by default, which ignores running_mean/var and computes batch statistics. So if we force training=False, the output will be wrong. That's likely why the outputs are all zeros? No, zeros still. Actually if we use running_mean=0 and running_var=1, and weight=1, bias=0, eps=1e-5, then output = x / sqrt(1+1e-5) approx x, which is not zero. So output would not be zero. So the zero output indicates the kernel didn't execute.
+
+Given the complexity, I'll fix the kernel to compute batch mean/variance internally, ignoring the passed mean/var. That will match training=True behavior. To do that with minimal change, we can modify the kernel to compute mean and variance per channel per sample. This requires two passes: one to compute sum and sum_sq, then another to normalize. But we can do it in one pass using vector operations? Possibly use `Sum` and `Mul` to compute variance. However, that would require additional tiling.
+
+Given time constraints, a safer approach: keep the kernel as is but ensure it works for training=False by using correct parameters, and also modify the model_src to call model.eval() before forward? But we cannot change the harness. The harness compares outputs directly from Model and ModelNew. So ModelNew must produce the same output as Model for the same inputs. Model with training=True will compute batch statistics. So ModelNew must compute batch statistics.
+
+Thus we need to implement batch statistics in the kernel. This is a significant change, but we can attempt a simple implementation: for each channel, compute mean and variance using vector sums and normalization. We can allocate additional local memory for mean/var computation.
+
+But the instruction says "minimal and targeted changes". Perhaps the previous attempt's output being all zeros is due to a bug other than the training mode. Let's re-examine: The kernel's `meanLocal_` etc. are loaded from GM_ADDR's. If the values are correct (running_mean=0, running_var=1, weight=1, bias=0), then the kernel should produce x/sqrt(1+eps) which is not zero. So why all zeros? Possibly the `DataCopy` from meanGm_ to meanLocal_ is writing to wrong memory because meanGm_ is not properly set? In Init, we set `meanGm_.SetGlobalBuffer((__gm__ float*)running_mean, numFeatures_);`. But `running_mean` is a GM_ADDR (void*), we cast to float*. That should work.
+
+Maybe the problem is that the kernel's Init is called after the tiling data is read, but the `tiling_data` macro may not have the correct values. The warning about tiling struct conflict might cause the macro to read garbage. So fix the conflict first.
+
+To fix the conflict, we can rename the tiling struct to something else? The auto-generated header uses `Ca6k04600CustomTilingData`. Our host_tiling_src also defines `Ca6k04600CustomTilingData`. That's the conflict. To avoid, we can not define our own; instead, we can rely on the auto-generated one. But then we need the auto-generated header file to be included. The auto-generated header is generated from the op_info? Actually, the opbuild generates a tiling header based on the op_info if we don't provide one. But if we provide one, it uses ours. The conflict warning suggests both exist. To resolve, we can remove our host_tiling_src definition and let the autogen handle it. But we still need to include the tiling header in host_operator_src. The header name is fixed as `op_name_tiling.h`. So we can include it. Then we need to set the TilingFunc to fill the fields. But we must know the exact field names the autogen will use. The autogen uses the field definitions from the op info? The op info does not define tiling fields; the tiling data structure is generated from the host_tiling_src we provide. So we must provide it. Maybe the build system sees both our definition and the one generated from the op_desc? The op_desc includes `AICore().SetTiling(optiling::TilingFunc)`, which might cause generation of tiling data struct. To avoid duplication, we should not define the tiling data struct in a separate header but inside the TilingFunc as a local? Not possible.
+
+Given the difficulty, a pragmatic fix: Remove the custom tiling fields `numFeatures` and `spatialSize`. Instead, pass those via the tiling data as blockDim and tileLength? But we need them in kernel. We can compute numFeatures from totalLength? Not without shape. Alternatively, we can use the tiling data to pass the shape info in a single uint32_t packed: e.g., one field `shapeInfo` containing numFeatures and spatialSize. But that's hacky.
+
+Better: Keep the tiling struct but ensure it matches the auto-generated one by using the exact order and field names that the autogen expects. Since the autogen generates based on the op_info and the opbuild source files, it might parse the host_tiling_src and generate a matching header. The conflict warning might be because we define the struct twice: once in our header and once in the generated code. The generated code is likely in a separate file that includes our header? I'm not entirely sure.
+
+Given time, I'll adopt a different strategy: Implement instance norm using the AscendC built-in `InstanceNorm` API if available? But that's not custom.
+
+I'll produce a final answer that fixes the kernel to properly compute instance norm with batch statistics, and uses a simpler tiling with only totalLength, tileLength, blockDim, eps, numFeatures, spatialSize (consistent). Also fix the local buffer allocation and indexing. And add training flag to op and tiling. And ensure the kernel uses training flag to determine whether to compute statistics or use inputs. I'll set training to 1 in tiling and kernel will compute statistics.
+
+Let's write the corrected code now.

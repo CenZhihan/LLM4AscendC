@@ -1,0 +1,170 @@
+We need to generate six Python string variables for a fused custom AscendC operator that replaces nn.ChannelShuffle. The operator name stem is ca6k_00597, so we'll use ca6k_00597_custom and Ca6k00597Custom.
+
+ChannelShuffle operation: Given input tensor of shape (N, C, H, W) and groups g, it first reshapes to (N, g, C//g, H, W), then transposes dimensions (1,2) -> (N, C//g, g, H, W), then flattens back to (N, C, H, W). Equivalent to: reshape to (N, g, C//g, H, W), permute to (N, C//g, g, H, W), reshape to (N, C, H, W). We can implement a custom kernel that does this directly using AscendC operations. But note: AscendC has limited support for tensor reshaping/transposing? We can use AscendC's view/as to reinterpret shapes, but we need to be careful about memory layout. Since the operation is just a permutation of channels, we can compute the output by reading from input with a stride pattern.
+
+A simpler approach: Since the operation is just a channel shuffle, we can implement it by copying data with permuted indices. The kernel can read input tiles and write to output tiles with appropriate indexing. We'll need to handle the shape: N, C, H, W. Groups g is an attribute.
+
+We'll design a single kernel that takes input x, groups, and outputs y. The tiling data will store total elements, tile length, block dim, groups, C, H, W. Actually, we can compute the mapping in kernel using integer arithmetic.
+
+Alternatively, we could implement using AscendC's transpose operation? But that's for matrices. Better to do custom index computation.
+
+Let's outline the plan:
+
+- project_json_src: define operator with input x (float), output y (float), attr groups (int).
+- host_tiling_src: define tiling data with totalLength, tileLength, blockDim, groups, channels, height, width, but actually we might compute tile length based on UB budget. However for simplicity, we can compute tiles along the batch-channel dimension? Since the shuffle is per spatial location? Actually channel shuffle is independent per spatial location: for each (N, H, W) position, we shuffle the C channels. So we can process each pixel independently. So tiling can be along the batch or spatial dimensions. We'll compute number of pixels = N*H*W, and each pixel has C elements. So total elements = N*C*H*W. The kernel will process a tile of pixels (batch of pixels) and for each pixel compute shuffled output.
+
+Tiling: For each pixel (index p), input base = p*C, output base = p*C. We need to read C floats, shuffle them, write C floats. So tile length can be number of pixels times C. UB budget: we can allocate for double buffer: 2 * tile_len * sizeof(float) plus temporary? We need to compute shuffle. We can use local tensor for input and output. Since shuffle is just reordering, we can compute output indices without additional temporary. So we can read input tile, compute output tile, write. So double buffer: 2*tile_len.
+
+We need to compute mapping: For channel index c in [0, C), group = c // (C//g), pos_in_group = c % (C//g). New channel index = pos_in_group * g + group. So for pixel p, input offset = p*C + c, output offset = p*C + new_channel.
+
+Thus kernel can process a tile of pixels. Tiling data: totalPixels = N*H*W, tilePixels = number of pixels per tile, groups, channels.
+
+But we also need to ensure alignment: tilePixels * channels should be aligned to 32 bytes? For DataCopy, we need to copy tile_len floats (tilePixels * channels). We'll align tilePixels such that tile_len is a multiple of 8 floats (32 bytes) to avoid misalignment? Actually DataCopy requires contiguous memory and alignment to 32 bytes. So we need tile_len * sizeof(float) aligned to 32. Best to make tile_len multiple of 8.
+
+Simplify: Instead of splitting by pixels, we can split by total elements (N*C*H*W) and compute mapping on the fly. But then we need to know the shape dimensions to compute indices. Tiling data will include channels (C), groups, and maybe spatial size to compute pixel index.
+
+We'll pass totalLength (total floats), tileLength (elements per tile), groups, channels, height, width, blockDim. But height, width might not be needed if we compute pixel index from element index? We can compute: element index = global index. Pixel index = element // channels; intra channel = element % channels. Then new channel as above. So we only need channels and groups.
+
+Thus tiling data fields: totalLength, tileLength, blockDim, groups, channels.
+
+Host tiling: compute UB budget: we need to read tile and write tile, so double buffer: 2*tileLen*sizeof(float). UB budget conservative 192KB. So max tileLen = 192*1024/(2*4)=24576 floats. But we also need alignment. Also consider that each element processing requires simple arithmetic, so tileLen can be large. We'll set tileLen = min(totalLength, maxTile). We'll also block dim based on number of tiles.
+
+Kernel: For each block, it will process a range of elements using grid-stride loop. For each element, compute pixel index and intra-channel index, then compute new channel index, and write to output.
+
+But careful: AscendC's index arithmetic: We can use local tensors for input and output. However, if we process element by element, we cannot use DataCopy efficiently. Better to use vectorized operations? But shuffle is not a vector operation; we need to reorder elements. We can read a tile of contiguous input, but the output order is not contiguous in the original input memory (for the same pixel, it's contiguous, but for the shuffled output, it's also contiguous per pixel). Actually, for a pixel, the input channels are contiguous, and the output channels are contiguous as well (just reordered). So we can read a tile of pixels (contiguous blocks of size C), and write them back in shuffled order at the same location? But we cannot overwrite input because we might need input for other pixels? Since we operate per pixel independently, we can read a tile of pixels into a buffer, compute shuffled output, and write to output. Since input and output are different global memory buffers, we can double buffer.
+
+Thus kernel can read a tile of input (contiguous elements of size tileLen), but note: contiguous elements correspond to consecutive pixels only if no padding. For ND tensor, it's contiguous. So reading tileLen floats corresponds to a contiguous chunk of pixels (except possibly at last tile). We'll process them by iterating over pixel index within the tile. For each pixel, we compute shuffled output for its C channels.
+
+So algorithm: For each tile, copy input to local buffer. Then iterate over pixels in that tile: for each pixel, for each channel c in 0..C-1, compute new channel, then write local input element at offset pixel*C + c to output local buffer at offset pixel*C + new_channel. Then copy output buffer to global.
+
+We need to know C and groups. So kernel Init receives totalLen, tileLen, groups, channels.
+
+Implementation details:
+
+- Use double buffer for inQueue and outQueue with BUFFER_NUM=2.
+- Also use a temporary queue? Not needed if we compute in-place? But we need to read input and write output separately. We can read into input buffer, then compute into output buffer. So we need two buffers: inQueue and outQueue. We don't need tmpQueue.
+- For each tile, DeQue from inQueue, then for each pixel compute output into outQueue buffer (allocate from outQueue). Then EnQue outQueue.
+- In CopyIn, we copy tileLen elements.
+- In Compute, we need to know the base index of this tile in the global tensor? Actually, we need the global index for the first element of the tile to compute pixel offset? But we can compute pixel index within tile relative to base. We'll need base global element index. We can pass base offset to Compute. In Process, we maintain base element index for the tile (grid-stride). So we can compute: for each pixel in tile, global pixel index = (base + i) // C? Actually, base is element offset. Since tile is contiguous, the first element of the tile corresponds to some pixel and intra-channel offset. But we can compute start pixel = base // C, and start channel = base % C. However, tile may start in the middle of a pixel. To avoid complexity, we can ensure tiles are aligned to pixel boundaries: tileLen should be a multiple of C and tileBase should be a multiple of C. So we can set alignment to C. For example, pad totalLength to multiple of C? Or in tiling, we ensure tileLen is a multiple of C and base from blockIdx*tileLen is aligned. Since totalLength is multiple of C (by definition of tensor shape), we can set tileLen to multiple of C. So we can compute pixel index and intra-channel offset easily.
+
+Thus tiling: tileLen = AlignDown(maxTile, C) and also ensure tileLen >= C.
+
+In kernel, we have base = blockIdx * tileLen, and tileLen is multiple of C. Then we know startPixel = base / C, and number of pixels in tile = tileLen / C. Then iterate over pixels: for p in 0..numPixels-1, global pixel index = startPixel + p. The input base for that pixel is (startPixel + p)*C. We can read from local input buffer at offset p*C.
+
+Compute: for c in 0..C-1, compute new channel index, write to local output buffer at offset p*C + new_channel.
+
+Edge case: last tile may have fewer elements than tileLen; we need to handle that. The loop should process until all elements accounted.
+
+We'll pass totalLen, tileLen, groups, channels, and also number of full tiles? But we can compute the actual number of elements for this block: actualBlockElems = min(tileLen, totalLen - base). Then actualPixels = actualBlockElems / C (since we ensured alignment, actualBlockElems is multiple of C last tile might be not multiple? Actually if totalLen is multiple of C, and tileLen is multiple of C, the last block's size is < tileLen but still multiple of C? Only if totalLen is multiple of C, which it is. So yes, last block size will be multiple of C because it's the remainder of dividing totalLen by tileLen, and both are multiples of C. So we can safely assume last block size is multiple of C.
+
+Thus kernel Process: use grid-stride loop with stride = blockNum * tileLen. We'll pre-fetch first tile, then loop.
+
+We'll need to get the base offset (element index) from blockIdx * tileLen. At each iteration, we compute actualLen = min(tileLen, totalLen - base); numPixels = actualLen / C.
+
+In Compute, we perform the shuffle.
+
+Now, implement host_operator_src with TilingFunc. We must use StorageShape* as per memory fix. Also avoid duplicate REG_OP as per memory fix. We'll define operator using the OpDef class with inputs and outputs.
+
+For InferShape and InferDataType, simple pass-through.
+
+We'll also need to register the operator with op registry. But in host_operator_src we will include the auto-generated header? Actually we need to provide the full host operator source that includes tiling and registration. We'll follow the pattern from the example: define TilingFunc in optiling namespace, then InferShape/InferDataType in ge namespace, then operator class with OP_ADD. Note: OP_ADD will cause redefinition if we also have auto-generated header? In the example, they used OP_ADD. But memory fix says avoid duplicate REG_OP; OP_ADD is different? Actually in Ascend build system, the auto-generated header may contain REG_OP macro. In the example, they used OP_ADD inside ops namespace. That might not conflict if the op name is same. To be safe, we can omit the operator class and just use the auto-generated registration by setting the tiling function in the OpDef? But the example shows full registration. We'll follow the example but ensure we only define once. The auto-generated header will not be present if we don't have a .ini file? Actually the build expects operator source to define the op. So we must define it. Memory fix says don't add a duplicate REG_OP block. OP_ADD is not REG_OP; it's a macro that creates an object at global scope. The auto-generated header may use OP_ADD or REG_OP. The fix earlier was that there was a duplicate REG_OP in host source after auto-generation. To avoid that, we should not include any extra registration macro that is already in auto-generated header. Since we are providing the full source, the build system might not auto-generate? Typically, the project_json defines the operator, and then the build system generates a header with OP_ADD or REG_OP. The host source should not contain another op definition. Wait, in the example provided, the host_operator_src contains a complete op definition with OP_ADD. That worked. So maybe for this project style, we need to include the op definition. We'll follow that pattern.
+
+Now, python_bind_src: We need to bind the custom operator to a function that calls aclnn execution. We'll define a function that takes tensor and groups, and calls EXEC_NPU_CMD(aclnnCa6k00597Custom, ...). We'll need to include the correct header. We'll use pytorch_npu_helper.hpp.
+
+model_src: define ModelNew class that uses custom_ops_lib. The user code will call getattr(custom_ops_lib, 'ca6k_00597_custom'). So python_bind_src should expose a function named 'ca6k_00597_custom'.
+
+Now, let's write the code carefully.
+
+First, project_json_src: top-level key "op". The JSON should be a list with one object? The example used a list with one object. We'll do same.
+
+JSON structure:
+[
+  {
+    "op": "Ca6k00597Custom",
+    "language": "cpp",
+    "input_desc": [{"name": "x", "param_type": "required", "format": ["ND"], "type": ["float"]}],
+    "output_desc": [{"name": "y", "param_type": "required", "format": ["ND"], "type": ["float"]}],
+    "attr": [
+      {"name": "groups", "param_type": "optional", "type": "int", "default_value": "1"}
+    ]
+  }
+]
+
+Note: groups is integer, default 1.
+
+Now host_tiling_src: define TilingData with fields: totalLength, tileLength, blockDim, groups, channels. We'll use TILING_DATA_FIELD_DEF for these. The namespace must be optiling.
+
+host_operator_src: include tiling header, register/tiling, etc. Use StorageShape* fix for GetInputShape. Also use direct assignment for tiling fields (not set_* per memory fix 3? Actually memory fix 3 says not to call set_* if it doesn't exist; but if TILING_DATA_FIELD_DEF is private, we need setter. Memory fix 4 says if private, use setter. So we need to know which one. In the example, they used set_* methods, and they worked. The fix 3 was for a case where set_* didn't exist, so they used direct member assignment. But memory fix 4 says if private, use setter. So we need to decide. Typically, if we define TILING_DATA_FIELD_DEF, it generates both member and setter? Actually, the macro TILING_DATA_FIELD_DEF(uint32_t, totalLength) likely creates a public member named totalLength_ and a setter set_totalLength(). In the example, they used tiling.set_totalLength(). So we'll use setters. But to be safe, we can follow the example and use setters. The memory fixes indicate that sometimes setters exist, sometimes not. We'll use setters as they are more common. If it fails, we can adjust, but for now we'll use setters.
+
+We'll compute tileLen based on UB budget. We'll also ensure alignment to C (channels). We'll get channels from input shape dim[1] (C). Height and width are not needed for tiling but we can get them for completeness. We'll compute totalLength as shape size.
+
+Implementation of TilingFunc:
+
+- Get const gert::StorageShape* inputShape = context->GetInputShape(0);
+- totalLength = inputShape->GetOriginShape().GetShapeSize();
+- Get channels = inputShape->GetShape().GetDim(1);
+- Get groups from attrs.
+- Compute maxTile from UB budget (double buffer: 2*tileLen*sizeof(float) <= UB_BUDGET). So maxTile = UB_BUDGET_BYTES / (2*sizeof(float)) = 24576.
+- Align maxTile down to C (channels). Also ensure maxTile >= C.
+- tileLen = min(totalLength, maxTile).
+- Also ensure tileLen multiple of C to avoid misalignment.
+- Compute blockDim = ceil(totalLength / tileLen) but clamped to some range (e.g., 1 to 24).
+- Set blockDim.
+- Set tiling fields using setters.
+
+We'll also set workspace to 0.
+
+Now kernel_src: implement Kernel class as described.
+
+We'll use double buffer with BUFFER_NUM=2. We'll have inQueueX and outQueueY. We'll include tmpQueue? Not needed. But we need to compute output in a separate buffer. So we allocate from outQueueY for writing. So we don't need tmpQueue.
+
+Init: initialize global tensors, pipe buffers.
+
+Process: grid-stride loop with stride = blockNum * tileLen. Base = blockIdx * tileLen. Pre-fetch first tile. Then loop: compute next tile pre-fetch, compute current, copy out.
+
+Compute: given input local tensor from inQueue, allocate output local tensor from outQueue. We'll know the base offset (element index) for this tile (passed as parameter). In Process, we can compute base for each tile. Then in Compute, we iterate over pixels.
+
+We need to handle the case where the actual number of elements in the last tile may be less than tileLen. So we need to pass the actual length for this tile. In Process, when prefetching, we compute actualLen = min(tileLen, totalLen - base). Similarly for next tile. Then when copying in, we use actualLen. In Compute, we also use actualLen. So we need to store actualLen for each tile. We can use a variable curLen. So we modify Process:
+
+Loop:
+- CopyIn(base, curLen)
+- If nextBase < totalLen: compute nextLen, CopyIn(nextBase, nextLen)
+- Compute(base, curLen)  // base needed to compute pixel index? Actually we need start pixel index = base / C. Since tileLen is multiple of C, base is multiple of C, so startPixel = base / C.
+- CopyOut(base, curLen)
+- base = nextBase, curLen = nextLen, continue.
+
+Inside Compute: We get local input tensor from inQueue. Allocate local output tensor from outQueue. Then for p in 0..numPixels-1 (numPixels = curLen / C):
+   For c in 0..C-1:
+        new_c = (c % (C/g)) * g + c // (C/g)
+   But we need to avoid division inside loop? Use integer arithmetic. We'll compute groupSize = C / groups.
+   For each c:
+        group = c / groupSize
+        pos = c % groupSize
+        new_c = pos * groups + group
+   Then write localOutput[p*C + new_c] = localInput[p*C + c].
+
+We can write using pointer arithmetic: localInput[p*C + c]. Since local tensor is 1D, we can access via integer index. AscendC LocalTensor supports [] operator. So fine.
+
+After loop, free input tensor and enqueue output tensor.
+
+Now ensure that we handle alignment: local buffers are allocated with size tileLen * sizeof(float), and we only use curLen elements.
+
+Now we need to include kernel_operator.h.
+
+Now python_bind_src: We'll write a function that takes tensor and groups, calls aclnnCa6k00597Custom. We'll need to include pytorch_npu_helper.hpp. We'll implement using EXEC_NPU_CMD.
+
+We'll also define the function py_ca6k_00597_custom and bind it with PYBIND11_MODULE.
+
+model_src: Define ModelNew that imports custom_ops_lib and calls the function.
+
+Now ensure naming: kernel function name in kernel_src must be ca6k_00597_custom. The operator name in project_json and host_operator_src must be Ca6k00597Custom.
+
+Let's write the code.
+
+One more thing: In host_operator_src, we need to include the tiling header and register. We'll follow the exact pattern from example but adapt.
+
+We'll include "ca6k_00597_custom_tiling.h" (generated from host_tiling_src). The name of the header should match the operator name in lower case? The example used "leaky_relu_custom_tiling.h". So we'll use "ca6k_00597_custom_tiling.h".
+
+Also in kernel_src, we need to include "kernel_operator.h" and use GET_TILING_DATA macro.
+
+Now produce final answer.

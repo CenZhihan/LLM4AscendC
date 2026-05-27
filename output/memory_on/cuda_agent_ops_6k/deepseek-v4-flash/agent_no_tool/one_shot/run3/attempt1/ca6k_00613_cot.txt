@@ -1,0 +1,98 @@
+We need to generate six Python string variables for the custom operator. The operator is a fused InstanceNorm1d. We'll create a single custom op called "ca6k_00613_custom" (kernel name) and "Ca6k00613Custom" in JSON. Since InstanceNorm1d involves normalization across spatial dimension, we need to compute mean, variance, then normalize, and optionally apply affine parameters. The inputs: x (float), and optionally gamma, beta (if affine). In reference, affine=True so we have learnable parameters. However note: the model is given without weights initially, but affine=True means there are parameters. The get_init_inputs returns num_features, eps, momentum, affine. But the actual model has nn.InstanceNorm1d(num_features, eps=eps, momentum=momentum, affine=affine). So the model has parameters running_mean, running_var (only when track_running_stats is True, default True) and weight, bias if affine=True. But note: InstanceNorm1d with affine=True creates learnable weight and bias. In forward, it's just self.instance_norm(x). So we need to handle both affine parameters and running stats? Actually default track_running_stats is True, so InstanceNorm1d tracks running mean and var during training but uses instance stats during forward? Wait: torch.nn.InstanceNorm1d: "The mean and standard-deviation are calculated per-dimension separately for each object in a mini-batch." It does not track running stats; it always uses per-instance stats. The running_mean and running_var are only for BatchNorm, not InstanceNorm. InstanceNorm1d does not have running stats; it computes mean and var for each channel of each sample. So we need to compute mean and var per (N, C) over the L dimension. Then normalize (x - mean)/sqrt(var+eps). Then apply affine if affine=True: out = gamma * normalized + beta. The parameters gamma and beta are learnable, shape (num_features). They are attributes of the module, but in forward they are used. In custom op, we can pass gamma and beta as inputs if affine=True. Since the reference model has affine=True, we need to include weight and bias. However the reference forward does not explicitly pass them; they are stored in the module and used internally. In our custom op, we need to handle them. But the user instruction says: "Fused API list: nn.InstanceNorm1d". So we replace the entire InstanceNorm1d with a custom op. The custom op should take x, and optionally gamma, beta, and also the epsilon (eps) and momentum (though momentum is not used in forward, it's for updating running stats if any; but InstanceNorm doesn't have running stats). So we can ignore momentum. For the custom op, we'll define inputs: x (float), weight (float, optional), bias (float, optional), and attribute eps. Since the reference model uses affine=True, we'll require weight and bias as inputs. But the get_inputs() only returns x. The weight and bias are parameters of the model, so they are part of the model state, not inputs to forward. In our custom op, we need to load them from somewhere. In the fused op approach, we can treat them as separate inputs that the caller must provide. In model_src, we'll create the custom op that takes x, weight, bias. So the ModelNew will need to store the parameters (gamma, beta) and pass them to the custom op. That's fine.
+
+Thus, the custom op: input "x" (ND, float), input "weight" (ND, float), input "bias" (ND, float), output "y" (ND, float), attribute "eps" (float, default 1e-5). Also we might have attribute "affine" but since we always have weight/bias we can assume affine=True. Alternatively, we can make weight and bias optional, but simpler to treat as required. In host_operator we will define the operator accordingly.
+
+Now, the kernel: We need to compute per instance (N, C) mean and variance over L dimension. That requires a reduction. Since AscendC supports reduction operations, we can use ReduceSum or similar. However, we need to be careful with the tiling and data layout. InstanceNorm1d input is (N, C, L). We need to compute for each (n, c) the mean and variance across L. So we can launch a kernel that processes each channel of each sample in parallel. The kernel can iterate over N*C blocks? Or we can use a grid-stride approach. Since the number of elements is large, we can tile across the L dimension and accumulate intermediate statistics per block, then combine? That's complex. Alternatively, we can compute mean and variance using two passes: first compute sum and sum of squares, then normalize. But AscendC kernel is single pass. We can use a vectorized approach: for each thread block, we process a contiguous chunk of data. But to compute mean and variance across L for each (n,c), we need to reduce within that chunk. A common approach: compute mean and var using a parallel reduction within the kernel. But AscendC provides APIs like ReduceSum, ReduceMean, etc. However, the kernel shown in example uses simple elementwise ops. For InstanceNorm, we need more complex reduction. Given constraints, we could use a two-pass kernel: first pass compute sums and sumsq per (n,c) and store in temporary buffer, then second pass normalize. But the harness expects a single fused custom op. We can implement a kernel that processes one instance (n,c) at a time, but that would be inefficient. Alternatively, we can use the AscendC built-in InstanceNorm operator? No, we must write custom.
+
+Simpler: Since the reference uses a small batch and dimensions, we can do a straightforward kernel that loads the entire tile for one (n,c) into local memory, computes mean and var, then normalizes and applies affine. That is feasible if the tile length (L) is not too large. We can tile the (N,C) dimensions, each block handles one (n,c). So we set blockDim = N*C. That might be large (2048*64=131072) which is too many blocks. But we can adjust: we can have one block process multiple (n,c) iteratively? Or we can use a grid-stride over the total number of (n,c) pairs. The kernel can have blockDim = some number (e.g., 24) and each block processes multiple (n,c) pairs. We'll need to compute mean and variance per pair. We can use a shared memory or local memory to compute sum. Since each (n,c) is independent, we can compute sequentially for each pair assigned to the block.
+
+To simplify, we'll adopt a strategy: each block handles a chunk of the data, but for each (n,c) we need to reduce over the entire L. If we process a chunk that spans multiple (n,c) pairs, we need to know boundaries. Better to have each thread handle one element? Not easy.
+
+Given time constraints, we can implement the kernel using the AscendC built-in reduce operations? There is "ReduceSum" but it's for entire tensor? Actually AscendC has vector reduction intrinsics like "ReduceSum" that can reduce a local tensor. We can load the entire L for one (n,c) into local memory (tile length), compute mean and variance using vector ops. So we will set tile length to L (seq_length=512). That's small. Then we can have each block process one (n,c). But number of blocks = N*C = 2048*64 = 131072, which is too many. But we can have a grid-stride loop: each block processes multiple (n,c). For example, blockDim = number of blocks active (like 24), and each block strides through (n,c) with step blockDim. We'll compute the total number of (n,c) pairs: totalInstances = N * C. Each block will compute for its assigned (n,c) indices. For each assigned (n,c), it will load the L elements (tile length = L), compute mean, var, normalize, apply affine, and write out.
+
+We'll need the global buffer layout: x is (N,C,L) with stride L per channel. So we can compute offset = (n*C + c)*L. Similarly for output. weight and bias are (C,) so for channel c we use weight[c] and bias[c].
+
+In kernel Init, we will set totalInstances = batchSize * numFeatures, and tileLen = seqLength. The kernel will loop over its assigned instances: for (int i = blockIdx; i < totalInstances; i += blockNum) { compute. }
+
+We'll need to store BatchSize, NumFeatures, SeqLength. Actually we can pass totalInstances and seqLength as tiling data.
+
+We'll also pass weightGm_ and biasGm_ as global buffers.
+
+Now, host_tiling: define fields: batchSize, numFeatures, seqLength, eps.
+
+Host_operator: Compute blockDim maybe 24, tile length = seqLength.
+
+Now, for the kernel code, we need to implement the instance norm.
+
+We'll compute mean = sum(x) / L, var = sum((x-mean)^2) / L or L-1? Instance norm uses biased variance (divided by L, not L-1). We'll follow PyTorch: uses unbiased=False? Actually torch.nn.InstanceNorm1d uses biased variance (divides by N, where N is number of elements, i.e., L). So we divide by L.
+
+We can compute mean by sum using vector add and reduce. But we can compute mean and var in one pass using Welford's algorithm? Simpler: load all L elements, compute sum, then compute mean, then compute sum of squared differences.
+
+Given that L is only 512, we can do two passes: first compute sum by iterating, then compute sum of squared differences. We can use AscendC's vector multiply and add. Actually we can use the DataCopy to load, then use AscendC's vector reduction? There is no native reduce in this simple kernel; we need to manually sum. We can use a loop to accumulate.
+
+In AscendC, we can use a local scalar accumulator and loop over the local tensor. That's fine as long as tile is small (512). Performance: we will have many blocks, but each block does 512 iterations to compute sum, then another 512 for sum of squares, then normalize and write. It should be acceptable.
+
+We'll need to use a temporary tensor for xLocal and also for squared differences.
+
+Procedure for each instance:
+- Load xLocal of length seqLength.
+- Compute sumX: loop i from 0 to seqLength-1, sumX += xLocal[i].
+- Compute mean = sumX / seqLength.
+- Compute sumDiffSq: loop i from 0 to seqLength-1, diff = xLocal[i] - mean, sumDiffSq += diff * diff.
+- Compute var = sumDiffSq / seqLength.
+- Compute invStd = 1.0f / sqrt(var + eps).
+- Then compute yLocal[i] = (xLocal[i] - mean) * invStd * weight[c] + bias[c].
+- Write yLocal to global.
+
+We'll need to load weight and bias per channel: weight[c] and bias[c]. Since c is part of the instance index: instanceIdx = n*C + c, we can compute c = instanceIdx % C. So we need to have weightGm_ and biasGm_ buffers.
+
+We'll pass batchSize and numFeatures so we can compute c.
+
+Alternatively, we can pass weightGm_ and biasGm_ as global buffers with size C.
+
+In Init, we set weightGm_ and biasGm_ accordingly.
+
+Now, the kernel code must be valid AscendC. We'll use standard includes.
+
+We'll also need to handle the float data type.
+
+We'll use the same pattern as example: pipe, queues, but for this kernel we might not need queues if we do all operations in-place. We can use local tensors directly.
+
+Simplify: We can use a single local tensor for xLocal, then compute in place. No need for multiple queues. But example used queues for overlap. We'll keep similar structure for consistency.
+
+However, for simplicity, we can use a single tensor and no double buffering because seqLength is small. But to be safe, we'll follow the pattern.
+
+Define:
+- inQueueX_: for loading x data (one tile, seqLength)
+- outQueueY_: for output
+- tmpQueue_: for intermediate calculations.
+
+Since each instance is independent, we can process one instance at a time. For each assigned instance, we allocate a tensor from inQueueX_, copy in, compute, then enqueue to outQueueY_, then copy out. But we need to handle multiple instances per block. We'll loop over instances: for each, we do CopyIn, Compute, CopyOut. That's fine.
+
+We'll set tile length = seqLength.
+
+Now, write the kernel.
+
+Let's produce the six strings.
+
+We'll follow the naming: operator name "ca6k_00613_custom", PascalCase "Ca6k00613Custom".
+
+Project JSON: define op with inputs: x, weight, bias. Output: y. Attributes: eps (float, default 1e-5).
+
+Host tiling: fields for batchSize, numFeatures, seqLength, eps. Also blockDim (number of blocks we plan to use). Tiling function will compute blockDim as min(24, totalInstances) or something. But we can set blockDim to a fixed number like 24 and use grid-stride.
+
+Host operator: We'll set blockDim based on totalInstances: if totalInstances < 24, blockDim = totalInstances else 24. Tiling data includes everything needed.
+
+Kernel: as described.
+
+Python bind: use pybind11 to expose a function "ca6k_00613_custom" that takes x, weight, bias, eps (optional).
+
+Model_src: define ModelNew class that creates parameters if affine (as given by init_inputs). Since affine=True, we will create nn.Parameter for weight and bias. Then forward: call custom op with x, weight, bias, eps. Also we need to handle momentum? Not used. We'll ignore momentum.
+
+Now, write the code.
+
+Note: The user said "output exactly six Python string variables". We'll output a single code block with assignments.
+
+We need to ensure no syntax errors. Use triple double quotes for strings. For strings containing backslashes or quotes, use raw strings or escape.
+
+Let's produce.

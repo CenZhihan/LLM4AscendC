@@ -1,0 +1,63 @@
+We need to generate a fused custom AscendC operator for CircularPad1d. The reference uses nn.CircularPad1d, which pads a 1D input with circular padding (wraparound). Input shape: (batch_size, channels, length). Padding is integer (same both sides). Output shape: (batch_size, channels, length + 2*padding). The operation: pad the last dimension by repeating the input values circularly.
+
+We need a single custom op that takes input tensor x and padding (int) and outputs padded tensor. Since it's a simple memory rearrangement, we can implement it by copying input and then copying wrap-around parts. But AscendC kernel can do this with DataCopy and index manipulation. However, CircularPad1D essentially does: output[..., i] = input[..., (i - padding) % length]. That's a gather operation. We can implement it by reading input with modulo indexing. But AscendC doesn't directly support arbitrary indexing on global tensor? Actually we can use DataCopy with proper offsets, but for wrap-around we need to copy from two segments: the last padding elements and the first padding elements. So kernel can: first copy the last 'padding' elements to output start, then copy the whole input to output[padding:padding+length], then copy first 'padding' elements to output[length+padding:]. That's simpler.
+
+So kernel will have totalLength = input_length + 2*padding. tiling per block will copy tiles. We need to handle batch and channels? Actually the pad is only on last dimension. To maximize throughput, we can treat the input as a flattened 1D array (BCL) and compute offsets accordingly. But careful: padding is on last dimension only, so each slice of size length is padded independently. So we can process per slice (batch*channels slices). But if we flatten, the pattern repeats every slice. However, if we treat the whole input as flat, the wrap-around boundary is only at slice boundaries, not across slices. So we need to pad each slice separately. The output will have slices of size L+2P. So we can loop over slices and pad each.
+
+Simpler: Use DataCopy with multiple copies: for each slice, we copy the last P elements to output start, then copy the entire slice to output offset P, then copy first P elements to output end. This can be done in a loop over slices. In AscendC, we can vectorize by processing multiple slices at once if we use larger tiles? But we can just process each slice sequentially inside each block. Since input can be large, we can distribute slices across blocks. So tiling: totalSlices = batch * channels. Each block processes a contiguous range of slices. For each slice, we perform three DataCopy operations. That's fine.
+
+Alternatively, we can implement a gather with modulo but that's more complex.
+
+Let's design:
+
+Operator name: Ca6k00517Custom (based on ca6k_00517). Kernel function: ca6k_00517_custom.
+
+Input: x (float, ND), attr: padding (int). Output: y (float, ND). Shape: input [N, C, L], output [N, C, L+2*padding].
+
+We need to compute total elements: N*C*(L+2p). Tiling: each tile covers some number of complete slices (or partial). Better to tile per block based on UB. Each slice requires reading L+2p elements? Actually for each slice, we read: last p elements (input slice offset L-p, p elements), then all L elements (input slice offset 0, L elements), then first p elements (input slice offset 0, p elements). So we need to read L + 2p elements total, all from same input slice. So reading is contiguous? No, the last p and first p are not contiguous with the middle. But we can do three separate DataCopies. So each slice requires reading L+2p elements, but in three chunks. UB budget: we need to store the output tile and input tile? Actually we can stream: for each slice, we read the three chunks into local tiles and write them to output. For efficiency, we can buffer the whole output tile? Since output size per slice is L+2p, which might be large. But we can process each slice's output tile in parts: first write last p, then middle L, then first p. However, we need to ensure we don't exceed UB. We can use a double buffer for input and output. But simpler: use a simpler single-buffer approach with BUFFER_NUM=1 as per memory 5 for this kind of sequential operation. Since the kernel is simple and we can process each slice fully within UB if L+2p is not too large. But L can be up to 26000, p=16, so per slice size ~26032 floats ~104KB * 3? Actually we need to read L+2p floats (input side) and write L+2p floats (output). That's about 2*104KB = 208KB, which exceeds typical UB budget (192KB) if we try to hold both input and output. But we can process in three steps, not holding entire slice at once. For each step, we copy a chunk from global to local, then write that chunk to output. So we only need a local buffer of size max chunk: max(L, p, p)? Actually middle chunk is L, which is up to 26000 (104KB). That might exceed UB budget if we allocate a local tensor of that size. But we can tile L further: break the middle chunk into multiple subtiles. So we need a hierarchical tiling: first slice-level tiling, then within each slice, for the middle part we tile further. To simplify, we can treat the entire operation as a flatten 1D array and just copy data with appropriate offsets. Since padding only affects boundaries, we can process the entire output in order. The output order: first p elements come from input indices (slice_start + L - p) to (slice_start + L -1). Then next L elements come from input indices slice_start to slice_start+L-1. Then last p elements come from input indices slice_start to slice_start+p-1. So we can implement a kernel that copies from global to global using DataCopy with multiple source regions. But DataCopy only supports contiguous copy. So we need to issue separate copies.
+
+Given the complexity, we can implement a simple kernel that for each slice, copies three segments. To avoid UB overflow, we can tile each slice's middle L part into tiles of size tileLen (chosen per UB). So we need a double loop: outer over slices, inner over tiles of the middle part. Additionally, the first p and last p are small (max 16) so can be done in one go.
+
+Thus tiling data: totalLength = total output elements? Actually we need to know input shape (N,C,L) and padding. Tiling struct will store: sliceNum = N*C, sliceLen = L, pad = padding, outSliceLen = L+2*pad. Also tileLen for sub-tiling of middle part. Block dim: we can assign each block a range of slices. For each slice, we output outSliceLen elements, but we need to read from input slice.
+
+Better: assign each block a contiguous range of output elements, and compute which slice and position it corresponds to. Then we can copy from appropriate input position. This might be more complex but avoids per-slice overhead.
+
+Given time, we can use a per-block slice-based approach: each block handles a number of complete slices. Tiling includes: blockSlices (number of slices is blockDim? Actually we set blockDim to number of blocks? We'll use grid-stride: each block iterates over slices with stride = blockNum. So each block handles slices blockIdx, blockIdx+blockNum, etc. For each slice, it copies three chunks. We'll further tile the middle L chunk if needed.
+
+UB: we need to allocate local tensors for each chunk. We'll use BUFFER_NUM=1 (sequential) to avoid double-buffer overhead (memory 5). So for each chunk, allocate, copy, compute (actually just copy, no computation), write, free. That works.
+
+Now, we need to implement the kernel in AscendC. We'll use DataCopy for float. Ensure alignment: 32-byte aligned DMA. Since we are copying contiguous floats, it should be fine.
+
+Let's write the code.
+
+Project JSON: op name Ca6k00517Custom, inputs: x (float, ND), attr: padding (int). outputs: y (float, ND).
+
+Host tiling: Ca6k00517CustomTilingData with fields: totalSlices (uint32_t), sliceLen (uint32_t), sliceOutLen (uint32_t), padding (int32_t), tileLen (uint32_t, for subtiling of middle part). Also blockDim? Usually we set blockDim in host operator.
+
+Host operator: TilingFunc computes these from input shape. Input shape: (N, C, L). So totalSlices = N*C. sliceLen = L, padding from attr. sliceOutLen = L+2*padding. tileLen chosen from UB budget. UB budget: we need to allocate for input tile (tileLen) and output tile (tileLen) for the middle part, plus small chunks for padding (which are small, can allocate separately or reuse same buffer). So budget = 2 * tileLen * sizeof(float). With UB ~192KB, tileLen ~ 192KB/(2*4) = 24K? Actually 192*1024 / 8 = 24576 floats. So tileLen up to 24576. But we also need room for extra small buffers, so we can set tileLen = min(24576, sliceLen) aligned to 32 bytes. Actually we can use a smaller tileLen like 2048 or 4096 to be safe (memory 1 suggests ALIGN_ELEMS=2048). We'll follow pattern.
+
+InferShape and InferDataType: output shape same as input except last dim +2*padding.
+
+We need to avoid OP_ADD (memory 3) because autogen will register operator. So host operator code should not have OP_ADD. The example had OP_ADD but that was for custom operator that didn't use autogen? But the example compiled? Actually the example had "OP_ADD(LeakyReluCustom);" and it worked. But memory 3 says if autogen already defines, we should remove. For safety, we will not include OP_ADD. Instead, we will rely on the autogen from project JSON. The host operator will only define TilingFunc, InferShape, InferDataType, and no class LeakyReluCustom with OpDef. The example had a class LeakyReluCustom that derived from OpDef and called OP_ADD. But that was for a custom operator where the autogen was not used? Actually the project_json_src in example was a list with an object that had "op" key, which presumably triggers autogen? The example code is from the user's context, and it seems they included both autogen and manual registration. That might cause redefinition (memory 3). To be safe, we will not include any manual OP_ADD or class definition. Instead, we will define only TilingFunc, InferShape, InferDataType, and use the autogen mechanism. In the host operator source, we include the tiling header, and register tiling with REGISTER_TILING_DATA_CLASS. The operator registration is done by the framework from project JSON. So we omit the ops::LeakyReluCustom class. The example had it but it might be redundant. We'll follow the transformed version pattern but without OP_ADD.
+
+For the kernel, we need to include kernel_operator.h and define the kernel function.
+
+We'll use grid-stride loop over slices, and within each slice subtile the middle part.
+
+Let's write the six strings.
+
+First, project_json_src: We'll use an array with one object. The "op" key should contain the operator name, inputs, outputs, attr, etc. The format should match Ascend operator definition. Use PascalCase for op.
+
+We'll follow similar structure as example but adjusted.
+
+host_tiling_src: Define tiling data struct.
+
+host_operator_src: TilingFunc, InferShape, InferDataType. No class or OP_ADD.
+
+kernel_src: Kernel function.
+
+python_bind_src: Pybind binding using EXEC_NPU_CMD and aclnnCa6k00517Custom. But note: aclnn custom operator needs to be implemented? Actually the pybind will call an external function that uses EXEC_NPU_CMD with the operator name. We'll follow pattern: include torch headers, define a function that uses EXEC_NPU_CMD with the operator name "Ca6k00517Custom". But EXEC_NPU_CMD macro likely exists in Pytorch adapter. We'll assume it's available.
+
+model_src: Import custom_ops_lib and define ModelNew calling the function.
+
+Now write the code.

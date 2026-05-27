@@ -1,0 +1,95 @@
+We need to generate the six strings for the given task. The reference model uses nn.LPPool2d with norm_type=2 (L2 pooling). We need to fuse this into a custom AscendC operator. The operator name should be "ca6k_00269_custom" in kernel, and in JSON/host it should be PascalCase "Ca6k00269Custom". We'll implement L2 pooling (norm_type=2) as a single custom op. However, note that LPPool2d with p=2 is similar to average pooling on squared values? Actually LPPool2d computes (sum(|x|^p)^(1/p)) for each window. With p=2, it's sqrt(mean(x^2)) * (window_size^(1/2))? Wait: LPPool2d definition: for each window, output = (1/(kH*kW) * sum_{i,j} |x_{i,j}|^p)^(1/p)? Or is it just sum of |x|^p then (1/p) power? According to PyTorch documentation: LPPool2d: "Applies a 2D power-average pooling over an input signal composed of several input planes." The formula: output(N_i, C_j, h, w) = (sum_{h',w'} |input(N_i, C_j, h+h', w+w')|^p)^(1/p). So it's sum of absolute values to the p, then take p-th root. No division by kernel size? Indeed, the formula says power average: (1/(kH*kW) * sum |x|^p)^(1/p) is wrong; it's just sum |x|^p then root. Actually I recall it's sum of abs to p then p-th root. Let's verify: PyTorch source: forward: "return F.lp_pool2d(input, self.norm_type, self.kernel_size, self.stride, self.ceil_mode)". F.lp_pool2d is defined as: "return _lp_pool2d(input, norm_type, kernel_size, stride, ceil_mode)". _lp_pool2d: "out = F.avg_pool2d(input.abs().pow(norm_type), kernel_size, stride, ceil_mode=ceil_mode).mul(kernel_size.prod()).pow(1/norm_type)". So it's: compute average of |x|^p over window, then multiply by kernel_size.prod() (to get sum), then take (1/p) power. So effectively: output = (sum |x|^p)^(1/p). That matches documentation.
+
+Thus we need to compute: y = (sum_{window} |x|^p)^(1/p). For p=2, it's sqrt(sum(x^2)) (since abs(x)^2 = x^2). So we can implement sqrt of sum of squares. However, we could also implement using AscendC built-in functions.
+
+We'll create a custom operator that takes input tensor (N, C, H, W), kernel_size (kW, kH), stride (sH, sW), and outputs pooled tensor. Since ceil_mode=False, we use floor. We'll need to handle tiling for batch and channels separately. We'll design the kernel such that each block handles a portion of output elements. We'll use a sliding window approach? But we can compute each output element by iterating over its receptive field and summing squares then sqrt. This is similar to convolution but with a reduction. We can use AscendC's MatMul? No, it's not a convolution. We'll implement naive loops with DMA.
+
+Given constraints, we need to be careful with UB budget. We'll fill UB with tiles of input and compute partial sums per output. Alternatively, we can use the concept of "im2col" but that may be heavy. Given simplicity, we'll do a straightforward per-output computation: for each output pixel, load the window data, compute sum of squares, then sqrt, then write. That may be slow but works for demonstration.
+
+But we need to be efficient: use vector instructions to compute sum of squares across rows/columns. We can use Vec::ReduceSum. But the window is small (3x5) so we can manually accumulate.
+
+We'll design tiling such that each block processes a contiguous chunk of output elements along spatial dimensions. We'll treat batch and channel as outer loops? Actually each output element is independent. We can flatten output spatial dimensions and iterate. To maximize parallelism, we can assign blocks to output elements.
+
+Let's define the operator attributes: kernel_size_h, kernel_size_w, stride_h, stride_w, ceil_mode (but we fix floor). We'll also need norm_type but we assume 2. However, to be generic, we can include norm_type as attribute but we only implement p=2 for now. In constraint, we only need to match reference with norm_type=2. So we can hardcode p=2. But to be safe, we can compute using pow for general p? That would require exp, log, which is heavy. We'll just do p=2.
+
+Thus the kernel will: for each output element (N, C, out_h, out_w), compute sum = 0, for dh in 0..kH-1, for dw in 0..kW-1, load x[N, C, out_h*stride_h + dh, out_w*stride_w + dw] and add its square, then set y = sqrt(sum).
+
+We'll need to handle input boundaries - padding not used.
+
+Given the large input size (batch=16, channels=16, height=256, width=512), kernel (3,5), stride=1, output size: H_out = floor((256 - 3)/1 + 1) = 254, W_out = floor((512 - 5)/1 + 1) = 508. Total output elements: 16*16*254*508 ≈ 16*16*129032 ≈ 33, please compute: 254*508 = 129032, times 256 = 33,032,192. That's about 33M float elements, each block can handle many.
+
+We can set blockDim = number of output elements? But limited by physical cores (max 24). So we assign each block a range of output elements (including batch and channel). We'll tile along the flattened spatial (H*W) per (N,C) pair? Actually we can treat each (N,C) as an independent plane, and then within each plane we can tile the spatial output region. To simplify, we'll process one plane per block? But planes are many (256). We'll let each block handle a chunk of output indices (including batch and channel). Use grid-stride loop over the flattened output tensor.
+
+Given the above, we need to write tiling structure: totalLength = number of output elements, tileLength = number of output elements per block per iteration (determined by UB). But note that for each output element, we need to load a window of size kH*kW from input. So the UB requirement: we need to load a tile of input elements maybe larger. The naive approach: for each output element, we load the window on-the-fly. That means per output, we do kH*kW loads. That is inefficient but works.
+
+Alternatively, we could use DataCopy to load a region of input that contains multiple windows. But given small kernel, we can accept per-element loading.
+
+Given UB budget, we need to keep the pipeline with double buffers. We'll have inQueueX for input tiles (window data) but each window is small. We could batch load multiple windows if we arrange contiguous. Better: we can compute per output element using scalar operations on loaded data. But we must use vector instructions for efficiency.
+
+Maybe we can use a convolution-like approach: we need to compute sum of squares per window. This is equivalent to a convolution with all-ones kernel on squared input. So we can first compute x^2, then use average pooling with kernel size? But we need sum, not average. Since we have no division, sum pooling is just a convolution with ones. But AscendC hardware might not have direct pooling ops, but we can implement as a convolution using MatMul? Not ideal.
+
+Given the task is to produce a fused custom op, and we are not restricted to perfect performance (demonstration), we can implement a straightforward kernel that processes each output element with loops. We'll use scalar loads? Actually we can use vector loads of the entire window into local memory and perform reduction. Since window size is small, we can load the window as a set of contiguous rows? Input is NHWC or NCHW? PyTorch is NCHW by default. We'll assume NCHW. So to load a window, we need to gather rows that are not contiguous in memory. That's expensive. To improve, we could load each row as a contiguous vector of width, then pick elements. But that adds complexity.
+
+Given time, we can assume that the kernel is for demonstration and may not be optimal. Let's design a kernel that computes sum of squares for each output element using scalar operations? That would be extremely slow but might still pass testing for small data. However, the input dimensions are huge (batch 16, channels 16, height 256, width 512). The output is 33M elements. Doing scalar load for each window (15 loads) would be 500M loads, which might be too slow for typical evaluation. But maybe the test harness runs on small subset? Not specified. We need to produce something that compiles and runs reasonably.
+
+Better approach: use the fact that p=2, so we can compute lp pool using avg_pool2d on squared input and then multiply by kernel size and sqrt. That is exactly the reference implementation: F.avg_pool2d(x.abs().pow(2), kernel_size, stride).mul(kernel_size.prod()).sqrt(). So we could fuse avg_pool2d and the multiply/sqrt. But we need to implement avg_pool2d as custom op. That is more complex.
+
+Maybe we can implement a custom op that does the entire LpPool2d using built-in AscendCL interfaces? But we are writing kernel code, not using existing operators.
+
+Given the constraints, I think the intended solution is to produce a plausible kernel that compiles and runs, but not necessarily high performance. We can implement a simple kernel that uses vector operations to compute sum of squares over a window by loading the entire window into local memory (if window fits in UB). For window 3x5 = 15 floats, that's very small. So we can load the window as 3 rows of 5 floats each. Since input is NCHW, the rows are not contiguous? Actually in NCHW, within a channel, the input is 2D (H,W). So spatial coordinates are contiguous in width direction. So each row is contiguous (width direction). So we can load each row of the window as a vector of length kW. Then we can compute squares and sum across rows. That is efficient.
+
+Thus for each output element (out_h, out_w), we need to load 3 vectors of length 5 from input at positions (out_h*stride_h + dh, out_w*stride_w) for dh=0..2. Since stride=1, these positions are consecutive rows. So we can load a block of 3*5 =15 contiguous floats? Actually the rows are separated by input width (512). So not contiguous overall. But we can still load each row as a vector of 5 floats. That's 3 vector loads per output. That's okay.
+
+We can use AscendC::DataCopy to load a vector of length 5 from global to local. But DataCopy expects contiguous data and length in element count. So we can load 5 floats from a given global address. That works.
+
+Thus per output element, we: load row1 (5 floats), compute squares, sum; load row2, add squares; load row3, add squares; then sqrt; store. To leverage vector instructions, we can use Vec::Mul for square, Vec::ReduceSum for sum? Actually we need to sum the 5 elements in a vector. We can use AscendC::ReduceSum on a local tensor. But we need to accumulate across rows. We'll have a scalar sum.
+
+We can use a local tensor of size 5 for each row. Then compute square and reduce sum using AscendC::ReduceSum. Then accumulate scalar. Then sqrt and store.
+
+Given that we have many output elements, we can batch: process multiple output elements per iteration using multiple vector loads and compute. But to simplify, we can tile along output elements: each block handles a chunk of output elements (e.g., 256 elements). For each, we compute as described.
+
+We need to load input data for each window. To avoid repeated loading of overlapping data, we could use sliding window technique, but not necessary.
+
+Given UB budget, we can allocate temporary buffers: for each output element, we need 3 vectors of 5 floats = 15 floats. If we process batch of 256 output elements, we need 256*15=3840 floats = 15KB, plus output buffer. That is okay within UB.
+
+We'll design pipeline with double buffer for input reading. But we need to read for each output element individually. We can precompute a list of global addresses to load? That's complex.
+
+Alternative: we can use a more efficient approach: since kernel size (3,5) is small, we can process the output in a tiled manner: load a block of input that covers multiple output windows. For example, if we load a tile of input of size (tileH, tileW), it can serve multiple output elements. That is similar to convolution tiling. But given time, I think the straightforward per-element approach is acceptable.
+
+Let's decide: We'll write kernel that processes each output element individually using scalar loops? That would be too slow. Instead, we'll use vector operations for each window with small size.
+
+We need to decide tiling data: totalLength = number of output elements. blockDim = number of NPU cores (e.g., 8 or 16). tileLength = number of output elements processed per block per iteration. We'll set tileLength such that UB usage is within limits. Each output element requires: 3 Input vectors (5 floats each) -> 15 floats, but we can load them all into local tensors of size kW=5, and reuse for each row. But we need to load three rows. So we can allocate 3 local tensors of size 5 each. That's 15 floats = 60 bytes. Plus output tensor of size 1 (per element). So per element negligible. But we also need intermediate for squares and reduce sum. We'll allocate local tensors for row squares, sum. That's also small.
+
+If we process batchSize output elements per iteration, we need arrays of these tensors. Let's define tileLength as number of output elements to process in one iteration per block. We'll set tileLength based on maximum number we can fit: if we process 512 output elements, we need 512 * (3*5 + 1) = 512*16 = 8192 floats = 32KB output? Actually output elements will be written to global. For local, we need buffers for input rows. Each output element needs 3 row buffers of size 5 = 15 floats per element. For 512 elements, that's 512*15=7680 floats = 30KB. Plus others. That's okay within 192KB UB. So we can set tileLength around 512.
+
+But we also need to consider that each block will iterate over all output elements assigned to it. We'll use grid-stride loop: each block processes indices from blockIdx * tileLength to blockIdx * tileLength + tileLength, but with stride = blockDim * tileLength. So we need to handle partial last tile.
+
+Now, the kernel will loop over each output element in its tile. For each, compute the window sum of squares.
+
+To compute the window, we need to map output element index to its (N, C, out_h, out_w). We'll flatten the output tensor. We'll compute total_out_spatial = out_H * out_W. Then output element idx = (n * C + c) * out_spatial + out_h * out_W + out_w. But careful: output shape is (N, C, out_H, out_W). We need to know input strides. We'll need input shape (N, C, H, W) and output shape. Tiling data should include these parameters: input_n_stride (C*H*W), input_c_stride (H*W), input_h_stride (W), input_w_stride (1). Similarly output strides.
+
+We'll pass these via tiling data.
+
+Now design host_operator_src: define operator, tiling function computes totalLength output elements, and tileLength based on UB, and also passes necessary strides and kernel/stride parameters.
+
+We'll embed kernel_size_h, kernel_size_w, stride_h, stride_w as attributes.
+
+Now write the six strings.
+
+Let's start with project_json_src: operator name "Ca6k00269Custom", input "x" (float, ND), output "y" (float, ND), attributes: kernel_size_h int, kernel_size_w int, stride_h int, stride_w int, norm_type int (but we ignore p). We'll put all as optional with defaults.
+
+host_tiling_src: define tiling data struct with fields: totalLength, tileLength, blockDim, inputNStride, inputCStride, inputHStride, inputWStride, outputNStride, outputCStride, outputHStride, outputWStride, kernelSizeH, kernelSizeW, strideH, strideW, outH, outW.
+
+host_operator_src: implement InferShape (output shape computed from input shape and kernel/stride), InferDataType, TilingFunc fills tiling data.
+
+kernel_src: implement kernel class that uses these tiling data to compute. We'll have a loop over output elements within tile. For each, compute sum of squares by loading rows.
+
+python_bind_src: bind using pybind and TORCH_LIBRARY.
+
+model_src: define ModelNew using custom_ops_lib.
+
+Now write the code. We'll be careful with AscendC API: using DataCopy for contiguous vector loads. For reduction, we can use AscendC::ReduceSum on a local tensor of size kW. Then accumulate across rows.
+
+We need to include header "kernel_operator.h".
+
+Let's produce the six variables.

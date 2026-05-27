@@ -1,0 +1,168 @@
+We need to fix the kernel to produce correct softmin output. The error showed all zeros. The reference output is non-zero. The previous kernel had issues: it used multiple passes but the logic for softmin is wrong. Softmin: output_i = exp(-x_i) / sum(exp(-x_j)). The kernel attempted to compute min and subtract, but the subtraction was done incorrectly. Also the kernel used globalMin? Actually softmin doesn't need min subtraction; it's just exp(-x) normalized. But numerically stable version uses max: exp(-x - min) etc. But the reference uses standard softmin. The kernel output all zeros suggests some division or overflow issue. The previous kernel used ReduceMin and ReduceSum but the implementation had bugs: it allocated tensors multiple times and freed incorrectly. Also the tmpQueue usage was wrong (allocated multiple tensors). The output was zero likely because globalSum was maybe NaN or Inf? Or the invSum was zero? Or the DMA copy didn't work.
+
+We need a simpler, correct implementation. Since the input shape is (batch_size, sequence_length, features) and dim=1 (the second dimension, sequence_length=70000). So softmin is applied along dim=1, i.e., over the sequence_length dimension. That's a large dimension (70000). We need to handle that efficiently.
+
+But correctness first: we can implement a straightforward kernel that for each vector (batch*features slices of dimSize), compute exp(-x) and sum, then normalize. Use tiling to fit in UB.
+
+Key issues in previous attempt:
+- The kernel used three passes but the tiling data didn't include negativeSlope or anything, just dimSize.
+- The Init function took blockDim but didn't use it.
+- The Process function used for loops over tiles but the logic for finding min and sum might have been wrong.
+- The output was all zeros, possibly because globalSum was zero? Actually exp(-x) is always positive, so sum > 0. But if the sum is huge, invSum could be very small, but not zero. Could be that the kernel didn't actually write results because of queue management errors.
+
+Let's look at the logs: there is a warning "tiling struct [Ca6k00518CustomTilingData] is conflict with one in file ca6k00518_custom_tiling.h, line 5". That indicates duplicate definition of tiling data. The host_tiling_src and the autogen might conflict. The host_operator_src includes "ca6k_00518_custom_tiling.h" but the tiling header defines Ca6k00518CustomTilingData. The autogen also generates tiling data. This could cause issues. But the build succeeded. However, correctness fails.
+
+We need to produce correct softmin. Let's rewrite the kernel simply:
+
+For each vector (size dimSize), we do:
+- Read tile, compute exp(-x[offset]), store in output buffer (temporary), accumulate sum locally.
+- After processing all tiles, normalize by dividing each element by sum.
+
+But we need to avoid multiple passes if possible. We can do two passes: first compute sum, second normalize. Or we can compute sum first, then re-read and normalize. That's fine.
+
+The previous kernel attempted three passes but had bugs in tensor allocation: it allocated tmpQueue multiple times without freeing properly. For example, in the first pass it did:
+
+AscendC::LocalTensor<float> localMin = tmpQueue_.AllocTensor<float>();
+AscendC::ReduceMin(localMin, xLocal, curLen);
+float lm = localMin.GetValue(0);
+tmpQueue_.FreeTensor(localMin);
+
+That's okay. But then in the second pass it did:
+
+AscendC::LocalTensor<float> diff = tmpQueue_.AllocTensor<float>();
+AscendC::Sub(diff, xLocal, globalMin, curLen);
+inQueueX_.FreeTensor(xLocal);
+
+AscendC::LocalTensor<float> negDiff = tmpQueue_.AllocTensor<float>();
+AscendC::Neg(negDiff, diff, curLen);
+tmpQueue_.FreeTensor(diff);
+
+AscendC::LocalTensor<float> expLocal = tmpQueue_.AllocTensor<float>();
+AscendC::Exp(expLocal, negDiff, curLen);
+tmpQueue_.FreeTensor(negDiff);
+
+AscendC::LocalTensor<float> sumLocal = tmpQueue_.AllocTensor<float>();
+AscendC::ReduceSum(sumLocal, expLocal, curLen);
+globalSum += sumLocal.GetValue(0);
+tmpQueue_.FreeTensor(sumLocal);
+tmpQueue_.FreeTensor(expLocal);
+
+But note: after freeing diff, they allocate negDiff from tmpQueue again, that's fine. But after exp, they allocate sumLocal from tmpQueue, then free sumLocal and expLocal. However, the queue tmpQueue_ is VECCALC and only 1 buffer, so consecutive alloc/free should work. However, the code might have issues with ordering: after freeing diff, the tmpQueue_ now has 1 free slot, alloc negDiff takes it, etc. That should work. But maybe the ReduceMin and ReduceSum operations require special handling? Alternatively, we can avoid using ReduceMin and ReduceSum because they might not work as expected on local tensors? Actually they should.
+
+The output zero might be because the kernel didn't execute the final write correctly: the last pass allocates outQueueY and then does EnQue and DeQue, but the DeQue returns the tensor, then DataCopy writes to global, then FreeTensor. That should work.
+
+But there is a fundamental issue: the kernel uses a single tmpQueue for multiple temporary tensors, but after each tile it frees them, so it's okay. However, the kernel also uses inQueueX and outQueueY. The outQueueY is used in pass 3: they allocate expLocal from outQueueY, then allocate yLocal from outQueueY, then free expLocal, enque yLocal, deque, copy, free. That might be problematic because they allocate two tensors from the same queue (outQueueY). The queue is initialized with BUFFER_NUM=2, so it can hold up to 2 tensors. That should be okay. But after freeing expLocal, the queue has one free slot, then alloc yLocal takes it, then enque, deque, copy, free. That seems fine.
+
+Maybe the issue is that the kernel is not correctly handling the large dimSize (70000) across multiple tiles. The tiling calculation in host might be wrong: tileLength could be too small, causing many tiles, and the kernel might run out of UB? But the kernel uses UB budget of 192KB, tileLength computed as maxTile = UB_BUDGET_BYTES / (2 * sizeof(float)) = 192*1024/8 = 24576, aligned down to 2048 => 22528? Actually AlignDown(24576, 2048) = 22528? 24576/2048=12, 12*2048=24576, so it's exactly 24576. But HARD_CAP_ELEMS=16384, so AlignDown(16384,2048)=16384. So tileLength=16384. That means for dimSize=70000, we have 5 tiles (70000/16384=4.27). That's fine.
+
+But the kernel does three passes per vector, which reads and writes global memory multiple times, but that should still produce output.
+
+Possible cause of zeros: The globalSum might be NaN if the exp is too large? Actually exp(-x) where x can be large positive (e.g., -1000 gives exp(1000) which is huge, maybe overflow to inf). Then sum becomes inf, invSum = 0, so output zero. That could be it! The softmin without normalization stability can overflow. The reference uses standard softmin which is numerically stable: it shifts by max (or min) to avoid overflow. The previous kernel tried to use globalMin but then subtracted globalMin from x and then negated: i.e., exp(-(x - min)) = exp(-x + min) = exp(min)*exp(-x). But they forgot to multiply by exp(min) in the normalization? Actually, if we subtract min first and then compute exp(-(x - min)), the sum becomes exp(min)*sum(exp(-x)). Then the normalized output should be exp(-(x - min)) / sum(exp(-(x - min))) = exp(-x) / sum(exp(-x)), which is correct. The factor exp(min) cancels. So using min subtraction is fine for stability.
+
+But in the kernel, they computed globalMin as the minimum of the vector. Then in pass2, they computed diff = x - globalMin, then negDiff = -diff, i.e., -(x - min) = -x + min. Then exp(negDiff) = exp(-x + min) = exp(min)*exp(-x). Then sumLocal = ReduceSum(expLocal). That's fine. Then globalSum accumulates these per-tile sums. So globalSum = exp(min)*sum(exp(-x)). Then invSum = 1/globalSum. In pass3, they again compute diff, negDiff, expLocal, then multiply by invSum: y = expLocal * invSum = exp(min)*exp(-x) / (exp(min)*sum(exp(-x))) = exp(-x)/sum(exp(-x)). Correct. So numerically stable.
+
+But why zeros? Perhaps because globalMin is computed incorrectly: they use ReduceMin which returns the minimum value in the tensor. That should be fine. However, they compute globalMin as the minimum across tiles by comparing with lm (float). If the vector has all positive numbers, min is positive, but exp(-x) is small but non-zero. So output should be non-zero.
+
+Maybe the problem is that the kernel uses `AscendC::DataCopy` with len in elements? In the example leaky_relu, DataCopy takes number of elements. So that's fine.
+
+Another possibility: The kernel uses `float globalMin = std::numeric_limits<float>::max();` but the AscendC environment might not support std::numeric_limits? It should, as it's a standard C++ header. But maybe not in aicore context. Better to use FLT_MAX. But that might not cause zeros.
+
+Given the error output is all zeros, I suspect the kernel never wrote any non-zero values because the process didn't execute correctly. Possibly the block dimension is too high? The host sets blockDim = numVectors (batch*features = 64*10=640) but then caps at 24. So blockDim = 24. That's fine.
+
+Maybe the issue is that the kernel uses `for (uint32_t vecIdx = blockIdx; vecIdx < numVectors; vecIdx += blockNum)` but numVectors could be up to 640, blockNum=24, so each block handles multiple vectors. That's okay.
+
+But the kernel also uses `inQueueX_.AllocTensor` inside loops, which might cause issues if the queue is not managed correctly. Actually, they allocate, then enque, then deque, then free. That's the pattern. But the queue has BUFFER_NUM=2, so inside a loop they do: allocate, datacopy, enque, then deque, compute, free. That should work because each iteration uses one buffer.
+
+I think a simpler and more robust approach: rewrite the kernel to compute the softmin in a single pass per vector but with two phases: first compute sum, then normalize. Since we have to read twice, it's fine.
+
+But to fix the current zeros, we need to identify the exact bug. The logs show "New output: tensor([[[0., 0., 0., ...]]])". That indicates all zeros. Possibly the kernel wrote zeros because globalSum was NaN or Inf? Or the kernel crashed early and didn't write? But the output is allocated as empty_like and then passed to EXEC_NPU_CMD, which should call the kernel. If the kernel didn't write anything, the output would be uninitialized, not zeros (maybe zeros due to empty_like filling with zeros?). Actually, empty_like allocates memory but does not zero it; it may contain arbitrary values. But the output shows zeros, which suggests the kernel explicitly wrote zeros or the memory was zeroed somehow. Could be that the kernel wrote all zeros because the sum computation resulted in inf and invSum=0, then mul gave zero.
+
+Let's compute: if x has large positive numbers, exp(-x) can underflow to zero, but sum of many zeros is zero, invSum = inf, mul gives NaN? Actually 0 * inf = NaN. But the output shows zeros, not NaN. So maybe the kernel didn't execute at all? Or the tiling data was wrong leading to zero tileLength, causing early return.
+
+In host_tiling_src, tileLength is computed, but if dimSize is smaller than ALIGN_ELEMS, they AlignDown(dimSize, ALIGN_ELEMS) which could be zero, then they set tileLength = dimSize. That's fine.
+
+But note: the kernel's Process function checks `if (totalLen_ == 0 || dimSize_ == 0) return;` dimSize_ is set from tiling_data.dimSize, which comes from shape. The shape is (64, 70000, 10), so dimSize along dim=1 is 70000, not zero. So that's fine.
+
+Another possibility: the kernel uses `GET_TILING_DATA(tiling_data, tiling);` and then passes tiling_data.dimSize to Init. But the autogen might have generated a different tiling struct name causing mismatch? The warning "tiling struct [Ca6k00518CustomTilingData] is conflict" suggests there are two definitions, possibly with different field order. The autogen may generate a tiling struct based on the JSON, and the host_tiling_src also defines it. This could cause the fields to be misaligned, leading to reading wrong values. For instance, the autogen might have totalLength, tileLength, blockDim, dimSize (maybe different order). But the JSON doesn't specify tiling fields; the autogen generates TilingData based on the op name and fields defined in host_tiling_src. The conflict warning indicates that the same struct is defined twice, which is undefined behavior. That is likely the root cause of wrong tiling data, causing the kernel to malfunction.
+
+To fix, we must avoid duplicate definition of tiling data. The host_operator_src includes the tiling header, but the autogen also generates a tiling header. Typically, the custom tiling header should be the only source. The autogen might include its own version. The warning says "tiling struct [Ca6k00518CustomTilingData] is conflict with one in file ca6k00518_custom_tiling.h, line 5". That suggests there is a conflict between the autogen's definition and the explicit one. To resolve, we need to ensure the tiling data is defined only once. The usual approach is to define tiling data in the host_tiling_src and let the build system pick it up; the autogen should not redefine it. But the autogen does because it generates a tiling data from the JSON? Actually, the autogen generates op_api and other files, but not tiling data. The conflict might be because the kernel source includes "ca6k00518_custom_tiling.h" (note the name: ca6k00518_custom_tiling.h vs ca6k_00518_custom_tiling.h?). In the host_operator_src, they include "ca6k_00518_custom_tiling.h". The tiling header file name should match the naming convention. The build system expects a certain naming. The warning indicates a conflict, so we should align the names and avoid redefinition.
+
+Given the constraints, we need to produce a minimal fix. The simplest is to ensure the tiling data is defined only in the tiling header and the kernel source includes that header. But the autogen might still cause conflict. However, the build succeeded, so the conflict might be harmless? But it could cause the tiling data size mismatch leading to wrong values.
+
+Also, note that in the host_operator_src, they defined the op class manually, but the autogen also generates op registration based on JSON. That might also conflict. However, the build succeeded, so the duplicate registration might be okay? Actually, the log shows "OP_ADD is autogenerated from project JSON, do not duplicate" comment, but they didn't add OP_ADD, so that's fine.
+
+Given the complexity, maybe we can simplify the kernel to avoid multiple passes and use a more robust approach. But the primary fix should address the conflict and ensure correct tiling data propagation.
+
+I think the best is to provide a corrected version that:
+- Uses a single tiling data definition (no conflict). We'll rename the tiling header to avoid conflict? But the autogen uses the op name to generate files. The warning says conflict with file ca6k00518_custom_tiling.h, line 5. That file is probably the autogen's. To avoid, we can not define our own tiling data? But we need custom fields. Actually, the autogen's tiling data might be empty because JSON doesn't define tiling fields. The warning might be because the autogen also defines Ca6k00518CustomTilingData with no fields? Or with same fields? It's unclear.
+
+Perhaps we can use a different approach: don't define custom tiling data at all; instead, use the built-in tiling data that passes raw pointers? No, we need to pass dimSize and other info. But we can encode them in the tiling buffer as raw bytes without using the macro. However, that's more complex.
+
+Given time, I'll provide a fix that changes the kernel to compute softmin correctly using a single pass per vector but with two phases using the same queue. Also, I'll rename the tiling header to match the expected naming and ensure no duplicate includes. Additionally, I'll ensure the kernel uses FLT_MAX instead of std::numeric_limits.
+
+But the error output zero might be due to the numeric overflow as I guessed. So I'll implement the numerically stable softmin using max subtraction instead of min. For softmin, we want exp(-x). To avoid overflow, we can shift by the maximum of -x (i.e., the minimum of x). So maxNeg = -min(x). Actually, we can compute max of -x, which is -min(x). Better: compute maxVal = max(x) (since x could be negative large, -x could be large positive). Wait: For softmin, exp(-x). If x is large negative, -x is large positive, causing overflow. To avoid overflow, we subtract the maximum of -x (which is -min(x)). So we compute maxOfNegX = -min(x). Then compute exp(-x - maxOfNegX) = exp(-x + min(x)). That's the same as previous but using negative shift. So same as before.
+
+The previous kernel did exactly that (using min). So numeric stability should be fine.
+
+Maybe the problem is that the kernel uses ReduceMin and ReduceSum, which might not be available or behave differently. In some AscendC versions, ReduceMin returns the minimum value as a scalar, but maybe the operation requires the tensor to be of a certain shape. Also, GetValue(0) might not work directly on a ReduceMin output? Actually, ReduceMin produces a tensor of length 1. GetValue(0) should work.
+
+To be safe, I'll rewrite the kernel to use a simpler approach: for each element, compute exp(-x) and accumulate to a local scalar sum using per-element operations, then normalize. But that would be slow for large dim. Better to use vector operations.
+
+Given the uncertainty, I'll provide a corrected version that addresses the tiling conflict and simplifies the kernel to avoid potential bugs. I'll remove the explicit tiling data definition from host_tiling_src and instead rely on the autogen's tiling data? But we need custom fields. The autogen generates a tiling data based on the JSON? Actually, the JSON does not have a "tiling" section. So the autogen might generate an empty tiling data. That would cause issues. So we must define tiling data.
+
+The conflict warning might be just a warning and not affect correctness. But the output zeros suggest something else. Let's examine the kernel code more carefully: In the first pass, they allocate inQueueX_, DataCopy, then enque, then deque, then compute ReduceMin, then free. In the second pass, they again allocate inQueueX_ and do DataCopy, enque, deque, etc. That is fine. But note: in the first pass, they compute globalMin but they never use it in the second pass? Actually they do: they use globalMin in Sub. So that's fine.
+
+However, there is a critical bug: In the second pass, they compute `AscendC::Sub(diff, xLocal, globalMin, curLen);` where globalMin is a float scalar. This subtracts the same scalar from all elements. That's correct.
+
+But then they call `AscendC::Neg(negDiff, diff, curLen);` which negates diff. Then `AscendC::Exp(expLocal, negDiff, curLen);` computes exp(negDiff). Then `AscendC::ReduceSum(sumLocal, expLocal, curLen);` returns a scalar. Then they do `globalSum += sumLocal.GetValue(0);`. That should work.
+
+In the third pass, they do similar but then multiply by invSum and write. The write uses `AscendC::DataCopy(yGm_[baseOff + tileOff], yLocal, curLen);` where yLocal is dequeued from outQueueY after EnQue. That should work.
+
+But note: they allocate expLocal from outQueueY, then allocate yLocal from outQueueY, then free expLocal, then enque yLocal, then deque, then copy, then free. That is okay.
+
+I suspect the bug is that in the third pass, they compute `AscendC::LocalTensor<float> expLocal = outQueueY_.AllocTensor<float>();` and then later `AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();` This is two allocations from the same queue. The queue has BUFFER_NUM=2, so it can hold two tensors. After allocating expLocal, they then allocate yLocal. That uses both buffers. Then they free expLocal, enque yLocal. Then deque. That's fine. But after freeing expLocal, the queue might have one free slot, but enque takes the slot. Then deque returns the tensor. So okay.
+
+Maybe the issue is that the kernel uses `AscendC::Muls(yLocal, expLocal, invSum, curLen);` but expLocal is already freed. Wait, free order: they call `outQueueY_.FreeTensor(expLocal);` after `Muls`? Let's check the code:
+
+```
+AscendC::LocalTensor<float> expLocal = outQueueY_.AllocTensor<float>();
+AscendC::Exp(expLocal, negDiff, curLen);
+tmpQueue_.FreeTensor(negDiff);
+
+AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+AscendC::Muls(yLocal, expLocal, invSum, curLen);
+outQueueY_.FreeTensor(expLocal);
+
+outQueueY_.EnQue(yLocal);
+yLocal = outQueueY_.DeQue<float>();
+AscendC::DataCopy(yGm_[baseOff + tileOff], yLocal, curLen);
+outQueueY_.FreeTensor(yLocal);
+```
+
+Yes, they free expLocal after Muls. That's fine.
+
+I'm leaning towards the tiling data conflict causing the kernel to read wrong tiling parameters, leading to zero length or something. The warning "tiling struct [Ca6k00518CustomTilingData] is conflict" might indicate that the autogen's tiling data has different field order (e.g., "totalLength, tileLength, blockDim, dimSize" vs ours "totalLength, dimSize, tileLength, blockDim"). If the autogen defines the struct with fields in one order and the kernel includes the header that defines it in another order, the memory layout is incompatible, causing wrong values. That is a very likely cause.
+
+So the fix: ensure the tiling data field order matches exactly what the autogen expects. The autogen generates the tiling data based on the field definitions in the tiling header? Actually, the autogen reads the tiling header to generate the op_api and other files. If there is a conflict, it might use one definition. The warning says conflict with file ca6k00518_custom_tiling.h, line 5. That file is probably the autogen's generated file. So the autogen generates a tiling data with the same name, possibly with fields in alphabetical order? Or the fields are defined in the order they appear in the JSON? The JSON doesn't have tiling fields. So the autogen might generate an empty tiling data. But the warning says conflict, meaning both have the same struct name but different content. So the compiler might pick one definition, leading to mismatched sizes.
+
+To avoid, we should ensure that our tiling header is the only definition. But the autogen also generates one. Maybe we can rename our tiling data struct to something else? But the macro REGISTER_TILING_DATA_CLASS registers it with the op name. The autogen likely also uses the same macro. So there is a duplicate.
+
+The safest approach: do not define custom tiling data at all. Instead, we can use the built-in tiling data typedef that passes raw bytes? Actually, AscendC provides a way to pass tiling data as a buffer of bytes and we manually parse it. The kernel can use a custom struct defined in the kernel source and cast the tiling pointer. That avoids the host-side tiling header conflict. The host can pack the tiling data into a buffer using the same layout. This is more flexible and avoids autogen conflicts.
+
+In the example leaky_relu, they used a custom tiling data and it worked. But they didn't have a conflict because the autogen didn't generate a tiling header? Actually, in the example, the project JSON includes the op name, and the autogen will generate tiling data as well. But the example's build log didn't show conflict? Possibly because the autogen's tiling data is empty (no fields) and the custom tiling data has fields, so they are different structs? But both are named LeakyReluCustomTilingData, so conflict. Yet the example succeeded.
+
+So maybe the conflict warning is benign? But in our case, it might be causing issues.
+
+Given the time, I'll provide a solution that avoids the conflict by not defining tiling data in the host_tiling_src; instead, we define it only in the kernel source as a POD struct and use a simple tiling buffer. The host can set the tiling data as raw bytes. This is a common pattern.
+
+Let's implement this:
+
+- host_tiling_src: empty or minimal (no tiling data definition).
+- host_operator_src: set tiling data as raw bytes using my own struct.
+- kernel_src: define the same struct and cast tiling GM_ADDR.
+
+This avoids autogen conflicts.
+
+Also, simplify the kernel to compute softmin correctly.
+
+I'll write the new code.

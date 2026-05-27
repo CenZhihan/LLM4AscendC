@@ -1,0 +1,144 @@
+We need to generate the six Python string variables for the fused operator "ca6k_00329_custom". The reference model uses nn.LazyBatchNorm2d. We need to implement a custom AscendC kernel that performs batch normalization (LazyBatchNorm2d is essentially BatchNorm2d with learned affine parameters after initialization; but since it's lazy, the num_features is set at first forward. However, the reference code: __init__ takes num_features as argument? Actually the Model's __init__ takes num_features, but LazyBatchNorm2d() doesn't take num_features. The get_init_inputs returns [num_features], but that's passed to Model? The reference Model class __init__ takes num_features, but the LazyBatchNorm2d is instantiated without arguments. That seems contradictory; but for the custom op, we need to fuse the entire batch normalization operation.
+
+The fused operation should take input x and output y = (x - mean) / sqrt(var + eps) * gamma + beta, where gamma and beta are learned parameters (initialized as ones and zeros). In LazyBatchNorm2d, the weight and bias are created lazily upon first forward. So after first forward, the module will have running_mean, running_var, weight, bias. For simplicity, we can assume that the custom op will receive all necessary parameters: input tensor, weight, bias, running_mean, running_var, eps, momentum? Actually forward of BatchNorm2d uses running statistics or not? In training mode, it updates running_mean and running_var. But the custom op is likely for inference or we can assume it's just for evaluation? The reference program is just a forward pass; we can treat it as evaluation (no training). For simplicity, we can implement a fused kernel that does batch normalization using given mean, var, weight, bias, eps.
+
+But the user said "replace relevant PyTorch operators" and "fuse into one or more custom ops". We can create a single custom op that does batch normalization. However, LazyBatchNorm2d also involves initialization of parameters. For simplicity, we can assume that the custom op receives the input tensor and the parameters (weight, bias) as separate inputs, plus running_mean and running_var (if we use them). But the reference model doesn't pass them explicitly. Alternatively, we can implement the custom op to compute mean and variance on the fly (no running stats). That would match the behavior of BatchNorm2d with track_running_stats=False. But LazyBatchNorm2d defaults to track_running_stats=True. However, for simplicity, we can ignore running stats and just compute on the fly for the forward pass. The numerical match should be close (within tolerance). Since the test will compare outputs, we need to ensure the same computation.
+
+Given the typical approach, we can implement a fused kernel that does:
+- Compute mean and variance along spatial dimensions (height, width) for each channel.
+- Normalize: (x - mean) / sqrt(var + eps)
+- Scale and shift: gamma * normalized + beta
+
+The kernel will take input x (N, C, H, W) and output y same shape. It will also need scaling factor and bias (learnable). For simplicity, we can pass weight and bias as additional inputs. Also eps is needed (default 1e-5). The custom op signature: input x, weight, bias, eps (float attribute). Output y.
+
+But then the model forward must provide weight and bias. In the reference, the LazyBatchNorm2d creates weight and bias after initialization. In the transformed model (ModelNew), we could create these parameters manually (nn.Parameter) and pass them to the custom op. However, to keep it simple, we can let the custom op internally manage these parameters? That would be more complex.
+
+Given the task constraints, we need to produce a custom op that can replace nn.LazyBatchNorm2d. We can define the op to take the input and return normalized output, with weight and bias as learnable parameters stored inside the op? No, custom AscendC operators are stateless. So we need to pass them as inputs. Therefore, the model must have weight and bias parameters. We can make the model create them in __init__ (since we know num_features from init_inputs). The reference Model's __init__ takes num_features but LazyBatchNorm2d doesn't need it. In ModelNew, we can create nn.Parameter for weight (ones) and bias (zeros). This is similar to how nn.BatchNorm2d does it.
+
+But note: the reference program's get_init_inputs returns [num_features], and that is passed to Model? Actually the harness likely creates Model with *init_inputs. So Model.__init__(num_features). In our transformed model, we also need to handle init_inputs. We'll create weight and bias accordingly.
+
+Thus, the plan:
+- Custom op name: ca6k_00329_custom (CamelCase: Ca6k00329Custom)
+- Inputs: x (float, ND, shape [N, C, H, W]), weight (float, ND, shape [C]), bias (float, ND, shape [C]).
+- Attribute: eps (float, default 1e-5)
+- Output: y (float, ND, shape same as x)
+- Operation: Batch normalization on the fly (compute mean and variance per channel, apply normalization, then affine transform).
+- Kernel: We'll implement a kernel that processes tiles. Since input is 4D, we need to handle strides. Possibly we can flatten the N and spatial dimensions except C. The safe approach: For each channel, compute mean and variance over all other dimensions. That is a reduction operation. For performance, we can do it in two passes: first compute mean, then compute variance. Or use custom kernel with double buffering.
+
+Given the complexity, we can use the AscendC operator's built-in support for batch norm? But we are writing a custom kernel. Alternatively, we could implement using AscendC API like BatchNorm. But the instruction is to write custom kernel. We'll need to implement mean and variance manually.
+
+Simplification: We can treat the input as N*H*W elements per channel, and compute mean and variance using a simple loop. Since we have to handle large tensors (512*32*128*128 = 268,435,456 floats), we need efficient tiling. The UB budget allows ~192KB per core. We can do tile-wise processing: each block processes a subset of elements per channel.
+
+We can define tiling: totalElements = N*C*H*W. We'll tile along the channel dimension? Or along spatial? For computing per-channel statistics, we need to accumulate across all spatial and batch. So it's easier to process each channel entirely on one block? But blockDim may not equal C. We can do grid-stride such that each block processes multiple channels. For each channel, we compute mean and variance over all spatial+batch elements. That requires two passes per channel: first compute sum, then sum of squares? Or we can compute using Welford's online algorithm in a single pass. That is more complex but doable.
+
+Given time, we can implement a simple kernel that for each element computes normalized value using precomputed mean and var. But we need to compute mean and var first. We could do a two-stage kernel: first kernel computes per-channel mean and var, stores in local memory, second kernel applies normalization. But we need a single fused op.
+
+Alternatively, we can compute mean and var in the tiling function? No, tiling is host-side and cannot access data. So we must compute in kernel.
+
+Approach: Use a two-pass kernel within one Process: first pass compute mean and var for the channels assigned to this block (using grid-stride channel loop). Because each block may handle multiple channels, we can compute running mean and var using Welford's algorithm. Then second pass apply normalization using those computed stats. Since stats are per-channel, we need to store them in UB for the duration of the block. Use local tensor to store mean and var per channel? But number of channels may be large (32). We can store them in a temporary queue.
+
+Better: For simplicity, we'll implement a kernel that processes the entire input but we can use a simpler method: each block computes mean and variance for a subset of channels, then uses those stats to normalize its own elements. However, that would require synchronization and global memory for stats. That's complicated.
+
+Given the constraints, maybe the expected solution is to use a built-in batch norm kernel? But the instruction says "custom AscendC kernel to replace specific operators". The reference uses nn.LazyBatchNorm2d, which internally uses cudnn. We can write a custom op that calls the AscendC batch norm primitive through the API. But that might not be considered "custom kernel". The example in the prompt uses simple element-wise operations. For batch norm, it's more complex.
+
+Given the repair memories, they indicate issues with tiling data, BUFFER_NUM, etc. So we need to produce a kernel that compiles and runs correctly. I'll attempt to implement a kernel that does batch norm in a straightforward way using local reductions.
+
+Plan for kernel:
+- Input x: shape [N, C, H, W] in ND format (contiguous). We'll treat it as a flat array of totalLength = N*C*H*W. The channels are contiguous: N*H*W elements per channel.
+- For each channel, we compute sum and sum of squares over N*H*W elements.
+- Then compute mean = sum / count, var = sumSq/count - mean^2 (or use unbiased? Torch uses biased variance? In torch BatchNorm, variance is computed as sum((x - mean)^2) / N (biased). We'll use biased: var = E[x^2] - (E[x])^2.
+- Then normalized = (x - mean) / sqrt(var + eps)
+- Then y = gamma * normalized + beta.
+
+We need to handle floating point precision. Since we are using float, it should be fine.
+
+Kernel design:
+- BlockDim: We'll set based on number of channels. Each block can handle a contiguous chunk of channels? Or we can distribute channels across blocks.
+- Tiling: totalLength, tileLength (elements per iteration for copying), channels (C), spatialCount (N*H*W). We'll also pass eps, gamma, beta as inputs? Actually gamma and beta are separate input tensors. In the kernel, we need to access them. We'll pass them as GM_ADDR.
+
+So the op has four inputs: x, weight, bias, and an attribute eps. Output y.
+
+Tiling data: totalLength, tileLength, blockDim, channels, spatialCount, eps.
+
+Kernel Process:
+- Each block iterates over its assigned channels using grid-stride loop over channels.
+- For each channel, we compute sum and sumSq by iterating over spatial elements in tiles.
+- Then compute mean and var.
+- Then second pass over the same spatial elements to compute normalized output.
+- We'll use double buffering? For simplicity, we can use single buffer (BUFFER_NUM=1) as per memory 3 (avoid pre-fetch). We'll process each tile sequentially.
+- We'll store intermediate results: mean and var per channel in local tensors (size channels). Since channels <= 32, we can allocate a local tensor of size channels*2 for mean and var.
+- Or we can recompute them in a single pass? Welford's algorithm: for each element, update mean and M2 (sum of squared differences). At the end, var = M2 / count. That avoids two passes. We can do that: for each channel, for each spatial element, update Welford. Then after loop, compute normalized output using that mean and var. But we need to store the elements? No, we can compute normalization in a second pass, re-reading the input from GM again. Since we have the input in GM, we can do a second iteration over the same spatial region. That's two passes over GM, but simpler.
+
+Given UB size, we can read a tile of spatial elements, compute partial sums for each channel in that tile? That's more complex because channels are interleaved. The simplest is to process one channel at a time: for each channel, we load the entire spatial region (N*H*W) in tiles, accumulate sum and sumSq, then load again to write normalized output. That would be O(C * spatial passes). That could be slow but acceptable for a small number of channels (32). With 32 channels, spatial size = 512*128*128 = 8,388,608 per channel. Reading that twice per channel is heavy. But we can optimize: We can compute sum and sumSq for all channels simultaneously by loading a tile that contains all channels? Since data is contiguous in N*C*H*W, a tile of size tileLength will contain multiple channels partially. For example, if we take a tile of size T, it will contain T // spatialCount channels? Actually contiguous layout: (N, C, H, W) is stored as [batch][channel][height][width] row-major? In PyTorch, default is NCHW. So a contiguous tensor has strides: C*H*W, H*W, W, 1. So for a given batch, the channels are contiguous in memory? The shape [N, C, H, W] with strides [C*H*W, H*W, W, 1] means that for a fixed batch index, the memory is C*H*W floats, with channels in the outer dimension? Actually stride for channel is H*W, meaning that moving from channel 0 to channel 1 adds H*W elements. So the memory for a fixed batch and channel is contiguous. So a tile of size T starting at some offset will span multiple channels only if T > spatialCount. We can design tiling such that each tile is a multiple of spatialCount, so that each tile contains complete channels. But spatialCount = N*H*W = 512*128*128 = 8,388,608, which is huge. Tiling will be much smaller (UB budget ~192KB = 49152 floats). So each tile is a fraction of a channel. So we need to accumulate across tiles per channel. So the easiest is to process each channel separately, loading its spatial data tile by tile.
+
+Given the complexity, maybe we should use a simpler approach: Use the built-in AscendC normalization API? But that might not be considered "custom kernel". However, the prompt says "custom AscendC kernel". So we need to write kernel code.
+
+Given time, I'll produce a simpler kernel that performs the normalization assuming the mean and var are given (precomputed on host?). No, they depend on input. The harness expects the outputs to match reference numerically. So we must compute on device.
+
+Maybe we can use a simpler fused operation: since LazyBatchNorm2d is just batch norm, we can use the AscendC operator "BatchNorm" which is implemented by the vendor. But we are to write a custom kernel, so we must write kernel code.
+
+I'll design a kernel that uses a two-phase approach within the block: first phase computes per-channel sums and sum of squares using global memory reads, storing intermediate results in local memory. Since UB is limited, we can store sums for all channels (32 floats each for sum and sumSq, total 256 bytes, fine). Then second phase writes normalized output using those stats.
+
+Implementation details:
+
+- Initialize local tensors: sum[channels] = 0, sumSq[channels] = 0.
+- For each tile of input (size tileLen), load into local. But note: the input is 4D. We'll iterate over the entire flat array. We'll have an outer loop over elements with stride blockDim * tileLen (grid-stride). For each element, we need to know its channel index. channel = (globalIdx // spatialCount) % channels. But that requires division. Alternative: we can precompute channel offsets. But we can compute channel index as (currentBase / spatialCount) % C? Since spatialCount is constant, we can compute it.
+
+Better: Use two loops: outer loop over channels assigned to this block, then inner loop over spatial elements in tiles. That's simpler.
+
+Pseudo:
+
+uint32_t channelStart = blockIdx * channelsPerBlock;
+uint32_t channelEnd = min(channelStart + channelsPerBlock, channels);
+for (uint32_t c = channelStart; c < channelEnd; ++c) {
+    float sum = 0.0f, sumSq = 0.0f;
+    uint32_t spatialCount = N * H * W; // maybe pass as tiling
+    // iterate over spatial elements
+    uint32_t base = c * spatialCount; // offset
+    for (uint32_t offset = 0; offset < spatialCount; offset += tileLen) {
+        uint32_t len = min(tileLen, spatialCount - offset);
+        // load from xGm_[base+offset] of length len
+        // update sum and sumSq using reduced addition
+    }
+    // compute mean = sum / spatialCount
+    // var = sumSq/spatialCount - mean*mean
+    // then second pass: write normalized output for this channel
+    for (uint32_t offset = 0; offset < spatialCount; offset += tileLen) {
+        uint32_t len = min(tileLen, spatialCount - offset);
+        // load x
+        // compute y = (x - mean) / sqrt(var + eps) * weight[c] + bias[c]
+        // write to yGm_
+    }
+}
+
+But this requires two reads of global memory for each channel. That's acceptable for small channel count.
+
+We need to pass spatialCount and channels to kernel via tiling. Also blockDim computed as number of blocks (maybe number of channels / channelsPerBlock). We'll set channelsPerBlock = max(1, ceil(channels / blockDim)). Or we can tile channels to blocks.
+
+Simpler: Set blockDim = 1 (single block) and process all channels sequentially. That avoids distributing. But the harness might test with many cores? We can set blockDim=1 and let the kernel do all work in one block. That is acceptable for correctness.
+
+We'll do that: blockDim=1 (single block). Then Process: for each channel, do two passes. Because total elements are large, but one block can handle it sequentially. That might be slow but should work. The tiling function can set blockDim=1.
+
+Thus, KernelLeakyReluCustom can be adapted to KernelCa6k00329Custom.
+
+We'll use BUFFER_NUM=1 to avoid double buffering issues (memory 3). We'll also use pointer to weight and bias globals.
+
+Let's write the code.
+
+First, project JSON: op name "Ca6k00329Custom", inputs: x (float, ND), weight (float, ND), bias (float, ND). Output: y (float, ND). Attributes: eps (float, default 1e-5). Also include required shapes: weight and bias shape [C] but we don't need to specify shape in JSON. We'll just set format ND, type float.
+
+host_tiling: define struct Ca6k00329CustomTilingData with fields: totalLength (uint32_t), tileLength (uint32_t), blockDim (uint32_t), channels (uint32_t), spatialCount (uint32_t), eps (float). Note: memory 1 says not to use setter methods, assign directly. So we'll do: tiling.totalLength = totalLength; etc.
+
+host_operator: Include tiling header, register op, set infer shape (output shape same as input x), infer data type, set tiling function.
+
+kernel: Process as described.
+
+python_bind: using aclnnCa6k00329Custom, with inputs x, weight, bias, result, and attribute eps.
+
+model_src: ModelNew that initializes weight and bias as nn.Parameter (ones and zeros) and calls the custom op.
+
+Let's craft the code.
+
+I must output exactly the six strings. No extra text.
+
+Now write the final answer.

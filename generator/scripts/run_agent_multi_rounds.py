@@ -6,7 +6,6 @@ import concurrent.futures
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import traceback
 from dataclasses import dataclass
@@ -97,6 +96,7 @@ def _run_eval_for_txt(
     eval_workers: int = 1,
     eval_npu: int = 1,
     eval_timeout_sec: int | None = None,
+    eval_pipeline_timeout_sec: int | None = None,
 ) -> int:
     if eval_workers != 1:
         raise ValueError(
@@ -117,8 +117,15 @@ def _run_eval_for_txt(
     )
     if eval_timeout_sec is not None:
         cmd.extend(["--eval-timeout", str(eval_timeout_sec)])
-    proc = subprocess.run(cmd, cwd=str(REPO_ROOT), check=False, env=os.environ.copy())
-    return int(proc.returncode)
+    from tools.common.runner import resolve_eval_pipeline_timeout_sec, run_subprocess_rc
+
+    pipeline_sec = resolve_eval_pipeline_timeout_sec(eval_pipeline_timeout_sec)
+    return run_subprocess_rc(
+        cmd,
+        cwd=str(REPO_ROOT),
+        env=os.environ.copy(),
+        timeout_sec=pipeline_sec,
+    )
 
 
 def _load_result_payload(path: pathlib.Path) -> Dict[str, Any]:
@@ -132,15 +139,30 @@ def _synthetic_result_payload_when_eval_json_missing(
     eval_rc: int,
     result_path: pathlib.Path,
     eval_timeout_sec: int | None = None,
+    eval_pipeline_timeout_sec: int | None = None,
 ) -> Dict[str, Any]:
     """
     eval_operator normally writes result_<op>.json even on failure; if the subprocess exits
     without creating the file (crash, pre-pipeline bug), synthesize the same top-level shape
     so repair rounds still get correctness_info and a written json for debugging.
     """
-    from tools.common.runner import DEFAULT_EVAL_TIMEOUT_SEC, EXIT_CODE_EVAL_TIMEOUT
+    from tools.common.runner import (
+        DEFAULT_EVAL_PIPELINE_TIMEOUT_SEC,
+        DEFAULT_EVAL_TIMEOUT_SEC,
+        EXIT_CODE_EVAL_TIMEOUT,
+        EXIT_CODE_PIPELINE_TIMEOUT,
+        resolve_eval_pipeline_timeout_sec,
+    )
 
-    if eval_rc == EXIT_CODE_EVAL_TIMEOUT:
+    if eval_rc == EXIT_CODE_PIPELINE_TIMEOUT:
+        resolved = resolve_eval_pipeline_timeout_sec(eval_pipeline_timeout_sec)
+        limit = int(resolved) if resolved is not None else DEFAULT_EVAL_PIPELINE_TIMEOUT_SEC
+        msg = (
+            f"[FAIL] Eval pipeline timed out after {limit}s "
+            f"(build+install+eval; subprocess rc={eval_rc}). "
+            f"No result json at {result_path}"
+        )
+    elif eval_rc == EXIT_CODE_EVAL_TIMEOUT:
         limit = (
             eval_timeout_sec
             if eval_timeout_sec is not None and eval_timeout_sec > 0
@@ -289,6 +311,7 @@ def run_multi_attempt_for_op(
     eval_workers: int,
     eval_npu: int,
     eval_timeout_sec: int | None = None,
+    eval_pipeline_timeout_sec: int | None = None,
     ascend_search_version_filter: Optional[str] = None,
     run_slug: str = "",
     memory_root: Optional[pathlib.Path] = None,
@@ -405,6 +428,7 @@ def run_multi_attempt_for_op(
                 eval_workers=eval_workers,
                 eval_npu=eval_npu,
                 eval_timeout_sec=eval_timeout_sec,
+                eval_pipeline_timeout_sec=eval_pipeline_timeout_sec,
             )
             outcome.eval_ran = True
             result_path = _eval_result_json_path(gen["txt_path"], op)
@@ -415,6 +439,7 @@ def run_multi_attempt_for_op(
                     eval_rc=eval_rc,
                     result_path=result_path,
                     eval_timeout_sec=eval_timeout_sec,
+                    eval_pipeline_timeout_sec=eval_pipeline_timeout_sec,
                 )
                 result_path.parent.mkdir(parents=True, exist_ok=True)
                 _write_json(result_path, payload)
@@ -511,6 +536,7 @@ def _run_single_op_job(
     eval_workers: int,
     eval_npu: int,
     eval_timeout_sec: int | None = None,
+    eval_pipeline_timeout_sec: int | None = None,
     op_slot: int,
     parallel_ops: int,
     ascend_search_version_filter: Optional[str] = None,
@@ -540,6 +566,7 @@ def _run_single_op_job(
         eval_workers=eval_workers,
         eval_npu=eval_npu,
         eval_timeout_sec=eval_timeout_sec,
+        eval_pipeline_timeout_sec=eval_pipeline_timeout_sec,
         ascend_search_version_filter=ascend_search_version_filter,
         run_slug=run_slug,
         memory_root=memory_root,
@@ -616,6 +643,7 @@ def _continue_single_op_worker(
         eval_workers=args_dict["eval_workers"],
         eval_npu=args_dict["eval_npu"],
         eval_timeout_sec=args_dict.get("eval_timeout_sec"),
+        eval_pipeline_timeout_sec=args_dict.get("eval_pipeline_timeout_sec"),
         op_slot=op_slot,
         parallel_ops=args_dict["parallel_ops"],
         ascend_search_version_filter=ascend_vf,
@@ -724,6 +752,7 @@ def _run_continue_session(
             eval_workers=args.eval_workers,
             eval_npu=args.eval_npu,
             eval_timeout_sec=args.eval_timeout,
+            eval_pipeline_timeout_sec=args.eval_pipeline_timeout,
             op_slot=op_slot,
             parallel_ops=args.parallel_ops,
             ascend_search_version_filter=ascend_vf,
@@ -764,6 +793,7 @@ def _run_continue_session(
             "eval_workers": args.eval_workers,
             "eval_npu": args.eval_npu,
             "eval_timeout_sec": args.eval_timeout,
+            "eval_pipeline_timeout_sec": args.eval_pipeline_timeout,
             "parallel_ops": args.parallel_ops,
             "use_repair_memory": args.use_repair_memory,
         }
@@ -837,6 +867,7 @@ def _run_continue_session(
         "eval_workers": args.eval_workers,
         "eval_npu": args.eval_npu,
         "eval_timeout_sec": args.eval_timeout,
+        "eval_pipeline_timeout_sec": args.eval_pipeline_timeout,
         "run_dir": str(out_run_dir),
         "categories": prior_agg.get("categories", list(args.categories)),
         "kernelbench102": prior_agg.get("kernelbench102", args.kernelbench102),
@@ -984,6 +1015,17 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--eval-pipeline-timeout",
+        type=int,
+        default=None,
+        metavar="SEC",
+        help=(
+            "Outer wall-clock timeout for whole eval_operator subprocess "
+            "(msopgen/build/install/pybind/eval); default 3600s or env "
+            "LLM4ASCENDC_EVAL_PIPELINE_TIMEOUT_SEC. <=0 disables."
+        ),
+    )
+    parser.add_argument(
         "--ascend-search-version",
         default=None,
         metavar="SUBSTRING",
@@ -1037,6 +1079,13 @@ def main() -> int:
 
         jobs = ensure_parallel_build_jobs(worker_count=args.parallel_ops)
         print(f"[batch] LLM4ASCENDC_BUILD_JOBS={jobs} (parallel_ops={args.parallel_ops})")
+
+    from tools.common.runner import warn_if_pipeline_timeout_lt_eval
+
+    warn_if_pipeline_timeout_lt_eval(
+        eval_timeout_sec=args.eval_timeout,
+        eval_pipeline_timeout_sec=args.eval_pipeline_timeout,
+    )
 
     llm_config = get_llm_config_compatible(cli_model=args.model)
     resolved_model = llm_config["model"]
@@ -1158,6 +1207,7 @@ def main() -> int:
         "eval_workers": args.eval_workers,
         "eval_npu": args.eval_npu,
         "eval_timeout_sec": args.eval_timeout,
+        "eval_pipeline_timeout_sec": args.eval_pipeline_timeout,
         "run_dir": str(out_run_dir),
         "categories": list(args.categories),
         "kernelbench102": args.kernelbench102,
@@ -1186,6 +1236,7 @@ def main() -> int:
                 eval_workers=args.eval_workers,
                 eval_npu=args.eval_npu,
                 eval_timeout_sec=args.eval_timeout,
+                eval_pipeline_timeout_sec=args.eval_pipeline_timeout,
                 op_slot=op_slot,
                 parallel_ops=args.parallel_ops,
                 ascend_search_version_filter=ascend_vf,
@@ -1215,6 +1266,7 @@ def main() -> int:
                     eval_workers=args.eval_workers,
                     eval_npu=args.eval_npu,
                     eval_timeout_sec=args.eval_timeout,
+                    eval_pipeline_timeout_sec=args.eval_pipeline_timeout,
                     op_slot=op_slot,
                     parallel_ops=args.parallel_ops,
                     ascend_search_version_filter=ascend_vf,

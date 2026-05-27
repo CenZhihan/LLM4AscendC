@@ -1,0 +1,107 @@
+We need to fix the previous attempt. The error is a vector core exception (aivec error). The kernel has issues: it's using TBuf incorrectly (alloc/free not in proper order), and the logic for CTC loss on AscendC is complicated. The error suggests a memory access violation or UB overflow.
+
+Given the constraints: we need a minimal fix. The previous attempt tried to implement CTC loss directly in kernel, which is complex and error-prone. The error log shows vector core exception. Possibly due to incorrect usage of TBuf or DataCopy.
+
+Alternative: Since the reference model does log_softmax + ctc_loss, and we are asked to fuse them, maybe we can simplify: keep log_softmax on NPU using existing ops, and then do CTC loss in a custom kernel? But the fused API says replace F.ctc_loss, not log_softmax. However, the reference forward does log_softmax first. The model_src in previous attempt already does log_softmax in PyTorch (using torch.nn.functional.log_softmax) and then calls custom op for ctc_loss. That is fine if we only fuse ctc_loss. But the custom op is intended to replace the entire forward? Actually the task says "Replace relevant PyTorch operators ... with custom AscendC kernels." It says fused custom operator for a multi-op reference program, and the API list includes F.ctc_loss. So we are supposed to replace ctc_loss (and log_softmax?) into a single custom op? But the model_src in previous attempt splits them; that might be acceptable if the custom op does both log_softmax and ctc_loss. However the previous attempt only does ctc_loss, not log_softmax. The model_src does log_softmax in Python, then calls custom op for ctc_loss. That is not a fused op that replaces both. But the instructions say "fused custom AscendC operator for a multi-op PyTorch reference program" and "replace / fuse these in the reference forward into one or more custom ops as you see fit". So we can choose to fuse log_softmax and ctc_loss into one kernel, or keep separate. The previous attempt kept separate (log_softmax in Python, ctc_loss in kernel). That is acceptable. The error is from the kernel.
+
+So the issue is the kernel implementation of CTC loss. The vector core exception indicates an out-of-bounds access or invalid pipeline usage.
+
+Let's examine the kernel source: It uses TBuf for logProbsRowBuf_ and tmpBuf_. However, TBuf is for local memory, but the way it's used: inside Process(), it allocates using AllocTensor and later frees. But the pipe_.InitBuffer for TBuf should be with size, but then AllocTensor will allocate from that buffer. However, for TBuf, you cannot AllocTensor multiple times without freeing? Actually TBuf is a fixed-size buffer; you can AllocTensor once and later free. In the loop, logProbsRowBuf_.AllocTensor is called each batch, and then freed before next iteration. That is okay.
+
+But there is a problem: The code uses inQueueTargets_ for copying target sequence, but the queue is of length BUFFER_NUM=1. That's fine. However, it copies only L elements? DataCopy(targetsLocal, targetsGm_[batchIdx * maxTargetLen_], L). That is correct.
+
+The main issue might be in the alpha array: extended and alpha arrays are local variables (stack), size used is 61, but max number of classes? Actually maxTargetLen is 30, so U=61. That fits.
+
+But the access to logProbsRow using GetValue is fine.
+
+Another issue: The kernel uses global memory access for logProbsGm_ with row offset computed as t * batchSize_ * numClasses_ + batchIdx * numClasses_. That's correct because logProbs is shape (maxTime, batchSize, numClasses). Also note that the logProbs tensor in the forward is already log_softmax applied (from model_src). So the kernel expects log probabilities.
+
+But the vector core exception could be due to the usage of AscendC::Exp and Log on small tensors (2 elements). That might be okay.
+
+I suspect the issue is with the DataCopy from global to local for logProbsRow. The TBuf is of size numClasses_*sizeof(float). But the copy uses logProbsGm_[gmOffset] with gmOffset computed incorrectly? Let's compute: gmOffset = t * batchSize_ * numClasses_ + batchIdx * numClasses_. That is correct. However, the global tensor is defined with total size maxTime*batchSize*numClasses, but the indexing using logProbsGm_[gmOffset] is by element offset? Yes, because GlobalTensor<float> operator[] returns reference at that element offset. So that's fine.
+
+Maybe the problem is that the kernel uses scalar operations inside loops (GetValue, SetValue) which might not be efficient but should work.
+
+Another possibility: The host operator sets blockDim=1, but the kernel uses single thread? That's fine.
+
+Given the time, we could try to simplify the kernel to not use TQue for targets? But that shouldn't cause error.
+
+Perhaps the error is due to insufficient UB size. The tiling data does not include UB budget; we are using a fixed maxTargetLen=61, but if numClasses is large (30), the logProbsRow buffer is 30 floats, fine. Total UB usage: pipe buffers: inQueueTargets (1*61*4=244), logProbsRowBuf (30*4=120), tmpBuf (2*4=8) = less than 1KB. So UB budget not an issue.
+
+Another potential issue: The kernel uses pipe_.InitBuffer for TBuf inside Init, but then the buffer is not used with proper AllocTensor/FreeTensor inside Process? Actually they are used. But note that the TBuf is of type VECIN for logProbsRowBuf_, but DataCopy to it is allowed if it's VECIN. However, later we use logProbsRow.GetValue, which reads from local tensor. That's fine.
+
+But the error vector core exception might be due to the use of GetValue on a local tensor; that is a scalar read, which is allowed but might be slow.
+
+Given the complexity, a minimal fix might be to use a simpler approach: since the CTC loss algorithm is sequential and involves loops with small dimensions, we could implement it entirely in the host (not in kernel) and call a series of existing NPU ops? But that would not be a custom kernel.
+
+Alternatively, we can replace the custom kernel with a simple wrapper that calls the native ACLNN CTC loss? But we are supposed to write a custom AscendC kernel.
+
+Given the error is runtime, maybe the issue is that the kernel uses DataCopy to copy from global to local for logProbsRow, but the local tensor is allocated from TBuf. That should be fine.
+
+Wait, in the code: AscendC::DataCopy(logProbsRow, logProbsGm_[gmOffset], numClasses_); Here, the destination is a local tensor obtained from AllocTensor, source is GlobalTensor at offset. The third argument is the number of elements. That is correct.
+
+But note that in the loop for time steps, after first iteration, we have already freed logProbsRow at the end of each batch (logProbsRowBuf_.FreeTensor(logProbsRow)). That is correct.
+
+Maybe the issue is with the DataCopy into inQueueTargets_: AscendC::DataCopy(targetsLocal, targetsGm_[batchIdx * maxTargetLen_], L); The source is GlobalTensor at offset, but the offset is in elements? Yes, targetsGm is GlobalTensor<int32_t>, so offset is element offset. That's fine.
+
+The error log shows "D-cache reads and writes data to the UB" with fixp_error0 info: 0x69, subErrType:4. That indicates a bus error. Possibly an out-of-bounds access to global memory. Check the global memory usage: logProbsGm_ is set with total size maxTime * batchSize * numClasses. In the loop, for t from 1 to T-1, we compute gmOffset = t * batchSize_ * numClasses_ + batchIdx * numClasses_. That is a valid offset. However, note that logProbs shape is (maxTime, batchSize, numClasses). That is correct. The copy copies numClasses_ elements.
+
+But there is a subtlety: The logProbs tensor in the Python code is created with log_softmax applied to logits of shape (seq_length, batch_size, num_classes). So the custom op receives that tensor directly. In the kernel, we treat it as (maxTime, batchSize, numClasses). But then in the loop, we copy a row of size numClasses. That's okay.
+
+Maybe the issue is that when we do AscendC::DataCopy(logProbsRow, logProbsGm_[gmOffset], numClasses_); the destination is a local tensor of size numClasses_, but it might need to be aligned? Not sure.
+
+Given the difficulty, we might try to rewrite the kernel in a simpler way: instead of trying to do the full CTC loss, we can rely on the fact that the NPU may have a built-in CTCLoss implementation. But the task says to implement a custom AscendC kernel. However, the previous attempt compiled successfully but crashed at runtime. We need to fix the vector core exception.
+
+One common cause is using GetValue/SetValue on local tensors that are not properly aligned or too small. But our tensor sizes are fine.
+
+Maybe the issue is that we are using TQue but we never set the pipe mode? Not sure.
+
+Another approach: Since the CTC loss for a single batch is a simple loop, we could implement it entirely with scalar operations on the host (CPU) and bypass the kernel? But the custom op must run on NPU.
+
+Given the time, a minimal fix could be to avoid using TQue and TBuf altogether and instead use a simpler approach: allocate a single large local buffer for all data, and use pointer arithmetic. But that may not fix the error.
+
+Alternatively, we could check the tiling data: The host operator sets blockDim=1. The kernel runs on a single core. That is fine.
+
+Maybe the error is due to the use of "AscendC::Exp(tmp, tmp, 2)" where tmp is a local tensor of 2 floats allocated from TBuf. That should be okay.
+
+Let's look at the exact error: "The vector core execution is abnormal. error code = 0, vec error info: 0x1000000a5, mte error info: 0x100000069". The mte error suggests a memory transaction error. Perhaps the global memory access is out of bounds.
+
+Check the global memory copy for logProbsRow at t=0: AscendC::DataCopy(logProbsRow, logProbsGm_[batchIdx * numClasses_], numClasses_); That's correct.
+
+But note that we are using logProbsGm_[gmOffset] where gmOffset can be large. For t=1, gmOffset = 1 * batchSize_ * numClasses_ + batchIdx * numClasses_. That is within bounds as long as batchSize_ and numClasses_ are set correctly. The tiling data sets batchSize, maxTime, etc. from input shapes. That seems correct.
+
+Another potential issue: the input_lengths and target_lengths are int32 tensors. In kernel, we use GetValue on them. That's fine.
+
+Perhaps the issue is that we declared the kernel function with 7 parameters, but the generated aclnn expects 7? The GET_TILING_DATA macro extracts tiling data from GM_ADDR tiling. That's fine.
+
+Maybe the problem is that the tiling data structure contains an 8-bit field reductionMean, but the struct alignment might cause issues. But the error is runtime, not compile.
+
+Given the difficulty, a possible minimal fix is to change the kernel to not use any local queues or buffers for targets, but instead copy target sequence into a local array directly from global memory using scalar reads. That would simplify and avoid potential TQue issues. Also avoid using TBuf for logProbsRow, instead use a local array on stack? But stack size for local arrays is limited; maxTargetLen=30, numClasses=30, so we can use stack arrays. On AscendC, we can use local variables of limited size. Use AscendC::LocalTensor? Actually stack arrays can be placed in UB? Might be risky.
+
+Given the error, I suggest we simplify the kernel drastically: Instead of implementing CTC loss from scratch, we can implement a kernel that just calls the NPU's built-in CTCLoss operator via the instruction? That is not done in custom kernels.
+
+Given the time, we might need to admit that a correct CTC loss kernel is hard and fallback to using the existing NPU CTCLoss through aclnn. But the task expects a custom kernel. However, the previous attempt compiled; we just need to fix the runtime error. The error might be due to a missing synchronization or incorrect use of pipeline. Let's try to remove the TQue and TBuf, and instead use a single large local buffer (UB) allocated with fp16? Or use a simpler approach: copy entire batches? But that's complex.
+
+Another idea: The kernel uses "inQueueTargets_.FreeTensor(tgt)" after the loop. That's correct.
+
+Maybe the error is due to the use of "AscendC::DataCopy(logProbsRow, logProbsGm_[gmOffset], numClasses_);" where logProbsRow is a local tensor allocated from TBuf. The TBuf is of type VECIN, which is fine for input. But the copy might require that the local tensor is in a specific memory region. Not sure.
+
+Given the complexity, I'll attempt a minimal fix: change the kernel to avoid using TBuf and TQue altogether, and instead use a single local array for all temporary data. Since maxTargetLen=30, numClasses=30, we can store target sequence in a local array of size 30, and logProbs row in a local array of size 30, and alpha arrays of size 61. These can be declared as kernel_local arrays? On AscendC, we can use __local__ attribute? Actually, AscendC's built-in local memory is accessed through LocalTensor. But we can declare a local array using AscendC::LocalTensor with proper allocation from a pipe buffer. However, we can simplify by declaring all these as member variables allocated in Init using pipe buffers, and reuse them.
+
+But perhaps the error is due to the fact that we are not using vector instructions for the CTC algorithm, but scalar operations. The scalar operations (GetValue, SetValue) are supported but slow. They might cause issues if not properly aligned.
+
+Given the time, I'll make a conservative fix: increase the buffer sizes to ensure alignment, and reduce the complexity by removing the TQue for targets and instead reading target directly from global memory using GetValue in the inner loop. Also remove TBuf for logProbsRow and use a simple local array. Also increase blockDim to maybe 8? But the algorithm is sequential, so blockDim=1 is fine.
+
+I'll rewrite the kernel to use a simpler approach: allocate a single large local buffer (say of 1024 floats) and use it for everything, avoiding TQue and TBuf. Use AscendC::LocalTensor via pipe buffer but with only one buffer. Actually, we can just use a single pipe buffer for both target copy and logProbs row. But the error might be from the TQue. Let's replace TQue with a simple DataCopy into a local tensor from a pipe buffer (not queued). Use a TPipe buffer for target copy: pipe_.InitBuffer(targetBuf_, 1, (maxTargetLen_+2)*sizeof(int32_t)); then copy target into that buffer, then use it. Similarly for logProbs row. That should be simpler.
+
+I'll implement such a fix.
+
+Also, ensure that the log_softmax is done in kernel? The model_src currently does log_softmax in Python, so the kernel expects log probabilities. That's fine.
+
+Let's produce the corrected code.
+
+We'll keep the project_json, host_tiling, host_operator mostly same. Modify kernel_src to use simpler buffer management. Also fix potential out-of-bounds: the extended array size is 2*L+1, L up to 30, so 61. But we need to ensure that we never access beyond that.
+
+I'll also change the kernel signature to use 'ca6k00387_custom' and keep the rest.
+
+Let's write the corrected kernel.

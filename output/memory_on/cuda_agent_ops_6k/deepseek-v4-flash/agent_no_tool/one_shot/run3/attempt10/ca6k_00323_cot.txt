@@ -1,0 +1,69 @@
+We need to fix the kernel's UB out-of-bounds error. The error "VEC instruction error: the ub address out of bounds" suggests the tile length is too large or alignment issues. The previous attempt used tileLen = UB_BUDGET_BYTES/8 = 128*1024/8 = 16384 floats, but the HARD_CAP_ELEMS was also 16384. That seems okay. However, the error occurs on multiple cores, indicating that some core's base + stride > totalLen? But the grid-stride should handle that. Another issue: the DataCopy size is in number of elements, not bytes? AscendC DataCopy typically expects the number of elements (float). But the InitBuffer uses tileLen_ * sizeof(float) bytes, correct.
+
+The error "ub address out of bounds" may be due to using Maxs with a scalar 0.0f but passing len as number of elements; that's fine. However, the prefetch mechanism might cause double allocation? In CopyIn we allocate xLocal, enque. Then in Compute we dequeue xLocal and allocate yLocal. But note that we also call CopyIn for next tile while the current tile's xLocal is still in the queue? Actually, the design: we enqueue xLocal for current tile, then compute: dequeue that xLocal, allocate yLocal, compute, enqueue yLocal, free xLocal. Meanwhile, we call CopyIn for next tile, which allocates a new xLocal, enqueues it. That's typical double-buffering. But note that we only have BUFFER_NUM=2. The queue depth is 2. We prefetch next tile while current tile is being computed, but the compute uses one xLocal and one yLocal. The next tile's xLocal will be enqueued after current tile's xLocal is freed? Actually, the sequence: CopyIn current -> enque xLocal (1). Then while loop: compute: dequeue xLocal (now queue empty), allocate yLocal, compute, enqueue yLocal, free xLocal. Then before compute, we prefetch next: CopyIn nextBase -> allocate new xLocal, enque it (now queue has 1). Then we compute again: dequeue that xLocal, etc. That works. But after the last iteration, we break after nextLen==0, so the final xLocal from prefetch might not be consumed? Actually, the loop structure: we prefetch next tile before computing current, then after compute and copyout, if nextLen==0 break. So the last tile's xLocal is prefetched, then we compute it, then break? Wait, let's trace: For first tile: base=blockIdx*tileLen. curLen = min(...). CopyIn(base, curLen) -> enque x0. While: compute nextBase? Actually, the code: while(true) { prefetch next; compute cur; copyout cur; if nextLen==0 break; base=nextBase; curLen=nextLen; } So after first iteration, we prefetch next, compute current, copyout current, then if nextLen==0 break. So the last tile's prefetch happens, then it's computed in the next iteration? No, because we break after checking nextLen==0. That means if there is a next tile, we set base and curLen to next, and loop continues. So the pattern: for each tile except the last, we prefetch the next tile before computing the current one. For the last tile, we prefetch nothing (nextLen=0), compute current, then break. That's correct.
+
+But the error says ub address out of bounds. Possibly the tileLen is not aligned properly for DataCopy? AscendC DataCopy requires the number of elements to be a multiple of 64? Actually, it might require alignment to 64 bytes, which is 16 floats. We used ALIGN_ELEMS=64, so tileLen is multiple of 64, fine. But maybe the totalLength alignment? In the tiling, we set tileLen = maxTile, but if totalLength < tileLen, we use aligned down to ALIGN_ELEMS, but if that's zero we use totalLength (which may not be aligned). That could cause a partial last tile that is not aligned. However, the error occurs on many cores, not just the last one. The error is "ub address out of bounds" - could be that the buffer size is not sufficient? We allocated pipe_.InitBuffer for inQueueX and outQueueY with tileLen_ * sizeof(float). That's the max tile length. But during Compute, we use Maxs on the dequeued xLocal of length len (which may be less than tileLen_). That's okay because the local tensor size is at least tileLen_, and we only process len elements. DataCopy also copies len elements, which is within the buffer.
+
+Another possibility: The grid-stride base may exceed bounds? We have if (base >= totalLen_) return; so that's fine.
+
+Maybe the issue is that we used AscendC::Maxs with scalar 0.0f but the Maxs function expects a scalar of the same type (float). That should work.
+
+Let's look at the error log: "VEC instruction error: the ub address out of bounds. CCU instruction address check error." This is a hardware error indicating that the vector unit tried to access memory outside its allowed range. This often happens when the local tensor size is insufficient for the operation. In our code, the local tensor for x is allocated with tileLen_ elements, but we may be passing len that is larger than tileLen_? No, we set curLen = min(...). So it's <= tileLen_.
+
+But note: In the prefetch, we call CopyIn(nextBase, nextLen) with nextLen possibly less than tileLen_. That's fine.
+
+However, there is a subtle bug: In CopyIn, we allocate a tensor of size tileLen_ floats, but we only copy len elements (number of elements). The DataCopy function copies len elements, but the local tensor size is tileLen_ elements, so that's fine. The issue might be with the double-buffering: we have BUFFER_NUM=2, but we also have a third queue? No, we only have two queues: inQueueX and outQueueY. But in the kernel, we do not have a tmpQueue. That's fine because we only need x and y.
+
+But wait, the error log shows "mte error info: 0x100000069" etc. That indicates memory access error.
+
+I suspect the problem is that the tile length is too large for the UB budget when considering that local tensors must be aligned to 256-byte boundaries? Or maybe the UB size calculated is wrong. Let's recalc: UB budget 128KB. For float, each tensor needs tileLen * 4 bytes. We have two tensors (x and y) simultaneously? Actually, during compute, we have xLocal (from dequeue) and yLocal (allocated). Both are of size tileLen_ floats. That's 2 * tileLen_ * 4 = 8 * tileLen_ bytes. If tileLen_ = 16384, then 8*16384 = 131072 bytes = 128KB exactly. That's exactly the budget. But there might be overhead for queue management, pipe, etc. So we should reduce the budget. In the previous successful leaky_relu example, they used UB_BUDGET_BYTES = 192 * 1024 for 5 buffers (total 20*tileLen). For our case with 2 buffers, 128KB seems tight. The error may be due to exceeding UB due to alignment rounding up. Let's reduce tileLen by using a smaller budget. Also, we should align to a larger value like 256-byte (64 floats) to ensure proper DMA alignment. But ALIGN_ELEMS=64 is already 64 floats = 256 bytes. That's fine.
+
+But the main fix: reduce UB_BUDGET_BYTES to be less than 128KB to leave headroom. For example, use 112*1024 = 114688 bytes, then maxTile = 114688/8 = 14336 floats. Then AlignDown to 64 => 14336 is multiple of 64? 14336/64=224, yes. That's safe. Also HARD_CAP_ELEMS can be 14336.
+
+Alternatively, we can follow the example pattern more closely: use 3 buffers (in, out, tmp) and compute ReLU differently? But we only need ReLU which is a single Maxs operation, no need for tmp buffer. However, the example used 5 buffers. But we can keep it simple. The key is to avoid UB overflow.
+
+Also, the kernel_src uses "AscendC::Maxs(yLocal, xLocal, 0.0f, len);" - this is fine.
+
+Let's also ensure the kernel name correctly matches: kernel function name "ca6k00323_custom". In the previous attempt, it's correct.
+
+One more thing: The kernel uses GET_TILING_DATA macro. That requires the tiling struct to have the fields defined in host_tiling_src. In previous attempt, host_tiling_src has totalLength, tileLength, blockDim. That's fine.
+
+Now, we need to also adjust the tiling function to not exceed UB. We'll use a smaller UB_BUDGET_BYTES.
+
+Also, we should consider that the blockDim calculation: previously used numTiles (CeilDiv(totalLength, tileLen)). But with grid-stride, each block processes multiple tiles. The blockDim should be set to a reasonable number of cores (e.g., 8-24). The previous calculation is okay but may set blockDim too high. However, the error is not about blockDim but about UB.
+
+Let's reduce UB_BUDGET_BYTES to 96 * 1024 = 98304 bytes. Then maxTile = 98304/8 = 12288 floats, AlignDown to 64 gives 12288 which is exact. That leaves more headroom. Or even lower to 80KB.
+
+But the original successful example used 192KB for 5 buffers (20*tileLen). So for 2 buffers (8*tileLen), equivalent UB usage would be 192KB * 2/5 = 76.8KB. So 80KB should be safe. Let's use 80*1024 = 81920 bytes. Then maxTile = 81920/8 = 10240 floats, AlignDown to 64 gives 10240. That's fine.
+
+We'll also set HARD_CAP_ELEMS to 10240.
+
+Now, the grid-stride strideElems = blockNum * tileLen_. That could be large. But fine.
+
+Also, the current code uses a while loop with prefetch. That's okay but we need to ensure that the prefetch doesn't cause the queue to overflow. With BUFFER_NUM=2, it's possible that we try to allocate a new xLocal while the previous one is still in the queue? Let's trace: After CopyIn current, queue has 1. Then we compute: dequeue xLocal, queue becomes 0. Then we allocate yLocal, compute, enqueue yLocal, free xLocal. Then we prefetch next: allocate xLocal, enqueue (queue becomes 1). Then we compute again: dequeue xLocal, etc. So queue depth never exceeds 1. That's safe.
+
+However, after the last iteration, we break after copyout, and we never free the yLocal? Actually, we copyout: dequeue yLocal, DataCopy, free. That's fine.
+
+But note: in the prefetch, we call CopyIn which allocates xLocal and enqueues. If at that point the queue is full (size 2), it would block. But our queue size is 2, and we always ensure there is at most 1 before prefetch. So safe.
+
+Potential bug: In the while loop, after prefetching next tile, we compute current tile using the dequeued xLocal (which was from the previous CopyIn call). That is correct.
+
+One more thing: The DataCopy function in AscendC expects the number of elements (not bytes) for the third argument? According to AscendC API, DataCopy(LocalTensor &dst, GlobalTensor &src, uint32_t num) where num is the count of elements of the tensor type. So that's correct.
+
+But there might be a requirement that the address and size are aligned to 32 bytes? For DataCopy, the global address should be aligned to 32 bytes. The input x may be aligned if the tensor is allocated by PyTorch? Usually yes. But we copy from global to local, and local tensor is aligned. The DataCopy should handle it.
+
+Given the error is "ub address out of bounds", it's almost certainly due to exceeding UB buffer capacity. So reducing tileLen should fix it.
+
+We'll modify host_operator_src to use UB_BUDGET_BYTES = 80 * 1024 (81920), and correspondingly adjust ALIGN_ELEMS to 64 (or maybe 32? but 64 is fine). And HARD_CAP_ELEMS = 10240.
+
+Also, in kernel_src, we should ensure that the local tensor buffers are initialized with the correct size. The pipe_.InitBuffer uses tileLen_ * sizeof(float). If tileLen_ is the computed tile length, that's fine.
+
+Now, we also need to update the model_src to be consistent. The previous attempt had model_src using 'ca6k00323_custom' function. That's fine.
+
+One more thing: The python_bind_src used aclnnCa6k00323Custom. That's correct.
+
+We'll output the corrected code with the reduced UB budget.
+
+Also, check the project_json_src: it must have "op" as top-level key. The previous attempt has an array. The example had an array. That's fine.
+
+Now, produce the final answer.

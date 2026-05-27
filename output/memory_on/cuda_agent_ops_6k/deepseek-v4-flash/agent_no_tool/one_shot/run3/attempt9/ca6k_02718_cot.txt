@@ -1,0 +1,91 @@
+We need to fix the correctness issue. The kernel outputs a scalar loss but the reference CTCLoss returns a scalar. The output mismatch: Reference output tensor(1929.5540) vs New output tensor(1495.7241). So the kernel's CTC implementation is incorrect.
+
+The previous attempt implemented a naive CTC algorithm on NPU but it's not numerically matching PyTorch's CTCLoss. The issue is likely in the alpha computation: the algorithm used is simplified and may not handle blanks correctly or the log-sum-exp stability.
+
+Given the complexity of implementing CTC loss correctly on AscendC (especially handling blank, reduction, and numerical stability), and the fact that the user wants to replace the operator, we might consider a simpler approach: instead of implementing CTC in kernel, we can delegate to the built-in NPU CTCLoss implementation via the AscendCL API (aclnnCTCLoss). That way we ensure numerical match. The task says "Replace relevant PyTorch operators with custom AscendC kernels" but it also says "fused custom AscendC operator". However, if we cannot get a correct kernel, using the built-in is acceptable as long as we expose it as a custom op? But the harness expects the custom op to be used. The correctness check compares reference (PyTorch CTCLoss) vs custom op output. So we need the custom op to give same results.
+
+Given the difficulty, perhaps we can implement a wrapper that calls the built-in NPU CTCLoss via AscendCL from the host operator, but the kernel is just a passthrough? That would still be a custom op that uses the built-in under the hood. However, the instructions say "Implement a single fused custom op (or a small set) on NPU that matches the reference Model outputs for the same inputs". It doesn't forbid using built-in libraries inside the custom op implementation. The host operator can call the built-in aclnnCTCLoss. That would guarantee correctness.
+
+But the current attempt had a kernel implementation that is buggy. The simplest fix is to remove the kernel implementation and instead in the host operator's TilingFunc or in the kernel itself call the built-in? However, the kernel is compiled to a binary that runs on the AI Core. Calling built-in from kernel is not straightforward. The typical way is to implement the operator with a host-side implementation that uses the AscendCL API to call the built-in CTCLoss. But then the custom op is just a wrapper. That is acceptable.
+
+Let's check the build logs: they show successful compilation. The error is in evaluation: output mismatch. So we need to fix the kernel algorithm.
+
+Alternative: implement the CTC loss correctly on AscendC using vector instructions. But that's complex.
+
+Given time, I'll propose using the built-in aclnnCTCLoss from the host operator's compute function. However, the current architecture uses a kernel that runs on the AI Core. To use built-in, we can implement the operator as a "host-only" operator that does not have a kernel? But the project JSON expects a kernel. We could change to a host-only op? But the template uses kernel. The simplest: keep the kernel as a dummy that just copies input? But then the loss computation is done via host code? That would be against the kernel paradigm.
+
+Maybe we can modify the host operator to compute the loss on CPU using AscendCL calls? That would be slow but correct. However, the harness likely runs the custom op via the kernel path.
+
+Given the difficulty, I will attempt to correct the CTC algorithm in the kernel.
+
+Common pitfalls in CTC implementation:
+- The blank index is 0.
+- The targets are stored as a 2D tensor (batch x max_target_length), but each sample has variable target length given by target_lengths.
+- The log_probs are of shape (T, N, C) in PyTorch CTCLoss. The reference uses that shape.
+- The alpha recurrence: For t=0, alpha[0] = log_probs[0, blank], alpha[1] = log_probs[0, target[0]] if U>0, else only alpha[0].
+- For t>0, alpha[s] = log_probs[t, lbl] + log_add(alpha_prev[s], alpha_prev[s-1]) plus if s>1 and lbl != lbl_prev2 then also alpha_prev[s-2].
+
+Also, the final loss = -log_add(alpha_last[S-1], alpha_last[S-2]). For U=0 (no targets), loss = -log_probs[t, blank] for all t? Actually CTC loss with no targets is sum over time of -log(blank probability). But in standard CTCLoss, if target_length = 0, the loss is -log(prob of all blanks). But we can handle.
+
+Numerical stability: use log-sum-exp with max.
+
+The previous kernel used a per-element log-sum-exp with scalar operations, which is inefficient and possibly incorrect because of the way it uses scalarQue (allocate/free inside loop). Also the indexing of targetsLocal is wrong: it uses GetValue with int32_t but targetsLocal is a tensor of size maxTargetLength_, but we only need first U elements. The code uses targetsLocal.GetValue(0) for alpha[1] initialization, which is correct only if U>0, but it doesn't check U>0 before accessing index 0. For sample with U=0, it still accesses getting undefined.
+
+Also the loop over s uses targetsLocal.GetValue(static_cast<int32_t>(s/2)) but that uses integer division, and for even s it returns index s/2 - 1? Actually for s=0, s/2=0 so it returns target[0] which is wrong (should be blank). For s=0, lbl should be blank, not target[0]. So the labeling is wrong. The correct mapping: s=0 -> blank, s=1 -> target[0], s=2 -> blank, s=3 -> target[1], ... So for s even, label = blank; for s odd, label = target[s//2]. The previous code had lbl = (s % 2 == 0) ? blank_ : targetsLocal.GetValue(s/2). That is actually correct: s%2==0 even -> blank, odd -> target[s/2]. But s/2 for integer division: for s=1, s/2=0 -> target[0]; for s=3, s/2=1 -> target[1]; correct. The issue is s=0: even -> blank, correct.
+
+But the code uses targetsLocal.GetValue(static_cast<int32_t>(s / 2)) for even s? No, it uses ternary: (s % 2 == 0) ? blank_ : targetsLocal.GetValue(s/2). So for even s, it uses blank_. That's correct.
+
+The bug might be in the initialization: alphaPrev.SetValue(0, firstProb); for t=0, alpha[0] = log_probs[0, blank]. That's correct. Then if U>0, alphaPrev.SetValue(1, logProbsGm_.GetValue(offsetLogProbs + targetsLocal.GetValue(0))); That is correct: alpha[1] = log_probs[0, target[0]]. But note: offsetLogProbs is the start of the sample's log_probs. For t=0, log_probs index is offsetLogProbs + 0*numClasses + label. So offsetLogProbs + blank_ is correct. For target label, offsetLogProbs + targetsLocal.GetValue(0) is correct.
+
+However, the kernel loads targets from global memory for each sample: it copies maxTargetLength_ elements. But then it uses only first U elements. That's fine.
+
+Major issue: in the loop for t, it loads log_probs for this time step into logProbsLocal, then enques and immediately deques. But it does this allocation inside the loop and frees at the end. That should be okay.
+
+But the alpha computation uses a single scalar tensor for log-sum-exp, which is allocated and freed each call, which might be okay but inefficient.
+
+More likely the algorithm is correct but the reduction is wrong: the kernel sums sampleLoss over batch and then divides by batch if reduction=mean. That matches PyTorch's CTCLoss with reduction='mean' which divides by batch size, not by total number of frames. That's correct.
+
+The numerical difference is large, so there's a bug in recurrence.
+
+Let's check the recurrence: For s=0, alpha_curr[0] = logProb[blank] + alpha_prev[0] (only from alpha_prev[0] because s=0, only previous s=0 contribution). The code: for each s, it starts with alphaCurr.SetValue(s, NEG_INF); then adds contributions. For s=0, it does:
+sum = alphaPrev.GetValue(s) + prob; alphaCurr.SetValue(s, LogSumExp(alphaCurr.GetValue(s), sum));
+then if s>0: sum = alphaPrev.GetValue(s-1) + prob; alphaCurr.SetValue(s, LogSumExp(...));
+then if s>1: check label mismatch and add alphaPrev.GetValue(s-2) + prob;
+For s=0, only the first sum is applied, which is from alphaPrev[0] + prob. That's correct.
+
+For s=1, it adds from alphaPrev[1] and alphaPrev[0]. That's correct.
+
+For s=2, it adds from alphaPrev[2], alphaPrev[1], and possibly alphaPrev[0] if label(2) != label(0). Since s=2 is blank and s=0 is blank, they are equal, so not added. That's correct.
+
+But note: the code uses LogSumExp function that is defined with local scalar allocation. However, the scalarQue is used inside LogSumExp and freed, but the function returns a float. That's fine.
+
+I suspect the bug is in the indexing of targetsLocal: it uses targetsLocal.GetValue with static_cast<int32_t>(s/2). But targetsLocal is of tensor type, and GetValue returns the element. That should work.
+
+Maybe the issue is with the order of operations: the kernel uses DataCopy to copy targets from global to local, but for each sample, it copies maxTargetLength_ elements, which is fine. But then it uses targetsLocal.GetValue(0) for initial alpha[1]. That is correct only if U>0. For samples with U==0, the initialization sets alpha[1] unnecessarily (should not exist). The code checks if U<=0 at start of sample and skips, but that skip also skips the loss calculation? Actually it just skips the sample by moving offsets, but does not add any loss. For U=0, the loss should be -log(alpha[T-1][0]) because blank sequence. The current code skips such samples, causing underestimation of loss. That could contribute to mismatch. In PyTorch's CTCLoss, even if target_length=0, the loss is non-zero (negative log-prob of all blanks). So we need to handle U=0.
+
+Also, for samples where U>0 but the initialization uses targetsLocal.GetValue(0) which is correct.
+
+Let's fix the kernel to handle U=0 cases and also ensure the recurrence is correct.
+
+I'll rewrite the kernel with a simpler, more robust approach: use a loop over t with proper handling of blank and label transitions. Also, to ensure numerical stability, use built-in vector log-sum-exp? There is AscendC::Log and AscendC::Exp, but we need per-element scalar. We could use local tensor of size 2 for max and log1p.
+
+Given time, I will produce a corrected kernel that:
+- Handles U=0 case (only blank path).
+- Uses local tensors for alpha that are sized appropriately (2*U+1).
+- Properly initializes alpha for t=0.
+- For each subsequent t, compute new alpha using log-add and transitions.
+- At the end, compute loss = -log_add(alpha_last[S-1], alpha_last[S-2]) for U>0; for U=0, loss = -log_probs_last[blank] (or sum over all time steps of -log prob of blank). But to match PyTorch, we need to compute the full loss: loss = -log_prob(blank path) for U=0. Actually for U=0, the only path is all blanks, so probability = product over t of log_probs[t][blank]. So loss = -sum_{t=0}^{T-1} log_probs[t][blank]. But the recurrence with the standard CTC alpha gives the same: alpha[S-1] at last time step is the log probability of blank path. So we can just run the recurrence with S=1 (only blank state). So we need to handle S=1.
+
+Our current code assumes S = 2*U+1, which fails for U=0 because S=1. We need to handle that.
+
+Also, the kernel currently uses a fixed maxTargetLength_ for the alpha buffers (2*maxTargetLength_+1). That's fine.
+
+I'll rewrite the kernel to be more correct. Also, avoid the scalarQue allocation inside LogSumExp; instead use local tensor of size 2 for temporary.
+
+I'll also remove the reduction division in kernel if reduction is 'mean' and pass batch size as float.
+
+Let's provide a corrected kernel.
+
+Additionally, the host operator's TilingFunc reads reduction attribute as char* but the attribute is defined as string, and the autogen may pass it as a null-terminated string. The current code uses strcmp, which is okay.
+
+Now, produce the corrected six strings.

@@ -1,0 +1,513 @@
+We need to generate a custom AscendC kernel for a fused operation: ConvTranspose1d (deconvolution) followed by adding a bias. The reference model uses nn.ConvTranspose1d and then adds a bias (which is a parameter with shape (out_channels, 1)). In PyTorch, the bias of ConvTranspose1d is part of the module, but here the bias appears to be separate (maybe the user wants to fuse it). Actually the reference code: self.conv_transpose = nn.ConvTranspose1d(...) with default bias=True, so it already includes a bias inside. But then they have a separate bias parameter self.bias with shape (out_channels,1) and add it. That means the reference computes conv_transpose(x) + bias, where bias is broadcast across batch and length. So the fused op should compute the transposed convolution and then add the bias term. The bias from convolution is inside the conv; we cannot easily remove that because it's standard. However, we can treat the entire operation as a custom op that takes input x, weight, and bias (the separate bias) and optionally the internal bias of conv? But the internal bias is not exposed as an input. Actually, nn.ConvTranspose1d has its own weight and bias parameters. The forward uses those. So the custom op should take x, weight and bias (internal) as inputs, plus the external bias. But the external bias is a separate parameter. The user passes bias_shape as a tuple (out_channels, 1) and initializes it with randn. So in the custom op, we need to compute: y = conv_transpose(x, weight) + bias_conv + bias_ext. Or we can set the internal bias to zero and use only the external. But the reference uses default bias=True inside conv_transpose, so there are two biases. To match numerically, we need to incorporate both. Options: (1) Create a custom op that takes input x, weight, conv_bias (shape (out_channels,)), and external_bias (shape (out_channels,1)), compute conv_transpose1d(x, weight, conv_bias) + external_bias. (2) Or we can absorb conv_bias into external_bias by adding them before the op? But that would require altering the model. Since we are replacing the entire forward with custom ops, we can treat the fused operation as a single op that takes x, weight, bias_conv (the internal bias of conv), and bias_ext. But the reference's conv_transpose module has these parameters; we need to extract them in the forward of ModelNew. That means ModelNew's forward will need to access the parameters from the original module? Actually the new model (ModelNew) is a replacement; it will have its own parameters (weight, bias_conv, bias_ext). The user initializes ModelNew with same init arguments as Model? The problem: get_init_inputs returns [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape]. ModelNew's __init__ should take these and initialize its own parameters accordingly. The forward then uses the custom op.
+
+Fused op: Let's call it Ca6k01864Custom (from task id ca6k_01864). The op will take inputs: x (3D tensor), weight (3D tensor), bias_conv (1D tensor), bias_ext (2D tensor? Actually external bias is shape (out_channels,1) which is 2D but can be squeezed). But for simplicity, we can pass bias_ext as 1D of size out_channels and broadcast in the kernel. In AscendC, we can handle broadcasting by adding after convolution.
+
+The convolution transpose 1d: input shape (N, C_in, L), weight shape (C_in, C_out, kernel_size) (note: ConvTranspose1d weight shape is (in_channels, out_channels, kernel_size) in PyTorch). Output length = (L-1)*stride - 2*padding + dilation*(kernel_size-1) + output_padding + 1. With given parameters: L=16384, stride=2, padding=1, output_padding=1, kernel_size=3 => output length = (16384-1)*2 - 2*1 + 1*(3-1) + 1 + 1 = 32766 - 2 + 2 + 1 + 1? Let's compute: (16384-1)*2 = 32766; -2*padding = -2; + dilation*(kernel_size-1)=1*2=2; + output_padding=1; +1 => 32766-2+2+1+1=32768. So output length = 32768. N=128, C_out=16. So output shape (128,16,32768). Bias_ext shape (16,1) broadcasts to (128,16,32768). So final shape (128,16,32768).
+
+Now, we need to implement transposed convolution in AscendC. That's a complex operation. But as an expert, we must write the kernel. AscendC has a "Conv2D" API but no direct ConvTranspose1D. However, we can implement it using MatMul? Not straightforward. Another approach: use im2col and matrix multiplication? That would be inefficient but maybe acceptable. AscendC has convolution APIs: "AscendC::Convolution" maybe? Let's think: The typical way to implement conv1d transpose is to treat it as a convolution of the input with a transposed kernel, with appropriate padding and stride. Actually, conv_transpose1d is equivalent to a convolution where the input is dilated and padded, and the kernel is flipped. But it can be implemented using the regular convolution by first zero-upsampling and then convolution. However, in AscendC, there is a "Conv2D" operation but it may not support 1D. We could treat 1D as 2D with height=1. Then use Conv2D transpose? Or we can implement the operation manually with data movement and vector operations. Since the user expects a custom kernel, we need to write it in AscendC. That is a lot of code. But maybe we can simplify: The fused operator could be implemented by calling the built-in AICPU or AICORE convolution? Actually, the host-side operator code can call existing ACL operators? The instruction says "implement a single fused custom op (or a small set) on NPU". We can write a kernel that does the convolution transpose using the AscendC compute APIs, but that is extremely complex. Alternatively, we can define a series of simpler ops (like tiling, matrix multiplication) but that's also heavy.
+
+Given the complexity, we might consider using the Huawei CANN API to call the built-in "ConvTranspose1D" operator from the host operator? But the host operator code is in C++ and can call ACL operators? The host operator typically registers tiling and shape inference, but the actual compute is in the kernel (aicore). The kernel is supposed to contain the compute logic. So we must implement in AscendC.
+
+However, for the purpose of this exercise (likely an automated evaluation), the kernel content might not be fully tested; the harness may just check that the six strings are valid and the operator builds. The numerical correctness may be checked with a simpler operation? But the instruction says "numerical match is verified by the offline harness using the same code as golden". So we must produce a kernel that actually computes the correct output.
+
+We can implement a simplified version: The kernel will perform the convolution transpose by iterating over output positions and computing the sum of contributions using vector multiplies and adds. That is doable but requires careful tiling. Since the output size is large (128*16*32768≈67M floats), UB memory is limited. We need to tile across output channels and spatial dimension.
+
+We can implement the convolution transpose using the fact that it's a matrix multiply when we unroll. We can use MatMul from AscendC? There is no explicit MatMul API, but there is "AscendC::MatMul" in newer versions? Possibly not. We'll avoid that.
+
+Simpler approach: Since the kernel size is 3, we can write a nested loop over output positions, computing the convolution as a sum over kernel elements with input indices. With stride 2 and padding 1, output index i corresponds to input index i // stride? Actually formula: output[i] = sum_{k} weight[k] * input[i - k + padding] where indices are adjusted. But transposed convolution is different: it places the kernel in each input position and sums overlapping outputs. So for each input position, it adds to multiple output positions. That is more naturally implemented as a scatter add. In AscendC, we can loop over input positions and add contributions to output. That might be more straightforward: For each input batch, channel, spatial position, we add the kernel scaled by input to the corresponding output positions. This involves atomic adds? But we have one block per output channel? We can assign each block a part of the output channel dimension. Since the output channels are independent, we can parallelize over C_out. For a given output channel, we need to read all input channels and the corresponding weight. That's a reduction over C_in. The weight shape is (C_in, C_out, K). So for each output channel, we have C_in * K weights. For a given output channel c_out, the output is sum over c_in and k of weight[c_in][c_out][k] * input[c_in][pos] where pos depends on output index.
+
+We can tile output spatial dimension and partially reduce over input channels.
+
+Given the complexity, in this answer, I will produce a simplified kernel that does not implement the full convolution but uses a dummy operation that matches the reference numerically? That's not possible. Alternatively, we can output a kernel that uses AscendC's built-in convolution API if available. Upon reviewing AscendC documentation, there is an "AscendC::Conv2D" API but not for 1D. We might adapt by reshaping to 2D with height=1.
+
+In the interest of time, I will write a kernel that implements the convolution transpose using loops over kernel and input, with proper tiling. This will be large but hopefully correct.
+
+I will also ensure the six strings are correctly formatted.
+
+Let's write the code.
+
+First, project_json_src: defines operator with input x, weight (float), bias_conv (float, optional?), bias_ext (float, optional?), output y. Actually we can combine biases into one: we can pass two biases? The op definition can have multiple inputs. We'll define four inputs: x (ND, float), weight (ND, float), bias_conv (ND, float, shape (out_channels,)), bias_ext (ND, float, shape (out_channels,1) but we can pass as (out_channels,1) or flatten to 1D). For simplicity, we can flatten bias_ext to 1D and broadcast in kernel. So input_desc: "x", "weight", "bias_conv", "bias_ext". Output: "y". Also attrs: stride, padding, output_padding, dilation (default 1). We'll need these for tiling.
+
+In host_tiling_src: define tiling data including totalLength, tileLength for each dimension, blockDim, and parameters. Since the operation is complex, we need to pass all necessary info: N, C_in, C_out, L_in, L_out, kernel_size, stride, padding, output_padding. We'll define fields.
+
+In host_operator_src: implement TilingFunc and InferShape. InferShape computes output shape based on input shape and parameters. Tiling sets blockDim and tiling data.
+
+In kernel_src: implement the actual convolution transpose with loops. We'll use a grid of blocks over output channels and output spatial dimension. Each block processes a tile of output channels and spatial, and accumulates over input channels. We'll need double buffering for weight? Weight is small (C_in*C_out*K) but C_out=16, C_in=3, K=3 => 144 floats, trivial. So we can load weight fully into UB. Input and output are large, so we tile spatial dimension.
+
+We'll implement a class KernelCa6k01864Custom with Init and Process. The global function "ca6k_01864_custom".
+
+In python_bind_src: we use PyTorch bindings to register the op with aclnnCa6k01864Custom? Actually we need to use ACL operator call. We'll follow the pattern: include "pytorch_npu_helper.hpp", call EXEC_NPU_CMD with appropriate arguments. The function signature: at::Tensor myop(const at::Tensor& x, const at::Tensor& weight, const at::Tensor& bias_conv, const at::Tensor& bias_ext, int64_t stride, int64_t padding, int64_t output_padding). We'll register with TORCH_LIBRARY.
+
+In model_src: define ModelNew that uses the custom op. It must replicate the reference forward: it should use the custom op with the same inputs. But note that the reference uses nn.ConvTranspose1d which has its own bias (default True). In ModelNew, we will not use nn.ConvTranspose1d; we will directly compute using the custom op. So we need to define parameters weight, bias_conv, and bias_ext. The weight and bias_conv should be initialized as in the reference: weight = torch.randn(in_channels, out_channels, kernel_size) (according to PyTorch ConvTranspose1d weight shape is (in_channels, out_channels, kernel_size)). bias_conv = torch.randn(out_channels). bias_ext = torch.randn(out_channels, 1). But the reference's bias_ext shape is (out_channels,1). Yes. So we'll create those as nn.Parameter in ModelNew.__init__ and then in forward, call custom_ops_lib.ca6k_01864_custom(x, self.weight, self.bias_conv, self.bias_ext, stride, padding, output_padding).
+
+Now, ensure kernel naming: operator name in project_json: "Ca6k01864Custom". In host operator, use same. In global function "ca6k_01864_custom". In python bind, use that name.
+
+Now write the code.
+
+We'll produce all six strings.
+
+Note: The example used triple-quoted strings without raw prefix. We'll do the same: use triple single quotes (''') for most, but careful with backslashes in C++? In Python, triple quotes allow any characters, but we need to escape triple quotes inside if needed. We'll use triple double quotes or triple single quotes accordingly. To avoid confusion, we'll use triple double quotes for strings that contain single quotes, and vice versa.
+
+Let's start.
+
+project_json_src: Use triple double quotes because JSON uses double quotes.
+
+```python
+project_json_src = """
+[
+  {
+    "op": "Ca6k01864Custom",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "x", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "weight", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "bias_conv", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "bias_ext", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "output_desc": [
+      {"name": "y", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "attr": [
+      {"name": "stride", "param_type": "optional", "type": "int", "default_value": "1"},
+      {"name": "padding", "param_type": "optional", "type": "int", "default_value": "0"},
+      {"name": "output_padding", "param_type": "optional", "type": "int", "default_value": "0"},
+      {"name": "dilation", "param_type": "optional", "type": "int", "default_value": "1"}
+    ]
+  }
+]
+"""
+```
+
+Now host_tiling_src: C++ header that defines tiling data struct. We'll include fields: N, C_in, C_out, L_in, L_out, kernel_size, stride, padding, output_padding, tileLen (for output spatial dimension), blockDim, etc.
+
+We'll define in namespace optiling with BEGIN_TILING_DATA_DEF and END. Use TILING_DATA_FIELD_DEF for each.
+
+Also REGISTER_TILING_DATA_CLASS.
+
+```python
+host_tiling_src = """
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Ca6k01864CustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C_in);
+  TILING_DATA_FIELD_DEF(uint32_t, C_out);
+  TILING_DATA_FIELD_DEF(uint32_t, L_in);
+  TILING_DATA_FIELD_DEF(uint32_t, L_out);
+  TILING_DATA_FIELD_DEF(uint32_t, kernel_size);
+  TILING_DATA_FIELD_DEF(int32_t, stride);
+  TILING_DATA_FIELD_DEF(int32_t, padding);
+  TILING_DATA_FIELD_DEF(int32_t, output_padding);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLen); // number of output spatial elements per tile
+  TILING_DATA_FIELD_DEF(uint32_t, totalLen); // total output elements (N*C_out*L_out)
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Ca6k01864Custom, Ca6k01864CustomTilingData)
+}
+"""
+```
+
+Now host_operator_src: includes tiling, infer shape, op registration. We'll write the tiling function: compute output shape: L_out = (L_in-1)*stride - 2*padding + dilation*(kernel_size-1) + output_padding + 1. With dilation=1. Use int32_t. Then set tiling. blockDim based on total output size and UB budget. We need to determine tileLen: number of output spatial positions per block iteration. We can set tileLen = min(UB_budget / (sizeof(float)* (C_out + C_in*2? ) ), L_out). Actually we need to load a segment of output (to accumulate) and input segment. The input segment needed for a given output segment depends on the convolution; for stride>1, input positions are scattered. But to keep it manageable, we can set tileLen to a fixed power of two like 2048. We'll compute maxTile from UB budget: we need to hold input chunk, output chunk, weight. weight is tiny. So UB budget / (C_in*sizeof(float)?) but we need both input and output. Let's do a simple heuristic: tileLen = 4096 for this example. Or compute based on UB.
+
+We'll also need to include headers: "register/op_def_registry.h", "ca6k_01864_custom_tiling.h" (the tiling header). The tiling header will be included as "ca6k_01864_custom_tiling.h" because the build system will generate it? Actually we need to include the tiling header we defined earlier; we'll name it "ca6k_01864_custom_tiling.h" (string in host_operator_src). We'll ensure consistency.
+
+Write the TilingFunc.
+
+```python
+host_operator_src = """
+#include "ca6k_01864_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "graph/types.h"
+#include "graph/operator.h"
+#include <cmath>
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context) {
+    Ca6k01864CustomTilingData tiling;
+
+    const gert::StorageShape *x_shape = context->GetInputShape(0);
+    const gert::StorageShape *weight_shape = context->GetInputShape(1);
+    // x: (N, C_in, L_in)
+    uint32_t N = x_shape->GetOriginShape().GetDim(0);
+    uint32_t C_in = x_shape->GetOriginShape().GetDim(1);
+    uint32_t L_in = x_shape->GetOriginShape().GetDim(2);
+    // weight: (C_in, C_out, kernel_size)
+    uint32_t C_out = weight_shape->GetOriginShape().GetDim(1);
+    uint32_t kernel_size = weight_shape->GetOriginShape().GetDim(2);
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    int32_t stride = attrs->GetAttrPointer<int32_t>(0)[0];
+    int32_t padding = attrs->GetAttrPointer<int32_t>(1)[0];
+    int32_t output_padding = attrs->GetAttrPointer<int32_t>(2)[0];
+    // dilation (not used)
+    // Compute output length:
+    int32_t L_out = (L_in - 1) * stride - 2 * padding + (kernel_size - 1) + output_padding + 1;
+    if (L_out <= 0) L_out = 1;
+    uint32_t totalLen = N * C_out * L_out;
+
+    // UB budget heuristic: assume 128KB per core, each tile uses output tile (float) and input tile (float) and weight (small)
+    // Let's set tile length for output spatial dimension
+    const uint32_t UB_BUDGET = 128 * 1024 / sizeof(float); // floats
+    // We need to store: output chunk: C_out * tileLen; input chunk: C_in * inputLen where inputLen depends on stride and kernel.
+    // Estimate inputLen = tileLen * stride + kernel_size -1.
+    // But to simplify, set tileLen fixed = 2048 floats for output.
+    uint32_t tileLen = 2048; // per output channel? Actually per block we process all C_out? Or per output channel?
+    // Better: each block handles a subset of output channels and spatial positions.
+    // We'll handle per output channel separately; tileLen is number of output positions.
+    // So output chunk size per block = tileLen (for one output channel).
+    // input chunk size = (tileLen * stride + kernel_size - 1) * C_in.
+    // With C_out=16, total output per block = tileLen * C_out. We'll assign blocks to output channels.
+    // Let's set tileLen = 2048, then input len ~ 4096 * 3 = 12288 floats. Output per block (C_out=16) = 32768 floats.
+    // That fits in UB (128K floats).
+    // We'll also set blockDim = C_out, each block handles one output channel.
+    uint32_t blockDim = C_out;
+    // Adjust tileLen if needed
+    if (tileLen > L_out) tileLen = (L_out + 1) / 2; // half
+    // Ensure alignment? Not needed.
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_N(N);
+    tiling.set_C_in(C_in);
+    tiling.set_C_out(C_out);
+    tiling.set_L_in(L_in);
+    tiling.set_L_out(L_out);
+    tiling.set_kernel_size(kernel_size);
+    tiling.set_stride(stride);
+    tiling.set_padding(padding);
+    tiling.set_output_padding(output_padding);
+    tiling.set_tileLen(tileLen);
+    tiling.set_totalLen(totalLen);
+    tiling.set_blockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context) {
+    // Compute output shape from input shapes and attrs
+    const gert::StorageShape *x_shape = context->GetInputShape(0);
+    const gert::StorageShape *weight_shape = context->GetInputShape(1);
+    // Get attrs
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    int32_t stride = attrs->GetAttrPointer<int32_t>(0)[0];
+    int32_t padding = attrs->GetAttrPointer<int32_t>(1)[0];
+    int32_t output_padding = attrs->GetAttrPointer<int32_t>(2)[0];
+    uint32_t N = x_shape->GetOriginShape().GetDim(0);
+    uint32_t C_in = x_shape->GetOriginShape().GetDim(1);
+    uint32_t L_in = x_shape->GetOriginShape().GetDim(2);
+    uint32_t C_out = weight_shape->GetOriginShape().GetDim(1);
+    uint32_t kernel_size = weight_shape->GetOriginShape().GetDim(2);
+    int32_t L_out = (L_in - 1) * stride - 2 * padding + (kernel_size - 1) + output_padding + 1;
+    if (L_out <= 0) L_out = 1;
+    gert::Shape y_shape({N, C_out, (uint32_t)L_out});
+    context->SetOutputShape(0, y_shape);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context) {
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class Ca6k01864Custom : public OpDef {
+public:
+    explicit Ca6k01864Custom(const char* name) : OpDef(name) {
+        this->Input("x").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias_conv").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias_ext").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND});
+        this->Attr("stride").AttrType(OPTIONAL).Int(1);
+        this->Attr("padding").AttrType(OPTIONAL).Int(0);
+        this->Attr("output_padding").AttrType(OPTIONAL).Int(0);
+        this->Attr("dilation").AttrType(OPTIONAL).Int(1);
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(Ca6k01864Custom);
+} // namespace ops
+"""
+```
+
+Now kernel_src: need to implement the convolution transpose. We'll write a kernel that iterates over input batch (N) and output channel (C_out) with block dimension being C_out. Each block handles one output channel for all batches? That would require looping over N, but N=128. We could parallelize over N and C_out, but with blockDim=C_out, each block does one channel across batches. That means we need a loop over N. The kernel will load weight for that output channel (size C_in * kernel_size). For each batch, we load input (C_in, L_in) and compute output (L_out) using the transposed convolution. Then accumulate bias_conv (scalar for this channel) and bias_ext (scalar for this channel). Then store output. We need to tile spatial dimension due to UB limit. We'll tile over L_out. For each tile of output positions (len tileLen), we need to load a slice of input that contributes to those output positions. That's tricky. Given time constraints, we'll implement a simpler but slower kernel that does not tile spatially within a block; instead we'll process the entire L_out at once? That may exceed UB if L_out=32768, C_in=3, floats for input: 3*16384=49152, plus output: 32768, plus weight: 3*3=9. Total ~ 82000 floats, within 128K floats. So we can fit entire batch for one channel in UB. So we can load whole input of one batch and compute whole output. That simplifies.
+
+Thus algorithm per block (processing one output channel c_out):
+- Load weight weight_c (C_in * kernel_size) into UB.
+- For each batch i in 0..N-1: (maybe we can parallelize over batches? But we don't have more blocks. We'll loop.)
+  - Load input (C_in, L_in) for this batch.
+  - Initialize output (L_out) to zero.
+  - For each input channel c_in, for each kernel k, for each input position pos_in, compute output position pos_out = pos_in * stride - padding + k. If within [0, L_out-1], accumulate: output[pos_out] += weight[c_in][c_out][k] * input[c_in][pos_in].
+  - After all, add bias_conv[c_out] and bias_ext[c_out] (broadcasted across spatial dimension).
+  - Store output for this batch.
+
+This works and fits UB. We'll need to load bias_conv and bias_ext as scalars per channel.
+
+In kernel_src, define class with Init and Process. The Process will loop over batches, and for each batch compute.
+
+We need to receive tiling data: N, C_in, C_out, L_in, L_out, kernel_size, stride, padding, output_padding, tileLen (not used if we do full length). But we will compute full L_out.
+
+We'll implement using AscendC local tensors and pipes.
+
+Let's write the kernel.
+
+```python
+kernel_src = """
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCa6k01864Custom {
+public:
+    __aicore__ inline KernelCa6k01864Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR bias_conv, GM_ADDR bias_ext,
+                                GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+        // Parse tiling data
+        GET_TILING_DATA(td, tiling);
+        N_ = td.N;
+        C_in_ = td.C_in;
+        C_out_ = td.C_out;
+        L_in_ = td.L_in;
+        L_out_ = td.L_out;
+        kernel_size_ = td.kernel_size;
+        stride_ = td.stride;
+        padding_ = td.padding;
+        output_padding_ = td.output_padding;
+        tileLen_ = td.tileLen;
+        blockDim_ = td.blockDim;
+
+        // Set global buffers
+        xGm_.SetGlobalBuffer((__gm__ float*)x, N_ * C_in_ * L_in_);
+        weightGm_.SetGlobalBuffer((__gm__ float*)weight, C_in_ * C_out_ * kernel_size_);
+        biasConvGm_.SetGlobalBuffer((__gm__ float*)bias_conv, C_out_);
+        biasExtGm_.SetGlobalBuffer((__gm__ float*)bias_ext, C_out_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, N_ * C_out_ * L_out_);
+
+        uint32_t blockIdx = GetBlockIdx();
+        c_out_ = blockIdx; // each block processes one output channel
+        if (c_out_ >= C_out_) return;
+
+        // Allocate local tensors
+        // weight for this channel: shape (C_in, kernel_size)
+        uint32_t weightSize = C_in_ * kernel_size_;
+        // local weight buffer
+        pipe_.InitBuffer(weightQueue_, 1, weightSize * sizeof(float));
+        // input buffer per batch: C_in * L_in
+        uint32_t inputSize = C_in_ * L_in_;
+        pipe_.InitBuffer(inQueueX_, 1, inputSize * sizeof(float));
+        // output buffer: L_out
+        uint32_t outputSize = L_out_;
+        pipe_.InitBuffer(outQueueY_, 1, outputSize * sizeof(float));
+        // temporary queue not needed
+    }
+
+    __aicore__ inline void Process() {
+        if (c_out_ >= C_out_) return;
+
+        // Load weight for this channel into local
+        AscendC::LocalTensor<float> weightLocal = weightQueue_.AllocTensor<float>();
+        // Weight at global: for each c_in, offset = c_in*C_out*kernel_size + c_out*kernel_size
+        // We need to copy interleaved? Actually weight is contiguous for each (c_in, c_out, k). So we can copy a rect of size C_in * kernel_size starting at offset c_out*kernel_size? No, weight layout: (C_in, C_out, kernel_size). For a fixed c_out, the weight tensor is not contiguous because between c_in, the next c_in's weight for same c_out is at stride C_out*kernel_size. So we need to scatter read. Alternative: we can load entire weight tensor and then index, but that would be 144 floats for whole weight, trivial. Let's load entire weight local (C_in*C_out*kernel_size) to avoid scatter copies. That's 144 floats, fits. So we'll load all weight.
+        uint32_t totalWeightSize = C_in_ * C_out_ * kernel_size_;
+        pipe_.InitBuffer(weightFullQueue_, 1, totalWeightSize * sizeof(float));
+        AscendC::LocalTensor<float> weightFull = weightFullQueue_.AllocTensor<float>();
+        AscendC::DataCopy(weightFull, weightGm_, totalWeightSize);
+        // Now we can index weightFull[ c_in * C_out_ * kernel_size_ + c_out_ * kernel_size_ + k ]
+        // We'll keep weightFull and use it.
+
+        // Load bias_conv and bias_ext for this channel (scalars)
+        float biasConv = *(biasConvGm_.GetPtr() + c_out_);
+        float biasExt = *(biasExtGm_.GetPtr() + c_out_);
+        float totalBias = biasConv + biasExt;
+
+        // Loop over batches
+        for (uint32_t n = 0; n < N_; ++n) {
+            // Load input for this batch
+            AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            uint32_t batchOffset = n * C_in_ * L_in_;
+            AscendC::DataCopy(xLocal, xGm_[batchOffset], C_in_ * L_in_);
+
+            // Initialize output to zero
+            AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+            AscendC::DupTensor(yLocal, 0.0f, L_out_);
+
+            // Perform transposed convolution
+            for (uint32_t c_in = 0; c_in < C_in_; ++c_in) {
+                // weight base for this c_in and c_out
+                uint32_t weightBase = c_in * C_out_ * kernel_size_ + c_out_ * kernel_size_;
+                for (uint32_t k = 0; k < kernel_size_; ++k) {
+                    float w = weightFull[weightBase + k];
+                    if (w == 0.0f) continue;
+                    // For each input position pos_in, compute output pos_out
+                    // pos_out = pos_in * stride - padding + k
+                    // To vectorize, we can use a loop over pos_in, computing pos_out and accumulate.
+                    // This is a scatter add. We can use AscendC::VecAdd with conditions? Better: iterate over pos_in.
+                    for (uint32_t pos_in = 0; pos_in < L_in_; ++pos_in) {
+                        int32_t pos_out = static_cast<int32_t>(pos_in) * stride_ - padding_ + k;
+                        if (pos_out >= 0 && pos_out < static_cast<int32_t>(L_out_)) {
+                            // Add w * x[c_in][pos_in] to output[pos_out]
+                            float xVal = xLocal[c_in * L_in_ + pos_in];
+                            yLocal[pos_out] += w * xVal;
+                        }
+                    }
+                }
+            }
+
+            // Add bias
+            // For all output positions
+            AscendC::Adds(yLocal, yLocal, totalBias, L_out_);
+
+            // Store output back to global
+            uint32_t outBatchOffset = n * C_out_ * L_out_ + c_out_ * L_out_;
+            AscendC::DataCopy(yGm_[outBatchOffset], yLocal, L_out_);
+
+            // Free tensors
+            outQueueY_.FreeTensor(yLocal);
+            inQueueX_.FreeTensor(xLocal);
+        }
+
+        // Free weight full tensor
+        weightFullQueue_.FreeTensor(weightFull);
+        weightQueue_.FreeTensor(weightLocal); // not used, but allocated
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> weightQueue_;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> weightFullQueue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueY_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> weightGm_;
+    AscendC::GlobalTensor<float> biasConvGm_;
+    AscendC::GlobalTensor<float> biasExtGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t N_ {0}, C_in_ {0}, C_out_ {0}, L_in_ {0}, L_out_ {0}, kernel_size_ {0};
+    int32_t stride_ {1}, padding_ {0}, output_padding_ {0};
+    uint32_t tileLen_ {0}, blockDim_ {0};
+    uint32_t c_out_ {0};
+};
+
+extern "C" __global__ __aicore__ void ca6k_01864_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR bias_conv,
+                                                         GM_ADDR bias_ext, GM_ADDR y, GM_ADDR workspace,
+                                                         GM_ADDR tiling) {
+    KernelCa6k01864Custom op;
+    op.Init(x, weight, bias_conv, bias_ext, y, workspace, tiling);
+    op.Process();
+}
+"""
+```
+
+Note: In Init, we used GET_TILING_DATA; we need to include that macro definition? It is provided by the framework. Also we need to be careful with variable naming. The global function signature should match the expected parameters from the operator definition. The operator has 4 inputs (x, weight, bias_conv, bias_ext) and 1 output (y). The tiling is passed as a GM_ADDR. The workspace may be null.
+
+Now python_bind_src: We'll write a function that accepts torch tensors and calls ACL operator. We'll use EXEC_NPU_CMD macro. We need to include pytorch_npu_helper.hpp. The function name: ca6k_01864_custom.
+
+```python
+python_bind_src = """
+#include <torch/extension.h>
+#include <torch/library.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor ca6k_01864_custom(const at::Tensor& x, const at::Tensor& weight,
+                              const at::Tensor& bias_conv, const at::Tensor& bias_ext,
+                              int64_t stride, int64_t padding, int64_t output_padding) {
+    // Infer output shape
+    int64_t N = x.size(0);
+    int64_t C_in = x.size(1);
+    int64_t L_in = x.size(2);
+    int64_t C_out = weight.size(1);
+    int64_t kernel_size = weight.size(2);
+    int64_t L_out = (L_in - 1) * stride - 2 * padding + (kernel_size - 1) + output_padding + 1;
+    if (L_out <= 0) L_out = 1;
+    // Create output tensor
+    at::Tensor result = at::empty({N, C_out, L_out}, x.options());
+    // Execute ACL operator
+    EXEC_NPU_CMD(aclnnCa6k01864Custom, x, weight, bias_conv, bias_ext, stride, padding, output_padding, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("ca6k_01864_custom", &ca6k_01864_custom);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("ca6k_01864_custom", &ca6k_01864_custom, "Fused ConvTranspose1d + bias (Ca6k01864Custom)");
+}
+"""
+```
+
+Now model_src: define ModelNew that uses the custom op. Note: The reference model's __init__ takes (in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape). ModelNew should take the same. Inside, we create weight, bias_conv, bias_ext as parameters. The weight should be initialized as randn with shape (in_channels, out_channels, kernel_size). bias_conv shape (out_channels). bias_ext shape bias_shape (out_channels,1). The forward calls the custom op.
+
+```python
+model_src = """
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'ca6k_01864_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.weight = torch.nn.Parameter(torch.randn(in_channels, out_channels, kernel_size))
+        self.bias_conv = torch.nn.Parameter(torch.randn(out_channels))
+        self.bias_ext = torch.nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, self.weight, self.bias_conv, self.bias_ext, self.stride, self.padding, self.output_padding)
+"""
+```
+
+Now we need to ensure that the operator name in python_bind_src TORCH_LIBRARY_IMPL matches the one used in model_src? Actually model_src uses custom_ops_lib (name of the compiled module). The C++ code registers into "myops" namespace? The example used "myops". That's fine. The python will import custom_ops_lib, which will have the function.
+
+We must also ensure that the project_json_src "op" name matches the C++ class name "Ca6k01864Custom" and the global function name "ca6k_01864_custom". All consistent.
+
+Now final code block.
+
+We'll output exactly one python code block with these six assignments.
+
+One more thing: In kernel_src, we used `pipe_.InitBuffer(weightQueue_, 1, weightSize * sizeof(float));` but then we allocated weightFullQueue_ instead. We should not allocate weightQueue_ if not used. Remove it. Also we need to ensure we have enough local memory; all fits.
+
+Let's refine kernel_src:
+
+- Remove weightQueue_ and its init.
+- Only use weightFullQueue_.
+
+Also, we need to free weightLocal that wasn't used. So remove allocation entirely.
+
+We'll adjust.
+
+Also, in the Init, we need to use the correct pipe init for weightFullQueue_ before allocating weightFull. The weightSize for full weight is totalWeightSize. We'll allocate that.
+
+Also, we need to handle the case where tileLen is not used; we can ignore.
+
+I'll rewrite kernel_src more cleanly.
+
+Also, note that the global function has parameters in order: x, weight, bias_conv, bias_ext, y, workspace, tiling. That matches the operator definition.
+
+We must ensure the signature matches the expected one from the framework. It is typical: GM_ADDR inputs..., then outputs..., then workspace, then tiling.
+
+Alright.
+
+Let's produce the final answer.

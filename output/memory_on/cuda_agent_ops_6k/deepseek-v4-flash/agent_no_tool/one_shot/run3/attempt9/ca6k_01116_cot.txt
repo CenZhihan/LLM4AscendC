@@ -1,0 +1,109 @@
+We need to fix the previous attempt based on error logs. The compilation succeeded, but correctness failed. The error log shows "TBE Subprocess[task_distribute] raise error[], main process disappeared!" and returncode -11 (segfault). This indicates a kernel crash at runtime. Likely issues: inadequate UB buffer handling, incorrect data access patterns (global tensor SetValue/GetValue inside nested loops is extremely slow and may cause issues; also using scalar operations for convolution is inefficient but the bigger issue is memory corruption or overflow). Also the kernel uses scalar operations which is not recommended; but the primary cause of segfault could be buffer overflow or incorrect data types.
+
+Key problems in previous kernel:
+- Using inQueueX_, inQueueW_, outQueueY_ with BUFFER_NUM=1 but then using AllocTensor and FreeTensor for each output element? That's wrong: queue usage is for pipelining data transfers, not for single scalars. The queue-based approach used in the leaky_relu example was for vectorized operations; here the kernel tries to use it but then does scalar loads via GetValue/SetValue, which defeats the purpose and likely corrupts because the allocated tensor of size sliceSize is used but not filled properly with DataCopy. Actually they allocated sliceSize elements but didn't use DataCopy; they used SetValue in a loop. That's okay but then they try to enqueue/dequeue? They call AllocTensor but never enqueue or dequeue; they just use it as local memory. That might be okay if they allocate and free without queue operations, but the pipe_ initialization expects queue usage? Actually they called pipe_.InitBuffer(inQueueX_, ...) which initializes the queue; but then they use AllocTensor without EnQue, and then FreeTensor. That might work but not efficiently. However the bigger issue: they allocate xLocal and wLocal of size sliceSize, but then they try to dequeue from inQueueX_? They don't; they only AllocTensor, fill, compute, FreeTensor. But they never copy data from global to local using DataCopy. So the local tensor contains uninitialized data? Actually they use SetValue to fill, so that's fine. But then they do scalar operations on local tensors using GetValue/SetValue which is okay but slow. But the real crash could be due to accessing out-of-bounds: in the loop they compute n, o, l_out from globalOutIdx, but for bias they check hasBias_ but always read bGm_.GetValue(o) which is valid only if bias exists. The issue: when hasBias_ is 0, they should not access bGm_. The tensor bGm_ is initialized to point to bias GM_ADDR; if bias is not provided, what is passed? In python_bind_src, they pass an empty tensor if bias not present. But GM_ADDR of an empty tensor might be null or garbage. Accessing that causes segfault. So they should conditionally access only if hasBias_ is 1.
+
+Additionally, the tiling sets hasBias= (context->GetInputShape(2) != nullptr) ? 1 : 0; This should work. But the kernel reads bGm_ regardless. Fix: guard with if (hasBias_) before reading bGm_. Also the kernel uses grid-stride over totalOutput elements, but allocates local tensors of size sliceSize each iteration; that's fine but inefficient. However the crash is likely due to bias access.
+
+Also note: the log shows no specific error message, just "main process disappeared" which suggests process crash (segfault). So fix the bias access and also make sure that the kernel uses proper DataCopy for performance but correctness first.
+
+We can simplify: remove the queue usage entirely, just use LocalTensor allocations and scalar operations. But we need to ensure memory is allocated from UB. Better to use AscendC's vectorized operations; but for correctness in minimal fix, we can keep the scalar approach but fix bias access and ensure local tensor sizes are correct.
+
+Another possible issue: the calculation of sliceSize = (C_ / groups_) * K_; but C_ and groups_ are uint32, so integer division is fine. However in the kernel they use c < (C_ / groups_) and cStart = g * (C_ / groups_). So fine.
+
+Also the weight loading: they load all sliceSize weights for output channel o, but weight shape is [O, C/groups, K]. So wOffset = o * (C_/groups_) * K_ is correct.
+
+Also the input loading: they load xLocal for each (c,k) combination for a given output position. But xGm_ offset: n * C_ * L_ + absC * L_ + idx. That's correct if idx is valid (0<=idx<L). They check idx>=0 && idx<L. So fine.
+
+But there is a major correctness issue: they are computing convolution as sliding window but they only consider one output position at a time. That's correct. But the tensor allocation of sliceSize is repeated for each output element; that's fine but may cause high overhead; however the crash is runtime.
+
+Let's focus on the most likely cause: bias access when bias not provided. Also maybe the workspace/tiling GM_ADDR: in kernel signature they have GM_ADDR workspace, GM_ADDR tiling. In GET_TILING_DATA, they read from tiling. That should be fine if tiling buffer is set correctly.
+
+Another potential: the host operator's InferShape uses context->GetAttrs() but in TilingFunc they use context->GetAttrs() as well. But the op registers attrs via Float/Int. The previous code uses Attr("stride").AttrType(OPTIONAL).Int(1); in OpDef. That should be fine.
+
+Also the tiling sets L_out, but L_out could be negative? They use int32_t L_out = ... but check that L_out >= 0. They cast to uint32_t, so if L_out negative it wraps huge. That would cause totalOutput huge, leading to memory access out-of-bounds. That is a possible crash: if dilation*(K-1) > L+2*padding, L_out becomes negative, wraps to large uint32, causing kernel to access beyond allocated output. The reference PyTorch program uses default stride=1, padding=0, dilation=1, groups=1, kernel_size=3, width=8192. So L=8192, K=3, dilation=1, padding=0: L_out = (8192 + 0 - 1*(3-1)-1)/1+1 = (8192-2-1)+1 = 8190? Actually compute: (L + 2*padding - dilation*(K-1) -1) = 8192 -2 -1 = 8189; /1=8189; +1=8190. That's positive. So not negative.
+
+But if width changes in testing it could become negative. However the reference uses fixed width=8192. So not the issue.
+
+Given the segfault, the bias access is the prime suspect. Also the fact that they allocate local tensors but never free them after the loop? They do FreeTensor in each iteration. That's fine.
+
+Better approach: rewrite the kernel to be vectorized using DataCopy and vector computations, but that is more complex. For a minimal fix, we can keep the scalar approach but ensure:
+
+- Guard bias access with hasBias_.
+- Change BUFFER_NUM to 2 (or keep 1 but ensure no queue operations). Actually they are not using queue operations (no EnQue/DeQue). They just AllocTensor and FreeTensor. That is allowed: you can use pipe_.AllocTensor to get a LocalTensor without queue, but you must not enqueue it. However they initialized queue buffers with pipe_.InitBuffer(inQueueX_, BUFFER_NUM, size); this allocation is used for the queue's internal memory. When they call AllocTensor from that queue, it allocates from queue memory but they don't enqueue; that's okay. But they should not use queues for plain memory allocations; better to use just pipe_.AllocLocalTensor for local memory without queue. Simpler: remove queue usage and use plain AllocLocalTensor. But need to initialize pipe_ first.
+
+Actually the correct way: Use pipe_.InitBuffer(inQueueX_, BUFFER_NUM, size) to allocate ping-pong memory for a queue. Then use inQueueX_.AllocTensor<float>() to get a tensor from that queue's free memory. That tensor is not yet enqueued; you can write to it. Then when done, you can free it via inQueueX_.FreeTensor(). That is valid but not pipelined. However after freeing, the memory remains in the queue's free pool. This should work but is non-standard. The leaky_relu example uses proper queues with EnQue/DeQue for pipeline. For simplicity, we can restructure to use a single pipe memory allocation for local memory size sliceSize, and reuse it.
+
+But to minimize changes, we can just fix the bias issue and also ensure that the kernel does not crash on empty bias. Also note: In host operator, they set hasBias based on whether input shape 2 is not null. But in tiling, they stored hasBias as uint32_t. In kernel, they used hasBias_ to guard access. However the python bind always passes an empty tensor even when bias not provided. That means the GM_ADDR for bias points to an empty tensor's data pointer, which might be null or a valid zero-sized allocation. Accessing it (even offset 0) could cause segfault. So we must not access bGm_ if hasBias_ is 0. The kernel currently does: sum += bGm_.GetValue(o); unconditionally. Fix: only add if hasBias_.
+
+Other possible improvements: The kernel uses inQueueX_ and inQueueW_ but never enqueues. That's fine but could cause memory leaks? FreeTensor should return memory to queue. But they allocate before the inner loops and free after dot product. That's okay.
+
+But there is another issue: they allocate outQueueY_ but never use? They allocate with size 1 * sizeof(float) (for one float?). Actually they allocate pipe_.InitBuffer(outQueueY_, BUFFER_NUM, 1 * sizeof(float)); but they never allocate tensor from outQueueY_. That is wasteful but not harmful. However they might have intended to store output there. Not used.
+
+Also they allocate inQueueX_ and inQueueW_ with size sliceSize * sizeof(float). But then they call AllocTensor from these queues each iteration; that's okay.
+
+But a bigger issue: the number of allocations per iteration might exhaust UB if sliceSize is large. For N=128, C=64, K=3, sliceSize=64/1*3=192. That's small. So not an issue.
+
+Given the error log shows "TBE Subprocess[task_distribute] raise error[], main process disappeared!" multiple times, it's likely a segfault in the kernel execution.
+
+The most straightforward fix: ensure bias access is guarded. Also ensure that the local tensor allocation and freeing is correct.
+
+Let's also note: In the kernel, they use inQueueX_.AllocTensor<float>() which returns a tensor; they then fill it with SetValue in a loop. But they never use DataCopy, which is fine but slower. However they must ensure that the tensor is allocated from the queue's memory. Since they haven't enqueued anything, the queue may not have any free tensors? Actually InitBuffer allocates BUFFER_NUM * size bytes for the queue; AllocTensor will retrieve a chunk of that memory. With BUFFER_NUM=1, there is one chunk of size sliceSize*sizeof(float). They allocate it each iteration, fill, compute, free. That should work. But if multiple iterations compete, it's fine because they free before next allocation.
+
+However, they also allocate from inQueueW_ inside the same iteration; total two allocations from two different queues. Each queue has its own buffer. So total local memory used per iteration: sliceSize floats from x queue + sliceSize floats from w queue = 2*192*4=1536 bytes. That's fine.
+
+Now, the segfault: could be due to index out-of-bounds in xGm_ or wGm_ or yGm_. Ensure that totalOutput_ calculation matches actual output size. In tiling they compute totalOutput = N * O * L_out. That's correct.
+
+But the kernel uses globalOutIdx as index into output, but it uses n = globalOutIdx / (O_ * L_out_); that's correct. rem = globalOutIdx % (O_ * L_out_); o = rem / L_out_; l_out = rem % L_out_. That is correct.
+
+However, when computing l_in_start = l_out * stride - padding, they use int32_t and then add k*dilation. They then check idx >=0 && idx < L_. That's correct.
+
+Now the bias access: if hasBias_ is 0, they still do sum += bGm_.GetValue(o); that reads from null or empty tensor. That is the most likely cause. Fix: if (hasBias_) sum += bGm_.GetValue(o);
+
+Also, ensure that in tiling, hasBias is set correctly: they check context->GetInputShape(2) != nullptr. But in the op registration, bias is OPTIONAL. When not provided, the shape pointer may be null. So that's fine.
+
+Now also note: In python bind, they pass empty tensor when bias absent, which causes the op to receive a valid input tensor of size 0. So the host will have input shape 2 non-null? Actually the shape will be present but size 0. So context->GetInputShape(2) will be non-null (since tensor exists) but shape size 0. The tiling code might treat that as hasBias=1 incorrectly. That would cause kernel to read from a zero-length tensor, still segfault. So we need to fix the python bind to pass a null-like indicator? Or better: modify host tiling to check the actual size of bias. But the operator definition says bias is optional, so if user passes an empty tensor, it's still considered present but empty. In the reference PyTorch model, the Conv1d has bias=True by default, so bias will be non-empty. So in the test, bias will be present with actual values. So the host will set hasBias=1, and kernel reads from valid bias tensor. But the python bind always passes empty tensor if bias not provided; but in the model_src, they always pass self.conv.bias, which is non-empty because they initialize Conv1d with bias=True. So in the evaluation, bias will be present. So the segfault is not due to empty bias; it's due to something else.
+
+Wait, the error logs indicate crash, but no further details. The problem might be elsewhere: maybe the kernel uses too much local memory or stack? The local tensors are allocated from queue, but the kernel uses stack variables like int32_t, etc. Should be fine.
+
+Another possibility: The kernel uses GET_TILING_DATA(tiling_data, tiling); where tiling is GM_ADDR of tiling buffer. But in the kernel signature, they have GM_ADDR workspace, GM_ADDR tiling. The macro GET_TILING_DATA expects the buffer to contain the tiling struct. That should be fine.
+
+Also note: They set blockDim in tiling to 8, but they use AscendC::GetBlockNum() in kernel, which should be set by context->SetBlockDim(blockDim). That's fine.
+
+But the kernel uses a grid-stride loop: for (uint32_t globalOutIdx = start; globalOutIdx < totalOutput_; globalOutIdx += step). If totalOutput_ is large (batch_size*out_channels*L_out = 128*64*8190 = 67 million), and blockDim=8, then each block handles about 8.3 million elements, the loop will iterate many times. Each iteration does a dot product of 192 elements with nested loops. That is extremely slow and may cause timeout or crash due to long execution? But the error is segfault, not timeout.
+
+Maybe the local tensor allocation within the loop causes memory corruption because they don't properly free before next allocation? But they do.
+
+Alternatively, the issue could be with the usage of SetValue and GetValue on LocalTensors; these are not vectorized but still work. However, if the tensor is allocated from queue memory, and they write beyond allocated size? They write sliceSize elements, which matches allocation.
+
+I think the most likely fix is to guard the bias access. Even if bias is present, the if (hasBias_) will be true and it will work. If bias is not present (which shouldn't happen in this test), it would crash without guard. So adding guard is safe.
+
+Additionally, we can improve the kernel to use DataCopy for bulk loading and vectorized operations for performance, but for correctness we keep the scalar approach.
+
+But we must also consider that the previous kernel's Process method never uses outQueueY_. That is fine but wasteful. To reduce complexity, we can remove outQueueY_ entirely. But not required.
+
+Given the limited information, let's provide a minimal fix:
+- Add if (hasBias_) before reading bGm_.
+- Possibly increase BUFFER_NUM to 2 to allow ping-pong? But not needed.
+- Ensure that the InitBuffer for outQueueY_ is not needed; we can omit it or keep.
+- Also, ensure that the local tensors are allocated with the correct type.
+
+But we also need to ensure the kernel compiles. The previous one compiled fine.
+
+Now, also check the host operator: In InferShape they use context->GetAttrs() which returns const RuntimeAttrs*. But the attributes are int32_t, they use attrs->GetAttrPointer<int32_t>(0)[0]; that's fine. However, note that the order of attrs in OpDef matches: stride, padding, dilation, groups. In InferShape, they access attrs in same order: stride, padding, dilation, but they don't access groups. That's fine.
+
+One more subtle issue: In TilingFunc, they compute L_out using int32_t, but then set tiling.set_L_out(static_cast<uint32_t>(L_out)); if L_out negative, wrap. But given the test params, it's positive. Not an issue.
+
+But the segfault could also be due to the totalOutput calculation overflow: N * O * L_out could exceed 32-bit? N=128, O=64, L_out=8190 -> product = 128*64*8190 = 67,108,864 which fits in uint32_t (max 4.29e9). So fine.
+
+Given that the only obvious bug is the unconditional bias access, I'll fix that. Also, to be safe, I'll change the bias handling in python bind to pass None instead of empty tensor when not provided, and adjust host to handle null pointer correctly. But the model_src always provides bias, so it should be fine.
+
+Another possible improvement: In the kernel, they allocate local tensors of size sliceSize, but they also use a separate local tensor for output? Not used. They could store output directly to global. They do yGm_.SetValue(globalOutIdx, sum); That's fine.
+
+Now, I'll produce corrected code with the bias guard. Additionally, I'll add a comment and reduce unnecessary code.
+
+Also, we need to ensure the python_bind_src uses the same function name as the op (ca6k01116_custom) and the module name matches.
+
+I'll keep the rest same.
+
+Let's produce the final answer with six strings.

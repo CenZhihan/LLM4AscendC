@@ -1,0 +1,185 @@
+We need to fix the previous attempt. The error log shows "NPU out of memory. Tried to allocate more than 1EB memory." That indicates a memory allocation issue, likely due to incorrect buffer sizes or tiling parameters. The kernel is doing scalar operations per element (looping over kernel size for each output element) which is extremely inefficient and may cause huge memory allocation? Actually the "1EB memory" error suggests a bug in buffer allocation or tiling data causing a huge number.
+
+Looking at the previous kernel: it allocates negInfBuf_ of size 1 float, scalarBufX_ and scalarBufY_ each of size 1 float. That's fine. The issue may be in the tiling data: totalSequences = batch * channels, which for batch=256, channels=128, width=8192 gives totalSequences=32768. The tileLen computation: UB_BUDGET_BYTES / (kernelSize * sizeof(float)) = 192*1024/(3*4)=16384. That's fine. Then tileLen = AlignDown(16384, 2048) = 16384? Actually 16384/2048=8, so AlignDown(16384,2048)=16384. Then maxTile is 16384. That's fine. blockDim = CeilDiv(32768,16384)=2, then clamped to 8. So blockDim=8. Per block sequences = 32768/8 = 4096. So each block processes 4096 sequences. The kernel loops over each sequence, and for each output element (outputLen = (8192+0-3)/1+1 = 8190) loops over kernelSize (3) and does scalar DataCopy operations. That's 4096*8190*3 data copies of length 1 each. That's a lot of tiny copies, but shouldn't cause out-of-memory. The error "allocate more than 1EB memory" suggests the allocation size calculation overflowed or the tiling data is wrong.
+
+Maybe the issue is in the python bind: the tensor result is created with IntArrayRef {batch, channels, output_len}. That's fine.
+
+But the NPU out of memory error is likely because the kernel's per-block processing is too large or there is an infinite loop? The kernel uses a for loop over sequences, but the per-block sequences could be huge (4096). But that should be okay.
+
+Alternatively, maybe the issue is the tiling data struct alignment or size causing buffer overflow? The tiling data includes many fields. But the error says "Tried to allocate more than 1EB memory", which is a typical sign of trying to allocate an array with size computed from an unintended huge value, like using a negative int32 as uint32 leading to huge number.
+
+In the kernel, we use `negInfBuf_.AllocTensor<float>(1)` but we called `pipe_.InitBuffer(negInfBuf_, 1, sizeof(float))` which is correct. The scalarBufX_ and scalarBufY_ are initialized similarly.
+
+Wait: The kernel uses `AscendC::DataCopy(oneVal, xGm_[seq * width_ + idx], 1)` where `seq * width_ + idx` could be large but within total elements (32768*8192 ~ 268 million) which is large but still within int range. However, if `width_` is 8192 and `seq` is up to 4095, seq*width_ up to 33 million, plus idx up to 8191 gives ~33 million, which is fine as uint32.
+
+But the "1EB memory" error likely comes from the `pipe_.InitBuffer` calls? No.
+
+Maybe the problem is that the kernel is not using any local memory for data movement and instead doing scalar copies from global memory repeatedly, which may cause the NPU to allocate some internal buffers? Not sure.
+
+Alternatively, the issue might be in the python binding: `EXEC_NPU_CMD(aclnnCa6k00513Custom, self, kernel_size, stride, padding, result);` The aclnn function signature from autogen might be different. The autogen expects the operator name and parameters. The operator's attributes are kernel_size, stride, padding as ints. The aclnn call likely expects the tensors and attributes. We need to ensure the binding matches the generated aclnn header. The previous code used `EXEC_NPU_CMD(aclnnCa6k00513Custom, self, kernel_size, stride, padding, result);` which might be correct.
+
+But the error occurs during eval, not compile. The OP compiled successfully. So the issue is at runtime.
+
+Given the constraints, we need to fix the kernel to avoid the out-of-memory error. The previous kernel used a very inefficient scalar approach. Perhaps a better approach is to load a tile of input data (e.g., one sequence width) into local memory and then compute max pooling for all output positions in that sequence using vectorized operations. That would be more efficient and avoid many small DataCopies. But the error is out-of-memory, not performance.
+
+Maybe the out-of-memory is because each block processes many sequences (4096) and each iteration of the inner loop allocates scalar buffers (oneVal, maxLocal) which are freed each loop, but the pipe may hold them? Actually we allocate and free inside the sequence loop: `oneVal = scalarBufX_.AllocTensor<float>();` and `maxLocal = scalarBufY_.AllocTensor<float>();` then free them. That should be fine.
+
+But the kernel also has `negInfBuf_.AllocTensor<float>()` at the start of Process(), which is freed at the end. That's fine.
+
+Maybe the issue is that the tiling data is not being used correctly: `tileLen_` is set but never used. The kernel ignores tileLen and processes sequences one by one. That's fine.
+
+The out-of-memory error message "Tried to allocate more than 1EB memory" suggests a 64-bit overflow leading to huge allocation. This could happen if `pipe_.InitBuffer` is called with a size that is zero or huge. Let's check: `pipe_.InitBuffer(negInfBuf_, 1, sizeof(float));` size=4. `pipe_.InitBuffer(scalarBufX_, 1, sizeof(float));` size=4. `pipe_.InitBuffer(scalarBufY_, 1, sizeof(float));` size=4. All small.
+
+But note: In the previous attempt, the code had `pipe_.InitBuffer(negInfBuf_, 1, sizeof(float));` but the template for TQue with VECCALC position expects only size argument? Actually the TQue<TPosition::VECCALC, 1> is a queue of 1 buffer, and InitBuffer takes the number of buffers and the size of each buffer. So `pipe_.InitBuffer(negInfBuf_, 1, sizeof(float))` is correct.
+
+Maybe the problem is that the kernel is trying to access global memory beyond bounds due to wrong indexing? For example `xGm_[seq * width_ + idx]` where seq * width_ could exceed the total length? But totalSequences_ * width_ is the total elements. If totalSequences_ is 32768 and width_ is 8192, product is 268,435,456, which is within uint32 max (4.29e9). So no overflow.
+
+Wait: The error "NPU out of memory. Tried to allocate more than 1EB memory." could be from the NPU driver when trying to allocate a buffer for the output tensor? The output tensor size is batch * channels * outputLen = 256 * 128 * 8190 = 268,369,536 floats = 1.07 GB, which is large but not 1EB. So that's fine.
+
+Alternatively, the issue might be in the host operator code: InferShape computes outputLen = (width + 2 * padding - kernelSize) / stride + 1, but in the kernel we also compute the same. That's fine.
+
+Given the vague error, we need to redesign the kernel to be more standard and avoid potential bugs. I'll adopt a more vectorized approach: For each block, process a tile of sequences (load a chunk of input data, compute max pool over the width dimension using vector operations). But that's complex.
+
+Alternatively, since the error is out-of-memory, maybe the issue is that the previous kernel's `ProcessSequence` uses a for loop over outputLen (8190) and kernelSize (3), and inside the loop it does many scalar operations that cause the NPU to allocate some internal state that grows huge? Unlikely.
+
+Given the repair memory hints, they mention tiling struct conflict and integer-to-float casts, but those don't apply directly. However, memory 2 says: "do not directly cast totalSamples from uint32_t to float in the kernel; instead store totalSamplesFloat in tiling data and pass it as a separate parameter." That might be relevant: we are passing uint32_t values, and maybe somewhere there is an implicit conversion causing overflow? Not directly.
+
+Maybe the problem is that the kernel uses `negInf` as local scalar, but the `Max` operation on scalar tensors may require alignment? Or the `DataCopy` of 1 element may not be efficient but should work.
+
+Given the difficulty, I'll simplify the kernel to process one entire batch*channels sequence per block, but avoid the inner scalar loop by loading a full row of input (width) into local memory, then computing max pooling using vector max operations. That will be more efficient and avoid many tiny DataCopies. Also, the local memory usage can be bounded to the tile_len (which is the width? actually tileLen is supposed to be the number of sequences per tile, but the kernel ignored it). We need to ensure that we don't allocate too much local memory.
+
+Let's design a new kernel:
+
+- Each block handles a contiguous chunk of sequences (batch*channels). For each sequence, load the entire width into a local buffer (max width 8192, which is 32KB for float, fits in UB if budget is 192KB). But we need to handle arbitrary width; we can tile the width dimension as well. However, for simplicity, since width is 8192, and UB budget is 192KB, we can load the whole sequence at once (8192 floats = 32KB). Then for each output position, we compute max over a window of kernel_size using vector operations efficiently? Actually max pooling can be done by sliding window, but vectorizing with AscendC intrinsics might be complex. But we can still do scalar loops but on local data, which is faster and avoids global memory access overhead.
+
+But the out-of-memory error: maybe the previous kernel's scalar approach caused the NPU to run out of memory because each DataCopy of 1 element might trigger some internal allocation? In AscendC, DataCopy of small sizes might be inefficient but should not cause out-of-memory.
+
+Let's check the kernel's `Init` function: it does `pipe_.InitBuffer(negInfBuf_, 1, sizeof(float));` but then `negInfBuf_` is of type `TQue<TPosition::VECCALC, 1>`. The VECCALC position is for intermediate computation buffers. The InitBuffer for VECCALC should specify the number of buffers and the size of each buffer. It seems correct.
+
+Maybe the error is because `ProcessSequence` uses `scalarBufX_` and `scalarBufY_` as scalar tensors, but they are allocated and freed many times (for each output element, each kernel step). That might exhaust some resource. But with 8190 outputs * 3 = 24570 allocations per sequence, and 4096 sequences per block, that's 100 million allocations, which could cause out-of-memory on the scalar buffer pool? Not sure.
+
+Better: Allocate a local buffer of width floats for each sequence, load the whole sequence at once, then compute max pooling using a vectorized sliding window? But AscendC doesn't have a direct sliding max operation. We can implement using a loop over output positions and a vector max across the window using `AscendC::Max` on pairs, but that's still iterative.
+
+Given the constraints, I will fix the kernel to process one sequence at a time but load the entire sequence into a local buffer and compute the max pooling using a simple loop over local memory, thus avoiding global memory access per element. This should also reduce the number of DataCopy calls from 24570 per sequence to 1 per sequence (load) and 1 per output (store). But the out-of-memory error might still occur if the local buffer allocation is too large? width=8192 floats = 32KB, that's fine.
+
+I'll also ensure that the tiling data is correctly computed and that blockDim is not too high. The previous tiling gave blockDim=8, which is fine.
+
+Let's redo the kernel with a simpler but safe approach:
+
+- In Process, each block has a fixed number of sequences.
+- For each sequence, load the whole input row into a local tensor of size width_.
+- Then for each output index o, compute max over the window: start = o*stride - padding; iterate k from 0 to kernelSize-1, idx = start + k; if idx valid, take max.
+- Store the result to global memory.
+
+This will allocate two local buffers: one for input row (width_ floats) and one for output row? Actually output row length = outputLen_ which is about 8190, also fits in local memory. But we can store directly to global.
+
+We need to be careful about local memory budget: width_=8192 (32KB), outputLen_~8190 (32KB), plus some scratch. That's 64KB, within 192KB.
+
+But the kernel from previous attempt did not allocate any local buffer for the full row; it only allocated scalar buffers. So the previous kernel had relatively small local memory usage, so the out-of-memory error is puzzling.
+
+Maybe the issue is in the python binding: the aclnn call might be incorrect. The previous python_bind_src used `EXEC_NPU_CMD(aclnnCa6k00513Custom, self, kernel_size, stride, padding, result);` but the generated aclnn function might expect different parameter order. The aclnn header is autogenerated from the operator definition. The operator has attributes: kernel_size, stride, padding. The aclnn function likely expects the input tensor, then the attributes, then output tensor? I'm not sure. But since compilation succeeded, the header exists. The runtime error might be due to incorrect attribute passing. For example, the aclnn call might expect int64_t but we pass int? That might cause memory corruption.
+
+Given the error is "NPU out of memory" and not a mismatch, it's likely a resource allocation issue in the kernel.
+
+I'll modify the kernel to use a more standard vectorized approach that avoids many small allocations. Also, I'll ensure the tiling data is correctly defined and that the kernel uses `tileLen_` to limit per-iteration workload (though the current kernel processes sequences one by one, not tiles of elements). But the kernel ignores tileLen, which might be fine.
+
+Another possibility: The previous kernel used `AscendC::DataCopy` with length 1 many times, which might cause the DMA engine to run out of descriptors? That could lead to out-of-memory? Possibly.
+
+Given the lack of clear root cause, I'll provide a corrected version that uses a more standard tiling pattern: load a tile of input elements (multiple sequences) into local memory, compute max pooling vectorially, and store. But that's complex for max pooling with sliding window. I'll keep the per-sequence approach but load the whole sequence into local and compute max pool using scalar loop on local data, which eliminates many DataCopy calls.
+
+Additionally, I'll fix a potential bug: In the previous kernel, `negInf` is allocated from `negInfBuf_`, but we never freed it before reusing it? Actually we free it at the end of Process, but inside ProcessSequence we don't touch it. That's fine.
+
+But note: In ProcessSequence, we allocate `oneVal` and `maxLocal` from `scalarBufX_` and `scalarBufY_`, and then free them. That should be fine.
+
+Maybe the out-of-memory is because the blockDim is 8, and each block tries to allocate the same local buffers, but there are 8 blocks concurrently, each with its own pipe, which should be fine as they have separate memory.
+
+Given the time, I'll implement a fix that avoids the repeated allocation/free of scalar buffers by moving them outside the loops. Also, I'll change to load the whole sequence into a local buffer.
+
+Here's the plan:
+
+1. In kernel Init, allocate two local buffers: `seqBuf_` of size width_ (to hold one sequence), and maybe a scratch buffer for max. But we can reuse the same buffer for max computation by doing in-place? Actually we need to keep input for computing max. We can allocate `inBuf_` of size width_ and `outBuf_` of size outputLen_ (or compute on the fly store to global). But to minimize memory, we can compute max directly and store to global without outBuf.
+
+We'll do:
+- After loading the sequence into `seqBuf_`, for each output index o, loop over kernel window on `seqBuf_` and compute max. Store result to global.
+
+We'll only need `seqBuf_` (width_ floats) and possibly a scalar for current max.
+
+But then we still do scalar ops on local tensor indices. In AscendC, accessing local tensor elements via `seqBuf_(idx)` is allowed? In kernel_operator.h, LocalTensor has operator() for indexing? I think it does. But the previous kernel used `maxLocal(0) = ...` which works. So we can use `seqBuf_(idx)`.
+
+To avoid many small memory allocations, we can allocate `seqBuf_` once per block (outside sequence loop) and reuse it. Similarly, we can have a scalar local tensor for max.
+
+Thus in Init, we allocate:
+- `seqBuf_` of width_ floats (maybe via a TQue<VECIN> for loading data? Actually VECIN is for input queue. We can use a single buffer queue of size width_. 
+Better: Use a simple AllocTensor from a pre-allocated buffer. But to keep it simple, we can use `pipe_.InitBuffer(inQueue_, BUFFER_NUM, width_ * sizeof(float));` and then allocate tensors from that queue. But BUFFER_NUM=2 gives double buffering, which we don't need for per-sequence processing. We can use a single buffer.
+
+But the previous kernel used TQue for scalar buffers; for a larger buffer, we can use the same pattern.
+
+I'll redesign the kernel:
+
+```
+class KernelCa6k00513Custom {
+public:
+    __aicore__ inline void Init(...) {
+        // ... set parameters
+        pipe_.InitBuffer(inQueueX_, 1, width_ * sizeof(float));
+        pipe_.InitBuffer(outQueueY_, 1, outputLen_ * sizeof(float));
+        pipe_.InitBuffer(maxBuf_, 1, sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        // per block sequences
+        for seq in range:
+            // Load sequence
+            LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+            DataCopy(xLocal, xGm_[seq * width_], width_);
+            // Compute max pool
+            LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();
+            LocalTensor<float> maxLocal = maxBuf_.AllocTensor<float>();
+            for uint32_t o = 0; o < outputLen_; ++o) {
+                int32_t start = static_cast<int32_t>(o * stride_) - static_cast<int32_t>(padding_);
+                maxLocal(0) = -__builtin_inff();
+                for (uint32_t k = 0; k < kernelSize_; ++k) {
+                    int32_t idx = start + static_cast<int32_t>(k);
+                    if (idx >= 0 && idx < static_cast<int32_t>(width_)) {
+                        if (xLocal(idx) > maxLocal(0)) maxLocal(0) = xLocal(idx);
+                    }
+                }
+                yLocal(o) = maxLocal(0);
+            }
+            DataCopy(yGm_[seq * outputLen_], yLocal, outputLen_);
+            maxBuf_.FreeTensor(maxLocal);
+            outQueueY_.FreeTensor(yLocal);
+            inQueueX_.FreeTensor(xLocal);
+    }
+};
+```
+
+But this still does scalar comparison in inner loop, which is okay. It avoids the previous many DataCopies.
+
+However, we need to ensure that the local buffer sizes are within UB budget. width_ = 8192, outputLen_ = 8190, that's about 32KB each, total 64KB + scalar = fine.
+
+But note: The previous kernel had no such local buffers, so it used less local memory. So why out-of-memory? Maybe it's because the `DataCopy` with length 1 many times causes the DMA engine to queue many small transfers, exhausting some resource.
+
+This new kernel will have only one DataCopy per sequence for input and one for output, which is much fewer.
+
+Also, I'll fix the tiling: the tiling data should include the output shape. In the host tiling, we have totalSequences, width, kernelSize, stride, padding, outputLen, tileLen, blockDim. That's fine.
+
+I'll also ensure that the kernel uses the tiling data correctly: the tiling data includes tileLen which is not used in this new approach (since we process one sequence at a time). We can ignore it or use it to limit the number of sequences per tile? But for simplicity, we'll process all sequences assigned to block.
+
+Potential overflow: seq * width_ could exceed total elements if seq is large? We guard start/end sequences.
+
+Also, need to handle the case where outputLen_ is zero (if kernel > width after padding). The reference model doesn't handle that, but we can assume positive.
+
+Now, the python binding: I'll keep as before, but ensure the aclnn call is correct. The autogenerated aclnn function signature might be `aclnnCa6k00513Custom(const at::Tensor& x, int64_t kernel_size, int64_t stride, int64_t padding, const at::Tensor& out)`. That matches the previous binding.
+
+But maybe the issue is that the binding passes `result` as a reference, but EXEC_NPU_CMD expects a pointer? Actually EXEC_NPU_CMD macro typically handles it. We'll keep.
+
+Also, the operator definition in host_operator_src must match the project_json. The project_json has attributes kernel_size, stride, padding as int. Good.
+
+Now, to avoid the NPU out of memory, I'll also adjust the tiling to set blockDim to a reasonable value. The previous had blockDim=8, which is fine. But maybe the totalSequences is 32768, and we divide into 8 blocks, each processing 4096 sequences. Each sequence uses local buffers of ~64KB, so per block local memory ~64KB * number of sequences processed concurrently? Actually the kernel processes sequences sequentially, so at any time only one sequence's data is in local. So local memory per block is about 64KB, well within UB budget (192KB). So should be fine.
+
+Given the new design, the kernel should not run out of memory.
+
+Let's also add a check: if tileLen_ is zero, return.
+
+I'll now write the corrected code.

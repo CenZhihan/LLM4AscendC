@@ -1,0 +1,145 @@
+We need to produce six Python string variables with the correct content. The error logs show that the previous attempt did not include 'kernel_src' and 'python_bind_src' in the txt bundle (they were missing or blank). The root cause is that the generated code in the previous attempt had a truncated kernel_src (comment "// block block block...") and likely empty python_bind_src. We must provide full implementations.
+
+We need to implement a fused MaxPool2d operator. The reference: nn.MaxPool2d(kernel_size=2, stride=2). Input shape: (16,3,3072,1536). Output shape: (16,3,1536,768). Since it's MaxPool2d, we can implement a single kernel that performs max pooling.
+
+We'll use a custom operator named Ca6k00342Custom / ca6k_00342_custom. The kernel will process N*C channels separately, each channel as a 2D matrix (H x W). We'll tile along H dimension for simplicity.
+
+Constraints: Keep behavior unchanged, use minimal changes relative to the previous attempt's structure but fix the missing sections.
+
+Note: The previous attempt's kernel_src was incomplete (truncated after "const uint32_t block block block"). We need to write a complete kernel. Also python_bind_src was empty. We'll provide them.
+
+We must follow the example given: the example had 6 strings. We'll produce similar strings.
+
+Let's outline:
+
+project_json_src: JSON with op "Ca6k00342Custom", inputs: x (float ND), output: y (float ND), attrs: kernel_size and stride (both int, default 2). But we know kernel_size=2, stride=2 from reference; we can set defaults as 2.
+
+host_tiling_src: Define tiling data structure with N, C, H, W, H_out, W_out, kernel_size, stride. Actually we might not need all, but keep consistent.
+
+host_operator_src: TilingFunc, InferShape, InferDataType, OpDef registration. Note that InferShape computes output shape from input shape and stride.
+
+kernel_src: The kernel implementation. We'll write a kernel that for each (n,c) channel, processes the input in tiles along H. Since the reference uses stride=2, we can implement directly: for each output row i (0 to H_out-1), compute max over input rows 2*i and 2*i+1, and over columns j in [0, W_out-1] take max over columns 2*j, 2*j+1. However, doing this with vectorized operations on AscendC might be tricky. We can use local tensors and loop over rows.
+
+We need to consider tiling and block distribution. The previous attempt sets blockDim = N*C, which is 48 (16*3). That is reasonable. Each block handles one channel. Within a block, we can process the H dimension by tiling. We'll tile the rows of the input for that channel, but since output rows are half, we need to process two input rows to produce one output row.
+
+Simplify: For each (n,c) block, we have input H rows. We'll tile along rows: process a chunk of rows at a time. But with stride=2, each output row requires two input rows. We could load two input rows, compute max over them, produce one output row. That can be done in a loop over H_out.
+
+We'll allocate local buffers for two input rows and one output row.
+
+Let's design:
+
+- Each block handles one (n,c) pair. BlockIdx = n*C + c.
+- Input per channel: H*W floats.
+- Output per channel: H_out*W_out floats.
+
+We'll tile the rows: for each output row index i from 0 to H_out-1, we load two input rows (at positions 2*i and 2*i+1) from global memory. Since W up to 1536, we can fit two rows (3072 floats) in UB. Then we compute max for each of the W_out output elements: for each j in [0, W_out-1], output[i][j] = max(input[2*i][2*j], input[2*i][2*j+1], input[2*i+1][2*j], input[2*i+1][2*j+1])? Wait, MaxPool2d with kernel_size=2, stride=2, no padding: each 2x2 block reduces to one element. So output element at (i,j) is max of input[2*i][2*j], input[2*i][2*j+1], input[2*i+1][2*j], input[2*i+1][2*j+1]. So we need to load four values. But we can load two rows and then iterate over columns.
+
+Alternatively, we can compute the max in a loop: for each j, compute max of the four values. That is scalar ops but can be vectorized? Possibly we can use VecMax reduction. Simpler: use scalar loops inside the kernel, but AscendC supports vector operations. We can load contiguous segments.
+
+Given W=1536, W_out=768. We can process columns in tiles of up to 256 or 512 to use vector max. We'll load a chunk of each row, then compute max across the 2x2 neighborhoods.
+
+Implementation plan:
+
+- For each output row i:
+  - Load input row 2*i and 2*i+1 into local tensors row0, row1 (each of length W).
+  - For output column block j_block from 0 to W_out-1 step tileCol:
+    - Extract columns: from row0 and row1, load segments of length 2*tileCol? Actually we need to gather pairs. Simpler: process column by column in loop, using scalar max. Since W_out=768, total per channel operations = 768 * H_out = 768 * 1536 = ~1.18e6, which is fine in a kernel. But to be efficient, we could use vector max by loading two rows and then using shuffle? Might be complex. Since the reference is just a simple pool, scalar is acceptable.
+
+But note: AscendC kernel operators like MaxPool2d are available as built-in? However, the task is to write custom kernel. We'll keep it simple: each block processes its channel fully in a loop over output rows.
+
+We'll allocate local tensors for two input rows and one output row (tiled along columns). We'll set tile size for columns: e.g., 64 or 128. For each column tile, we load 2*tileSize elements from each row? Actually we need to load 2 rows * tileSize elements from each row? Let's decide: For each output column group, we need a contiguous segment of input columns: indices [2*j, 2*j+2*tileCol-1] from both rows. So we can load two local tensors of length 2*tileCol from global. Then compute max for each output column within that tile.
+
+But the max over 2x2 is not directly vectorizable to produce one output per 2 inputs. We could use a custom loop: for k in 0..tileCol-1: compute max(row0[2*k], row0[2*k+1], row1[2*k], row1[2*k+1]). That's scalar but we can unroll.
+
+Given simplicity, we'll do a scalar loop over all output columns, processing each element individually. That avoids complexity and should work for the given sizes.
+
+However, we must ensure UB usage: we need temporary tensors for input rows (2 * W floats) and output row (W_out floats). W=1536, W_out=768. Total floats = 2*1536 + 768 = 3840 floats = 15360 bytes, well within UB. We can allocate them as local tensors.
+
+So kernel per block:
+
+```
+__aicore__ inline void Process()
+{
+    uint32_t n = GetBlockIdx() / C_;
+    uint32_t c = GetBlockIdx() % C_;
+
+    // Pointers to global memory for this channel
+    float* x_channel = xGm_.GetPtr() + n*C_*H_*W_ + c*H_*W_;
+    float* y_channel = yGm_.GetPtr() + n*C_*H_out_*W_out_ + c*H_out_*W_out_;
+
+    // Local tensors for two input rows and one output row
+    AscendC::LocalTensor<float> row0 = localBufRow0_;
+    AscendC::LocalTensor<float> row1 = localBufRow1_;
+    AscendC::LocalTensor<float> outRow = localBufOutRow_;
+
+    for (uint32_t i = 0; i < H_out_; i++) {
+        // Load two input rows
+        AscendC::DataCopy(row0, x_channel + (2*i)*W_, W_);
+        AscendC::DataCopy(row1, x_channel + (2*i+1)*W_, W_);
+        // Compute output row
+        for (uint32_t j = 0; j < W_out_; j++) {
+            float v0 = row0(2*j);
+            float v1 = row0(2*j+1);
+            float v2 = row1(2*j);
+            float v3 = row1(2*j+1);
+            float m = v0;
+            if (v1 > m) m = v1;
+            if (v2 > m) m = v2;
+            if (v3 > m) m = v3;
+            outRow(j) = m;
+        }
+        // Store output row
+        AscendC::DataCopy(y_channel + i*W_out_, outRow, W_out_);
+    }
+}
+```
+
+But need to initialize local tensors from pipe. We'll allocate buffers in Init.
+
+Okay, let's write the six strings.
+
+Note: The previous attempt had host_operator_src but it didn't include the OpDef registration? It only had TilingFunc and InferShape/InferDataType, but missing the class that inherits OpDef and the OP_ADD macro. I see in the example they had that. So we need to include that as well.
+
+Also python_bind_src: need to include code that registers the op and provides a function. Use EXEC_NPU_CMD with aclnnLeakyReluCustom? For our custom op, we need to generate aclnn calls? The example used EXEC_NPU_CMD with a specific op name. We'll similarly define a python binding that calls EXEC_NPU_CMD(aclnnCa6k00342Custom, ...) but note: EXEC_NPU_CMD expects a valid aclnn operator. Since we are using custom op, we need to have the AscendC operator registered. The python_bind_src in example registered a custom implementation using TORCH_LIBRARY_IMPL and PYBIND11_MODULE. We'll follow that pattern: define a function that calls the custom operator via EXEC_NPU_CMD with the operator name "ca6k_00342_custom". We must ensure the operator name matches. We'll use "Ca6k00342Custom" as op type in JSON, but the kernel function name is "ca6k_00342_custom"? In example, kernel function name = "leaky_relu_custom", op type = "LeakyReluCustom". The host operator uses "LeakyReluCustom" as class name and OP_ADD(LeakyReluCustom). So we follow: kernel entry = "ca6k_00342_custom", op type = "Ca6k00342Custom". EXEC_NPU_CMD macro expects the second argument to be the operator name (like aclnnLeakyReluCustom). But EXEC_NPU_CMD likely generates a call to aclnnOpName. In the example, they used "aclnnLeakyReluCustom". So we should use "aclnnCa6k00342Custom". Also ensure the function signature matches.
+
+We'll produce python_bind_src similar to example:
+
+```
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor ca6k_00342_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty({self.size(0), self.size(1), self.size(2)/2, self.size(3)/2}, self.options());
+    EXEC_NPU_CMD(aclnnCa6k00342Custom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("ca6k_00342_custom", &ca6k_00342_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("ca6k_00342_custom", &ca6k_00342_impl_npu, "MaxPool2d custom kernel (Ca6k00342Custom on NPU)");
+}
+```
+
+But note: the operator has no attrs passed from python? In the reference, the model has kernel_size and stride as init args. But in the forward, they are fixed. The custom op can have attrs embedded in the op definition, and the python binding just calls the op with default attrs? Actually the example called `leaky_relu_custom(x, negative_slope)` with two args. In our case, the op takes only x as input (since kernel_size and stride are attrs with default values). So the python binding function should take only self tensor. That's fine.
+
+model_src: We need to define ModelNew class that uses the custom op. Since the op name is "ca6k_00342_custom", we call getattr(custom_ops_lib, _FN)(x). But note: the custom op returns output; we must ensure output shape matches.
+
+Now we must also ensure the host_operator_src includes the OpDef class and OP_ADD macro. The previous attempt omitted that. We'll include it.
+
+Also, we need to set blockDim appropriately. For MaxPool2d, we can set blockDim = N*C (48). That is fine.
+
+Let's write the strings.
+
+Careful: The previous attempt's error says "txt bundle missing blocks: ['kernel_src', 'python_bind_src']". So we must include those blocks. They were probably empty or omitted in the actual output. In our answer, we must ensure they are present and filled.
+
+Now produce the final answer: a code block with six assignments.
+
+We'll write each string using triple double quotes (no raw prefix) for consistency with example. But we can use ''' if needed. Example used """ for some strings. We'll use ''' for most.
+
+Also, ensure no leading whitespace after the opening ```python line.
+
+Let's write.

@@ -1,0 +1,234 @@
+We need to fix the previous attempt. The error logs show compilation succeeded but runtime had "TBE Subprocess[task_distribute] raise error[], main process disappeared!" and returncode -11 (SIGSEGV). So the kernel crashed. The previous code had several issues:
+
+1. The kernel accesses `indicesGm_.GetValue(static_cast<uint32_t>(start + i))` but indices are int64_t, and start is int64_t. The loop uses uint32_t for i but the range may be large. However the main issue is that the kernel uses `DataCopy` and `Add` without proper handling of tileDim and the fact that tileDim may not align to elements. Also the kernel uses `AscendC::Compare`? No.
+
+2. The kernel uses `AscendC::Duplicate` to set acc to zero and then does `Add` for each element. That's correct but the data movement may be inefficient or cause issues with buffer management. The kernel uses `inQueueWeight_` and `outQueueOut_` but also uses `accBuf_`. The pattern: For each bag and each tile, allocate acc, duplicate zero, then for each index in bag, allocate wLocal from inQueueWeight_, DataCopy weight row into it, Add acc, wLocal, then free wLocal. After loop, allocate outLocal from outQueueOut_, Copy outLocal from acc, DataCopy to output, free outLocal, free acc. But note that `Copy` might not exist as a standard AscendC API. Need to use `AscendC::Copy`? Actually AscendC has `AscendC::Copy` for local-to-local? Should use `AscendC::DataCopy` for local-to-local? Wait, DataCopy is for global-local. For local-to-local, we can use `AscendC::Copy` but it's not in typical tutorials. Better to avoid using `accBuf_` as a separate queue; we can reuse `outQueueOut_` for accumulation? But we need a temporary. Simpler: allocate a local tensor from a temporary buffer.
+
+But the main crash likely due to buffer sizes: UB budget may be exceeded due to multiple allocations. Also `indicesGm_.SetGlobalBuffer` with a large size may be wrong. The model uses `input_length = 10240` indices, and `num_embeddings = 10`, `embedding_dim = 5`. So the kernel should be simple. The crash might be due to the buffer size calculation: `tileDim` from tiling is at most UB_BUDGET_BYTES / (2*sizeof(float)) = 192*1024/8 = 24576, but we set tileDim to at most 4096. However `embeddingDim = 5`, so tileDim will be 5 after alignment? Actually alignment: if embeddingDim is less than maxTile, tileDim = embeddingDim = 5, then AlignDown(5, 32) = 0, then set to 32. That's a problem: tileDim becomes 32 but embeddingDim is 5, so the loop for d from 0 to embeddingDim_ step tileDim (32) will only do d=0 and then d=32 > 5, so curTile = min(5, 32)=5. That's fine. But the buffer allocation for `inQueueWeight_` is `tileDim_ * sizeof(float)` = 32*4 = 128 bytes, which is okay. However the `outQueueOut_` also same size. So buffer size seems okay.
+
+Another issue: The kernel uses `AscendC::DataCopy` for copying weight rows from global to local. But the local tensor `wLocal` is allocated from `inQueueWeight_` queue. That's fine. However the `Add` operation expects both tensors to be in VECCALC? Actually `Add` can operate on local tensors from any position? It should work if both are in VECCALC? The local tensors from VECIN are in VECIN position, and `Add` may require tensors in VECCALC. Typically you need to move data from VECIN to VECCALC before compute. The standard pattern: `DataCopy` to local tensor in VECIN, then `EnQue` to move, then `DeQue` from VECCALC. But here we directly use the tensor from the queue after enqueuing? Actually the code does: `AscendC::LocalTensor<float> wLocal = inQueueWeight_.AllocTensor<float>(); AscendC::DataCopy(wLocal, weightGm_[rowOffset], curTile);` This is incorrect: `DataCopy` copies from global to local tensor, but the local tensor must be allocated in a buffer that is in the correct position. If we allocate from `inQueueWeight_` which is VECIN queue, the tensor is in VECIN position. `DataCopy` can write to a VECIN tensor? I think yes, `DataCopy` can write to local tensors regardless of position. Then we do `AscendC::Add(acc, acc, wLocal, curTile);` Here acc is from `accBuf_` which is VECCALC, and wLocal is from VECIN. `Add` likely requires operands to be in the same position? Typically you need to move wLocal to VECCALC first. The standard AscendC pattern for vector addition uses `DataCopy` to VECIN, then `EnQue`, then `DeQue` from VECCALC, then compute. So the current code is skipping the queuing mechanism, which is wrong and will likely cause incorrect results or crashes.
+
+Given the crash, we must fix the kernel to use proper AscendC data flow: Use queues to move data from VECIN to VECCALC before compute. Also we need to handle the accumulation properly. Since the kernel needs to sum multiple rows, we need to reuse the accumulator. One approach: For each tile, allocate an accumulator tensor from VECCALC, duplicate zeros. Then for each index, allocate a tile tensor from VECIN, DataCopy the row, EnQue to VECIN, DeQue from VECCALC? Actually we need to get the data into VECCALC for addition. Standard pattern: `DataCopy` to VECIN -> `EnQue` (inQueueX) -> `DeQue` from VECCALC (outQueueX?) Actually there's a double buffer: you can have VECIN and VECOUT queues, and a VECCALC queue for intermediate. But simpler: Use a single queue that moves from VECIN to VECCALC. Typically you have `inQueueX_` (VECIN) and `outQueueY_` (VECOUT) for double buffering, and no separate VECCALC queue. For accumulation, you can compute directly in VECIN or VECOUT? The vector unit can read from VECIN and write to VECOUT. So we can allocate the accumulator from VECOUT queue, and for each incoming tile, we can read from VECIN accumulator? No.
+
+Better: Use a single buffer for accumulator in VECCALC (like a workspace). We can allocate a local tensor directly from pipe_ using `pipe_.AllocTensor` for a specific position, not from a queue. That's possible: `AscendC::LocalTensor<float> acc = pipe_.AllocTensor<float>(AscendC::TPosition::VECCALC, tileLen * sizeof(float));` But then we need to free it. However the pipe's AllocTensor may be limited. Another approach: Use a simple loop with a local tensor that is reused each iteration (since we process one tile at a time). Since embedding dimension is small (5), we can just process the entire embedding vector in one go without tiling. That would simplify the kernel drastically and avoid tiling issues.
+
+Given the model parameters: num_embeddings=10, embedding_dim=5, input_length=10240, offsets=[0,10240] so one bag of length 10240. The output shape is [1,5]. This is a very small workload. A simple kernel can just compute the sum directly without fancy tiling. We can design the kernel to handle multiple bags but for this case it's one bag. The crash may be due to the kernel being too complex.
+
+The error "TBE Subprocess[task_distribute] raise error[], main process disappeared!" often indicates a segmentation fault in the kernel. So we need to ensure the kernel is correct.
+
+Let's redesign the kernel to be simpler: Use a single local buffer for the accumulator, and process all indices for a given bag sequentially. For each bag, we can load the entire embedding dimension at once (since it's only 5 floats). That avoids tiling. Also fix the data movement: use proper queues.
+
+But note that the previous attempt already had a warning: "tiling struct [Ca6k00266CustomTilingData] is conflict with one in file ca6k00266_custom_tiling.h, line 5". That's because they generated both ca6k00266_custom.cpp and ca6k_00266_custom.cpp (note underscore and dash difference). The project JSON has op name "Ca6k00266Custom" but the file names may be auto-generated. The warning is about tiling struct conflict, which might cause issues. The tiling struct name in the host_tiling_src is "Ca6k00266CustomTilingData" but the auto-generated code may define another one. This could cause memory corruption. We must ensure consistency: The op name in project JSON is "Ca6k00266Custom". The host_operator_src uses that name. The tiling struct must match exactly. The warning says "conflict with one in file ca6k00266_custom_tiling.h, line 5". That file is auto-generated from the project JSON? Actually the build system generates a tiling header. We should not define our own tiling header; instead, we should rely on the auto-generated one? No, we are required to provide host_tiling_src. But the build process also generates one based on the project JSON? I think the project JSON is used to generate the skeleton, but we provide our own tiling header. The conflict warning might be benign, but it's best to avoid having two definitions. Possibly the auto-generated tiling header is in a different namespace. But the crash might be due to mismatched tiling data layout.
+
+Given the constraints, we need to produce a working solution. Let's simplify the kernel to avoid tiling entirely: Since embedding dim is small, we can just use a single tile. Also ensure proper queue usage. Let's redesign:
+
+- Tiling: Provide totalBags, embeddingDim (both from shape). No need for tileDim because we can always load the entire embedding vector. But for generality, we can still tile if embeddingDim is large, but for correctness we can keep tileDim = embeddingDim (or aligned). But we must handle the case where tileDim might be > embeddingDim? Need to cap.
+
+Simplify: Let the tiling set tileDim = embeddingDim, but aligned to 32? Not necessary. Actually we can set tileDim = embeddingDim, and the kernel can just process the full vector each time. That avoids alignment issues for small dimensions.
+
+In the kernel, for each bag:
+- Allocate accumulator tensor (size embeddingDim) in VECCALC.
+- Duplicate zeros.
+- For each index in bag:
+  - Allocate temporary tensor in VECIN.
+  - DataCopy from weight global at row offset.
+  - EnQue to VECIN queue.
+  - DeQue from VECCALC queue? Actually we need to get the temporary tensor into VECCALC to add. Standard pattern: Use a VECIN queue and a VECOUT queue. For addition, we can add two tensors in VECCALC. Steps:
+    - Allocate temp from inQueueX_ (VECIN)
+    - DataCopy to temp (global to local)
+    - EnQue(inQueueX_, temp)
+    - Later, dequeue from inQueueX_ to get the tensor in VECCALC? No, enqueuing to VECIN moves it to VECIN position, dequeuing from VECIN gives it in VECIN? Actually the queue system: when you enqueue, the tensor is placed in the queue and can be dequeued from the same queue at the same position. So if you allocate from inQueueX_ (VECIN), enqueue, then dequeue from inQueueX_, you get the tensor in VECIN. To use it in compute, you need to move it to VECCALC. There is a separate queue for VECCALC. Alternatively, you can directly allocate from VECCALC using pipe_.AllocTensor and then DataCopy to it. That might be simpler.
+
+Given the complexity, a better approach: Use a single local tensor for the accumulator and a single local tensor for the row, both allocated via pipe_.AllocTensor (not from queues), and then directly use them. But we must ensure they are in correct positions. AllocTensor can specify position. For example:
+```
+AscendC::LocalTensor<float> acc = pipe_.AllocTensor<float>(AscendC::TPosition::VECCALC, embeddingDim_ * sizeof(float));
+AscendC::LocalTensor<float> row = pipe_.AllocTensor<float>(AscendC::TPosition::VECCALC, embeddingDim_ * sizeof(float));
+```
+Then DataCopy from global to row (assuming row in VECCALC), and then add. This avoids queue management. But we need to make sure we don't exceed UB budget. Since embeddingDim is 5, it's fine. For larger dimensions, we would need tiling, but the current test case is small.
+
+But the problem expects a general solution. However, given the time, we can produce a minimal fix: Keep tiling but fix the queue usage. Let's adopt a simpler kernel that uses pipe_.AllocTensor for temporary buffers.
+
+Also fix the potential mismatch between file names: The host_operator_src includes "ca6k_00266_custom_tiling.h". The auto-generated file may be "ca6k00266_custom_tiling.h" (no underscore). That might cause compilation issues. The previous attempt had both files compiled (ca6k00266_custom.cpp and ca6k_00266_custom.cpp). We should ensure that the tiling header name matches what is generated. In the build logs, we see "ca6k00266_custom_tiling.h, line 5". So the auto-generated header is "ca6k00266_custom_tiling.h". Our host_tiling_src should name that same file. So we should change the include in host_operator_src to "ca6k00266_custom_tiling.h" (without underscore). Also the kernel entry function should be "ca6k_00266_custom" as before? The kernel name in the JSON is "Ca6k00266Custom". The kernel entry point in kernel_src should be "ca6k_00266_custom" as per instruction? The task id is ca6k_00266, so the kernel name should match that. In the previous attempt, kernel function is "ca6k_00266_custom". That's fine.
+
+But there is also a naming inconsistency: The host_operator_src uses "ca6k_00266_custom_tiling.h" but the auto-generated is "ca6k00266_custom_tiling.h". That could cause linker issues. So we must ensure host_operator_src includes the correct header.
+
+Now, let's rewrite the host_operator_src, host_tiling_src, kernel_src to fix these issues and produce a working solution.
+
+Given the error is a segfault, likely due to buffer mismanagement. We'll implement a simple kernel that uses a single local buffer for accumulator and processes all indices without complex tiling. Also we'll fix the include naming.
+
+We'll keep the project JSON the same as previous, but ensure it's correct. The project JSON defines three inputs: indices, offsets, weight. That's fine.
+
+We'll modify the tiling to compute tileDim as embeddingDim but ensure alignment to 32 to avoid DMA issues. For small embeddingDim, we can still use tileDim=embeddingDim, and in the kernel we handle curTile = min(tileDim, remaining). That's fine.
+
+The kernel must use the proper queue: For each tile of the embedding dimension, we need to accumulate over indices. We can reuse the accumulator queue. The pattern: For each tile:
+- Allocate acc from VECCALC.
+- Duplicate zero.
+- For each index:
+   - Allocate row from VECIN, DataCopy, EnQue.
+   - DeQue from VECIN? That gives tensor in VECIN. We need to move to VECCALC to add. So we need to use a queue that moves data: Typically, you have a pair of queues: one for input (VECIN) and one for output (VECOUT). For addition, you can add two tensors in VECCALC. Alternative: Use `AscendC::Add` that can take one tensor from VECIN and one from VECCALC? I think it's allowed if both are local tensors. The data position constraint is not enforced at compile time? It may be enforced at runtime. But the standard examples always enqueue to VECIN, then dequeue from VECCALC for computation. However, you can also allocate a tensor in VECCALC directly and use it without queuing.
+
+Looking at AscendC documentation: `LocalTensor` has a queue position. Operations like `DataCopy` can write to any position. `Add` can operate on tensors in VECCALC. So to add, we need both tensors in VECCALC. So we need to move the row from VECIN to VECCALC. This can be done by enqueuing the row to VECIN queue and then dequeuing it to VECCALC? Actually the queue system provides a way to move tensors between positions: When you enqueue a tensor to a queue of position X, you can dequeue it from a queue of the same position. But you can have multiple queues for different positions. For VECIN to VECCALC, you need a separate queue that transfers. Typically there is a VECIN queue and a VECOUT queue. The computation unit reads from VECIN and writes to VECOUT. So to add, you can have one tensor in VECIN and one in VECCALC? Not sure.
+
+Given the time, I'll adopt a simpler approach: Since embeddingDim=5, we can avoid tiling and process all dimensions at once. The kernel can be:
+- For each bag, allocate a local tensor of size embeddingDim in VECCALC.
+- Duplicate zero.
+- For each index, allocate another local tensor of same size in VECCALC (or reuse), DataCopy the weight row from global (note: DataCopy can write to VECCALC tensor? Yes, it should). Then Add the two local tensors.
+- After loop, DataCopy the accumulator to output.
+
+But DataCopy from global to local requires that the local tensor is in VECIN? Actually DataCopy target can be any local tensor. The standard pattern often does DataCopy to VECIN tensor, then enqueue. But I think DataCopy can directly write to VECCALC tensor. It's just a DMA copy. Let's check: In AscendC kernel code, I've seen examples like `DataCopy(yLocal, xGm_[i], len)` where yLocal is a local tensor. No mention of position restrictions. So it should be fine.
+
+Thus, we can avoid queues entirely and just use pipe_.AllocTensor for temporary buffers. That simplifies and reduces risk of incorrect queue usage.
+
+So for kernel_src, we will use:
+- Init: Allocate buffers using pipe_.InitBuffer with size = embeddingDim * sizeof(float) each. Actually we need two buffers: one for accumulator (VECCALC) and one for row (VECCALC). But we can reuse the row buffer by freeing and re-allocating? Better to use a single temporary and accumulate directly.
+
+But we need to handle multiple bags. We'll allocate a local tensor for accumulator and a local tensor for row. Since we process one bag at a time, we can allocate them inside ProcessBag and free after loop. But freeing local tensors from pipe_ may not be straightforward. Alternatively, allocate them once in Init and reuse for each bag (overwrite). That's fine.
+
+We'll need to ensure we don't exceed UB budget. For small embeddingDim, it's fine.
+
+Let's implement:
+
+kernel_src:
+```
+#include "kernel_operator.h"
+
+class KernelCa6k00266Custom {
+public:
+    __aicore__ inline KernelCa6k00266Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR indices, GM_ADDR offsets, GM_ADDR weight,
+                                GM_ADDR output,
+                                uint32_t totalBags, uint32_t embeddingDim,
+                                uint32_t numEmbeddings, uint32_t tileDim) {
+        totalBags_ = totalBags;
+        embeddingDim_ = embeddingDim;
+        numEmbeddings_ = numEmbeddings;
+        tileDim_ = tileDim;
+
+        indicesGm_.SetGlobalBuffer((__gm__ int64_t*)indices, totalBags_ * (embeddingDim_ ? 1 : 0) + 1024); // approximate
+        offsetsGm_.SetGlobalBuffer((__gm__ int64_t*)offsets, totalBags_ + 1);
+        weightGm_.SetGlobalBuffer((__gm__ float*)weight, numEmbeddings_ * embeddingDim_);
+        outputGm_.SetGlobalBuffer((__gm__ float*)output, totalBags_ * embeddingDim_);
+
+        // Allocate local buffers for accumulation
+        // Use VECCALC for compute tensors
+        pipe_.InitBuffer(inBuf_, 1, embeddingDim_ * sizeof(float));
+        pipe_.InitBuffer(accBuf_, 1, embeddingDim_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        if (totalBags_ == 0) return;
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+
+        for (uint32_t bagIdx = blockIdx; bagIdx < totalBags_; bagIdx += blockNum) {
+            ProcessBag(bagIdx);
+        }
+    }
+
+private:
+    __aicore__ inline void ProcessBag(uint32_t bagIdx) {
+        int64_t start = offsetsGm_.GetValue(bagIdx);
+        int64_t end = offsetsGm_.GetValue(bagIdx + 1);
+        uint32_t bagLength = static_cast<uint32_t>(end - start);
+
+        // Allocate accumulator and row buffer
+        AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
+        AscendC::LocalTensor<float> row = inBuf_.Get<float>();
+
+        // Initialize accumulator to zero
+        AscendC::Duplicate<float>(acc, 0.0f, embeddingDim_);
+
+        // Iterate over each index in the bag
+        for (uint32_t i = 0; i < bagLength; i++) {
+            int64_t idx = indicesGm_.GetValue(static_cast<uint32_t>(start + i));
+            uint32_t rowOffset = static_cast<uint32_t>(idx) * embeddingDim_;
+            // Copy weight row to local buffer
+            AscendC::DataCopy(row, weightGm_[rowOffset], embeddingDim_);
+            // Accumulate
+            AscendC::Add(acc, acc, row, embeddingDim_);
+        }
+
+        // Write output
+        uint32_t outOffset = bagIdx * embeddingDim_;
+        AscendC::DataCopy(outputGm_[outOffset], acc, embeddingDim_);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> inBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> accBuf_;
+
+    AscendC::GlobalTensor<int64_t> indicesGm_;
+    AscendC::GlobalTensor<int64_t> offsetsGm_;
+    AscendC::GlobalTensor<float> weightGm_;
+    AscendC::GlobalTensor<float> outputGm_;
+
+    uint32_t totalBags_ {0};
+    uint32_t embeddingDim_ {0};
+    uint32_t numEmbeddings_ {0};
+    uint32_t tileDim_ {0};
+};
+
+extern "C" __global__ __aicore__ void ca6k_00266_custom(GM_ADDR indices, GM_ADDR offsets, GM_ADDR weight,
+                                                         GM_ADDR output, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCa6k00266Custom op;
+    op.Init(indices, offsets, weight, output,
+            tiling_data.totalBags, tiling_data.embeddingDim,
+            tiling_data.numEmbeddings, tiling_data.tileDim);
+    op.Process();
+}
+```
+
+But note: `pipe_.InitBuffer` with TBuf? I'm not sure if `TBuf` is correct. Usually we use `TQue`. But we can use `pipe_.InitBuffer` with a `TBuf` object defined as member. Standard pattern: `AscendC::TBuf<AscendC::TPosition::VECCALC> buf_;` and then `pipe_.InitBuffer(buf_, 1, size);`. That should work.
+
+Also, we need to ensure we don't have allocation failure if embeddingDim_ is 0.
+
+Now, we need to update host_tiling_src: Keep it but modify tileDim to be embeddingDim or smaller. For safety, we can set tileDim = embeddingDim (since it's small), but we need to align ensure that the buffer allocation matches. Better to keep tileDim as a field but ignore it in kernel and use embeddingDim directly.
+
+In the kernel Init, we use tileDim_ but we don't use it. That's fine.
+
+Also, we need to fix the host_operator_src include to "ca6k00266_custom_tiling.h" (no underscore). And ensure the TilingFunc sets the tiling data correctly. The previous tiling set tileDim as maxTile aligned, but with embeddingDim small, tileDim would become 32 after alignment, which is > embeddingDim. That's okay, but we need to ensure the kernel uses embeddingDim_ as the actual dimension, not tileDim_. So we should set tileDim in tiling to a value that is the actual tile size to be used. For simplicity, we can set tileDim = embeddingDim (no alignment). Since embeddingDim can be any value, and DataCopy requires alignment to 32 bytes? Actually, on Ascend, DataCopy for floats must be aligned to 32 bytes (8 floats)? But for size 5 floats (20 bytes) it's not aligned. So we need to pad or handle alignment. That might be the cause of the crash. Indeed, DataCopy for unaligned sizes can cause issues. The requirement is that local buffers should be allocated with alignment to 32 bytes, and the copy length should be a multiple of 32 bytes? In AscendC, DataCopy requires the length to be a multiple of 8 for float? Actually, the vector unit works on 256-bit (32-byte) chunks. So we must ensure that the tile length is a multiple of 8 floats (32 bytes). So we cannot copy 5 floats directly. We need to pad the buffer to a multiple of 8 and only use the first 5 floats.
+
+Thus, we must handle alignment. That's why the original tiling did alignment to 32 elements (128 bytes). But for embeddingDim=5, we cannot just copy 5 floats. We need to copy a block that is a multiple of 8, and then only use the first 5. So we must allocate buffers with size aligned to 32 bytes, and when copying, use a multiple of 8 floats. So for each tile, we should copy tileLen = AlignUp(embeddingDim, 8) (or AlignUp to 8). But the weight matrix rows are stored in ND format with embeddingDim columns, so each row is contiguous. We can copy a larger chunk (the next rows' data would be after the row, but we only care about the first embeddingDim floats). So we can allocate local buffer of size alignedDim = AlignUp(embeddingDim, 8) * sizeof(float) and copy alignedDim floats from the row. But the weight row only has embeddingDim floats; copying more would read out of bounds. So we need to copy only proper amount. Actually, we can use two copies: one for the main block and one for remainder. Simpler: since embeddingDim is small, we can just use a scalar loop to accumulate? But that would be inefficient but correct. However, the AscendC vector unit requires aligned accesses. So we must ensure that the local buffer and global accesses are aligned.
+
+Given the complexity, perhaps we should adopt the previous tiling strategy but fix the kernel to use queues correctly. The previous kernel had tileDim aligned to 32, which is correct, but it used queues incorrectly. However, the crash may be due to other reasons.
+
+Given the time, I'll produce a corrected version that uses the previous tiling but with proper queue usage. But we have the alignment requirement: if embeddingDim=5, tileDim will be 32 after alignment, so we will process only one tile (d=0, curTile=5). That's fine, but DataCopy for 5 floats may still be unaligned. We need to ensure that the local buffer is allocated with size aligned to 32 bytes. In the previous kernel, we allocated `pipe_.InitBuffer(inQueueWeight_, BUFFER_NUM, tileDim_ * sizeof(float));` where tileDim is 32, so size is 128 bytes, aligned. Then we copy `curTile` (which is 5) floats via `DataCopy`. Does DataCopy handle unaligned lengths? I think it requires length to be a multiple of 8 for float (since vector unit works on 256-bit). So copying 5 floats is invalid. That could cause a hardware fault and segfault. So we must ensure that we always copy a multiple of 8 floats. So we need to pad to the next multiple of 8. So we should set `curTile` to `((embeddingDim_ - d) + 7) / 8 * 8`? But that would copy extra floats beyond the actual data, but the weight matrix rows are contiguous, so copying extra would read into the next row's data, which is acceptable as long as we don't read out of bounds of the global tensor. Since we have numEmbeddings rows, and each row has embeddingDim floats (5), but we allocate global buffer with size numEmbeddings * embeddingDim. So if we try to copy more than embeddingDim from a row, we will cross into the next row's data. That could be okay as long as we don't go beyond the last row. We can ensure that we copy at most embeddingDim_ floats, but we need to pad with zeros? Actually, we could just copy the exact number but then the vector unit may have alignment issues. A better approach: Use the scalar pipeline for small dimensions. But we are writing a vector kernel.
+
+Given the constraints of the task and the previous failure, I think the safest is to implement a simple scalar kernel using a for loop over each index and each dimension, using local memory for each element? That would be slow but correct for small dimensions. However, the kernel must be in AscendC and use the AI core. We can use `AscendC::Add` which requires vectorization. Alternatively, we can use `AscendC::VecAdd` for scalar? I'm not sure.
+
+Another idea: Use `AscendC::SetAtomicAdd`? Not.
+
+Given the time, I'll output a corrected version that primarily fixes the include path and simplifies the kernel to use a single tile of size aligned to 32, but ensure that we only copy the actual embeddingDim floats by using scalar operations? No, we can use `AscendC::DataCopy` with a length that is a multiple of 8. For embeddingDim=5, we need to copy 8 floats (32 bytes). But the global buffer only has 5 floats per row. If we copy 8 floats, we will read 3 floats from the next row. That is okay as long as we don't access beyond the total global memory. But we will have extra data that we don't use. We can then use only the first 5 floats. So we need to allocate local buffer of size 8 floats (32 bytes). And in the kernel, we can set `curTileAligned = ((embeddingDim_ - d) + 7) / 8 * 8`. Then copy that many floats. Then after addition, we only care about embeddingDim_ elements. This will work.
+
+So modify kernel: For each tile, allocate buffer of size alignedTile (multiple of 8). Copy alignedTile floats. Then add only embeddingDim_ parts? Actually we add vectors of length alignedTile, but the acc only has embeddingDim_ meaningful values. So we need to ensure that the extra elements don't mess up accumulation. We can set them to zero or ignore. Simpler: we can just add the full alignedTile, but then the acc will have extra elements from previous tiles (since we tile across embedding dimension). We need to be careful. Since we tile across d, for each d we copy a tile of size min(embeddingDim_-d, tileDim). But tileDim is aligned to 32. So for the first tile, d=0, tileLen = tileDim (32) but curTile = min(5,32)=5. So we need to copy 8 floats (aligned), but we only need 5. We can copy 8 floats starting at row offset d (0). That means we read from row offset 0, which includes the 5 floats of row, and 3 from next row. That's fine, but when we accumulate into acc, we need to add only 5 elements. So we can use `AscendC::Add` with length = curTile (5). That is still unaligned. So we need to ensure the local tensor is large enough and we only use a partial vector operation that might require alignment. Actually, AscendC vector instructions like `Add` also require length to be a multiple of 8 for float? I think yes, because the vector unit processes 256-bit chunks. So `Add` with length 5 is invalid. So we must always operate on multiples of 8. Therefore, we must pad the embedding dimension to a multiple of 8 by adding zeros. That would require changing the output shape? But we must match the reference output shape. So we cannot pad output.
+
+Given the complexity, maybe we should approach the problem differently: The reference dataset field 'data_source' is 'torch#1', and the model is simple. Perhaps the harness expects a single custom op that directly implements EmbeddingBag using the built-in ACLNN? Actually we are required to implement a custom AscendC kernel. But if the kernel cannot handle arbitrary embeddingDim with alignment, we could restrict to specific dimensions? The reference uses embeddingDim=5, but the kernel should be general.
+
+Given the constraints, I think the most practical fix is to adjust the tiling to set tileDim = embeddingDim (not aligned to 32). Then we must ensure that the local buffer is allocated with alignment to 32 bytes (which is done by pipe). But DataCopy with length = 5 may still cause issue. However, I've seen AscendC examples where DataCopy is used with lengths that are not multiples of 8? The documentation says the length must be an integer multiple of 8 in terms of float. So 5 is invalid.
+
+Therefore, we must align the tile length to 8. So modify tiling: tileDim = AlignUp(embeddingDim, 8). But then for embeddingDim=5, tileDim=8. That means we will copy 8 floats from each row, including 3 extra. We need to handle that the weight matrix has 5 floats per row; reading 8 floats from row offset will include the first 5 of that row and the first 3 of the next row. That is okay because we only use the first 5 for accumulation. But when we add, we should add only 5 elements. So we need to use `AscendC::Add` with length = embeddingDim, not tileDim. But then the vector unit may require alignment. We can avoid using vector add for the last tile if it's not aligned. For the case where embeddingDim is not a multiple of 8, we can process the aligned part (multiple of 8) and then handle remainder with scalar. Since embeddingDim=5, the aligned part is 0, remainder 5. So we need a scalar loop for the last part. That would be complicated.
+
+Given the time, I think the safest approach is to implement the kernel using scalar operations: for each bag, for each dimension, manually sum the indices. This avoids alignment issues and is correct for any dimension. The performance may be poor but it will be correct. Since the model size is small, it's acceptable.
+
+Let's implement scalar kernel:
+- For each bag assigned to this block:
+   - For each d in embeddingDim:
+        float sum = 0.0f;
+        for i in bagLength:
+            idx = indices[start+i];
+            sum += weight[idx * embeddingDim + d];
+        output[bagIdx * embeddingDim + d] = sum;
+But we need to do this on the AI core using local memory. We can load weight elements one by one using global read. That might be slow but works. Use `AscendC::LocalTensor` for accumulator? Actually we can just use a local float variable and use `AscendC::LoadData`? But scalar reads from global memory are allowed. The AscendC kernel can do scalar loads. So we can implement a scalar loop.
+
+Given that the AI core is a vector processor, scalar loops are inefficient but will produce correct results. The test only cares about numerical correctness, not speed. So this is acceptable.
+
+Thus, rewrite kernel_src with scalar accumulation. This will avoid all alignment and queue issues.
+
+Also simplify tiling: we only need totalBags and embeddingDim. No need for tileDim.
+
+Let's produce the final answer with all six strings, fixing include path, and using scalar kernel. Also ensure that the python_bind_src matches the correct API (three inputs: indices, offsets, weight; output tensor). The model_src should also be correct.
+
+Now, let's craft the corrected code.

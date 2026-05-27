@@ -1,0 +1,155 @@
+We need to fix the previous attempt. The error log shows a vector core execution error ("aivec error") during evaluation. The kernel is attempting to implement nanmedian on AscendC, but the approach of doing element-wise conditionals and scalar reads (GetValue, SetValue) inside a loop is likely causing the problem. AscendC vector cores are designed for vectorized operations, not scalar loops with many small DataCopy calls. The error "When the D-cache reads and writes data to the UB, the response value returned by the bus is a non-zero value" suggests memory access issues, possibly due to unaligned or out-of-bounds accesses, or using DataCopy with length 1 repeatedly (which is inefficient and may hit hardware limits). The kernel also uses a naive quickselect algorithm with many small copies and scalar comparisons. This is not suitable for AscendC.
+
+Given the constraints (keep behavior unchanged, minimal changes), we need to redesign the kernel to be more vector-friendly. However, nanmedian is inherently a reduction with non-linear logic (ignoring NaNs, finding median). On AscendC, the best approach is to use a two-pass: first, for each row (along dim), count non-NaN values and load the entire row into UB (if row size fits), then run a sorting or selection algorithm entirely in UB, then write back median and index. But the input shape: (512000, 3). So rowSize=3, columns=512000. That's tiny rows! That means the median of 3 numbers (ignoring NaNs) is straightforward: sort the three numbers (skipping NaNs) and pick the middle. Actually nanmedian: the median of non-NaN elements. For a row of size 3, median is the second smallest (after removing NaNs). So we can implement a simple per-row logic without complex algorithms.
+
+But the previous kernel tried to do a quickselect per row, which is overkill and caused issues with many small DataCopy calls (each DataCopy of length 1 is bad). Also, the kernel assumed columns (number of rows) equals blockDim, but blockDim is set to min(columns, 24). That's fine. Each block handles one row. For rowSize=3, we can simply load the 3 floats into a local tensor of size 3 (or even use scalar reads with SetValue but better to load whole). Then compute median manually.
+
+The error likely stems from the loop over rowSize_ with tileLen_=1024, but rowSize_=3, so it will copy 3 floats, then loop again? Actually the loop: for offset=0; offset<rowSize_; offset+=tileLen_. With tileLen_=1024, offset=0 and curLen=3, then offset+=1024 > rowSize so loop ends. So it copies 3 floats per row. That should be fine. But then it does scalar reads with GetValue inside loops, which may be okay if small. However, the quickselect part does many DataCopy of 1 element (ReadOneFloat) and more loops. That's likely the cause.
+
+Simplify: For each row, load the entire row (3 floats). Then count non-NaN values. If none, output 0.0 and 0. Else, we can simply sort the three values (using if statements) and pick the median. That avoids any DataCopy inside loops.
+
+Also, the output shapes: values should be (512000,) and indices (512000,). The kernel currently writes to valuesGm_[blockIdx] and indicesGm_[blockIdx]. That's correct.
+
+Now, the tiling: rowSize=3, tileLen could be 3 (or aligned to 1). We should set tileLen to align to 1 (small). UB budget is huge, but we need to initialize buffers. For rowSize=3, we can just use a buffer of size 3. But we also need a small buffer for temporary if needed. Simpler: load the 3 floats into a local tensor of size 3. Then compute median.
+
+Also, the kernel's Init allocates inQueueX_ with tileLen_ elements. If tileLen_=3, that's fine.
+
+We need to adjust the tiling to set tileLength = rowSize (since we load entire row). Also it's better to set blockDim = min(columns, 24) as before.
+
+Now, let's produce corrected code. The approach:
+
+- Host tiling: set tileLength = rowSize (3), or if rowSize is larger, use aligned tile but for this case rowSize=3.
+- Kernel: For each block (handles one row), load the row of length rowSize into local tensor using a single DataCopy. Then count non-NaN manually using a loop over the local tensor (scalar). Then determine median: if nonNaN == 0 => 0,0; if nonNaN==1 => that value and its index; if nonNaN==2 => average? Wait torch.nanmedian: for even number of elements, median is the middle value (not average). Documentation: "median of the non-NaN elements; if the number of non-NaN elements is even, median is the smaller of the two middle values" (I think it's the lower median). Actually PyTorch: nanmedian returns the median of non-NaN values; for even count, it returns the smaller middle value (same as median). So for nonNaN count 2, median is the smaller of the two (since sorted, median = first value? Let's check: median of [1,2] is 1? No, median of [1,2] typically average but PyTorch's median returns the lower middle value for even length. Yes, torch.median([1,2]) returns 1. So we need to handle that. For rowSize=3, nonNaN could be 0,1,2,3. For 3, median is the second smallest (index 1 after sorting ignoring NaN). For 2, median is the smaller (since sorted [a,b] -> median is a). For 1, median is that element.
+
+We'll implement simple sort of up to 3 values using if statements.
+
+Also need to handle the case where dim is not 1? The reference uses dim=0, so the shape is (512000,3) and dim=0 means we compute median over the 512000 elements per column? Wait, dim=0 means reduce along first dimension, resulting shape (3,). But the reference output: torch.nanmedian(x, dim=self.dim) returns values and indices of shape (3,) (since reducing along dim 0). So we need to change our approach: the kernel should compute median over rows (dim 0), not per row. The previous attempt mistakenly treated each row (dim=1) as the reduction axis. The reference Model uses dim=0, so we need to reduce along the first dimension. That means for each column (3 columns), we compute median of 512000 elements (with NaNs). That is a large reduction, not per-row. The error arises because the kernel tried to allocate per-block per-row, but blockDim=24 and columns=512000? Actually columns = totalLength / rowSize, and they set rowSize= dim=0 dimension? They computed rowSize = shape[dim] but dim=0 means shape[0]=512000, so rowSize=512000, columns=3. Then blockDim = min(columns,24)=3. So only 3 blocks, each handles a column of 512000 elements. That is correct. But then the kernel tried to compute median of 512000 elements with NaNs per block, using quickselect with many small copies. That is heavy but could be vectorized? However, the quickselect algorithm involves many passes over the data, each with DataCopy of tileLen (1024) and scalar comparisons. That might be too slow and cause timeouts? But the error is vector core exception, possibly due to memory access violations.
+
+The main issue may be that the kernel uses AscendC::DataCopy with length 1 in ReadOneFloat, and also uses GetValue/SetValue on local tensors that may not be properly aligned? Also the use of AscendC::LocalTensor::GetValue is allowed but may have restrictions on sizes. However, the error code "0x20000001c" indicates an access error.
+
+A simpler approach for nanmedian on large rows (512000) is to sort or use a histogram? But on AscendC, we can implement a selection algorithm using vectorized operations. However, the prior attempt's quickselect is the right idea but the implementation is buggy: the quickselect modifies lowIndex/highIndex but also re-reads from global memory each time; it may have out-of-bounds accesses or infinite loops. Additionally, the pivot selection reads three values with DataCopy of length 1 each time, which could cause misalignment issues.
+
+Given the time, we should simplify: since the row size is large, but we can use a two-pass: first count non-NaN and collect values into a local buffer? UB size is 192KB = 49152 floats, so we can't hold the whole row (512000). So we need a streaming algorithm. Quickselect is okay, but we must implement it correctly with proper vectorized operations. However, the error suggests memory issues. Perhaps we can use AscendC's built-in sorting or median functions? There is no direct median but we can use a reduction. But we can implement a selection using a combination of vectorized min/max and partitioning? That's complex.
+
+Maybe the root cause is that the kernel uses `AscendC::DataCopy` with a length that is not aligned to 16 bytes or 32 bytes? For float, a length of 1 is 4 bytes, which may be okay but could cause issues if the global address is not aligned? The global tensor is likely aligned. But DataCopy for 1 element should work.
+
+However, the error "D-cache reads and writes data to the UB ... non-zero value" suggests a bus error, possibly from writing to global memory incorrectly. The kernel writes `valuesGm_.SetValue(blockIdx, medianVal);` - SetValue is scalar and should work if the global tensor is properly set. But `valuesGm_` is declared with totalLength (512000*3=1,536,000), but we only write blockIdx (0,1,2) for each block, which is fine.
+
+Perhaps the problem is that the kernel uses `AscendC::DataCopy` with `xGm_[colStart + offset]` where colStart + offset may exceed bounds? For rowSize=512000, colStart = blockIdx * rowSize_ (0, 512000, 1024000). Then offset loops up to rowSize_ - tileLen_ (512000-1024). The max offset is 511000, so colStart+offset max = 1024000+511000=1535000, which is less than totalLength=1536000. So within bounds.
+
+Another potential issue: The kernel uses `inQueueX_` for multiple DataCopy calls in sequence, but it only allocates one tensor at a time, and enqueues and dequeues properly. That should be fine.
+
+Maybe the error is due to the large number of DataCopy calls (each tile of 1024 floats, 500 tiles per block, 3 blocks = 1500 calls) causing a timeout? But the error is vector core exception, not timeout.
+
+Given the difficulty, a minimal fix could be to reduce the tile size to something small like 64 or 128, and avoid the quickselect algorithm entirely by using a simpler approach: copy the entire row into UB in chunks, then run a selection algorithm only on the portion that fits? That won't work for median.
+
+Alternatively, we can use AscendC's built-in sort or median via `AscendC::Sort` or `AscendC::Median`? There is `AscendC::Median` in some API? I recall there is `AscendC::Median` for vector reduction. Let me check the AscendC documentation: There is `AscendC::Median` function that computes median of a vector. Yes, in kernel_operator.h there is `AscendC::Median(LocalTensor<T> dst, LocalTensor<T> src, uint32_t len)`. That would be ideal. But it might not support NaN handling. We can handle NaN by replacing NaN with some sentinel (like INF) before computing median? Actually, we need to ignore NaNs. We could first mask them out: replace NaN with a large positive value (or negative) and then compute median, but median would include those values. Instead, we can count non-NaN and then use a selection. But perhaps the AscendC Median function ignores NaN? I doubt it.
+
+Given the constraints and time, the most pragmatic fix is to simplify the kernel to avoid the quickselect and use a straightforward approach: for each column (block), we can sort the entire column using a batched sort? That's too heavy.
+
+Maybe the issue is specific to the previous implementation's use of `GetValue` inside a loop that may cause the vector core to stall. We can replace the scalar comparisons with vectorized operations: use `AscendC::Compare` and `AscendC::Select` to implement the partitioning. But that is still complex.
+
+Alternatively, we can change the algorithm to use `AscendC::Sort` to sort each column? But we would need to store the entire column in UB, which is not possible.
+
+Wait, the input shape: (512000,3) with dim=0 => we reduce along dim 0 to get shape (3,). So per column, we have 512000 elements. We can process each column in tiles, and for each tile, we can compute a local sorted list? That won't give global median.
+
+Given the error is vector core exception, maybe the quickselect loop is causing a hang due to an infinite loop when NaN handling goes wrong. For example, if pivotPos becomes out of bounds? Let's examine the quickselect code: It picks pivot using median-of-three but if those values are NaN, it seeks first non-NaN. Then it counts less and equal. But the loop continues until lowIndex > highIndex. However, after partitioning, it sets lowIndex = pivotPos+1 or highIndex = pivotPos-1. This is a standard quickselect but it doesn't actually partition the data; it just counts based on pivot value, then adjusts bounds. This is a counting-based selection (like quickselect with counting, not swapping). That should work. But there might be a bug: the counting loops over all elements again each time, which is fine. But the pivotPos may not be within [lowIndex, highIndex] after adjustments? Actually, pivotPos is chosen from the original array, but after we shrink the search interval, the pivotPos may be outside the new interval. That's okay because we only use it to update lowIndex/highIndex. But the pivot value might not be in the interval if the pivot's value is not in the current interval? For example, if we pick a pivot that is the maximum, then after first iteration, highIndex becomes pivotPos-1, and the pivot is at the original high end. That's fine. However, if the pivot value appears multiple times, the equal count may be large. The algorithm seems plausible.
+
+But the error might be due to the infinite loop if maxIter runs out? We have maxIter=200, which should be enough for up to 512000 elements (logarithmic). But with many NaNs, it could take more? Actually, quickselect on average O(n), but worst-case O(n^2) if pivot is bad. For 512000 elements, 200 iterations might not be enough if the pivot selection is poor. But we have a safeguard to break.
+
+However, the vector core exception suggests a hardware error, not a software loop. It could be due to accessing global memory with SetValue on a tensor that is not properly aligned or has incorrect size. The kernel declares `valuesGm_` with totalLength (1,536,000), but the output values tensor is of size (3,) not (1,536,000). The kernel writes to `valuesGm_.SetValue(blockIdx, medianVal)`. That uses blockIdx as the index (0,1,2), which is fine. But the global tensor size is totalLength, so it's writing to offset 0,1,2. That's okay.
+
+Similarly, indicesGm_ is size totalLength but we write to blockIdx.
+
+One more issue: The kernel's Process() function uses `AscendC::GetBlockNum()` and `AscendC::GetBlockIdx()`. These are valid.
+
+Maybe the error is due to the fact that the kernel uses `AscendC::LocalTensor::GetValue` which returns a float, but the local tensor may not be fully in registers and there might be alignment constraints. The AscendC documentation says that GetValue is allowed but may be slow and should be used sparingly. Using it in a loop over 512000 elements per block is a lot. That might cause the vector core to execute many scalar instructions, leading to a timeout? But the error is not timeout.
+
+Given the severity, I'll simplify the kernel to avoid GetValue/SetValue as much as possible. We can implement a median by copying the entire column into a global buffer? No.
+
+Actually, we can use a different algorithm: use a histogram-based median if values are within a range? Float range is large.
+
+Better: Use the AscendC API `AscendC::Median` if it exists. Let me check the AscendC kernel_operator.h standard functions. In the AscendC documentation, there is `AscendC::Median` for computing median of a vector. Example: `Median(LocalTensor<T> dst, LocalTensor<T> src, uint32_t len)`. This computes the median of the elements in src and writes to dst (scalar). It likely ignores NaN? Not sure. But we can test with assumption it works. However, we need to process the entire column (512000) which doesn't fit in UB. So we would need to stream.
+
+Given the complexity, the safest minimal fix is to change the approach to use a single-pass algorithm that works on tiles and accumulates a sorted list of a few elements? That's not possible for median.
+
+Another idea: Since the row size per column is 512000, which is divisible by 512? We can use a reduction approach: first compute the number of non-NaN elements per column, then in a second pass compute the median using a selection that uses vectorized comparison and counting. However, this requires two passes over the data: one to count non-NaN, second to find the median. The counting pass can be done with a vectorized comparison (Compare with NaN? AscendC has `IsNan`?). There is `AscendC::IsNan` function? I think there is `AscendC::Equal` with `AscendC::IS_NAN`? Actually, AscendC provides `AscendC::IsNan()` for local tensors? Let's check: In kernel_operator.h, there is `AscendC::IsNan(LocalTensor<T> dst, LocalTensor<T> src, uint32_t len)`. Yes, it exists. So we can efficiently count non-NaN elements per tile using vectorized operations: `IsNan` produces 1 for NaN, then we sum to count NaN, subtract from tile length.
+
+Similarly, for median selection, we can use a quickselect that uses vectorized comparisons to count elements less than a pivot, and also to partition? But we don't need to partition the data; we only need to count. So we can implement the same counting-based quickselect but using vectorized operations to count less/equal in each tile. That would be much more efficient and avoid scalar GetValue entirely.
+
+Also, we can avoid small DataCopy calls by using a tile size that fits in UB (like 4096 or 8192) and process the entire column in chunks.
+
+Thus, corrected kernel plan:
+- Use a tile size of 4096 or 8192 floats (16KB or 32KB). UB budget 192KB, we can have multiple buffers.
+- Preprocess: count total non-NaN elements per column using vectorized IsNan and ReduceAdd (or pipelined sum).
+- Then quickselect: for each iteration, choose pivot (median of three from global reads? We can read three values via DataCopy of 1 element? Still problematic. Instead, we can pick pivot as the first non-NaN element from the first tile? Or we can read the first three non-NaN elements from the column? That would require scanning. Alternative: use the median of a small sample (e.g., from first tile). That's okay.
+- For counting less/equal, process each tile: load tile, compare with pivot (vectorized), get mask, then reduce sum (vectorized) to get count less and equal. This can be done with `AscendC::Compare` and `AscendC::ReduceAdd`. Also need to handle NaN (skip by using IsNan to mask them out). So we can compute: valid = not NaN; less = (val < pivot) AND valid; equal = (val == pivot) AND valid. Then sum them.
+
+- For reading pivot values, we still need to read individual floats. But we can read them using DataCopy of 1 element? That might still be okay if done only a few times (3 per iteration). The iteration count is O(log N) ~ 20 for 512000. So about 60 small DataCopy calls, which is acceptable. The previous kernel had many more due to quickselect scanning all elements each iteration? Actually, each iteration it did DataCopy for each tile to count less/equal, but that's also done. The small DataCopy for pivot reads is only 3 per iteration. So that's fine.
+
+- However, the previous kernel used DataCopy of 1 element in ReadOneFloat, which is used in pivot selection and also in the counting loops? Actually, the counting loops used tile-based DataCopy of 1024 elements, which is fine. The small ones are only for pivot reads. So the issue might not be the small reads.
+
+But the vector core exception could be due to the use of `AscendC::LocalTensor::GetValue` inside the counting loops: the loop over each element in the tile calls `GetValue(i)`. That is very scalar and may cause problems. We should replace that with vectorized comparisons.
+
+So the main fix: replace the scalar loops in counting with vectorized operations.
+
+Additionally, we need to ensure the tiling works for the new tile size. Also, the kernel should handle the case where the number of non-NaN is zero.
+
+We'll keep the same tiling: tileLength = 1024 (or adjust to 4096). We'll use a larger tile to reduce number of iterations.
+
+Let's produce corrected code.
+
+Also, the python_bind_src and model_src seem fine, but we need to ensure the output shapes: values shape (3,) and indices shape (3,). The kernel writes to valuesGm_ as a flat array of size totalLength (1536000) but only writes first three indices. That's okay but the output tensor is of shape (3,), so we should set the global tensor size to columns (3) not totalLength. We should adjust Init to use columns as the size for valuesGm_ and indicesGm_. The previous code used totalLength which is too large. That could cause out-of-bounds writes? No, we only write to indices 0,1,2. But the global tensor is declared with totalLength elements, which is 1536000. Writing to 0,1,2 is fine. However, the output tensor is (3,), so when copying back, it will read only the first 3 elements from the global memory? That's correct, because we only wrote those. But the global memory after that is uninitialized. That's okay.
+
+But to be safe, we should set valuesGm_ and indicesGm_ to size columns (3) rather than totalLength. That avoids potential issues with later reads.
+
+Let's implement the corrected kernel with vectorized counting.
+
+Also, we need to include <cmath> for fabs? Not needed.
+
+We'll use `AscendC::IsNan`, `AscendC::Compare`, `AscendC::ReduceAdd`.
+
+Implementation details:
+
+- In Process() for each block:
+  - First pass: count non-NaN elements over the column. We'll iterate tiles and use:
+    LocalTensor<float> xTile = inQueueX_.AllocTensor<float>();
+    DataCopy(xTile, xGm_[colStart + offset], tileLen);
+    LocalTensor<uint8_t> nanMask = ... // use IsNan
+    But we need a temporary tensor for mask. We'll allocate a local tensor of same size for mask (uint8 or float?) IsNan outputs float? Actually IsNan returns a LocalTensor<float> where 1 for NaN, 0 otherwise. So we can use that.
+    Then reduceAdd to sum NaN count, subtract from tileLen to get non-NaN count.
+  - After counting, if nonNaN==0, output 0,0 and return.
+  - Then determine median position k = (nonNaN-1)/2 (0-indexed).
+  - Then quickselect: low=0, high=rowSize-1, while low<=high:
+    - pick pivot: read three values at low, mid, high (handling NaN possibly)
+    - count less and equal using vectorized loops over the column again.
+    - adjust low/high as before.
+  - Then write median value and index.
+
+We must be careful: the pivot selection may choose NaN if the row has many NaNs. We handle by skipping NaNs in reading pivot: for each of the three positions, if value is NaN, we find the next non-NaN from the start or end? We can simply scan linearly from low to high to find a non-NaN pivot. That is safe and fast enough.
+
+We'll also need a small buffer for reading single floats.
+
+Now, let's write the corrected code.
+
+We'll set tileLength to 4096 (16384 bytes) to reduce number of iterations.
+
+Adjust tiling: set tileLen = min(UB_BUDGET_BYTES/(2*sizeof(float)), MAX_TILE_ELEMS) and align to 1024. For rowSize=512000, tileLen=4096.
+
+Now produce the six strings.
+
+Also, we need to fix the project_json: the output names should match the python bind: "values" and "indices". That's fine.
+
+The host operator: we need to adjust tiling data to include fields for totalLength, columns, rowSize, tileLength, dim, blockDim. That's fine.
+
+But we need to ensure the kernel uses the correct global tensor sizes: valuesGm_ should be set with size columns (number of output elements), not totalLength. So we'll add a parameter outSize = columns.
+
+Also, the kernel signature in "extern C" should include all parameters: x, values, indices, workspace, tiling. That's fine.
+
+We'll also add a workspace? Not needed.
+
+Let's write the corrected Python strings.
+
+Note: The previous attempt had a bug in the host operator: the InferShape for indices uses values_shape, but there is a potential issue when dim=0 and shape is (512000,3), output shape should be (3,). Our InferShape should compute correctly.
+
+Now, produce the final answer.

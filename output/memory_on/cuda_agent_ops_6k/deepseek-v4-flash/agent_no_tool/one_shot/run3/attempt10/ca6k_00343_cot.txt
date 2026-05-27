@@ -1,0 +1,145 @@
+We need to fix the previous attempt. The correctness fails because the output is all zeros. The core issue is that the kernel accesses global memory directly without using vectorized DMA copies (DataCopy) and local tensors. The previous kernel does a naive loop over global memory, which is extremely slow and likely not working correctly on Ascend NPU. The "conflict" warning about tiling struct is just a warning, not a fatal error.
+
+The key fix: The AscendC kernel must use vectorized operations: copy input data from global to local, compute in local, copy back. For AdaptiveMaxPool1d, we need to compute max over sliding windows. Since we need to compute max along the last dimension (L), and output size is smaller, we can tile along the first two dimensions (N*C). For each (n,c) slice, we process the entire L and compute outputSize values.
+
+We need to use BUFFER_NUM double buffering for input/output, and a temporary buffer for computation.
+
+But the original attempt's kernel does not use any local tensors (no TQue, no DataCopy). That's why it outputs zeros.
+
+We need to rewrite kernel_src to use proper AscendC API: DataCopy, local tensors, etc.
+
+Also, the tiling struct warning can be ignored if compilation passes. The real issue is correctness.
+
+Let's design a correct kernel:
+
+- Input shape: [N, C, L] float.
+- Output shape: [N, C, outputSize] float.
+- Block: each block processes a subset of (n,c) slices.
+- For each slice, we need to compute outputSize max values. The input length L can be large (100000). We need to tile the computation along L and also along output dimension? Actually for each output element, we need to scan a window of input. The window size is roughly L/outputSize (could be uneven). We can process each output element sequentially, but we need to load input data in chunks.
+
+Alternative: Since the input L is 100k and outputSize=32, we can load the entire input of one slice? That would be 100k floats = 400KB, which may exceed UB limit. UB budget per core is 192KB. So we cannot load whole slice at once. We need to tile the input and compute partial maxes per output bin, then merge.
+
+Better approach: Use local memory to hold intermediate max values for each output bin. Initialize them to -inf. Then iterate over input in tiles. For each input tile, we need to know which output bins it contributes to. Since the mapping from input positions to output bins is known (adaptive pooling divides into equal intervals), we can for each input element compute which output bin it belongs to, and update the max in that bin.
+
+This is like a scatter-max operation. We can compute bin index: bin = (i * outputSize) // L. Since L is large and outputSize is small (32), we can store per-slice output max values in local tensor (32 floats) and update them as we go.
+
+Given UB budget, we can allocate:
+- input tile buffer (say 8192 floats = 32KB)
+- output max buffer (32 floats = 128 bytes) (very small)
+- also need double buffering for input? Maybe single buffer for input, and we can double-buffer to hide latencies.
+
+Simplify: For each slice, we can process the entire L by iterating over tiles of input. Keep an array of output max values in local memory (size outputSize). Initialize to -inf. For each tile, for each element, compute bin index and update max. Finally, write output max values to global.
+
+This is a valid AscendC kernel. Need to ensure we use DataCopy for input tiles and DataCopy for output.
+
+We need to allocate local tensor for output max values. That's tiny.
+
+We also need to allocate a local tensor for the input tile. We'll use double buffering to overlap compute and data copy.
+
+But for simplicity, we can use single buffer with blocking: start copy, wait, compute, then copy next. However, double buffering is better.
+
+Let's use a pipe with two input queues (BUFFER_NUM=2) for input. Also a local tensor for output max values (single buffer, reused). And a local tensor for the output tile (we'll write output after all input tiles processed). Actually output size is only 32, so we can write it directly after all tiles.
+
+We need to be careful about the bin mapping: For each input index i (0..L-1), bin = (i * outputSize) // L. This is integer division. Since outputSize and L are known at compile-time? No, they are runtime attributes. We can compute bin for each element in the loop.
+
+Potential optimization: Precompute bin boundaries? Not necessary.
+
+Now, the kernel_src must use AscendC API correctly.
+
+Let's write the Init function:
+- Set global buffers.
+- Set N, C, L, outputSize.
+- Init pipe with inQueueX (2 buffers) of size tileLen * sizeof(float). Determine tileLen based on UB budget. We can compute tileLen in tiling data. But we can also hardcode a reasonable tile length like 8192 elements (32KB). Since L up to 100k, we may need multiple tiles.
+
+But we need to pass tileLength in tiling data to kernel. In previous attempt, tiling data didn't include tileLength. We need to add tileLength to tiling data. Or we can compute tileLen inside kernel based on UB budget. Safer to compute in tiling and pass.
+
+Thus we need to modify tiling data to include tileLength. We also need to ensure the tiling struct is consistent: define it only in host_tiling_src (header) and use GET_TILING_DATA macro which auto-includes the generated header. The warning "conflict" is because the tiling struct is also defined in the kernel? Actually kernel uses GET_TILING_DATA which generates code that matches the host tiling header. The warning says the struct definition in the host header conflicts with the one in the generated file? It might be a harmless warning. But we can avoid it by not duplicating definition.
+
+In the previous attempt, the host_tiling_src defined the struct, and kernel uses GET_TILING_DATA. That should be fine. The warning is likely from the opc tool comparing the host struct with the one inferred from kernel code. It's just a warning. So don't worry about that.
+
+The critical issue is that the kernel does not use local memory.
+
+Let's rewrite kernel_src entirely.
+
+Also, the python_bind_src: The function name in the binding should match the op name. We have "ca6k_00343_custom". That's fine. But we need to ensure the ACLNN function is aclnnCa6k00343Custom (capitalized according to op name). In the previous attempt, it matches.
+
+Now, the model_src: It expects init_inputs[1] as output_size. The reference model takes init_inputs: [in_channels, output_size]. So output_size is init_inputs[1]. That's correct.
+
+But note: The reference forward function does not use in_channels. So ModelNew only needs output_size.
+
+Now, we need to fix the kernel to actually compute adaptive max pool.
+
+We'll modify host_tiling_src to add tileLength. Also adjust blockDim calculation to be more robust. Actually we can just set blockDim to min(24, N*C) to cover all slices.
+
+But we also need to ensure that the kernel has enough UB for input tile buffer (2 * tileLen * sizeof(float)) plus output max buffer (outputSize * sizeof(float)) plus some overhead. We can compute tileLen in tiling: e.g., UB_BUDGET_BYTES = 184320 (180KB) leave margin, then tileLen = (UB_BUDGET_BYTES - outputSize*sizeof(float) - overhead) / (2 * sizeof(float)). We can set overhead = 4096. Then tileLen = (184320 - 128 - 4096) / 8 ≈ 22500? Actually (184320-128-4096)=180096, /8=22512. Align down to 4096? We can keep it simple: set tileLen = 8192 (32KB) to be safe.
+
+We'll add uint32_t tileLength to tiling data.
+
+Now, rewrite kernel_src.
+
+We'll need to implement Process() that loops over slices assigned to this block. For each slice:
+- Initialize local max array (outputSize_ floats) to -inf.
+- Loop over input tiles: compute start = tileIdx * tileLen, len = min(tileLen, L_ - start)
+- Copy that tile from global to local.
+- For each element i in tile, compute bin = ((start + i) * outputSize_) / L_. Update max if val > max.
+- After all tiles, write output max array back to global.
+
+To double-buffer input tiles, we can use two queues and prefetch next tile while computing current. But we also need to copy from local to local for max array? The max array is local. So we can do:
+
+```
+CopyIn(current tile); // async
+while(true) {
+  // Wait for current tile
+  LocalTensor<float> xLocal = inQueueX_.DeQue<float>();
+  // If next tile exists, start CopyIn for it
+  if(next exist) { CopyIn(next tile); }
+  // Compute on current tile
+  ComputeTile(xLocal, ...);
+  // Free current tile
+  inQueueX_.FreeTensor(xLocal);
+  // Advance
+  if(!next) break;
+}
+```
+
+But we need to be careful with double buffering indices.
+
+We also need to handle the output max array. Since outputSize is small, we can allocate it as a local tensor of size outputSize_ and keep it across tiles.
+
+We'll allocate a single local tensor for output max array (in outQueueY_? Actually we can allocate a temporary tensor from pipe for the max array. Or we can use a separate queue? Simpler: allocate a local tensor from pipe for the max array, reuse for each slice.
+
+Let's design:
+
+In Init, we will init pipe and allocate buffers. We also need a local tensor for output max. We can allocate it in tmpQueue_ (VECCALC) with one buffer. That will be used for temporary max values.
+
+But we need to initialize the max array to -inf. We can use AscendC::Muls or DupTensor? Use Muls with -inf? There's no direct -inf constant. We can use AssignValue or a helper. Can use a loop? But we can also do a vectorized fill using SetValue maybe? AscendC has Duplicate? Not sure. Safer to use a predefined constant and Muls? Since we need to set all 32 elements to a very negative number. Could use a fixed value like -1e38. We can do AscendC::Muls(tLocal, scalar, len) but it sets tLocal = scalar? Actually Muls(tLocal, tLocal, scalar, len) multiplies existing values. Not good. Better to use AscendC::AssignValue? There is a function `AscendC::VecArgMax`? No.
+
+Simpler: we can just loop over elements in scalar fashion for initializing the 32-element local array. That's fine because it's only 32 iterations.
+
+So in ProcessSlice, after allocating tLocal for max array, we can do a simple for loop to set each element to NEG_INF.
+
+That is acceptable.
+
+Now, we also need to copy output max array to global after all tiles. We can use DataCopy (scalar copy) for 32 floats. Use DataCopy(yGm_ + outOffset, tLocal, outputSize_).
+
+But DataCopy expects the second argument to be a LocalTensor. So we need to get a LocalTensor from the pipe for output? tLocal is already a local tensor. So we can do:
+
+```
+AscendC::DataCopy(yGm_[outOffset], tLocal, outputSize_);
+```
+
+But we need to ensure that tLocal is not freed before copy. We'll free after copy.
+
+Now, we need to decide on tileLen. Let's compute in tiling: use UB_BUDGET_BYTES = 184320. Our per-input-tile buffer: 2 * tileLen * sizeof(float) = 8 * tileLen bytes. Add output max array: outputSize_MAX * sizeof(float) (32*4=128). Plus maybe some overhead. So tileLen = (184320 - 128 - 4096) / 8 ≈ 22512. But we can set a hard cap like 16384 to be safe. We'll compute in tiling and pass as tileLength.
+
+Now, let's produce the corrected code.
+
+We need to keep the same project_json_src and host_tiling_src except add tileLength to tiling data and compute it.
+
+Also adjust host_operator_src to compute tileLength.
+
+Now, write the full corrected code.
+
+We must ensure naming consistency: kernel name is ca6k_00343_custom, op name is Ca6k00343Custom.
+
+Let's write the six strings.

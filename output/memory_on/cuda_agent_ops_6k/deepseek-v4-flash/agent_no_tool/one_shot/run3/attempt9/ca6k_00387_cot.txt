@@ -1,0 +1,118 @@
+We need to analyze the errors and fix them. The previous attempt had a vector core execution error (507035) at runtime. The kernel attempted to implement CTC loss manually with local tensors for targets and log probs rows, and used GetValue/SetValue extensively on local tensors (which may cause the vector core exception). The logs indicate "D-cache reads and writes data to the UB" error. The kernel is complex and uses many local tensor operations, possibly exceeding UB size or using incorrect addressing.
+
+Key observations from memory 4: accessing LocalTensor via GetValue/SetValue is the safe way, but the kernel already uses that. However, the kernel also uses DataCopy on a LocalTensor that was allocated with a certain size, but then uses GetValue on it for individual elements. That should be fine. The error might be due to using `inQueueTargets_` (BUFFER_NUM=1) and then EnQue/DeQue with a size that might be larger than allocated, or using `logProbsRowBuf_` with BUFFER_NUM=1 but reusing it in a loop.
+
+The kernel uses `logProbsRowBuf_.AllocTensor<float>()` inside the loop, then later `logProbsRowBuf_.FreeTensor(logProbsRow)` before next batch. But also there is a separate `tmpQueue_` which is used inside the loss computation and freed. The `inQueueTargets_` is used similarly.
+
+However, the vector core exception could be due to memory access violation: the local tensors might be too large or the pipe buffer size is insufficient. The kernel allocates two local tensors per iteration: one for targets (size maxTargetLen_ int32_t) and one for logProbs row (size numClasses_ float). maxTargetLen is 30, numClasses is 30. That's small. The tmp queue is tiny. So UB memory should be fine.
+
+But there is a serious issue: in the Process function, the kernel uses `AscendC::DataCopy(logProbsRow, logProbsGm_[gmOffset], numClasses_);` after having already allocated logProbsRow from the buffer. But note: `logProbsRowBuf_` is defined as a TQue<TPosition::VECIN, BUFFER_NUM> with `pipe_.InitBuffer(logProbsRowBuf_, BUFFER_NUM, numClasses_ * sizeof(float));`. However, `logProbsRowBuf_` is used as a queue but the kernel does not enqueue/dequeue properly; it just allocates and frees directly. That might be incorrect usage: a TQue is for double buffering with EnQue and DeQue, not for single allocation. The kernel uses `AllocTensor` and `FreeTensor` on a TQue, which might be allowed but could cause issues.
+
+Looking at the leaky_relu example, they used `pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));` and then `inQueueX_.AllocTensor<float>()`, `inQueueX_.EnQue(xLocal)`, `inQueueX_.DeQue<float>()`, `inQueueX_.FreeTensor(xLocal)`. That is the proper pattern. In our kernel, we are using `AllocTensor` and `FreeTensor` on the queues without proper EnQue/DeQue. This is likely causing the vector core exception because the underlying buffer management is not designed for direct allocation/free without queue operations.
+
+Also, the kernel uses `GetValue` and `SetValue` on local tensors, which is fine. But the `tmpQueue_` is also misused: they do `tmp = tmpQueue_.AllocTensor<float>();` then set values, call Exp, Log, then `tmpQueue_.FreeTensor(tmp);`. Again, no queue operations.
+
+The typical pattern for a simple kernel that doesn't need double buffering is to use `LocalTensor` allocated directly from a pipe's buffer using `pipe_.InitBuffer` and then `LocalTensor` pointer via `buf.AllocTensor<float>()` and `buf.FreeTensor(tensor)`. But that buffer is not a TQue; it's a TBuf. For a single buffer, use `TBuf<TPosition::VECIN> buf; pipe_.InitBuffer(buf, size);` then `buf.AllocTensor<float>()` and `buf.FreeTensor(tensor)`. Using a TQue with BUFFER_NUM=1 might work but the correct pattern is to use `TQue` with `EnQue/DeQue` for pipelining.
+
+Moreover, the `inQueueTargets_` and `logProbsRowBuf_` are defined as TQue, but the kernel does not use them in a queued manner; it allocates and frees directly. This is an API misuse and likely causes the error.
+
+We should simplify the kernel: since the data size is small (maxTime up to 2048, numClasses 30, batchSize 16), we can process one batch at a time with the same block or use a simpler approach. But given the vector core exception, we need to fix the queue usage.
+
+We could change all queues to TBuf (single buffer) and use AllocTensor/FreeTensor properly. However, the kernel uses `inQueueTargets_.AllocTensor` then `inQueueTargets_.EnQue` and later `inQueueTargets_.DeQue` and `inQueueTargets_.FreeTensor`. That is actually correct if BUFFER_NUM=1? But the code shows:
+
+```
+AscendC::LocalTensor<int32_t> targetsLocal = inQueueTargets_.AllocTensor<int32_t>();
+AscendC::DataCopy(targetsLocal, targetsGm_[batchIdx * maxTargetLen_], L);
+inQueueTargets_.EnQue(targetsLocal);
+AscendC::LocalTensor<int32_t> tgt = inQueueTargets_.DeQue<int32_t>();
+```
+
+That is the correct pattern: allocate, copy, enqueue, then dequeue. But then later they free via `inQueueTargets_.FreeTensor(tgt)`. That should work.
+
+The problem might be that `L` could be less than allocated size, but DataCopy copies L elements, which is fine as long as L <= maxTargetLen_. That's fine.
+
+The `logProbsRowBuf_` usage is different: they allocate with `logProbsRowBuf_.AllocTensor<float>()` and later free with `logProbsRowBuf_.FreeTensor(logProbsRow)` without enqueue/dequeue. That is inconsistent. They should either use a TBuf or follow queue pattern.
+
+In the loop, they allocate `logProbsRow` before the inner time loop, then after the inner loop, free it. But then they allocate `tmp` from `tmpQueue_` and free it inside the per-batch loop. The pattern of allocate/free on a TQue without enqueue/dequeue might corrupt the buffer state.
+
+I suspect that's the cause of vector core exception.
+
+We can simplify: use a single TBuf for logProbsRow and tmp. Or treat them as regular local tensors allocated from a single pipe buffer.
+
+Better: completely rework the kernel to use a simpler approach that is known to work: use pipe local memories with TBuf, and only use simple DataCopy and arithmetic. But since the CTC algorithm is inherently scalar (conditional branches based on extended target), maybe the kernel is too complex. However, the task requires fusing CTC loss; we must implement it in kernel.
+
+Given the error, the most targeted fix is to replace the TQue misuse with proper TBuf for logProbsRowBuf_ and tmpQueue_, and ensure all local tensors are allocated/freed correctly.
+
+Also, the kernel uses `AscendC::Exp` and `AscendC::Log` on a local tensor of size 2. That is fine. But the `Exp` and `Log` are vector operations; they operate on a vector of elements. That should work.
+
+Another possible issue: the kernel uses `float logProb = logProbsRow.GetValue(extended[u]);` where `extended[u]` could be up to 60 (since U<=61). That's fine.
+
+The host_operator_src also has a warning about "ISO C++ forbids converting a string constant to 'char*'" but that's from autogen and not our code.
+
+Now, the model_src: it uses `log_probs = F.log_softmax(logits, dim=-1)` before calling custom op. That matches the reference.
+
+But the reference forward: first log_softmax, then ctc_loss. In model_src, we do log_softmax and then call custom op. So the kernel receives log_probs. The kernel does CTC forward algorithm on log probs. That's correct.
+
+Now, also note that the custom op expects inputs: log_probs, targets, input_lengths, target_lengths, blank (int), reduction (string). The host operator defines blank as optional int with default 0, reduction as optional string with default "mean". The python_bind_src calls aclnnCa6k00387Custom with blank and reduction. That seems fine.
+
+One more thing: the kernel uses `GET_TILING_DATA(tiling_data, tiling);` with `tiling` as GM_ADDR. That's standard.
+
+Now, to fix, we will:
+
+1. Change logProbsRowBuf_ from TQue to TBuf<TPosition::VECIN> and use AllocTensor/FreeTensor on it (no EnQue/DeQue).
+2. Similarly, change tmpQueue_ to TBuf<TPosition::VECCALC>.
+3. Keep inQueueTargets_ as TQue with proper EnQue/DeQue (that part is okay).
+4. Ensure all tensor lifetimes are correct.
+
+Also, we should avoid using `logProbsRowBuf_.FreeTensor` before finishing using it? The current code: after the time loop, they free logProbsRow. But they had used logProbsRow inside the time loop (inside the inner loop). That's fine.
+
+But note: they allocate logProbsRow once per batch, then copy data into it at each time step using `DataCopy`. That overwrites the same buffer. That's fine.
+
+But there is a subtlety: after freeing logProbsRow, they then allocate tmp from tmpQueue_ and use it. That should be fine since they are separate buffers.
+
+We'll also ensure that the `pipe_.InitBuffer` calls are consistent with the new TBufs.
+
+Now, let's produce the corrected code.
+
+We must output exactly six strings.
+
+We'll modify kernel_src to replace the misused queues. Also, ensure the kernel compiles without warnings.
+
+We'll also check if there is any issue with the tiling data definition: it's defined in host_tiling_src as BEGIN_TILING_DATA_DEF, and included in kernel via GET_TILING_DATA. That is fine.
+
+Another memory: memory 4 says to use GetValue/SetValue instead of direct indexing, which we already do.
+
+Memory 5 not relevant.
+
+Now, code changes.
+
+We'll write the kernel with:
+
+- `TBuf<TPosition::VECIN> logProbsRowBuf_;` and `pipe_.InitBuffer(logProbsRowBuf_, numClasses_ * sizeof(float));`
+- `TBuf<TPosition::VECCALC> tmpBuf_;` and `pipe_.InitBuffer(tmpBuf_, 2 * sizeof(float));`
+- Inside Process, allocate: `AscendC::LocalTensor<float> logProbsRow = logProbsRowBuf_.AllocTensor<float>();` and later free.
+- Similarly allocate `tmp = tmpBuf_.AllocTensor<float>();` and free.
+
+Also need to allocate `logProbsRow` before the inner time loop, and allocate `tmp` inside the per-batch loss computation.
+
+We'll also need to adjust the init: no need for `inQueueTargets_` as TQue? Actually we still need to copy target sequence into local tensor for fast access. We can keep that as before: allocate, DataCopy, then use GetValue. But we can also use a simple TBuf for that. However, the queue pattern is fine; we just need to be careful about the sequence: allocate, copy, enqueue, dequeue, use, free. That is correct. We'll keep it.
+
+But we must ensure that we don't exceed UB size. The allocated sizes: maxTargetLen=30 int32 -> 120 bytes; logProbs row 30 float -> 120 bytes; tmp 2 float -> 8 bytes. Total < 1KB. So UB budget fine.
+
+Now, write the corrected kernel.
+
+Also note: the kernel uses `uint32_t gmOffset = t * batchSize_ * numClasses_ + batchIdx * numClasses_;` but the logProbs tensor is of shape (maxTime, batchSize, numClasses). In Init, we set `logProbsGm_.SetGlobalBuffer(...)` as batchSize * maxTime * numClasses. That's wrong: should be maxTime * batchSize * numClasses. The reference uses logits of shape (seq_length, batch_size, num_classes). So maxTime = seq_length = 2048, batchSize = 16, numClasses = 30. The total elements = maxTime * batchSize * numClasses. So the stride for time step t is t*batchSize*numClasses, and within that, batchIdx*batchSize*? Actually the layout is (t, b, c). So offset for (t, b, c) = t * batchSize * numClasses + b * numClasses + c. So the DataCopy for logProbs row should copy from offset t * batchSize * numClasses + batchIdx * numClasses. That's what the kernel does with `gmOffset = t * batchSize_ * numClasses_ + batchIdx * numClasses_`. That's correct given the buffer is set to batchSize * maxTime * numClasses? Wait: the SetGlobalBuffer should be `(float*)logProbs, maxTime * batchSize * numClasses`. In the code, it's `batchSize * maxTime * numClasses` which is the same product but the order of dimensions is swapped in the linear buffer, but since we compute offset as t * batchSize * numClasses + batchIdx * numClasses, it assumes the stride for t is batchSize*numClasses, which is correct only if the first dimension is time and second is batch. But the buffer is set with total size `batchSize * maxTime * numClasses`, but that is ambiguous. Actually if the input is (maxTime, batchSize, numClasses), the linear order is maxTime * batchSize * numClasses, with time varying slowest. So the correct total size is maxTime * batchSize * numClasses. In the code it's `batchSize * maxTime * numClasses`, which is the same number but the interpretation of strides is different. However, when we compute `gmOffset = t * batchSize_ * numClasses_ + batchIdx * numClasses_`, we are assuming that the data is stored as time-major with batch as second dimension. That is correct. The total number of elements `batchSize * maxTime * numClasses` is the same as `maxTime * batchSize * numClasses`. So it's fine. The buffer pointer is set with that count. So offset calculation is correct.
+
+So the kernel logic is sound.
+
+Now, let's fix the queue/buffer usage.
+
+We'll also consider memory 3: when using double buffering, the error appeared. But here we are using single buffering (BUFFER_NUM=1) for target queue, and no double buffering for logProbs row. So that should be fine. But we'll still use single buffering.
+
+Now, output the six strings.
+
+We need to ensure the host_operator_src and python_bind_src remain mostly unchanged. The only change is in kernel_src.
+
+But we should also double-check the host_tiling_src: it includes batchSizeFloat as float, which is used only in kernel to divide totalLoss. That's fine.
+
+Now, produce the final code block.

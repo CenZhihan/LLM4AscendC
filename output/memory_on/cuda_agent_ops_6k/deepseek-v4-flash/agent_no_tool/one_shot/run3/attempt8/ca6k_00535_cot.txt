@@ -1,0 +1,167 @@
+We need to fix the previous attempt. The error logs show that the kernel compiled successfully (returncode 0) but gave all-zero output. The warning about tiling struct conflict "tiling struct [Ca6k00535CustomTilingData] is conflict with one in file ca6k00535_custom_tiling.h, line 5" suggests a duplicate definition. Also the output being all zeros indicates the kernel is not correctly computing the cumulative max.
+
+The memory tip advises to define tiling struct in a single shared header and include consistently. But the main issue is likely that the kernel uses AscendC::GlobalTensor::GetValue/SetValue which are not efficient and may be incorrect for vectorized memory access? Actually they might work but the real problem: kernel does `yGm_.SetValue(idx, curMax)` at each row. That's fine but perhaps the issue is that the tiling data is not being read correctly due to the conflict warning? But the output is all zeros, meaning the kernel executed but produced zeros. That could mean either tiling data is zero (rows=0, cols=0) or the computation doesn't update the output. Since rows and cols from tiling might be zero due to conflict? Or the kernel's `Process` for each block might be wrong because blockDim not set correctly? The host sets blockDim = min(cols,24). For shape (20000,50), cols=50, blockDim=24. colsPerBlock = ceil(50/24)=3. So each block gets 2 or 3 columns. Then loop row by row, set y. Should work.
+
+But the output is all zeros on NPU, meaning maybe the global memory writes are not happening. Could be that `DataCopy` style is needed, not `SetValue`. But also the kernel uses `AscendC::SetValue` - what is that? Actually AscendC has `GlobalTensor::SetValue`? Not standard, the standard is to use DataCopy or vector instructions. However the kernel uses `xGm_.GetValue(idx)` and `yGm_.SetValue(idx, curMax)`. Those might not be valid operations for GlobalTensor. In AscendC, to access individual elements you need to use `AscendC::GlobalTensor<float>::operator[]` but that returns a reference? Actually the documentation: GlobalTensor can be indexed with [i] to get a LocalTensor? No, it returns a reference to the element? I'm not sure. The typical pattern is to copy data into local memory using DataCopy, then process, then copy out. But here they use element-wise access, which may not be supported or may be extremely slow. However the kernel compiled and ran, so it's syntactically valid? The all-zero output suggests the writes are not reaching global memory.
+
+Another possibility: the kernel uses `yGm_.SetValue(idx, curMax)` but SetValue is not a member function. Actually the code says `yGm_.SetValue(idx, curMax)`. That's probably a custom function? In the previous attempt's kernel_src, it uses AscendC::GlobalTensor<float> and calls SetValue. That might be undefined behavior. I suspect the kernel is not actually writing to y because SetValue doesn't exist or does something else. The standard AscendC API does not have SetValue. Instead, you should use DataCopy to copy a local tensor back. So the kernel approach is fundamentally flawed.
+
+Given the context, the correct approach for cumulative max along dim=0 (rows) for each column is a reduction-like operation that requires local memory. However, since the operation is cumulative and not a simple reduction, we need to maintain a running max per column. That can be done by processing each column independently using vector operations. But the naive element-wise loop in kernel is not idiomatic AscendC and likely not working.
+
+But the memory tip focuses on tiling struct conflict. The warning indicates that the tiling struct is defined in both host_tiling_src and also perhaps generated automatically? The fix is to not define the tiling struct manually in the kernel? Actually the tiling struct should be defined only in the host tiling header, and the kernel includes that header via `GET_TILING_DATA` macro which expects the struct to be defined in `ca6k_00535_custom_tiling.h`. But in the previous attempt, host_tiling_src defines it, and kernel_src does not include it, but uses `GET_TILING_DATA(tiling_data, tiling)`. That macro expects the struct to be defined. It might be that the build system auto-generates a tiling struct and there is a conflict. The memory tip says "define it in a single shared header and include it consistently". So we should ensure the kernel includes the tiling header.
+
+Also the kernel should use proper AscendC data movement. Since we need to rewrite the kernel to be correct, we need to implement cumulative max using vector instructions. However the problem is that cumulative max along rows for each column is sequential (dependence on previous row). So we cannot easily parallelize within a column. One approach: each block handles a set of columns, and for each column, it loads a tile of rows, processes sequentially using local memory. That is fine.
+
+Let's design the kernel properly:
+
+- The input is 2D ND tensor with shape (R, C).
+- We want y[i][j] = max_{k<=i} x[k][j].
+- We can process each column independently. For each column, we iterate rows from 0 to R-1, maintain running max, and store result.
+
+We can load a chunk of rows (tile) for one column into local memory, compute cumulative max using a scalar variable in register, but we need to output cumulative max for each row. That is straightforward: for each row, update max and write. Since we need to write each row, we can do DataCopy after processing a tile? But DataCopy is block-wise; we need to write each element individually? Actually we can compute cumulative max per column using a loop over rows, and for each row, we can set the value in local memory and then after processing a tile of rows, we copy the tile back to global memory. That requires the computation to be done in local memory.
+
+Simpler: for each column, we load the whole column into local memory (if it fits within UB budget). For 20000 rows, that's 80KB per column (float32). UB budget 192KB, so we can fit maybe 2 columns at a time? But we need also output buffer. Alternatively, we can process row by row across all columns: load a tile of rows (say tileLen rows, all columns) into local memory, compute cumulative max element-wise? But cumulative max depends on previous row, so we need to keep per-column running max values. We can keep a local array of running max per column in UB. Since cols=50, that's 200 bytes per column, trivial. So approach:
+
+- For each block, it handles a subset of columns (colsPerBlock).
+- The block keeps a local buffer `runningMax` (size colsPerBlock) initialized to -inf.
+- It loops over rows in tiles of tileLen rows (or just one row at a time if tileLen=1? But better to batch rows to amortize data copy overhead).
+- For each tile: load a tile of rows for the assigned columns from global to local (size: tileLen * colsPerBlock floats). Then for each row in the tile, compute updated max per column and write output for that row. Need to store the output for that tile back to global.
+
+But this requires an output buffer also of same size. So we need to handle double buffering. However that might be complex. Given the simplicity, maybe we can just do row-by-row with DataCopy per row? That would be inefficient but might work for correctness.
+
+Given the constraint to fix with minimal changes, maybe the main issue is the tiling struct conflict and the kernel using SetValue which doesn't work. The memory tip says to fix tiling struct conflict. I'll focus on that and also replace the element-wise access with proper data movement using DataCopy. But I need to ensure the kernel works.
+
+Better to follow a known pattern: the example leaky_relu used vector operations on tiles. For cummax, we cannot vectorize across rows because of dependency. So we need a scalar loop over rows within a tile, but accelerated by processing multiple rows in a tile? Actually we can process each row independently across columns using vector operations: for each row, compute max of that row's current values and the previous row's cumulative max? That is not possible because max is not a linear operation.
+
+So the only way is per-column sequential. That is inherently sequential and cannot be vectorized. But we can still use DataCopy to bring the column data into local memory (if fits), then loop locally in scalar, then DataCopy out. That is acceptable.
+
+Given the shape (20000, 50), each column has 20000 floats = 80KB. UB budget 192KB, so one column (80KB input + 80KB output = 160KB) fits. Two columns might exceed. So we can process one column at a time per block, with each block processing one column. But blockDim is up to 24, columns=50, so some blocks handle 2 columns sequentially. That's fine.
+
+So kernel plan:
+
+- For each block, iterate over columns assigned.
+- For each column, copy the entire column from xGm_ to local input buffer (size rows_).
+- Compute cumulative max in place on a local output buffer: for i from 0 to rows_-1, take xLocal[i], compute curMax = max(curMax, xLocal[i]), store in yLocal[i].
+- Copy yLocal back to yGm_ column.
+
+This uses two local buffers each of size rows_ * sizeof(float) = 80KB, total 160KB, within 192KB. But we also need maybe a tmp buffer for the copy? Actually DataCopy can copy into LocalTensor, then we can compute using local tensors. We need to allocate input and output buffers.
+
+Implementation details:
+
+In Init: allocate pipe with buffers for one column input and one column output. Also tiling provides rows and cols.
+
+In Process: for each column assigned, copy column from global to local input buffer using DataCopy (need to compute offset: col * rows). Then compute cumulative max using a scalar loop (or vector reduction? but we need per-element output, so scalar loop is fine). Then copy output buffer to global column.
+
+But we must ensure we don't exceed UB. rows_=20000, two buffers 80KB each = 160KB, plus maybe some overhead, should be okay.
+
+We also need to be careful about alignment: DataCopy requires alignment to 32 bytes? Usually aligned to 32 bytes, but rows_ may not be multiple of 32? 20000 is not. But we can still copy because rows_ is exact count. The DataCopy function takes number of elements; it should handle non-aligned sizes? Typically AscendC requires vector loads to be aligned to 32 bytes (8 floats). 20000 is a multiple of 8? 20000/8 = 2500, so yes 20000 mod 8 = 0? 20000 / 8 = 2500, remainder 0. Good.
+
+Now, fix tiling struct conflict: The host_tiling_src defines the struct, and kernel_src does not include the header. Actually kernel_src uses `GET_TILING_DATA(tiling_data, tiling)` which expects the struct to be declared in a header named `ca6k_00535_custom_tiling.h` (from the macro). That header is generated from host_tiling_src? Usually the build system generates the tiling header from the host_tiling_src. But there is a conflict warning because the struct is also defined elsewhere. The fix is to ensure that the kernel includes the header via `#include "kernel_operator.h"` which doesn't include tiling, and then `GET_TILING_DATA` uses a forward declaration? Actually `GET_TILING_DATA` is defined in `kernel_operator.h`? No, it's a macro that uses the tiling struct name. Typically you need to include the tiling header in the kernel. So we should add `#include "ca6k_00535_custom_tiling.h"` in kernel_src. That should resolve the conflict.
+
+Also, previous kernel_src had no include, which might have caused the tiling struct to be auto-generated differently, leading to conflict.
+
+So minimal changes:
+
+1. Add `#include "ca6k_00535_custom_tiling.h"` in kernel_src.
+2. Change kernel implementation to use proper DataCopy and local tensors for column-wise processing.
+3. Keep host_tiling_src and host_operator_src same, but ensure tiling struct consistent.
+4. Also adjust python_bind_src to use correct header name? The original used `aclnnCa6k00535Custom`, which is auto-generated. That should be fine.
+
+But the memory tip says to define tiling struct in a single shared header. Currently host_tiling_src defines it, and kernel_src will include that header. That should be consistent.
+
+Let's rewrite kernel_src to use proper AscendC patterns.
+
+We'll also need to handle the case where rows_ may be large, but we allocate buffers for entire column – that fits.
+
+Implementation:
+
+```cpp
+#include "kernel_operator.h"
+#include "ca6k_00535_custom_tiling.h"
+
+class KernelCa6k00535Custom {
+public:
+    __aicore__ inline KernelCa6k00535Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t rows, uint32_t cols,
+                                uint32_t blockDim)
+    {
+        rows_ = rows;
+        cols_ = cols;
+        blockDim_ = blockDim;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, rows_ * cols_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, rows_ * cols_);
+
+        // Allocate local buffers for one column
+        pipe_.InitBuffer(inBufX_, 1, rows_ * sizeof(float));
+        pipe_.InitBuffer(outBufY_, 1, rows_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (rows_ == 0 || cols_ == 0) return;
+
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t colsPerBlock = (cols_ + blockDim_ - 1) / blockDim_;
+        uint32_t startCol = blockIdx * colsPerBlock;
+        uint32_t endCol = startCol + colsPerBlock;
+        if (endCol > cols_) endCol = cols_;
+
+        for (uint32_t col = startCol; col < endCol; col++) {
+            // Copy column x to local
+            LocalTensor<float> xLocal = inBufX_.Get<float>();
+            DataCopy(xLocal, xGm_[col * rows_], rows_);
+            
+            // Compute cumulative max
+            LocalTensor<float> yLocal = outBufY_.Get<float>();
+            float curMax = -3.4028235e+38f;
+            for (uint32_t i = 0; i < rows_; i++) {
+                float val = xLocal(i);
+                if (val > curMax) curMax = val;
+                yLocal(i) = curMax;
+            }
+            
+            // Copy back to global
+            DataCopy(yGm_[col * rows_], yLocal, rows_);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> inBufX_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> outBufY_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t rows_ {0};
+    uint32_t cols_ {0};
+    uint32_t blockDim_ {0};
+};
+```
+
+But we need to ensure that `DataCopy` works with LocalTensor from TBuf. Yes, `TBuf::Get<float>()` returns a LocalTensor. Also we need to include "kernel_operator.h" which provides those types.
+
+Now, note that the pipe_ needs to be initialized with buffer parameters. We used `pipe_.InitBuffer(inBufX_, 1, rows_ * sizeof(float));` That's correct.
+
+Also, we need to be careful about the `DataCopy` call: `DataCopy` takes a LocalTensor destination, GlobalTensor source, and number of elements. The source uses `xGm_[col * rows_]` which is a GlobalTensor reference shifted by offset. That's valid.
+
+Similarly for output.
+
+Now, we also need to ensure that the tiling struct includes `rows` and `cols` and `blockDim`. Already present.
+
+Also, we need to fix the python_bind_src: it should not have a trailing underscore? It's fine.
+
+Now, output the six strings.
+
+But we must also consider that the previous attempt had a warning about tiling struct conflict. By including the header in kernel, it should go away.
+
+Additionally, the host_operator_src currently includes "ca6k_00535_custom_tiling.h". That's fine.
+
+Now, produce the corrected Python code.
+
+Make sure to use triple double quotes as in the example (no raw-string prefix). And follow exact formatting.
+
+Let's write the final answer.

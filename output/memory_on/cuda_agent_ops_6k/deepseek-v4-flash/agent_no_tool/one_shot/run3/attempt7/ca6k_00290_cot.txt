@@ -1,0 +1,97 @@
+We need to fix the correctness issue: the custom kernel outputs all zeros instead of the correct tril result. The previous attempt's kernel does `yLocal(i) = val` where `val` is determined by checking if col <= row + offset. But the issue is that the loop iterates over elements within a tile, but the base offset is not correctly handled: `globalIdx = base + i` is correct, but then `posInMat = globalIdx % elementsPerMat_` uses global index, which is wrong because the matrix (H x W) repeats across the batch and channel dimensions. Actually the shape is [B, C, H, W], so elementsPerMat_ = H*W, and the tril operation should be applied per each HxW matrix independently. The global index approach is wrong: it computes posInMat = globalIdx % (H*W), but this mixes across batch and channel dimensions incorrectly. For example, for the first matrix (index 0 to H*W-1), posInMat = globalIdx % (H*W) works because globalIdx < H*W. But for the second matrix (H*W to 2*H*W-1), globalIdx % (H*W) gives the same posInMat, which is correct. Actually that is correct: each matrix is independent, and we want the same tril mask for each matrix. So using `globalIdx % (H*W)` to get the row and column within the current matrix is correct. The row = posInMat / W, col = posInMat % W. That should work.
+
+But why are we getting all zeros? Let's examine the kernel code more carefully. The kernel uses a grid-stride loop: `for (uint32_t i = 0; i < curLen; ++i)` inside each tile, and computes `globalIdx = base + i`. Then it checks `static_cast<int32_t>(col) <= static_cast<int32_t>(row) + offset_`. If true, set val = xLocal(i); else val = 0.0f. This should work.
+
+However, there might be an issue with the `DataCopy` and queue management. In the kernel, we do:
+
+```
+AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+AscendC::DataCopy(xLocal, xGm_[base], curLen);
+inQueueX_.EnQue(xLocal);
+
+xLocal = inQueueX_.DeQue<float>();
+...
+```
+
+But then we do `inQueueX_.FreeTensor(xLocal);` after compute. This is a bit odd: we allocate, copy, enque, then dequeue, compute, then free. It's safe but note that we used `pipe_.InitBuffer(inQueueX_, BUFFER_NUM, tileLen_ * sizeof(float));` with BUFFER_NUM=2. The queue management seems okay.
+
+But the output all zeros could be because the `DataCopy` is not actually copying the correct data? Or maybe the `offset` attribute is not being passed correctly. The host operator sets `tiling_data.offset` from the attribute. But in the python_bind_src, we call `EXEC_NPU_CMD(aclnnCa6k00290Custom, self, offset, result);`. The attribute name in JSON is "offset", and in host operator we read `int32_t offset = *attrs->GetAttrPointer<int32_t>(0);`. That should be fine.
+
+Wait, the previous log shows "Warning: tiling struct [Ca6k00290CustomTilingData] is conflict with one in file ca6k00290_custom_tiling.h, line 5". That's a warning but not an error. But the output is all zeros. Let's check the data copy: `AscendC::DataCopy(xLocal, xGm_[base], curLen);` - the third argument is the number of elements? In the leaky relu example, they used `len` which is number of elements. Yes, that's correct. 
+
+But maybe the problem is that the kernel uses `AscendC::DataCopy` with a local tensor that is allocated with `tileLen_ * sizeof(float)` but the actual copy length is `curLen`. That should be fine as long as curLen <= tileLen_.
+
+One more thing: In the `Process()` loop, we first allocate xLocal, copy in, enque, then dequeue, compute, enque yLocal, free xLocal, then dequeue yLocal, copy out, free yLocal. This sequence is correct. However, note that we are using `inQueueX_` with BUFFER_NUM=2, and we allocate and enque a tensor, then immediately dequeue it. That's fine.
+
+But maybe the issue is that the kernel is not correctly handling the tile length when the total length is less than tileLen. In the tiling, we set tileLen based on UB budget, but for small matrices it might be the total length aligned down. Suppose totalLength = 16*3*2048*2048 = huge, but tileLen is around 32768. That's fine.
+
+Another suspect: The attribute `offset` is of type `int` in JSON, but we read as `int32_t`. That should match.
+
+Let's look at the model_src: `return fn(x, self.tril_offset)`. The python_bind function takes `int64_t offset`, but the attr is `int32_t`. That mismatch could cause problems. In the binding, we pass offset as int64_t, but the host operator reads it as int32_t. This could cause the offset value to be interpreted incorrectly. For example, if the offset is 1, as int64_t it might be passed correctly, but if there is a type mismatch it could be read as a large value or zero. Since all zeros output, maybe the offset is being read as a very large number causing the condition `col <= row + offset` to always be true? Actually if offset is very large, then condition always true, so we should copy all values, not zeros. If offset is read as negative large, then condition might always false, resulting zeros. The default offset is 0 in JSON, but the test uses offset=1. So if the attrs are not read correctly, offset could be 0, and then for most elements col > row so zeros. But we see all zeros, which would happen if the condition is always false. That could be because offset is read as some bogus large negative.
+
+Let's fix the type: In host operator, we read `int32_t offset = *attrs->GetAttrPointer<int32_t>(0);`. The attribute in JSON is "type": "int". The default is "0". But the actual attribute passed from Python is `int64_t offset`. In the Ascend framework, the attribute type might be int64_t for Python int. The host operator should use `int64_t` to match. Let's change all occurrences to `int64_t` for offset.
+
+Also, in the tiling data, we have `TILING_DATA_FIELD_DEF(int32_t, offset);` - we should change to `int64_t` if we want 64-bit, but tiling data fields are typically 32-bit. Actually, the attribute can be int64_t, but we only need to store it in tiling as int32_t for this use case since offset is small. But the reading from attrs must match the actual type. If the framework passes int64_t, reading as int32_t could give wrong value. We should read as int64_t and then cast to int32_t for tiling.
+
+We'll adjust the host operator to read as `int64_t` and store as `int32_t` in tiling data (since offset is small). Also ensure the kernel receives correct offset.
+
+But the kernel also receives offset as `int32_t`. That's fine.
+
+Let's also check if the `DataCopy` for the first tile is done correctly. Note that in the grid-stride loop, we do `AscendC::DataCopy(xLocal, xGm_[base], curLen);` and then `inQueueX_.EnQue(xLocal);` then `xLocal = inQueueX_.DeQue<float>();`. This is fine.
+
+Another potential issue: The kernel writes `yLocal(i) = val;` but `yLocal` is a local tensor. However, we are using `outQueueY_` for output. We allocate `yLocal = outQueueY_.AllocTensor<float>();` before compute. Then after compute we enque it. Then we dequeue and copy out. That's standard.
+
+Maybe the problem is that the tensor `xLocal` after dequeuing is not the same as the one we copied into? But it should be.
+
+Let's also check the workspace and tiling data handling: The kernel signature is `void ca6k_00290_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)`. The workspace is not used. That's fine.
+
+Given the all-zero output, it's likely that the condition is always false. Could be that offset is read as 0 because default is 0 in JSON and the attr is not being set correctly. But we are passing offset from Python. Let's check the python_bind: `EXEC_NPU_CMD(aclnnCa6k00290Custom, self, offset, result);`. This macro generates the aclnn call. The order of arguments: first input tensor, then scalar attributes, then output tensor. That matches the aclnn generated API. The generated API signature should be something like `aclnnCa6k00290Custom(...)`. So offset is passed correctly.
+
+But note: In the host operator, the attr is defined as `Attr("offset").AttrType(OPTIONAL).Int(0);` (I don't see this in the host_operator_src because it's missing! The previous attempt's host_operator_src only contains tiling function and infer shape functions, but not the OpDef registration with Attr calls. Actually, looking at the example leaky_relu, they have an ops namespace with class LeakyReluCustom that defines Attr. In the previous attempt, the host_operator_src only has tiling and infer shape, but not the OpDef class with Attr definition. That's a critical missing part! The operator registration with Attr is needed to pass the attribute to the kernel. Without that, the attribute might not be recognized.
+
+In the host_operator_src of the previous attempt, after the infer shape functions, they have `namespace ge { ... }` but no `namespace ops { class Ca6k00290Custom ... OP_ADD(...); }`. The example has that. So the operator definition is missing. That would cause the attribute to not be registered, so the tiling function might not receive it correctly, potentially using the default value 0.
+
+We need to add the OpDef registration with Attr. Also, the tiling function and infer shape functions should be outside the namespace ge? In the example, they are inside `namespace optiling` and `namespace ge` respectively, and then a separate `namespace ops` for the OpDef. We need to add that.
+
+Let's also note that the host_operator_src should include the OpDef class and OP_ADD macro. The JSON project file already has the op definition, but the host operator C++ code must also define the OpDef to link the tiling and shape inference. Without it, the operator might be handled by the auto-generated code? But the build succeeded, so maybe the autogen handled it partially. However, the warning about tiling struct conflict suggests there might be two definitions. The missing OpDef could cause the attribute to not be passed.
+
+Let's fix by adding a complete host_operator_src that includes: 1) tiling function in optiling namespace, 2) InferShape and InferDataType in ge namespace, 3) a class in ops namespace that registers the operator with Input, Output, Attr, and sets tiling and shape inference, and OP_ADD.
+
+Also, we need to ensure the tiling data structure includes all needed fields. Currently, host_tiling_src has `TILING_DATA_FIELD_DEF(uint32_t, H);` and `TILING_DATA_FIELD_DEF(uint32_t, W);`. Those are used in kernel but not necessary because we can recompute from shape inside kernel? But we already pass them. That's fine.
+
+Now, the kernel: the loop uses `globalIdx % elementsPerMat_` to get row/col. That is correct. But there's a subtlety: when we tile, we are processing elements in a contiguous chunk of global memory. The mapping from global index to matrix position is correct. So the kernel logic seems fine given correct parameters.
+
+The all-zero output strongly suggests the condition `col <= row + offset` is always false. That would happen if offset is read as a very negative value. Or if `row` and `col` are computed incorrectly. Let's check row/col computation: `posInMat = globalIdx % elementsPerMat_; row = posInMat / W_; col = posInMat % W_;`. For a matrix of size H=2048, W=2048, elementsPerMat_ = 4,194,304. For global index 0, posInMat=0, row=0, col=0: condition 0 <= 0 + offset -> true. For global index 1, row=0, col=1: condition 1 <= 0+offset -> if offset=1, true; if offset=0, false. So if offset=0, most elements will be zero except those on the diagonal. But we see all zeros, meaning even diagonal elements are zero. That would happen if offset is negative and large in magnitude so that col > row + offset for all (col>=0). For offset=-2048, condition col <= row -2048 is false for all col< row, so all zeros. But offset should be 1.
+
+Maybe the offset value is being read as -1? The default in JSON is 0, but the test passes offset=1. If the attribute is not being passed, the default is 0. But we still see zeros on diagonal? Actually if offset=0, diagonal elements should be non-zero because for row=col, condition col <= row + 0 is true. So we should see non-zero diagonal. But the output shown is all zeros. So perhaps the condition is not being executed at all, or the entire output is written as zeros for some other reason.
+
+Could it be that the grid-stride loop is not executing because `base >= totalLen_`? The blockDim calculation might set blockDim=24, and totalLen=16*3*2048*2048 = 201,326,592. tileLen=32768. strideElems = 24*32768 = 786,432. base = blockIdx * tileLen. For blockIdx=0, base=0 < totalLen, so it enters. Then it copies in curLen = min(tileLen, totalLen) = 32768. Then it does compute and copy out. Then base += strideElems. After many iterations, base will exceed totalLen. But for the first block, it should produce non-zero output. Yet the entire output is zeros, suggesting either the kernel didn't run at all, or the output was written elsewhere.
+
+Maybe the issue is that the kernel uses `outQueueY_` and then copies out, but for the first block, it should write some non-zero values. The output printed is from npu:0 and it's all zeros. So either the kernel didn't modify the output tensor, or it wrote zeros.
+
+Another possibility: The `DataCopy` for output might be writing to the wrong address because of the offset. Let's check: `AscendC::DataCopy(yGm_[base], yLocal, curLen);` - this copies from local to global. The address `yGm_[base]` should be correct.
+
+Given the complexity, let's simplify: Instead of a custom kernel that manually implements tril with element-wise loop, we can use AscendC's built-in operations? But we need a custom op. However, we can implement tril by zeroing out upper triangle elements. In the kernel, we can use a more efficient approach using vector operations? But for simplicity, we can fix the existing kernel by ensuring the condition works correctly.
+
+Let's test the condition manually: row = posInMat / W, col = posInMat % W. For offset=1, condition is col <= row + 1. That's correct for tril with offset 1. So kernel logic is correct.
+
+Maybe the bug is that we use `static_cast<int32_t>(col) <= static_cast<int32_t>(row) + offset_` but if row and col are uint32_t, and offset_ is int32_t (could be negative?), the comparison might be problematic if row+offset_ is negative. For row=0, offset=1, row+offset=1, col<=1 is fine. For row=0, offset=0, row+offset=0, col<=0 only for col=0. So diagonal should appear. Not all zeros.
+
+Thus, the issue must be that the offset attribute is not being passed correctly, or the tiling function is not reading it. Let's look at the tiling function: `int32_t offset = *attrs->GetAttrPointer<int32_t>(0);`. This assumes the attribute is at index 0 and type int32_t. If the actual type is int64_t, this could read garbage. We'll change to read as int64_t and cast.
+
+Also, we must add the OpDef class. Let's construct a corrected host_operator_src that includes the complete OpDef.
+
+We also need to ensure the project_json_src matches: the op name should be "Ca6k00290Custom" (PascalCase). The kernel name should be ca6k_00290_custom (snake_case). That's consistent.
+
+Let's write the corrected code.
+
+Changes:
+1. host_tiling_src: change offset field to int32_t (keep).
+2. host_operator_src: add op registration with Attr("offset").Int(0). And read offset as int64_t then store as int32_t.
+3. kernel_src: no change needed if offset is correctly passed as int32_t.
+4. python_bind_src: change offset parameter type to int64_t to match Python int, but keep as int64_t.
+5. model_src: fine.
+
+Also, ensure that the kernel includes the necessary headers and uses correct AscendC APIs.
+
+Let's produce the final answer with six strings.

@@ -1,0 +1,228 @@
+We need to generate the AscendC artifacts for fusing adaptive_max_pool3d into a custom operator. The task says "Fused API list: F.adaptive_max_pool3d" so we're replacing that single op with a custom kernel. However, note that adaptive_max_pool3d is a complex operation that involves computing pooling regions and taking max. Writing a custom AscendC kernel for that is substantial but we must do it.
+
+Given constraints: use kernel/operator names from ca6k_04668_custom (kernel name, same stem) and PascalCase Ca6k04668Custom for project JSON.
+
+We need to output six string variables.
+
+I need to understand the reference model: It takes a 5D tensor (batch, channels, height, width, depth) and applies adaptive_max_pool3d with output_size given as a tuple of 3 ints (depth, height, width). The output size is provided as init input: output_size = (1,2,2). So input shape: (4,3,512,64,32) -> output shape: (4,3,1,2,2) if output_size is (d, h, w) = (1,2,2). However adaptive_max_pool3d expects output_size as a tuple of 3 ints for Depth, H, W.
+
+We need to implement a custom kernel that does adaptive max pooling 3D. This is nontrivial: we need to compute for each output voxel, the corresponding input region (start and end indices) based on input size and output size, then take max. Since it's adaptive, the region sizes vary.
+
+We can simplify by assuming that the kernel will be called with fixed input sizes? But the kernel must handle generic sizes via tiling.
+
+We'll need host tiling to compute the pooling parameters.
+
+Memory tips: From memory 4: do not use setter methods; use direct field assignment. So in tiling data, use struct fields and assign directly.
+
+Memory 5: do not include the tiling header in kernel source (the host_operator_src already includes tiling header, kernel should not include it). The kernel source gets tiling data via GET_TILING_DATA macro.
+
+Memory 1,2,3: avoid duplicate OP_ADD; use autogen REG_OP only. Also use const gert::StorageShape* instead of const gert::Shape* in TilingFunc.
+
+Given these, we must be careful to not include duplicate definitions.
+
+Let's design the operator:
+
+- Input: x, shape [N, C, D, H, W] (ND format, float32)
+- Output: y, shape [N, C, d_out, h_out, w_out] = [N, C, output_size[0], output_size[1], output_size[2]]
+- Attributes: output_size (list of 3 ints) maybe? But the reference uses init inputs. In the custom op, we can pass output_size as attribute. The project JSON should define attr for output_size as list of ints.
+
+But note the reference Model's forward takes only x, output_size is passed at init. So we need to store output_size in model and pass to operator. In ModelNew, we can either store it and pass as argument to the custom op, or as attribute. Since AscendC ops can have attributes, we can define output_size as attribute.
+
+So operator signature: Ca6k04668Custom(x, output_size) -> y.
+
+In project JSON, input_desc: x (ND, float). output_desc: y (ND, float). attr: output_size (list of 3 ints, required).
+
+Tiling: we need to compute total length, input shape, output shape, stride calculations. Because the kernel needs to know input dimensions to compute adaptive pooling.
+
+We'll tile over output elements? Or over input? Since output is smaller typically, we can tile over output elements in a grid-stride loop.
+
+But to simplify, we can treat the operation as a pointwise-like per output element: for each output element, compute the corresponding input region and compute max. This requires indexing knowledge.
+
+We'll need to store in tiling data: input D, H, W; output D_out, H_out, W_out; total output number of elements (N*C*D_out*H_out*W_out). Then tile over those.
+
+Kernel: for each output element index (linear), compute batch and channel and spatial indices; compute start and end indices for input pooling region; loop over region and compute max. Use local tensor for accumulation? But max can be done by iterating.
+
+AscendC provides max reduction but we need to manually loop.
+
+Since we are constrained by UB, we can process one output element at a time? Or batch multiple? Given the output sizes are small (e.g., 1x2x2=4 elements per N*C), so total output is N*C*4 = 4*3*4=48. That's tiny. But the input is large. We need to access many input elements per output element. Maybe tile over outputs but each tile processes one output element? That is inefficient but works.
+
+Better: tile over input? Not straightforward.
+
+Given the output size is small, we can actually do the whole pooling in each block by iterating over all outputs. But we need to handle arbitrary sizes.
+
+Simplification: we can implement the kernel as a naive per-output-element loop, using global memory reads for input. That might be slow but correct. Since the harness checks numerical match, we can just do that. Use AscendC's DataCopy only for output? Actually we can read input directly from global memory, compute max, write output. But we must use local tensors for efficiency? We can load input tiles into local memory and compute.
+
+Given the complexity, I'll design a kernel that:
+
+- Tiling data includes: input_N, input_C, input_D, input_H, input_W; output_D, output_H, output_W; total output elements (N*C*D_out*H_out*W_out).
+- Grid stride over total output elements, each block processes tileLen output elements.
+- For each output element in the tile:
+  - Compute batch, channel, od, oh, ow.
+  - Compute pooling region: start_d = floor(od * input_D / output_D), end_d = ceil((od+1)*input_D / output_D) - 1? Actually adaptive pooling: region size = ceil((od+1)*input_D/output_D) - floor(od*input_D/output_D). Typically the start index is floor(od * input_D / output_D) and end index is ceil((od+1)*input_D / output_D) - 1. We'll compute that.
+  - Then loop over region in depth, height, width, read from global input using gm indexing, compute max.
+  - Write max to output_gm at corresponding position.
+
+This involves many global reads. To optimize, we could load a slice of input into local memory, but the region sizes vary. For simplicity, we'll directly read global memory in a loop. Use AscendC's global tensor reading.
+
+We must ensure we use the correct index calculations: input is 5D [N,C,D,H,W] with strides: stride_D = H*W, stride_H = W, stride_W = 1. Output same.
+
+Will define in tiling: inputStrideD, inputStrideH, inputStrideW, similarly output strides.
+
+However, we must be careful about memory of tiling data. We can store them as uint32_t.
+
+Also need to handle negativeSlope? No.
+
+Now, constraints from memories:
+
+- host_operator_src must NOT include OP_ADD as it will be autogen. So we define the operator using OpDef class? Actually the autogen already defines it via REG_OP. The typical host operator src includes #include "register/op_def_registry.h" and then a function TilingFunc, plus InferShape, InferDataType. The operator registration is done via OP_ADD in the class definition. But memory 1 says not to include duplicate OP_ADD if REG_OP already defines it. In our case, we are not using autogen? The build process will generate op_proto.h from project_json and auto-add REG_OP. So we should not manually add OP_ADD. Therefore in host_operator_src, we should only provide the TilingFunc and infer functions, but not the OpDef class with OP_ADD. We must let the autogen handle registration.
+
+But the example includes a class with OpDef and OP_ADD. To avoid conflict, we should remove the class and OP_ADD and only provide the TilingFunc and infer functions in a namespace. According to memory 1 and 3, we should rely solely on REG_OP from autogen. So we will not define the operator class; we will only define TilingFunc, InferShape, InferDataType, and then maybe register them with the autogen operator? Actually the autogen REG_OP will call SetTiling etc. We need to provide those functions. So we need to define a function that can be used by the operator's TilingFunc. Typically the autogen will include a header that declares a function like "optiling::TilingFunc". So we need to define that function in the same namespace as expected. We'll define a function with the exact name expected by the framework, which is based on the operator name. The autogen typically creates a TilingFunc named "Ca6k04668CustomTilingFunc" or similar. But the memory suggests to just define a function named TilingFunc inside optiling namespace? The standard pattern in the example is: inside namespace optiling, a function TilingFunc with signature ge::graphStatus TilingFunc(gert::TilingContext *context). Then the autogen will use that. So we should define that.
+
+In host_operator_src we will have:
+
+- #include "register/tilingdata_base.h" (but tiling data is in separate header)
+- #include "ca6k_04668_custom_tiling.h" (the tiling data header)
+- #include "register/op_def_registry.h"
+
+Then in namespace optiling, define TilingFunc that uses Ca6k04668CustomTilingData tiling; set fields directly, etc.
+
+Also define InferShape and InferDataType in namespace ge.
+
+But we must not define the OpDef class. The autogen will handle that.
+
+Thus host_operator_src will not contain the class LeakyReluCustom; only the three functions.
+
+Adjust from example: remove the class and OP_ADD.
+
+Now, we need to create the tiling data header (host_tiling_src). Use the same pattern with BEGIN_TILING_DATA_DEF and fields.
+
+Fields needed: input_N, input_C, input_D, input_H, input_W; output_D, output_H, output_W; totalOutputElems (N*C*D_out*H_out*W_out); maybe tileLength and blockDim (optional). We'll also include negativeSlope? No.
+
+But note: we need to tile over output elements. So we need totalOutputElems and tile length from UB budget.
+
+UB budget: we need to estimate how many output elements we can process per iteration. Each output element requires reading a variable number of input elements (region size). To limit UB usage, we can set a fixed tile length for output elements, say 128 or something, and process each output element by directly reading global input. That doesn't need local buffers for input. Only we need local tensor for output before writing? We can write directly to global, but to use DataCopy we need local tensor. However, we can use scalar loop and write directly via SetValue? Not efficient. Better to accumulate max in scalar variable and then store to global using SetValue on a local tensor then DataCopy. But that would be one float per output element. So we can batch a tile of output elements: for each output element in tile, we compute max and store in a local array, then copy to global. This uses tileLen * sizeof(float) for output buffer, plus maybe some scratch. UB budget: we need space for output buffer of tileLen floats. No input buffer needed if we read global directly. So UB size = tileLen * 4 bytes. UB budget typically 192KB, so tileLen can be up to 48K floats. But we must also consider that the reading of input is global, so no UB needed. So we can set tileLen to a reasonable value, e.g., 1024.
+
+But we also need to handle that the input shape may be large, but we only need to read regions.
+
+Thus tiling data: totalOutputElems, tileLen, input_N, input_C, input_D, input_H, input_W, output_D, output_H, output_W.
+
+We also need blockDim. We'll compute blockDim based on number of tiles.
+
+Now, kernel source: We'll implement KernelCa6k04668Custom class with Init and Process. Use queue for output? Yes, we need to use local output tensor and DataCopy. So we allocate outQueueY with BUFFER_NUM. No inQueueX (since we read directly from global). We'll have tmpQueue for temporary? Actually we can compute max in scalar variable and then store to local tensor of size tileLen (or we can store per element). But we need to do for each output element sequentially within the tile. We can use a local array to store results. So we allocate a local tensor yLocal of size tileLen. For each element i in tile, compute max, then assign to yLocal[i]. Then after processing all elements, we copy yLocal to global.
+
+We need to read input global elements for each output element. That is fine.
+
+In Process, we iterate over grid-stride blocks. For each block, we compute offset = blockIdx * tileLen, curLen = min(tileLen, totalOutputElems - offset). Then for i from 0 to curLen-1, compute linear index = offset + i. Compute batch, channel, od, oh, ow. Then compute region start/end indices, loop over region, read input using a scalar variable (float) from global, update max. Then store max in yLocal[i]. After loop, copy yLocal to global output at offset.
+
+We must ensure we use AscendC::Approach for global reads: we can use xGm_[index] directly? That works but is not vectorized. But it's simple.
+
+We'll define xGm_ as GlobalTensor<float> pointing to input. yGm_ as GlobalTensor<float> pointing to output.
+
+In Init, we set them.
+
+We need tiling data: totalOutputElems, tileLen, input_N, input_C, input_D, input_H, input_W, output_D, output_H, output_W.
+
+Because we need to compute strides: We can compute strides from these dimensions: input stride batch = input_C * input_D * input_H * input_W; input stride C = input_D * input_H * input_W; input stride D = input_H * input_W; input stride H = input_W; input stride W = 1. Similarly output strides.
+
+We can compute these in Init and store as member variables.
+
+Now, we must include "kernel_operator.h" and no tiling header as per memory 5.
+
+Now, python_bind_src: Similar to example but for our operator name. Use aclnnCa6k04668Custom.
+
+model_src: Use ModelNew that calls the custom op. The custom op will be available as custom_ops_lib.ca6k_04668_custom (function name). We need to output ModelNew class.
+
+Now, project_json_src: JSON with op name "Ca6k04668Custom". Input "x", output "y", attr "output_size" of type list_int (ascend format: "list_int")? Actually in Ascend, list attr is "list_int" with default value? We'll use "list_int" with default value [1,2,2] but the model passes output_size from init. So we can leave default but the user should provide. In model, we will pass output_size as argument.
+
+Now, careful: The reference model uses output_size from init. So in ModelNew, we will store output_size and pass it to custom op.
+
+Now, let's write the code.
+
+We'll use the same pattern: triple-quoted strings.
+
+Let's write each part.
+
+First, project_json_src:
+
+[
+  {
+    "op": "Ca6k04668Custom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "output_size",
+        "param_type": "optional",
+        "type": "list_int",
+        "default_value": [1,2,2]
+      }
+    ]
+  }
+]
+
+Note: list_int default value is list of ints.
+
+Now host_tiling_src:
+
+We need to define tiling data struct. Use BEGIN_TILING_DATA_DEF(Ca6k04668CustomTilingData) with fields:
+
+- totalOutputElems (uint32_t)
+- tileLen (uint32_t)
+- blockDim (uint32_t)
+- input_N (uint32_t)
+- input_C (uint32_t)
+- input_D (uint32_t)
+- input_H (uint32_t)
+- input_W (uint32_t)
+- output_D (uint32_t)
+- output_H (uint32_t)
+- output_W (uint32_t)
+
+Then REGISTER_TILING_DATA_CLASS
+
+Now host_operator_src:
+
+Include tiling header, register/op_def_registry.h. Use const gert::StorageShape* for input shape. Get origin shape, get dim sizes. Parse output_size from attrs. Compute total output elements. Compute tile length from UB budget. Set tiling fields directly. Set blockDim. Also define InferShape and InferDataType.
+
+No OpDef class.
+
+Make sure to set context->SetBlockDim.
+
+Now kernel_src:
+
+Includes kernel_operator.h. Gets tiling data via GET_TILING_DATA macro. Then define KernelCa6k04668Custom class.
+
+Now python_bind_src:
+
+Include torch headers, define function ca6k_04668_custom that calls EXEC_NPU_CMD with aclnnCa6k04668Custom. Then TORCH_LIBRARY_IMPL and PYBIND11_MODULE.
+
+Now model_src:
+
+Define ModelNew that takes init inputs (output_size) and in forward applies custom op.
+
+Let's write the code carefully, avoiding the memory pitfalls.
+
+Note: The memory 4 says use direct field assignment not setter. So in tiling data assignment, do tiling.totalOutputElems = totalOutputElems; etc.
+
+Also memory 2: use const gert::StorageShape*.
+
+Memory 5: no tiling header include in kernel.
+
+Memory 1 & 3: no duplicate registration.
+
+Now, I'll generate the full answer.

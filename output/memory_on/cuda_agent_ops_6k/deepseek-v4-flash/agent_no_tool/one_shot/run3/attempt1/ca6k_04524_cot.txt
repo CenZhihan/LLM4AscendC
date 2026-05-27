@@ -1,0 +1,83 @@
+We need to generate the six strings for a fused InstanceNorm2d custom operator. The reference uses nn.InstanceNorm2d with num_features, eps, momentum, affine=False, track_running_stats=True. Since it's InstanceNorm, it computes per-instance (i.e., per sample and per channel) mean and variance, then normalizes. We'll implement a single fused custom op called Ca6k04524Custom (based on ca6k_04524_custom). Input shape: (N, C, H, W). Output same shape. Need to handle training mode with track_running_stats, but in reference it's True, though InstanceNorm doesn't update running stats by default? Actually nn.InstanceNorm2d with track_running_stats=True computes running mean and variance during training, but in forward it uses the batch statistics for normalization (InstanceNorm always uses current batch stats per instance). The running stats are stored but not used in forward unless affine=False? Actually InstanceNorm uses per-instance statistics always, and track_running_stats only affects whether running mean/var are computed for potential use in inference (but for InstanceNorm they are not used in normalization unless you set affine=True? Wait: In PyTorch docs: "If track_running_stats is True, the running mean and variance are tracked during training and used during eval(). If True, this module will always run in training mode and the running mean and variance are not used during eval (?)." Actually InstanceNorm always uses per-instance statistics, so track_running_stats only stores running mean/var (which are not used during normalization). However, for our custom op we can ignore running stats and just compute instance norm. The reference model passes affine=False, so only scaling and shifting from instance stats. So our custom op just computes: y = (x - mean) / sqrt(var + eps) where mean and var are over spatial dims (H,W) per instance (N,C). That's it. We'll implement kernel that loads tile of input, computes local mean and variance, normalizes. Since it's 4D, we need to tile across batches and channels? But we can flatten spatial dimensions. efficient: treat each instance as a 2D slice of size C*H*W? No, we need per-channel mean and var. Actually InstanceNorm2d normalizes per (N, C) over (H,W). So we have N*C independent groups of size H*W. Input shape (N,C,H,W). We can tile along the flattened dimension? We'll need to compute mean and variance over H*W elements for each (n,c). So we can iterate over N*C groups. For each group, load its H*W elements, compute mean via sum, then variance via sum((x-mean)^2), then normalize. Use vector instructions. UB budget limited; we need to handle large H*W (512*128=65536) which is 65536 floats = 256KB. That might exceed UB. So we need to tile within each group. Use two-pass approach: compute sum of elements, then sum of squares? Or compute mean first, then variance using (x-mean)^2. To avoid two passes, we can compute mean in one pass, then compute variance in a second pass using the stored mean. But that requires storing the entire group elements? We can compute mean and variance in a single pass using Welford's algorithm, but that is sequential and not vectorizable easily on AscendC? Might be doable but complex. Simpler: compute sum and sum of squares in one pass, then compute variance as (sum_sq/N) - (mean)^2. But that formula is numerically less stable, but for InstanceNorm it's okay. However, we might need high precision. We'll use the stable formula: var = (sum_sq - (sum*sum)/N) / N. This can be done with vector operations: compute sum of elements using ReduceSum, sum of squares using Muls and ReduceSum? But ReduceSum is not a standard AscendC operation? We can use vector accumulate? Actually AscendC provides: ReduceAdd for sum? There is DataCopy but for reduction we might need custom loops. But we can use built-in reduction functions from AscendC: there is `AscendC::ReduceSum` available as kernel built-in? Not sure. Alternatively, we can implement a simple loop over elements to compute sums. Since we need to tile due to UB, we can accumulate partial sums in UB and then combine.
+
+Better approach: Use a two-tile strategy: for each (n,c) group, process tiles of H*W elements. Compute tile-level sum and sum_sq, store partials, then after all tiles, combine to get global mean and variance. Then normalize each tile using the global mean and variance. This requires two passes: first compute sums, second normalize. We can do pipelining: load tile, compute sum/sumsq, accumulate locally, then after all tiles, compute mean, var, then reload tiles for normalization. However, that requires storing the tile data? We can keep it in UB if we re-read from global? But we can also compute normalization on the fly during second pass by re-reading from global memory (GM). That is okay. So kernel algorithm:
+
+- For each (n,c) group:
+  - Initialize sum=0, sum_sq=0.
+  - For each tile of the H*W elements:
+    - Load tile from GM to local.
+    - Compute partial sum and sum_sq using vector operations (Add, Muls, etc.) and accumulate into scalar accumulator (must use scalar operations). But we need to sum over a vector. We can use a loop to add each element? That's inefficient. Better: use vector reduction functions available in AscendC: `AscendC::ReduceSum`? Actually there is `AscendC::ReduceAdd`, but it's for block-level reduction? Need to check. Alternatively, we can compute sum as dot product with all ones? We can use `AscendC::Mul` and `AscendC::Add` iteratively? Perhaps we can use the fact that AscendC supports vector operations like `Add` to accumulate a vector into a scalar? No, it's element-wise. So we need a reduction within the vector. We can use `AscendC::ReduceSum` which is part of the math API? Let's assume it's available. If not, we could implement a parallel reduction in UB: use half the vector, half etc. But for simplicity, we can compute sum and sum_sq by iterating elements of the tile using a loop. Since tile size is limited (e.g., 2048 elements), that loop is acceptable. Actually AscendC has `AscendC::Vec::ReduceSum`? Not sure. Given complexity, we could use a simpler approach: compute mean and variance using the two-pass method but with the help of built-in vector functions like `Min`, `Max`, `Abs`, etc. We can compute sum by using `AscendC::Add` to a zero vector and then reduce? There is `AscendC::ReduceSum` in the `AscendC::Vec` namespace? I recall that AscendC supports `AscendC::Vec::Sum`? Let's assume we can use the high-level reduction functions.
+
+Given time, I'll implement using the sum of squares formula and use AscendC's `ReduceAdd` (or `AscendC::ReduceSum`). I'll write kernel that uses a double buffer and loop over tiles. For simplicity, I'll compute mean and variance per group using two passes: first pass compute mean by summing all elements and dividing by number of elements; second pass load again to compute variance. But two passes double global memory reads. Alternatively, we can compute sum and sum_sq in one pass, then compute variance. That is more efficient. So we'll do that.
+
+Kernel steps:
+
+1. For each block (since we have many groups, we can assign multiple groups to each block? Use grid stride over groups. Each block processes one group at a time? Actually we have N*C groups. We can parallelize over groups: each block handles a contiguous range of groups? Or use multi-block per group if group is large? But H*W can be up to 65536 elements; UB can hold maybe 2048 floats per tile. So a single block can handle a group by iterating over tiles. So we can assign each block to handle a specific group index. Use blockIdx to determine which group (n,c) to process. Number of blocks = min(total_groups, max blocks). If total_groups > blocks, each block processes multiple groups in a loop (grid stride over groups). That's fine.
+
+2. For each group assigned:
+   - Compute total elements in group = H*W.
+   - Initialize sum = 0, sum_sq = 0.
+   - Loop over tiles of the group:
+     - Load tile into local buffer (size tile_len).
+     - Compute tile_sum = sum of all elements in tile (via loop or reduction).
+     - Compute tile_sum_sq = sum of squares (elementwise Multiply and sum).
+     - Accumulate.
+   - After all tiles, compute mean = sum / total_elems.
+   - Compute variance = (sum_sq - (sum*sum)/total_elems) / total_elems. (We can use float division)
+   - Then second pass: loop over tiles again:
+     - Load tile from GM to local.
+     - Normalize: (elem - mean) / sqrt(variance + eps) (using Vdiv, Vsqrt maybe).
+     - Store to output GM.
+   - Proceed to next group.
+
+This requires two passes per group. To improve performance, we could use double buffering for the second pass while the first pass is in progress? No, we need sums first. So two passes are acceptable.
+
+We need tiling parameters: tile_len based on UB budget. For each tile we need: input buffer, output buffer, temporary for sqrt? Also we need to compute sum per tile. We'll use a scalar variable for sum, but need to accumulate tile-wise sums. We can compute tile_sum by loading into local tensor and then using AscendC::ReduceSum? I'll assume there is a function. Alternatively, we can use a loop over elements to sum manually using scalar addition. Since tile_len is small (e.g., 2048), loop is fine. Same for sum_sq.
+
+Now, for the six string variables:
+
+- project_json_src: Define operator with one input "x" (4D float ND), one output "y", and attributes: "eps", "momentum", "affine", "track_running_stats"? Actually the reference uses these args in init, but the forward only uses eps from InstanceNorm? InstanceNorm uses eps only. So we only need eps as attribute. We can also include momentum and track_running_stats but they are not used in forward if affine=False. So just eps.
+
+- host_tiling_src: define tiling data: totalLength (number of elements in input? but we need per-group info), but we'll use shape dimensions: N, C, H, W. Also tileLen. blockDim.
+
+- host_operator_src: define operator, infer shape same as input. Tiling function will compute tileLen based on UB, and blockDim based on number of groups.
+
+- kernel_src: implement kernel as described.
+
+- python_bind_src: bind to aclnn implementation? We need to call the custom op via EXEC_NPU_CMD? But that requires an aclnn interface. Alternatively, we can use torch_npu's custom op registration pattern. But the example uses EXEC_NPU_CMD(aclnnLeakyReluCustom, ...). So we need to define an aclnn function? Actually the operator is registered via TORCH_LIBRARY_IMPL. The python_bind_src should be a C++ file that implements a function that calls the custom op via AscendC runtime? Typically, the pattern is: include "pytorch_npu_helper.hpp", define a function using EXEC_NPU_CMD with the operator name. So we'll do that: define a function `ca6k_04524_custom_npu` that takes tensor and eps, returns result.
+
+- model_src: define ModelNew that calls the custom op.
+
+We must use the naming: kernel name "ca6k_04524_custom", JSON op name "Ca6k04524Custom". Tiling struct name "Ca6k04524CustomTilingData". Kernel function name "ca6k_04524_custom".
+
+Now, careful about UB budget: The example uses 192KB UB. We'll use similar. We need memory for input tile (tile_len floats), output tile (tile_len), and possibly temporary for variance computation (like sqrt of variance, but we can compute with vector operations). We'll need buffer for sqrt of variance? Actually we can compute inv_sqrt variance = rsqrt(var+eps) and then multiply. So we need a scalar rsqrt, then vector multiply. So we need input buffer, output buffer, and maybe a temp buffer for elementwise subtract? We can compute in-place: load to input buffer, subtract mean, multiply by inv_sqrt, store to output buffer. So we need input and output buffers. Also we need a temporary for sum and sum_sq accumulators (scalar). So total UB floats = 2 * tile_len (in/out) + maybe one more for intermediate? Actually we can reuse input buffer for computing sum? We'll compute sum before normalization, so we need a separate buffer for normalization? We can reuse the input buffer after we have computed sums? But we need to load again for normalization, so we can use the same input buffer for second pass. So buffer for input tile, output tile, maybe a temporary for element-wise square? For sum_sq we can compute using squaring of input and accumulate. We'll need a temporary for square values. So three buffers: input, square, output? But we can reuse: compute square by using `Mul` on input buffer and store to same buffer? Then we lose input. So we need a separate temp buffer for square. So total 3 * tile_len floats = 12 * tile_len bytes. With UB 192KB, max tile_len = 192KB / 12 / 4 = 16384/? Actually 192KB = 196608 bytes. 12 * 4 = 48 bytes per element => max elements = 196608 / 48 = 4096. So tile_len up to 4096. We'll set ALIGN_ELEMS = 1024 for safety, and HARD_CAP_ELEMS = 4096.
+
+Now implement host_tiling: compute tileLen, blockDim = min(total_groups, 24) etc.
+
+Write code.
+
+Need to ensure kernel uses correct loops for sum and sum_sq. We'll implement a simple sum loop using `for (int i=0; i<len; i++)` with scalar accumulator. AscendC kernel functions allow loops.
+
+Also note: Input dimensions: N, C, H, W. Total groups = N*C. Each group size = H*W.
+
+We'll compute group stride: each block handles groups with step blockNum.
+
+Implementation details:
+
+In kernel_operator.h include "kernel_operator.h". We'll use class KernelCa6k04524Custom.
+
+Init: store N, C, H, W, totalGroups, groupSize, eps, etc. Also tileLen.
+
+Process: for each group assigned, do two passes: compute sum/sum_sq, then normalize.
+
+Compute sum: load tile, loop to add each element to sum_scalar, also compute square and add to sum_sq_scalar.
+
+After all tiles, compute mean, variance, inv_std = rsqrt(variance + eps). Then second pass: load tile, subtract mean, multiply by inv_std, store.
+
+We'll use double buffering only for the second pass? For simplicity, use single buffer for each pass, no double buffering. Can add later.
+
+Now, write the six strings.
+
+We must output them in a single Python code block with assignments.
+
+Proceed to generate.

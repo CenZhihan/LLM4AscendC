@@ -1,0 +1,395 @@
+We need to analyze the correctness issue. The error log shows that the output of the custom cumsum kernel (dim=0) is producing results that are shifted by one row: the first row is all zeros, and the remaining rows are the cumsum of the previous row's prefix. The reference output shows cumsum along dim=0 correctly: each row is the cumulative sum of all rows up to that row.
+
+In the kernel, the algorithm is:
+- Initialize accumulator to zero.
+- For each row i from 0 to N-1:
+  - Load row i
+  - Add to accumulator
+  - Write accumulator to output row i
+
+This should produce exactly the cumulative sum along dim=0: output[0] = row0; output[1] = row0+row1; etc.
+
+But the observed output shows:
+- row0 is all zeros (should be row0 itself)
+- row1 is row0 (should be row0+row1)
+- row2 is row0+row1 (should be row0+row1+row2)
+
+So it seems the write is writing the accumulator before adding the current row? Actually the code shows: Add(acc, acc, xDeq, C_); then DataCopy(yGm_[offset], acc, C_). That should be correct: add first, then write. But the output shows first row is zero, so it appears the Add is being done after the write? Wait: the DataCopy writes after Add, so row0 should get accumulator after adding row0, which should be row0. But it shows zeros. That suggests that either the accumulator is initialized to zero and the first row is not being added, or the DataCopy is writing before the Add.
+
+Let's examine the Process loop more carefully. There is a prefetch mechanism? No, it's a simple sequential loop. The accumulator is initialized in Init, then EnQue'd.
+
+In Process:
+- Loop i from 0 to N-1:
+  - offset = i * C_
+  - Alloc tensor xLocal, DataCopy from xGm_[offset], EnQue
+  - DeQue xDeq, DeQue acc
+  - Add(acc, acc, xDeq, C_)
+  - DataCopy(yGm_[offset], acc, C_)
+  - FreeTensor xDeq, EnQue acc
+
+This looks correct. But the symptom is that row0 is zeros. Could it be that the accumulator is not properly initialized? In Init, we allocate acc, Duplicate to 0.0f, then EnQue. Then in Process, we DeQue acc, which gets that zero tensor. Then Add(acc, acc, xDeq, C_) adds row0 to acc, so acc becomes row0. Then DataCopy writes row0 to yGm_[offset]. That should work.
+
+But maybe the issue is that when we EnQue the accumulator after freeing, we are re-using the same tensor? That should be fine.
+
+Alternatively, perhaps the issue is that the DataCopy writes before the Add completes? Since it's a synchronous kernel, the operations are ordered. But it's AscendC, operations are pipelined but within a scope they are ordered.
+
+Look at the output more closely: row0 all zeros, row1 is row0, row2 is row0+row1, etc. So it seems that for each row i, we are writing the previous accumulator (before adding the current row). That is exactly the behavior if the DataCopy is placed before the Add. But in the code, DataCopy is after Add.
+
+Wait, the code in the previous attempt is:
+
+```
+AscendC::Add(acc, acc, xDeq, C_);
+// Write result to global memory
+AscendC::DataCopy(yGm_[offset], acc, C_);
+```
+
+That's correct. But maybe due to the pipeline, the DataCopy might be overlapping with the next iteration's operations if the accumulator is reused? However, we have only one buffer for inQueueX and accQueue. That means we cannot overlap because we need to finish the current before moving to next because we need the accumulator.
+
+Actually, with BUFFER_NUM = 1 for both queues, there is no double buffering; the operations are sequential. So it should be fine.
+
+Let's check the output format: The reference output has row0 as the first row itself (1.1620...), row1 as row0+row1, etc. The custom output has row0 all zeros, row1 as row0, row2 as row0+row1. So indeed the custom kernel is writing the accumulator before adding the current row. But the add is before write in code. Could there be an issue with the order of operations in AscendC? DataCopy might be asynchronous? No, it's blocking.
+
+Maybe the problem is that the accumulator is not being dequeued properly. In the loop, we do:
+```
+AscendC::LocalTensor<float> xDeq = inQueueX_.DeQue<float>();
+AscendC::LocalTensor<float> acc = accQueue_.DeQue<float>();
+```
+But note that we use the same variable name "acc" as the local tensor allocated in Init. That's fine; it's a new handle? In AscendC, DeQue returns a LocalTensor that points to the same memory. So it's correct.
+
+Perhaps the issue is that we are using the same buffer for inQueueX for each row, but we allocate xLocal, DataCopy, EnQue, then DeQue, FreeTensor. That should be fine.
+
+Wait: there's a potential issue with the pipe initialization. In Init, we initialize inQueueX_ with BUFFER_NUM = 1, tile length = C_ * sizeof(float). That means each buffer holds one row. That's fine.
+
+But in Process, we allocate a tensor from inQueueX_ for each row, then EnQue, then DeQue. That's using the single buffer twice per iteration (allocate and free). Should be okay.
+
+Maybe the issue is that the accumulator queue is initialized with BUFFER_NUM = 1, but we only have one tensor in it. In Process, we DeQue and EnQue it each iteration. That's fine.
+
+Let's examine the actual error: The output mismatch says the first row is zeros. Could it be that the kernel is not writing row0 at all? The first row of output is all zeros, which is consistent with the accumulator being zero and not being added to. What if the Add is not executed for i=0 because of some condition? But there is no condition.
+
+Another possibility: The kernel might be running on multiple blocks? In tiling, blockDim is set to 1, so only one block runs. That's fine.
+
+Maybe the issue is that the kernel is not using dim correctly. The dim attribute is passed but in the kernel we only handle dim=0. For dim=0, the algorithm should be as implemented. But the reference uses dim=0 (since y is 0). So that should be fine.
+
+Wait, the reference model uses `torch.cumsum(x, dim=y)` where y is 0. So dim=0.
+
+In the kernel, we do:
+```
+if (dim_ != 0) return; // only dim 0 implemented
+```
+So for dim=0, it proceeds. That's correct.
+
+Maybe the issue is that the kernel writes to yGm_ starting from offset=0 for row0, but the output shows zeros for row0. Could it be that the DataCopy for row0 is not writing correctly because the accumulator is still zero? But the Add should make it non-zero.
+
+Let's think about the AscendC API: Add(acc, acc, xDeq, C_) modifies acc in place. Then DataCopy writes that to global memory. That should work.
+
+Could there be a synchronization issue? In AscendC, operations within a scope are sequential. So Add completes before DataCopy.
+
+I suspect the issue might be with the initialization of the accumulator. In Init, we do:
+```
+AscendC::LocalTensor<float> acc = accQueue_.AllocTensor<float>();
+AscendC::Duplicate(acc, 0.0f, C_);
+accQueue_.EnQue(acc);
+```
+But then in Process, we DeQue the accumulator. However, note that in the Init function, we also set xGm_ and yGm_ buffers. That's fine.
+
+Perhaps the problem is that the pipe and queues are not properly reset between calls? But it's a single kernel invocation.
+
+Another possibility: The kernel might be using the wrong memory space for the accumulator queue. It's VECCALC, which is for vector calculation. That should be fine.
+
+Let's look at the reference solution for cumsum: typically, you need to do a prefix sum. The implementation above is correct for dim=0: each block processes a row, but we only have one block processing all rows sequentially. That should work.
+
+But the output shows row0 zeros. Perhaps the first row is not being processed because the loop starts at i=0 but something goes wrong with the queue operations for i=0.
+
+Let's re-examine the kernel code from the previous attempt:
+
+```cpp
+__aicore__ inline void Process()
+{
+    if (totalLen_ == 0u || C_ == 0u) return;
+    if (dim_ != 0) return; // only dim 0 implemented
+
+    for (uint32_t i = 0u; i < N_; ++i) {
+        uint32_t offset = i * C_;
+
+        // Load one row of input
+        AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm_[offset], C_);
+        inQueueX_.EnQue(xLocal);
+
+        // Deque input and accumulator
+        AscendC::LocalTensor<float> xDeq = inQueueX_.DeQue<float>();
+        AscendC::LocalTensor<float> acc = accQueue_.DeQue<float>();
+
+        // acc = acc + xDeq
+        AscendC::Add(acc, acc, xDeq, C_);
+
+        // Write result to global memory
+        AscendC::DataCopy(yGm_[offset], acc, C_);
+
+        // Free temporary tensors and re-enque accumulator
+        inQueueX_.FreeTensor(xDeq);
+        accQueue_.EnQue(acc);
+    }
+}
+```
+
+Is there a possible bug where for i=0, the accumulator DeQue returns the zero-initialized tensor, then Add sums, then DataCopy writes, that should produce row0. But the output shows zeros. Could it be that DataCopy writes before Add completes due to pipelining? I doubt it.
+
+Maybe the issue is that the accumulator is not being used correctly across iterations. In the first iteration, we DeQue the initialized accumulator, Add, Write, EnQue. That should work. In the second iteration, we DeQue again, which should be the updated accumulator. That works.
+
+But the output shows row1 is row0, meaning the accumulator written for row1 is row0. That suggests that for the second iteration, the accumulator is still row0 (from after first iteration's Add), and then we write it before adding row1? No, we Add then Write. So row1 should be row0+row1. But it shows row0. So it appears that for row1, the Add is not happening? Or the Write is writing the accumulator before Add.
+
+If we assume that for some reason, the Add does not affect acc (maybe due to a zero length? but C_ is 128), then row1 would remain row0. And row0 would be zero if the initial accumulator was zero and row0 was not added. But row0 is zero in output, so it seems row0 is also not added. So perhaps the Add is not executed at all for any iteration? That would result in all rows being zero. But row1 is row0, so some data is written. Actually row1 is row0, meaning the accumulator after first iteration is row0 (since row0+0 = row0 if Add didn't happen? No, if Add didn't happen, acc remains 0, then write would be zero. So something else.
+
+Wait: row1 is row0, meaning the data written to y at row1 is the actual row0 data from x. That suggests that the accumulator after first iteration contains row0, and then in the second iteration, we write that accumulator unchanged before adding row1. But the code Add then Write, so if Add is executed, acc becomes row0+row1. So it must be that Add is not executed for the second iteration. That is strange.
+
+Maybe the issue is that we are re-using the same LocalTensor handle for acc, and the AscendC compiler might be reordering operations? Or the Add might be a no-op if the tensors are not valid? Or perhaps the inQueueX DeQue is blocking and causing issues?
+
+I recall that in AscendC, you must ensure that the tensor you are using is properly allocated and not freed before use. In this code, we allocate xLocal, DataCopy, EnQue, then DeQue. That's fine. For acc, we allocate in Init, EnQue, then DeQue. That's fine.
+
+Could there be an issue with the EnQue/DeQue order? We EnQue xLocal before DeQue. That's correct.
+
+Maybe the problem is that we are using a single buffer for inQueueX, and we allocate, EnQue, DeQue, FreeTensor in each iteration. But after FreeTensor, the buffer is free for the next allocation. That's fine.
+
+Let's look at the overall output pattern more carefully. The new output is:
+```
+[[ 0.0000e+00,  0.0000e+00,  0.0000e+00,  ...,  0.0000e+00,
+    0.0000e+00,  0.0000e+00],
+ [-1.1620e+00,  1.3113e+00,  1.5073e-01,  ...,  1.7549e+00,
+   -9.9234e-01,  2.9780e-01],
+ [-3.1788e+00,  1.5748e+00,  5.0968e-01,  ...,  2.2483e+00,
+    3.3526e-01,  4.1254e-01],
+ ...
+```
+So row0 zeros, row1 = reference row0, row2 = reference row1, etc. This corresponds to a shift where each row is the cumsum of previous rows? Actually reference row0 is the first row itself, and output row1 is reference row0, output row2 is reference row1, etc. So it seems that the kernel is writing the accumulator before adding the current row, but for row0, the accumulator is zero, so it writes zero. For row1, the accumulator after adding row0 is row0, so it writes row0. For row2, the accumulator after adding row1 is row0+row1, so it writes row0+row1, which matches reference row1 (since reference row1 is row0+row1). So indeed it appears that the Add is being performed after the Write, not before. That is, the sequence is: DeQue acc (which contains previous sum), then Write this acc, then Add xDeq to acc, then EnQue acc for next iteration. That would produce exactly the observed pattern.
+
+But the code shows Add before Write. So either the compiler is reordering, or there is a subtle bug where the Add is not actually executed due to some condition, or the Write uses a stale buffer.
+
+One common mistake in AscendC is that the pipeline might cause the Write to use the old value of acc if the Add is not yet committed. But normally, operations are sequential within a block.
+
+Another possibility: The queues might be causing synchronization issues. Since we have only one buffer each, the DataCopy might be scheduled before the Add because of how the queue dependencies are managed. In AscendC, operations on local tensors are ordered by the dependence chain. If we write to global memory using a tensor that is also used in a previous Add, the Add must complete first. The compiler should enforce that.
+
+But perhaps the problem is that we are using the same acc tensor for both Add and DataCopy, and the Add writes to acc, then DataCopy reads from acc. That's fine.
+
+Given the observed symptom, the only way to explain it is that the order of Add and DataCopy is reversed. Since we cannot change the compiler, we can explicitly enforce ordering by using a separate temporary tensor for the write stage, or we can restructure the loop to ensure the Add happens before the DataCopy by using a different pattern.
+
+A simpler fix: Instead of writing the accumulator after adding the current row, we can write the accumulator from the previous iteration before adding the current row. That would be equivalent to: For the first row, write the initial sum (which is zero? But we want row0 itself). Actually, we want: after processing row0, output[0] = row0. That's what the current code does (Add then Write). But if the order is reversed, we get the observed behavior. To fix, we can reverse the order in code: Write before Add, but then for the first row we need to handle separately. Alternatively, we can use a double-buffered accumulator: keep a previous sum and current sum.
+
+A minimal fix: In the loop, we can first write the previous accumulator (which for row0 we need to write row0, so we need to add before write). So we can't simply swap. We need to ensure the Add happens before the Write. To force ordering, we can use a local variable and do a blocking operation? Or use a separate temporary tensor for the Write.
+
+One reliable method: Use a separate local tensor for the result of Add, then write that tensor. That way, the Add must complete before the DataCopy because of the dependency. In the current code, Add and DataCopy both use the same acc tensor. That should create a read-after-write dependency that prevents reordering. But the symptom suggests reordering.
+
+Maybe the issue is that the Add and DataCopy are both asynchronous, and they can be issued in any order by the compiler if it determines they are independent? But they are not independent because Add writes acc and DataCopy reads acc. So the compiler should not reorder.
+
+Wait, maybe the problem is that we are using different tensors for Add and Write? No, it's the same.
+
+I think we need to look at the actual executed binary. Since we can't, we should apply a fix that is known to work: use a double-buffer approach or use explicit synchronization.
+
+Simpler: Use a separate accumulator for the result and keep the previous accumulator. Actually, we can mimic the typical prefix sum pattern: For each row, compute current = previous + x, write current, then set previous = current. In the current code, we are using a single accumulator that is updated in place. That should work.
+
+Maybe the issue is that the accumulator queue is initialized with one element, but the EnQue/DeQue operations might have a bug when only one buffer is used. Sometimes queues need at least 2 buffers to work properly because of the enque/deque mechanism. With BUFFER_NUM = 1, the queue might not allow both a producer and consumer to operate simultaneously. In our case, we are doing EnQue after DeQue in the same iteration, which might be problematic if the queue expects a certain count.
+
+In AscendC, a queue with 1 buffer can be used sequentially: you can Alloc, EnQue, DeQue, FreeTensor, then repeat. That is allowed. But perhaps there is a subtle issue with the accumulator queue because we DeQue before we EnQue (in the first iteration, we DeQue the initialized tensor, then later we EnQue). That should be fine.
+
+I suspect the problem might be the pipe initialization: in Init, we initialize inQueueX_ with BUFFER_NUM = 1 and size = C_ * sizeof(float). For accQueue_, we also initialize with BUFFER_NUM = 1 and size = C_ * sizeof(float). But in Init, we allocate a tensor from accQueue_ and EnQue it. That's fine. But then in Process, we DeQue that tensor. However, note that the pipe's InitBuffer might set up the queues, but the first Alloc/EnQue is done in Init, which might not be valid across functions? The pipe is a global object that persists across Process? It should be.
+
+Actually, the pipe is instantiated as a member of the kernel class, and Init is called once before Process. So the queue state carries over. That should be fine.
+
+Another angle: The kernel might be running on multiple blocks? But blockDim is set to 1, so only one block. But maybe the default blockDim is not 1? The tiling sets blockDim to 1, but perhaps the runtime uses a different block assignment? Unlikely.
+
+I think the most straightforward fix is to change the algorithm to use a double-buffered approach that avoids any potential reordering: separate the accumulation and write into two distinct tensors. We can use a workspace or simply use two local tensors: one for the current sum, one for the previous sum. But that would increase register pressure.
+
+Alternatively, we can use the typical ascendc pattern for prefix sum: use a vector recurrence. But for simplicity, we can use the existing code but with BUFFER_NUM=2 for the accumulator queue to allow double buffering. That way, the DeQue and EnQue are done on different buffers, and the pipeline might work correctly. However, the previous pattern with BUFFER_NUM=1 should work.
+
+Let's try a different approach: Instead of in-place update, we can compute and write using two separate tensors to force ordering. For example:
+
+```
+AscendC::LocalTensor<float> xDeq = inQueueX_.DeQue<float>();
+AscendC::LocalTensor<float> accOld = accQueue_.DeQue<float>();
+AscendC::LocalTensor<float> accNew = pipe_.AllocTensor<float>(C_);
+AscendC::Add(accNew, accOld, xDeq, C_);
+AscendC::DataCopy(yGm_[offset], accNew, C_);
+pipe_.FreeTensor(accOld);  // actually accOld is from queue, we need to free it correctly
+accQueue_.EnQue(accNew);
+inQueueX_.FreeTensor(xDeq);
+```
+
+But this requires allocating a new tensor each iteration, which may exhaust local memory.
+
+Simpler: We can use a temporary tensor (like a scalar or a small vector) to break the dependency. But the operation is vector.
+
+Given the observed error pattern matches exactly a reversed order of Add and DataCopy, the fix is to ensure ordering by using a separate temporary tensor for the result. We can allocate a temporary tensor from a queue (like tmpQueue) and use it to hold the result of Add, then write that tensor to global memory, then enqueue it back to accQueue. That way, the Add writes to tmp, then DataCopy reads from tmp, then we enqueue tmp into accQueue. This creates a clear dependency.
+
+In the existing code, there is no tmpQueue. We can add one. In the leaky_relu example, there is a tmpQueue_ used for intermediate results. We can do similar.
+
+So fix: 
+- In Init, allocate a tmp buffer (not a queue, just a local tensor or a queue for reuse). But we need a local tensor that we can reuse. We can use a queue with BUFFER_NUM=1 for tmp.
+- In Process, after DeQue acc, we DeQue tmp, then Add into tmp (Add(tmp, acc, xDeq, C_)), then DataCopy from tmp, then EnQue tmp to accQueue, then FreeTensor xDeq, and leave tmp in queue? Actually we need to return tmp to accQueue. But accQueue expects the new accumulator. So we can use tmp as the new accumulator and enqueue it. So we can avoid a separate queue: just use the same queue but allocate a new tensor each iteration? That would require freeing the old one. But we can do: 
+  - In Init, allocate acc tensor from accQueue, initialize to zero, enqueue.
+  - In Process, for each row:
+    - DeQue acc (old accumulator)
+    - Allocate new tensor newAcc from accQueue (by AllocTensor)
+    - Add(newAcc, acc, xDeq, C_)
+    - DataCopy(yGm_[offset], newAcc, C_)
+    - EnQue newAcc
+    - FreeTensor acc (return old to pool)
+    - FreeTensor xDeq
+
+But this uses two tensors from the same queue, which requires BUFFER_NUM >=2. So we can set BUFFER_NUM=2 for accQueue. That might fix the ordering issue as well.
+
+Alternatively, keep BUFFER_NUM=1 and use a separate workspace queue.
+
+Considering minimal changes: change accQueue_ to BUFFER_NUM=2 and modify the loop to use two different tensors. That is a targeted fix.
+
+But actually, the current code with BUFFER_NUM=1 should work if the Add and DataCopy are properly ordered. Since they are not, we need to enforce ordering.
+
+The simplest fix: Insert a "fence" or a "sync" between Add and DataCopy. In AscendC, there is `SetFlag` or something? Not sure.
+
+I think the most reliable approach based on the leaky_relu example is to use a separate tmpQueue for the result. In leaky_relu, they used tmpQueue_ for intermediate computation but then freed it before enqueuing the result. In our case, we can do:
+
+- Add a new TQue for VECCALC with BUFFER_NUM=1, call it tmpQueue.
+- In Process:
+  - DeQue acc from accQueue
+  - DeQueue tmp from tmpQueue (it will be allocated)
+  - AscendC::Add(tmp, acc, xDeq, C_);
+  - AscendC::DataCopy(yGm_[offset], tmp, C_);
+  - EnQue tmp into accQueue (since tmp now holds the new accumulator)
+  - FreeTensor xDeq
+  - FreeTensor acc (return to pool of accQueue? But we are not using acc anymore; we need to return it to the pool. Actually, acc was dequeued from accQueue, so we must either enqueue it back or free it. We have enqueued tmp as new accumulator, so we should free acc. So we need to call pipe_.FreeTensor(acc) or free it via a queue? In AscendC, when you DeQue a tensor, you are responsible for returning it to the pool via FreeTensor. So we should free acc.
+
+But we also need to initialize tmpQueue in Init with one buffer of size C_ * sizeof(float). And we need to allocate and enqueue a tensor into tmpQueue in Init so it's available in Process.
+
+Let's design:
+
+In Init:
+```
+pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));
+// Allocate and enqueue an empty tensor
+AscendC::LocalTensor<float> tmp = tmpQueue_.AllocTensor<float>();
+tmpQueue_.EnQue(tmp);
+```
+
+In Process, for each row:
+```
+AscendC::LocalTensor<float> xDeq = inQueueX_.DeQue<float>();
+AscendC::LocalTensor<float> acc = accQueue_.DeQue<float>();
+AscendC::LocalTensor<float> tmp = tmpQueue_.DeQue<float>();
+
+AscendC::Add(tmp, acc, xDeq, C_);
+AscendC::DataCopy(yGm_[offset], tmp, C_);
+
+accQueue_.EnQue(tmp);  // tmp becomes new accumulator
+inQueueX_.FreeTensor(xDeq);
+pipe_.FreeTensor(acc); // return old accumulator to pool
+// Do not free tmp because it is now enqueued into accQueue
+// Also need to maintain tmpQueue: we need to re-enqueue a tensor for next iteration.
+// But we just used tmp from tmpQueue and moved it to accQueue. So tmpQueue is empty.
+// We need to allocate a new tensor for tmpQueue for next iteration.
+// This is getting messy.
+```
+
+Simpler: Use two buffers in accQueue (BUFFER_NUM=2) and use a double-buffering pattern where we have two tensors, one for current sum and one for next. When we DeQue, we get one; after computing new sum, we EnQue that same tensor (after updating), and free the other. That is essentially what we have now with BUFFER_NUM=1, but with BUFFER_NUM=2, the operations might be pipelined correctly. But the issue of ordering remains.
+
+I think the root cause is that the compiler is reordering the Add and DataCopy because it thinks they are independent? They are not, but maybe the compiler sees that acc is both read and written, but since both use the same tensor, it might reorder if it believes the write is to a different location? Unlikely.
+
+Given the symptom, I suspect the issue might be that the accumulator queue is not properly initialized or that the first DeQue returns something else. Let's try a different approach: Instead of using queues for the accumulator, we can simply use a local tensor that persists across iterations. In AscendC, you can use a local tensor that is declared as a member variable and allocated with a fixed size. Then you can read/write it without queues. That bypasses any queue ordering issues.
+
+For example, in Init, we can allocate a single local tensor acc_ and initialize to zero. Then in Process, we directly use that tensor, update it, and write from it. No need for a queue for accumulator. That is simpler and avoids queue dependencies.
+
+But the kernel is designed to run on a single core, so using a static local tensor should be fine. However, the local memory is limited, but we are only storing one row's worth of floats (C_ up to 128 or more). That's fine.
+
+So we can modify:
+
+- Remove accQueue_ altogether.
+- Add a member `AscendC::LocalTensor<float> accLocal_;` and a boolean to indicate if initialized.
+- In Init, allocate accLocal_ with size C_ * sizeof(float) using `pipe_.InitBuffer(accBuffer_, 1, C_ * sizeof(float));` and then get a tensor from that buffer? Actually, to get a LocalTensor not via a queue, we can use `pipe_.AllocTensor<float>(C_);` and then keep it. But the pipe's alloc must be paired with free. We can allocate once and reuse.
+
+Simpler: Use a static local array. But in AscendC, you can declare a local variable `float __local__ acc[C_];`? That might not be supported directly.
+
+Better: Use a queue with a single buffer but not use it as a queue; just keep a reference.
+
+But the simplest fix is to change the algorithm to write before add for the first row, and accumulate after write for subsequent rows? No.
+
+Given time, I'll adopt the approach of using a separate temporary tensor for the sum and implement the fix with a double-buffer using two separate tensors allocated from the same pool with BUFFER_NUM=2. This is a common pattern.
+
+Actually, looking at the leaky_relu example, they used a tmpQueue for intermediate computation and freed it. They did not keep state across iterations. For cumsum, we need state. So we can keep the accumulator as a tensor that is allocated once and reused. To avoid queue ordering issues, we can allocate it from a buffer with BUFFER_NUM=1 and not use DeQue/EnQue for it; just directly use the tensor handle. That is, we store the tensor handle as a member and update it each iteration.
+
+But in AscendC, when you allocate a tensor from a pipe, you get a handle that remains valid until you free it. So we can allocate it in Init, keep the handle, and use it throughout Process without enque/deque. That avoids any queue ordering issues.
+
+Let's implement that:
+
+- Remove accQueue_ (and its init).
+- Add a new TQue<...> for the accumulator buffer? Actually, we just need a buffer: `AscendC::TBuf<AscendC::TPosition::VECCALC> accBuf_;`
+- In Init: `pipe_.InitBuffer(accBuf_, 1, C_ * sizeof(float));`
+- Then get a tensor from it: `AscendC::LocalTensor<float> accLocal = accBuf_.Get<float>();` But Get yields a temporary? Actually, Get returns a LocalTensor that refers to the buffer. We can store that as a member. However, using Get repeatedly might return the same tensor. So we can store the handle in a member `accLocal_` determined at Init.
+- In Process, use accLocal_ directly: `AscendC::Add(accLocal_, accLocal_, xDeq, C_);` and then `DataCopy(..., accLocal_, C_);` No need to free or enque.
+
+But we need to initialize accLocal_ to zero. We can do that in Init by `AscendC::Duplicate(accLocal_, 0.0f, C_);`
+
+This approach uses a static local tensor that persists across rows. It should work without queue synchronization issues.
+
+Let's check the memory: TBuf is a buffer, and Get returns a tensor. The buffer is allocated once. That's efficient.
+
+So the fix is:
+- Replace accQueue_ with accBuf_ and a stored LocalTensor.
+- Modify Init to set accBuf_ and initialize.
+- Modify Process to use the stored tensor directly.
+
+We also need to ensure the pipe init is done correctly. The pipe has InitBuffer for TBuf, not for TQue. So we change the member type.
+
+Implementation details:
+
+In kernel class:
+```
+AscendC::TBuf<AscendC::TPosition::VECCALC> accBuf_;
+AscendC::LocalTensor<float> accLocal_; // must be initialized after InitBuffer
+```
+
+In Init:
+```
+pipe_.InitBuffer(accBuf_, 1, C_ * sizeof(float));
+accLocal_ = accBuf_.Get<float>();
+AscendC::Duplicate(accLocal_, 0.0f, C_);
+```
+
+In Process:
+```
+for each row:
+  // Copy in as before
+  AscendC::LocalTensor<float> xDeq = inQueueX_.DeQue<float>();
+  AscendC::Add(accLocal_, accLocal_, xDeq, C_);
+  AscendC::DataCopy(yGm_[offset], accLocal_, C_);
+  inQueueX_.FreeTensor(xDeq);
+```
+
+No need for accQueue at all. This is simpler and avoids any queue ordering issues.
+
+But we must ensure that the accLocal_ tensor is valid throughout the kernel execution. Yes, the buffer is allocated in Init and freed when pipe_ is destroyed, which happens after Process returns.
+
+One more thing: The inQueueX_ is still used. That's fine.
+
+Now, we also need to adjust the tiling to pass the necessary parameters. The current tiling passes numRows, numCols, etc. That's fine. But we also pass dim, which we ignore in kernel (only handle dim=0). We should handle the case where dim!=0 by returning an error or falling back. But for now, we only support dim=0.
+
+We should also ensure that for dim=0, the algorithm is correct. With the new approach, we process each row sequentially, adding to accumulator. This should produce the correct cumsum along rows.
+
+Let's also consider the case where dim=1. The reference implementation supports arbitrary dim. But the constraint says to implement a fused custom op that matches the reference. The reference only uses dim=0 (since y=0). So we can assume dim=0. But we should still handle it gracefully.
+
+Now, we need to update the six source strings. The changes are:
+- host_tiling_src: unchanged.
+- host_operator_src: unchanged.
+- kernel_src: replace the kernel class to use TBuf for accumulator.
+- python_bind_src: unchanged.
+- model_src: unchanged.
+- project_json_src: unchanged.
+
+We also need to ensure that the kernel name remains ca6k00071_custom.
+
+Let's write the new kernel_src.
+
+Also, we need to fix the issue that the previous kernel had BUFFER_NUM=1 for inQueueX, which might also cause issues? But it seemed to work for data copy. The main issue is the accumulator. So we focus on that.
+
+Now, write the complete code with minimal changes.
+
+We'll also keep the tiling data fields as they are, but we don't need dim anymore? The kernel ignores it except for the early return. We can keep it.
+
+Let's generate the corrected code.

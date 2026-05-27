@@ -1,0 +1,105 @@
+We need to fix the correctness issue. The previous attempt compiled but produced output all zeros, meaning the kernel logic is flawed. The error log shows output mismatch, with the custom op output all zeros. The kernel implementation seems to have issues: in Compute(), it uses a loop over spatial positions and channels, but the tile layout is not guaranteed to align with C dimension boundaries. Also, the kernel uses scalar operations inside Compute() which is inefficient and likely wrong because it modifies local tensors in a non-vectorized way. We need to implement CrossMapLRN2d correctly.
+
+CrossMapLRN2d formula: For each spatial position (h,w), for each channel c, output = x / (k + alpha * sum_{j=max(0,c-size/2)}^{min(C-1,c+size/2)} x_j^2)^beta.
+
+We need to compute the sum of squares across channels for each spatial location. Since the input is 4D (N,C,H,W), we can process per batch and per spatial location. The kernel should handle tiling across batches/spatial locations. The previous kernel used totalLength as total number of elements, but processing per spatial location with channel dimension is key.
+
+Better approach: Have the kernel work on a tile that is a contiguous block of spatial positions (i.e., multiple (H,W) positions). For each spatial position, we need to compute across all channels. But the tile buffer includes the channel dimension. The tiling should be in terms of spatial elements (H*W) with full channel depth. That is, tile length = tileSpatialCount * C, where tileSpatialCount is number of spatial positions processed per iteration. The UB budget must accommodate that.
+
+Alternatively, we can process one spatial position at a time, but that would be slow. Better to process a group of spatial positions that fit in UB.
+
+Given the complexity and the fact that the previous kernel produced zeros, likely because the Compute loop's indexing is wrong (it uses sqLocal[baseIdx + j] but sqLocal is a local tensor of length tileLen, and tileLen might not be aligned to dimC; also the loop over spatial positions assumes that len / dimC gives spatial count, but tileLen may not be multiple of dimC because tiling uses AlignDown(maxTile, dimC) but then later adjusted with AlignDown(totalLength, dimC). However, the code in TilingFunc sets tileLen = AlignDown(maxTile, dimC); but then if totalLength < tileLen, tileLen = AlignDown(totalLength, dimC); which ensures tileLen is multiple of dimC. That seems okay.
+
+But the kernel Compute loop: for (uint32_t sp = 0; sp < spatialCount; ++sp) { baseIdx = sp * dimC_; for (c ...) ... } It uses sqLocal[baseIdx + j] which accesses the local tensor. However, sqLocal was allocated with length tileLen, and xLocal similarly. That should work if tileLen is multiple of dimC. However, the kernel uses scalar operations inside the innermost loop: it does tmpScalar.SetValue(0, denom); AscendC::Pow(tmpScalar, tmpScalar, -beta_, 1); then float invDenomPow = tmpScalar.GetValue(0); This is very inefficient and also uses AscendC::Pow on a scalar tensor of length 1, which is okay but then multiplies yLocal[baseIdx + c] = xLocal[baseIdx + c] * invDenomPow; This scalar access is allowed? LocalTensor does support [] operator for element access? In AscendC, LocalTensor can be indexed with [] to read/write individual elements if the tensor is in VECCALC or VECOUT? Usually, AscendC requires vectorized operations. Using scalar indexing inside a loop is not recommended and may not work correctly (maybe returns zero). The fact that output is all zeros suggests that either the scalar operations are not functioning or the indexing is wrong.
+
+We need to rewrite the kernel to use vectorized operations. The core operation is: for each spatial position, compute sum of squares across a sliding window of channels, then apply the formula. This can be done with a convolution-like operation: compute x^2, then compute the sum with a 1D box filter of size 'size' along channel dimension, then compute denominator = k + alpha * sum, then raise to -beta, then multiply by x. We can use AscendC vectorized functions for convolution? But AscendC has limited support. Alternatively, we can implement the box filter using sliding window with vectorized add/subtract (like moving sum). That would be efficient.
+
+But given the complexity, perhaps we should implement a simpler but correct kernel: process one spatial position per block? The input size is 512*16*64*64 = 33,554,432 floats, which is large. We need many blocks.
+
+We can design the kernel to process a batch of spatial positions (e.g., per block handle one row of spatial positions). We'll need to restructure.
+
+Alternatively, we can use the existing host tiling and kernel but fix the scalar access issue: use AscendC::Mul, AscendC::Add, AscendC::Pow on vector tensors. For the sum of squares window, we can compute cumsum across channels and then subtract, but that requires extra buffer.
+
+Perhaps a simpler fix: keep the scalar approach but ensure that the index calculations are correct and that the local tensor elements are properly set. The fact that output is all zeros suggests that either the scalar denom is infinity or the multiplication yields zero. Also note that in the kernel, after computing sum, denom = k + alpha*sum, then Pow with -beta. If sum is zero, denom = k=1, Pow(1, -0.75)=1, then output = x. So not zero unless x is zero. But the output is all zeros, so maybe the local tensors are not correctly populated or the scalar reads fail.
+
+Looking at the previous kernel: it uses tmpQueue_ for temporary tensors, but inside Compute it allocates sqLocal from tmpQueue, then later allocates tmpScalar from tmpQueue again. That might cause conflicts because tmpQueue has only 1 buffer. The code does: AscendC::LocalTensor<float> sqLocal = tmpQueue_.AllocTensor<float>(); then later inside loop: AscendC::LocalTensor<float> tmpScalar = tmpQueue_.AllocTensor<float>(); but tmpQueue_ only has 1 buffer. This would cause double allocation without freeing the first? Actually, after the loop, it frees sqLocal. But inside the loop, it allocates tmpScalar and frees it each iteration. However, sqLocal is still allocated until after the loop. Allocation from a queue with only 1 buffer may fail or cause undefined behavior. This could be why the output is zero: the second allocation might fail, leading to incorrect data.
+
+Fix: increase tmpQueue buffer count to at least 2, or use a separate queue for the scalar. But better to avoid scalar allocation inside loop. Instead, we can compute denominator using vectorized operations: compute the sum of squares window using a temporary tensor, then compute Pow on that denominator tensor, then multiply. But we need to handle the window sum.
+
+Given time, we can rewrite the kernel to be simpler: each block handles a group of consecutive channels? Or use a different tiling: tile as one row of spatial positions (H*W) across all channels? That is too large.
+
+Maybe we can implement a version that processes one spatial position at a time per block, using grid-stride loops. For each block, iterate over spatial positions with stride blockNum, and for each spatial position, compute the LRN across channels. This will be slow but correct. Since the task is to replace the operator for performance, but correctness is first. We can later optimize.
+
+Let's design a new kernel that:
+- Total length = N*C*H*W.
+- Tiling: tileLen = C (i.e., one spatial position's data). But then total number of spatial positions is huge. We'll use block stride over spatial positions. For each spatial position, we need to read the entire channel data for that position (C floats) from global to local, compute the sum of squares window, compute denom, multiply, and write back.
+
+We can have a single queue for input and output. Each tile is one spatial position's data (C floats). The UB budget can handle C=16 easily. So we can set tileLen = C (16) and process many tiles per block using a stride loop.
+
+But the total number of spatial positions = N*H*W = 512*64*64 = 2,097,152. With 24 blocks, each block processes about 87,000 spatial positions. Each block can process multiple tiles (each tile of size C). The stride loop will be: for each spatial position index spIdx from blockIdx to totalSpatialPositions-1 step blockNum, read the C floats from global, compute, write.
+
+That is simple and should be correct.
+
+We need to compute the sum of squares across a window of size `size` along channels. Since C=16 and size=5, we can compute by sliding window sum using a simple loop with partial sums. This is vectorizable but we can also do scalar loop inside the kernel because C is small (16). Using AscendC local tensor with element access might still be problematic, but we can use vectorized operations: we can copy the squares into a local tensor of length C, then compute the window sum using convolution or manual slide.
+
+Given C=16, we can just use a for loop with scalar reads/writes, ensuring proper allocation. We'll avoid nested AllocTensor conflicts by using a single temporary for squares and another for denominator.
+
+Better: Use a single local tensor for x (C floats), compute squares in-place? Or use a separate. Since we have only one temporary queue, we can allocate two tensors from the same queue if we increase the queue size to 2. Or we can use the outQueueY for temporary? But outQueueY is used for output. We can use a separate queue for VECCALC with 2 buffers.
+
+We'll restructure:
+- Update tiling: tileLen = dimC (channel count). Also store totalSpatial = N*H*W.
+- In kernel: for each spatial position in stride, do:
+  - CopyIn: read C floats from global at offset spIdx * C.
+  - Compute: compute squares, compute window sum, compute denominator, multiply.
+  - CopyOut: write C floats.
+
+We need to be careful with indexing.
+
+Also, the host tiling should set tileLength = dimC (16). The blockDim can be set to max (24). The totalLength remains total number of floats.
+
+We also need to adjust the kernel Init to accept spatialCount and use it.
+
+Let's rewrite the code accordingly. We'll also remove the problematic tmpScalar allocation inside loop.
+
+We'll implement Compute using vectorized operations where possible, but with small C, scalar is acceptable if done correctly.
+
+We'll allocate two local tensors from tmpQueue: one for squares (sqLocal) and one for denom (denomLocal). We'll compute squares as AscendC::Mul(sqLocal, xLocal, xLocal, C). Then compute window sum: we can do a loop for c from 0 to C-1, compute sum from max(0,c-halfSize) to min(C-1,c+halfSize) by iterating and accumulating. This is O(C*size) ~ O(80) per spatial position, which is fine. We'll store sum in denomLocal[c]. Then compute denomLocal[c] = k + alpha * sum, then Pow(denomLocal, denomLocal, -beta, C), then Mul(yLocal, xLocal, denomLocal, C). This uses vector Pow and Mul.
+
+But note: Pow in AscendC operates element-wise on tensors, but we need to raise each element to -beta, which is fine.
+
+So the Compute function becomes:
+- sqLocal = tmpQueue.AllocTensor<float>(C)
+- denomLocal = tmpQueue.AllocTensor<float>(C)
+- Mul(sqLocal, xLocal, xLocal, C)
+- For c in 0..C-1:
+    sum = 0
+    for j in start..end:
+        sum += sqLocal[j]
+    denomLocal[c] = k + alpha * sum
+- Pow(denomLocal, denomLocal, -beta, C)
+- Mul(yLocal, xLocal, denomLocal, C)
+- Free tensors.
+
+But the loop involves scalar writes to denomLocal[c] and scalar reads from sqLocal. This should work if we use SetValue/GetValue or direct indexing? In AscendC, you can index local tensor with [] if it's in VECCALC? It should be allowed for scalar access. However, to be safe, we can use AscendC::Muls, Adds, etc. For the window sum, we can compute using a sliding window vectorized approach: compute cumulative sum and then subtract, but that requires extra buffer. Given C=16, scalar loop is simpler.
+
+We must ensure the tmpQueue has enough buffers (2). We'll change pipe_.InitBuffer(tmpQueue_, 2, C * sizeof(float));
+
+Also, we need to change the kernel signature: remove dimH, dimW, use spatialCount (totalSpatial = N*H*W). We'll store spatialCount in tiling data.
+
+Let's update the host_tiling and host_operator accordingly.
+
+We also need to replace dimH/dimW with spatialCount. But we still need dimC for tiling length. Keep dimC, and add totalSpatial.
+
+Simplify: In tiling data, keep totalLength, tileLength, blockDim, dimC, totalSpatial, size, alpha, beta, k.
+
+In host_operator TilingFunc, compute totalSpatial = totalLength / dimC. tileLength = dimC (since each tile is one spatial position). Ensure tileLength is a multiple of dimC.
+
+We'll also adjust blockDim to be max (24) but not exceed totalSpatial. BlockDim = min(24, totalSpatial). Since totalSpatial = 2M, it will be 24.
+
+Let's write the new code.
+
+Also, the python_bind and model_src remain similar but the kernel name is ca6k_00371_custom.
+
+We'll also fix the TilingFunc to set tileLength = dimC.
+
+Now produce the corrected six strings.

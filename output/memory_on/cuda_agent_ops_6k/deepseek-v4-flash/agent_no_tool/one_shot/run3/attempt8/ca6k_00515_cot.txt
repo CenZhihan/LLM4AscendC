@@ -1,0 +1,313 @@
+We need to diagnose the correctness failure. The reference model uses nn.AdaptiveAvgPool2d(kernel_size) followed by a linear layer. The custom op is supposed to replace the adaptive avg pool. However, the output mismatch shows that all rows of the new output are identical, while the reference output has different rows. This suggests the kernel is not correctly computing per-batch/per-channel adaptive average pooling; instead it appears to be computing something that yields same result for all batches? Possibly the grid-stride loop logic is wrong, or the calculation of batchChannel is wrong.
+
+The output shape: reference output has shape (4, 3, 2, 2) then flattened to (4, 12) then linear to (4, 16). The new output shows shape (4, 16) as flattened. But all four rows are identical, which is wrong. The reference output has distinct rows. So the kernel is not indexing correctly across batches.
+
+In kernel Process(), the grid-stride iterates over flat output indices. The mapping from flatIdx to batchChannel is flatIdx / (outputH * outputW). Since outputH=2, outputW=2, perChannel=4. So batchChannel = flatIdx / 4. For flatIdx 0..3, batchChannel=0; flatIdx 4..7, batchChannel=1; etc. That seems correct. But then the calculation of inputBase = batchChannel * inputH * inputW assumes that batchChannel corresponds to batch index * C + channel? Wait, the reference model uses AdaptiveAvgPool2d on a tensor of shape (N, C, H, W). The adaptive pool outputs shape (N, C, outputH, outputW). So the indexing should be: batch b, channel c -> output indices. So the flat output index should be: (b * C + c) * perChannel + spatial. That matches the code: batchChannel = flatIdx / perChannel, which gives a combined index = b*C + c. Then inputBase = batchChannel * inputH * inputW. That is correct if the input tensor is contiguous with shape (N, C, H, W). However, in the kernel, we are reading from xGm_ which is set to point to the input tensor. The input layout is (N, C, H, W). So the formula for the position of a specific (b, c, h, w) is: (b * C + c) * (H*W) + h*W + w. That matches batchChannel = b*C + c. So inputBase = batchChannel * inputH * inputW. Then for row ry, rowOffset = inputBase + ry * inputW + startW. That seems correct.
+
+But why are all output rows identical? Possibly because the kernel's DataCopy is not working correctly? Or the averaging across rows is flawed? Let's examine: For each output pixel, the code loops over rows in the region, copies a row into local, then iterates over elements and adds to sum. That is sequential and not using vectorized operations. But it should still produce correct results per output element, provided the tiling and indexing are correct.
+
+Another possibility: The kernel uses `inRowQueue_` and `tmpScalar_`. In the loop, after copying a row, it enques it, then dequeues it immediately. That is fine. But note that `inRowQueue_` is initialized with BUFFER_NUM=2 and size `inputW_ * sizeof(float)`. However, when copying a row, we copy `wRegion` elements, not necessarily the full input width. But the buffer is allocated for inputW_ floats, which is >= wRegion. Should be okay.
+
+Wait, the output mismatch pattern: All rows identical. That could mean that the grid-stride loop assigns all output indices to the same block? Or that the compute for each output index is using the same input data? Check the mapping: The kernel uses block-level grid stride. With blockNum=8 (set in tiling), and totalLen = N * C * outH * outW = 4*3*2*2 = 48. So each block processes about 6 output elements (grid-stride). Block0 will process indices 0,8,16,24,32,40. That should produce distinct output elements across batches. The output result shows all rows identical across batch dimension, meaning all batchChannel values 0..3 produce same output? That would happen if inputBase calculation somehow always gives same address. Check: batchChannel values: For flatIdx 0 (b=0,c=0), batchChannel=0; flatIdx=4 (b=0,c=1), batchChannel=1; flatIdx=8 (b=0,c=2), batchChannel=2; flatIdx=12 (b=1,c=0), batchChannel=3; etc. So those are distinct. inputBase = batchChannel * inputH * inputW. Input H=512, W=512, so H*W=262144. So inputBase values are multiples of 262144. That is fine.
+
+But the output results show all rows identical. Possibly the kernel is not being executed correctly? The new output shows identical rows, which suggests the custom operator is not processing different batches; maybe the Python binding is wrong? Let's check python_bind_src: It uses `aclnnCa6k00515Custom` with args: self, output_h, output_w, result. That should invoke the operator with the correct attributes. The operator is defined to take x and produce y, with attrs output_h and output_w. The kernel receives totalLength, inputH, inputW, outputH, outputW. That seems okay.
+
+But the kernel initializes yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_); and then writes to yGm_ using SetValue. But SetValue is a single element write. That should work.
+
+Perhaps the issue is that the kernel uses `AscendC::DataCopy` with a length in elements, but DataCopy expects number of floats? In the example, they use `AscendC::DataCopy(xLocal, xGm_[gmOffset], len);` where len is number of elements. That should be fine.
+
+Another possibility: The kernel does not handle the case where the input dimensions are not divisible by output dimensions correctly. The reference AdaptiveAvgPool2d uses floating-point scaling and fractional indexing; it takes averages over regions that may be of different sizes. The kernel uses integer floor: startH = static_cast<uint32_t>(oy * scaleH); endH = static_cast<uint32_t>((oy + 1) * scaleH); This matches the standard adaptive pooling algorithm. However, note that scaleH = inputH / outputH = 512/2 = 256 exactly. So each output pixel corresponds to exactly 256 input rows. Similarly scaleW = 256. So the region sizes are exactly 256x256. That should be fine.
+
+But the output mismatch shows all four rows identical, meaning for each batch, the pooled feature maps are identical. That would happen if the input tensor has the same values across channels? Unlikely. Or if the kernel only processes the first batch and writes the same data to all output locations? Let's look at the writing: `yGm_.SetValue(outputBase, avg);` outputBase = batchChannel * perChannel + oy * outputW + ox. That should be correct. But maybe the kernel is only executed by one block? Or the tiling's blockDim is set to 8 but the kernel actually only uses one block? Check the kernel: it uses GetBlockNum() to get the actual number of blocks. If the runtime gives only one block, then grid-stride will process all output indices in that block sequentially, but still correctly produce all output elements. However, the output would be correct.
+
+Given that the compilation succeeded, the kernel is compiled and linked. The problem is numerical.
+
+I suspect a bug in the kernel: `inRowQueue_.AllocTensor<float>()` allocates a buffer of size inputW_ * sizeof(float), but we only use wRegion entries. The DataCopy uses len = wRegion, which is fine. But then we iterate over wRegion elements using rowLocal(i). That should give correct values.
+
+Wait, there is a subtlety: `AscendC::DataCopy` expects a local tensor of exactly len elements? The documentation: it copies len elements from global to local. Local tensor must have enough capacity. The buffer size is inputW_ >= wRegion, so it's okay.
+
+Another issue: The inner loop uses `for (uint32_t i = 0; i < wRegion; i++) { float val = rowLocal(i); sumLocal.SetValue(0, sumLocal(0) + val); }` This is a scalar loop; it's inefficient but should work. However, sumLocal is a tensor of 1 element. Using SetValue to update the same element repeatedly might have undefined behavior? In AscendC, SetValue is a vector operation that sets all elements? Actually, SetValue is for scalar assignment: `sumLocal.SetValue(0, value)` sets element 0 to value. That is fine. But reading sumLocal(0) after SetValue should give the updated value. However, the SetValue might overwrite previous value? Actually SetValue sets the tensor to the given value? No, SetValue(index, value) sets a single element. So successive SetValue should incrementally update. But note that AscendC may have concurrency issues if not synchronized. But it's within the same thread.
+
+Alternatively, maybe the issue is that the kernel is not correctly reading from global memory? The xGm_ is set to point to the input global tensor. But the input tensor may not be contiguous? In torch, tensors are contiguous by default. But when passing to the custom op, it's likely contiguous.
+
+I think the most likely cause is the host operator's TilingFunc does not compute the correct totalLength? It computes totalLength = N * C * oh * ow, which is correct. But the kernel's Process uses totalLen_ and iterates over output flat indices. That seems fine.
+
+But note that the host operator also sets inputH, inputW, outputH, outputW in tiling. The kernel uses those. So the mapping should be correct.
+
+Let's check the actual output values: The new output shows all rows identical. That suggests that for each output pixel, the average is computed from the same input region across all batches? That would happen if inputBase is always 0? Or if the kernel ignores the batchChannel? Look at the line: `uint32_t inputBase = batchChannel * inputH_ * inputW_;` If batchChannel is always 0, then all output pixels would use the first channel of the first batch. But why would batchChannel be 0? Check the calculation: `uint32_t batchChannel = flatIdx / perChannel;` Since perChannel = outputH_ * outputW_ = 4. For flatIdx from 0 to 47, batchChannel = floor(flatIdx/4). So batchChannel ranges from 0 to 11. That covers all 3 channels across 4 batches. So it should be non-zero for later indices.
+
+Unless the kernel's computation of totalLen_ is wrong: totalLen_ = totalLength = N*C*oh*ow = 4*3*2*2=48. So the while loop iterates over 48 indices. That should produce all output values.
+
+Maybe the problem is that the kernel is not using the correct tiling data? The kernel uses GET_TILING_DATA(tiling_data, tiling); which extracts the tiling struct from the GM_ADDR tiling. The tiling struct is defined as Ca6k00515CustomTilingData in host but the kernel defines a manual struct. The kernel's struct must match exactly the host's struct. In host_tiling_src, the tiling data struct has fields: totalLength, inputH, inputW, outputH, outputW. In kernel, it defines the same fields. However, there is a conflict warning: "tiling struct [Ca6k00515CustomTilingData] is conflict with one in file ca6k00515_custom_tiling.h, line 5". This indicates that the auto-generated tiling header (from the .cpp) might have a different definition, possibly including a negativeSlope field? No. But the kernel defines its own struct manually, which might not match the auto-generated one in memory layout due to alignment differences? The warning says conflict, but it likely still works if the structs are identical. However, the auto-generated header from host_tiling_src is used by the build system. The kernel's manual struct may be different if there are padding differences. To avoid conflict, it's better to include the auto-generated header rather than redefining. But the kernel_src includes "kernel_operator.h" and then defines struct. We should include the tiling header. However, the kernel is compiled in a different context; the tiling header is located in a specific path. The build system generates a tiling header in the build area. Could include it. But the example leaky_relu did not include it; it used GET_TILING_DATA macro which expects a struct defined in the tiling header. The leaky_relu kernel included "kernel_operator.h" and then used GET_TILING_DATA. In that example, the tiling struct was defined in host_tiling_src and the kernel did not define it manually; GET_TILING_DATA expects the struct to be included from the auto-generated header. In the leaked attempt, the kernel manually defined the struct, likely causing mismatch.
+
+The error log shows: `[Warning]: tiling struct [Ca6k00515CustomTilingData] is conflict with one in file ca6k00515_custom_tiling.h, line 5`. That confirms that the kernel's manual struct is conflicting. The auto-generated tiling header is likely correct. So we should remove the manual struct definition and instead include the tiling header. In the build system, the kernel source is compiled with include paths that include the generated tiling header. So we can just use `#include "ca6k00515_custom_tiling.h"`. But wait, the kernel file is separate; the build system for kernel compilation usually includes the tiling header automatically? In the example leaky_relu kernel, they did not include any tiling header; they used GET_TILING_DATA and the struct came from the host tiling header which was already included via the op_build. Actually, in AscendC, the kernel typically includes "kernel_operator.h" and then uses GET_TILING_DATA which expects a macro-defined struct. The struct is defined in the tiling header that is generated from the host code. The kernel does not need to include it explicitly because the build toolchain adds the include path. In the leaked attempt, they manually defined the struct, which is wrong.
+
+Thus the fix: modify kernel_src to not define the struct manually, and instead rely on the auto-generated one. Also, ensure that the host_tiling_src and host_operator_src are consistent. In host_tiling_src, the struct is defined correctly. In host_operator_src, we use TilingFunc and set fields. That should be fine.
+
+Also, note that the kernel uses `AscendC::DataCopy` and `AscendC::Mins` etc. The manual loop for averaging is inefficient but should work. However, to improve correctness, we could replace the scalar loop with vectorized ops. But the priority is to fix mismatch.
+
+Another possible issue: the kernel's `ComputeOneOutput` uses `sumLocal.SetValue(0, 0.0f);` then within loops adds. But SetValue might be a blocking operation; it's fine.
+
+But the output mismatch suggests the kernel is not computing correct averages. Possibly because the region boundaries are wrong? Let's test mental: For output pixel (oy=0,ox=0): startH=0, endH=256. Correct. startW=0, endW=256. So it averages a 256x256 block. For (oy=1,ox=1): startH=256, endH=512; startW=256, endW=512. That also averages a 256x256 block. So all output pixels have region of exactly 256x256. That is correct given the input dimensions 512x512 and output 2x2.
+
+But the reference output uses AdaptiveAvgPool2d which should give the same result. However, the new output shows all rows identical, which is not expected. Wait, maybe the kernel is only processing the first block's output? Since in the grid-stride loop, each block writes to its assigned output indices. If only one block runs (blockNum=1), then that block would write to all indices sequentially, but still correctly. If multiple blocks run, they might write to same locations if there's a race? No, each block writes to disjoint indices.
+
+Could the problem be that the kernel's `yGm_.SetValue(outputBase, avg);` uses a data type that is not properly handled? SetValue writes a float. That should be fine.
+
+Maybe the issue is that the kernel uses `AscendC::DataCopy` with a length that is not aligned? For example, copying wRegion=256 floats, which is aligned to 64 bytes? 256*4=1024 bytes, aligned to 64 bytes. Should be fine.
+
+Let's examine the new output values: all rows are identical and the values are slightly different from any single row of reference. The reference first row: [-0.2292, -0.2421, 0.1804,...]. The new row: [-0.2286, -0.2420, 0.1798,...]. So they are close but not exact. This suggests the kernel computes averages that are close but not identical across batches. But the reference has distinct rows across batches because the input random tensor has different values per batch. The kernel output should also have different rows. The fact that all rows are identical indicates that the kernel is using the same input data for all batches, i.e., it's ignoring the batch index. That points to `batchChannel` being computed incorrectly, or `inputBase` being incorrectly scaled. Wait, batchChannel = flatIdx / perChannel. For flatIdx = 0..11, batchChannel = 0,1,2,3,4,5,6,7,8,9,10,11. That should produce 12 distinct values. But the output row for batch 0 (flatIdx 0-3) and batch 1 (flatIdx 4-7) should be different. But the new output shows all four rows identical. That would occur if for each output pixel, the same input region is always read, regardless of batch. That could happen if inputBase is calculated but the global tensor pointer xGm_ is not offset by batch? Actually, xGm_ is a GlobalTensor<float> set to the base address. When we do xGm_[gmOffset], it accesses element at index gmOffset. In the kernel, we use `xGm_[rowOffset]` where rowOffset is the flat index in the input tensor. This should correctly index into the input. Unless the DataCopy is not using the correct offset? Let's examine the CopyIn in the kernel? There is no CopyIn; the kernel directly reads from xGm_ using DataCopy in the loop. That DataCopy takes a global tensor slice xGm_[rowOffset] and copies len elements. The rowOffset is computed as inputBase + ry * inputW + startW. That should be correct.
+
+But why would all batches get the same result? Possibly because the kernel is only executed once, and the loop over flatIdx is not correctly iterating over all output indices? Or the tiling data's totalLength is incorrectly set to something else? Let's cross-check: In host_operator_src, TilingFunc sets totalLength = N * C * oh * ow = 4*3*2*2=48. The kernel uses totalLen_ = totalLength. So it should iterate over 48 indices. However, the grid-stride starts at blockIdx, and in the while loop, idx += blockNum. If blockDim=8, then each block processes approximately 48/8=6 indices. That should produce all output elements. But the output shows only 16 values per row? Actually the output tensor shape is (4, 16) after flattening. The kernel writes output elements to yGm_ which has totalLen_ = 48 elements. The flattened output from the model is (4, 16) = 64 elements? Wait, the linear layer maps from 12 to 16. So the custom op output must be (N, C*oh*ow) = (4, 12) before flattening? Actually the reference: AdaptiveAvgPool2d produces (N, C, oh, ow) = (4,3,2,2) -> flatten -> (4,12) -> linear -> (4,16). So the custom op's output shape is (4, 3, 2, 2) = 48 elements. That matches totalLen_=48. The linear layer then operates on that. So the new output printed is after linear? The log shows "New output: tensor([[-0.2286,...], ...])" shape (4,16). So the linear layer produced identical rows because the input to linear (the pooled features) are identical across batches. That means the custom op output (pooled) must have identical values across batches. So the custom op's output tensor has all spatial/feature maps same across batch. So the kernel writes the same values for all batch indices.
+
+This points to batchChannel being zero for all output indices. Let's examine how batchChannel is computed: It uses perChannel = outputH_ * outputW_ = 4. flatIdx ranges 0..47. So batchChannel = floor(flatIdx/4). That gives 0 for flatIdx 0-3, 1 for 4-7, etc. So batchChannel should be non-zero for later indices. But maybe the kernel's Process is not iterating over all flatIdx because the while loop condition uses totalLen_ < idx? Let's re-read kernel Process: 
+```
+uint32_t idx = blockIdx;
+while (idx < totalLen_) {
+    ComputeOneOutput(idx);
+    idx += blockNum;
+}
+```
+If blockIdx=0 and blockNum=8, then idx = 0,8,16,24,32,40 -> 6 iterations. That covers flatIdx 0,8,16,24,32,40. Note that flatIdx 0..3 are not all covered; only 0 is covered. So batchChannel for idx=0 is 0, for idx=8 is 2, for idx=16 is 4, for idx=24 is 6, for idx=32 is 8, for idx=40 is 10. So this block handles batchChannel values 0,2,4,6,8,10 (i.e., batch0-ch0, batch0-ch2, batch1-ch1, batch2-ch0, batch2-ch2, batch3-ch1). That would produce varying results. Similarly, other blocks handle other indices. So the output should not be all identical across batches. Unless the other blocks are not executing or are writing to wrong locations.
+
+But the printed new output shows all rows identical, suggesting that for output rows (batches), the flattened pooled features are the same. The linear layer output is the same because the input to linear (pooled features) are the same across batches. That means the custom op output tensor must have all 48 entries identical? Or at least for each batch the 12-element vector is the same. That would happen if the kernel only writes to a subset of indices, and the uninitialized entries are zero? But the output tensor is allocated with `at::empty_like` in the bindings? Actually in python_bind_src, it allocates `at::Tensor result = at::empty(sizes, self.options());` which does not initialize to zero. But then the new output shows all rows identical with non-zero values, so likely the kernel writes all entries correctly. However, if the kernel only writes to indices corresponding to one batch (e.g., batch 0), the other entries would be garbage, but the result shows consistent values across rows, which is unlikely garbage.
+
+Maybe the kernel is actually writing the same values to all output positions because of a bug in the output index calculation. Let's examine `outputBase`:
+```
+uint32_t outputBase = batchChannel * outputH_ * outputW_ + oy * outputW_ + ox;
+```
+But note that `batchChannel` already includes the channel dimension multiplied by perChannel? Actually, batchChannel = flatIdx / perChannel. Then outputBase = batchChannel * perChannel + oy*ow + ox = flatIdx. Because flatIdx = batchChannel * perChannel + spatialIdx, and spatialIdx = oy*ow+ox. So outputBase = flatIdx. So the kernel writes to the same flat index as it reads? Actually, it writes to yGm_ at index outputBase, which equals flatIdx. So the output order is sequential. That is correct. So all output indices are written.
+
+Then why are all rows identical? Let's consider the input reading: For a given flatIdx, batchChannel determines which channel and batch. That seems correct. But if the input tensor has the same values across batches? The random input might have different values per batch. However, the reference output shows different rows, so input is different.
+
+Maybe the kernel is not using the input tensor at all; maybe it's using some constant? No.
+
+Another possibility: The tiling data fields are not correctly read. In kernel, we use GET_TILING_DATA(tiling_data, tiling). This macro expects the tiling struct to be defined in an included header. In the leaked attempt, the kernel defined the struct manually. That could cause the fields to be read incorrectly (e.g., swapped or offset). For example, if the manual struct has a different alignment, the values of inputH, inputW, etc., might be zero or garbage. Let's check the warning: "tiling struct [Ca6k00515CustomTilingData] is conflict with one in file ca6k00515_custom_tiling.h, line 5". This conflict likely means that the kernel's manual struct does not match the auto-generated one. The auto-generated one is probably the same as defined in host_tiling_src, but there might be padding differences because the host struct is packed? Not sure. The safest is to not define the struct manually and instead include the generated header. Modify kernel_src to include the tiling header.
+
+Also, note that the host_operator_src includes the tiling header: `#include "ca6k_00515_custom_tiling.h"` (note underscore before 00515). The host_tiling_src file name is `ca6k_00515_custom_tiling.h`? The host_operator_src includes "ca6k_00515_custom_tiling.h". That is correct. In kernel_src, we should include the same file. But the build system may have a different path. The typical pattern is to use `#include "kernel_operator.h"` and then the tiling struct is available via the generated header that is included automatically? Actually, in the example leaky_relu, the kernel does not include any tiling header; it uses GET_TILING_DATA and the struct came from the host side. The GET_TILING_DATA macro is defined to include the generated tiling header? I recall that the build process generates a file like `ca6k00515_custom_tiling.h` in the build directory. The kernel source is compiled with -I pointing to that directory. So the kernel can include it. But the example leaky_relu did not include it; perhaps GET_TILING_DATA implicitly includes it? The macro definition is something like:
+```
+#define GET_TILING_DATA(tiling_data, tiling) \
+    auto tiling_data = *(Ca6k00515CustomTilingData *)tiling;
+```
+This requires the type to be known. Usually, the tiling header is included in the kernel via the generated code. In the build system, a wrapper file is generated that includes the tiling header and calls the kernel. So the kernel itself does not need to include the tiling header; the GET_TILING_DATA macro expands to a cast to the struct type which must be declared. In the example leaky_relu kernel, they defined the tiling struct manually? Let's re-check: The example kernel_src includes "kernel_operator.h" and defines `GET_TILING_DATA(tiling_data, tiling);` there is no manual struct definition. But in the example, they used `GET_TILING_DATA(tiling_data, tiling);` and then accessed `tiling_data.totalLength` etc. That means the struct is defined somewhere. In the leaky_relu example, the host_tiling_src defines the struct and registers it. The build system generates a header that the kernel can use. In that example, they did not manually define the struct, so it worked. In our leaked attempt, the kernel defines the struct manually, which causes conflict.
+
+Thus, we should modify kernel_src to remove the manual struct definition and instead rely on the auto-generated one. But we need to ensure the struct fields match exactly. The host_tiling_src defines fields: totalLength, inputH, inputW, outputH, outputW. No extra fields. The kernel will use those fields. So we should delete the manual struct and use GET_TILING_DATA directly. However, we also need to include the tiling header to have the type definition. The safest is to add `#include "ca6k_00515_custom_tiling.h"` at the top of kernel_src. But note that the kernel source file is compiled with a different name? The build system generates a kernel wrapper that includes the tiling header. If we include it again, it might be fine. But to be consistent with the example, we can omit the include and just use GET_TILING_DATA with the assumption that the type is known via the generated wrapper. But in the leaked attempt, it was not working. Let's check the actual error: compilation succeeded, but runtime mismatch. So the type might be resolved, but the struct layout mismatch caused wrong values. Therefore, we must ensure the kernel does not define the struct itself. Additionally, we should fix any other potential issues.
+
+Another issue: In the kernel, we use `AscendC::GetBlockNum()` and `AscendC::GetBlockIdx()`. However, the tiling sets blockDim=8, and the kernel uses GetBlockNum. But the actual number of blocks launched is determined by the runtime, which may be less than blockDim? Usually, the runtime respects blockDim. So it's fine.
+
+Maybe the problem is the inner loop averaging is not correctly resetting the sum for each output pixel? It allocates sumLocal and sets to 0.0f at the beginning of ComputeOneOutput. That is correct.
+
+I think the most likely fix is to avoid manual struct definition and to include the tiling header. Also, we should ensure that the kernel uses proper vectorized operations for performance, but that's not required for correctness.
+
+Additionally, note that the host_operator_src includes "ca6k_00515_custom_tiling.h". The host_tiling_src defines the struct. The file names should match the operator name. In the build, the generated tiling header is named based on the operator name. The operator name is "Ca6k00515Custom". The header file is likely `ca6k_00515_custom_tiling.h` (with lowercase? The host includes `"ca6k_00515_custom_tiling.h"`. The host_tiling_src should be named accordingly. The build expects the source files to be named with underscores. So the host_tiling_src string is the content of that file. That is fine.
+
+Now, the kernel_src: we need to include "kernel_operator.h" and use GET_TILING_DATA. We also need to pass the tiling data fields to Init. In the leaked code, Init receives the fields as separate arguments. We need to read them from tiling_data inside the kernel entry function and pass to Init. Currently, the kernel entry does:
+```
+GET_TILING_DATA(tiling_data, tiling);
+KernelCa6k00515Custom op;
+op.Init(x, y, tiling_data.totalLength, tiling_data.inputH, tiling_data.inputW, tiling_data.outputH, tiling_data.outputW);
+```
+This assumes tiling_data struct has those fields. If we remove manual struct, this should work as long as the auto-generated struct has those fields. So we just delete the manual struct definition.
+
+Also, note that in the kernel entry, we have `GM_ADDR workspace` unused. That's fine.
+
+Now, the python_bind_src: It uses EXEC_NPU_CMD with aclnnCa6k00515Custom. The aclnn API expects the operator to be registered. The operator is defined in host_operator_src. The python binding must match the operator's attribute names. The operator has attributes output_h and output_w. In the python binding, we pass output_h and output_w as int64_t. The EXEC_NPU_CMD macro likely calls the aclnn API with these arguments. That should be fine.
+
+But we also need to ensure that the operator's shape inference is correct. In host_operator_src, InferShape sets output dimensions based on attrs. That is implemented.
+
+Potential error: In InferShape, we use x_shape->GetDim(0) for batch and x_shape->GetDim(1) for channels. That is correct.
+
+Now, the model_src: It calls custom_ops_lib.ca6k_00515_custom(x, kernel_size[0], kernel_size[1]). That matches the python binding's function signature. Good.
+
+So the main fix is to remove manual struct definition from kernel_src and possibly include the tiling header. Also, we might want to optimize the kernel to use vectorized operations for averaging, but that is optional for correctness. However, the current kernel has a scalar loop that might be slow but correct. But there is a subtle issue: The loop uses `rowLocal(i)` to access individual elements. In AscendC, `LocalTensor::operator()` returns a scalar reference? Actually, it's a method that returns the element at that index. That is allowed. However, when using `DataCopy` to copy a row, the rowLocal might be a vector of length wRegion. Then iterating with `rowLocal(i)` works. But note that `rowLocal` is a temporary after DeQue. It should be fine.
+
+Nevertheless, the all-rows-identical symptom suggests a deeper issue. Let's double-check the mapping: For output element at flatIdx = 0 (batch0, ch0, oy0, ox0), the kernel will compute average of input region for batch0, ch0, rows 0-255, cols 0-255. That should be correct. For flatIdx = 1 (batch0, ch0, oy0, ox1), it averages rows 0-255, cols 256-511. That should differ. So within the same batch, the four output spatial values should differ. The new output row shows four values: [-0.2286, -0.2420, 0.1798, -0.2564, ...] which are not all the same, so within batch the values differ. But across batches, the pattern is identical. That indicates that for each batch, the 12-element pooled feature vector is the same. That would happen if the input tensor is constant across batches? But reference shows different. So likely the kernel is reading from the same batch index for all batches. Possibly the batchChannel calculation is wrong because perChannel is wrong? perChannel = outputH_ * outputW_ = 4. That is correct. So batchChannel = flatIdx/4. For flatIdx=0, batchChannel=0 (batch0, ch0). For flatIdx=4, batchChannel=1 (batch0, ch1). So batchChannel does increase. But maybe the kernel is not processing flatIdx values that belong to higher batches? Wait, the while loop only processes indices for that block. Block0 processes indices 0,8,16,24,32,40. These correspond to batchChannels 0,2,4,6,8,10. That spans across batches: batch0 channels, batch1 channels, batch2 channels, etc. But the output rows are for entire batches. So the output for batch0 (channels 0,1,2) should be comprised of flatIdx 0-3. Block0 handles flatIdx 0 and 8 (which are batch0-ch0 and batch0-ch2? Actually flatIdx 0 is batch0-ch0, flatIdx 8 is batch0-ch2? Wait, flatIdx 8: 8/4=2, so batchChannel=2, which is batch0-ch2 (since batch0: ch0=0, ch1=1, ch2=2). So flatIdx 8 is batch0-ch2-oy0-ox0? No, flatIdx 8 spatial index = 8%4=0, so oy0,ox0. So block0 handles ch0 and ch2 of batch0, but not ch1 (flatIdx 4 is handled by block2 maybe?). So if block0 writes ch0 and ch2 values, and other blocks write the remaining channels, the final output should still be correct. The fact that the printed output after linear is identical across batches implies that the pooled features for each batch are identical. That would require that for each batch, the three channels values are the same. That seems unlikely. Unless the kernel is only writing values for one batch and the other batches get zero? But the output shows non-zero values, so they are written. Could it be that the kernel's output writing is overwriting previous values due to multiple blocks writing to same locations? But the output indices are unique per flat index, and each block writes to disjoint set. So no race.
+
+I think the most plausible explanation is that the tiling data inputH and inputW are not being read correctly, causing the kernel to always compute averages over a region of size 0? For example, if inputH_ is 0, then startH=0, endH=0, hRegion=0? But then the code has: if (endH <= startH) startH = endH - 1; which would set startH to -1 (underflow) but it's uint32_t, might wrap. That would cause wrong results. But inputH_ is 512, so should be fine.
+
+Perhaps the kernel is using the wrong tiling data because the struct conflict leads to misalignment. The warning suggests conflict, so likely the manual struct is not identical to auto-generated. The auto-generated struct might have additional fields or different packing. If the fields are displaced, then read values might be garbage. For example, if the auto-generated struct has a field `negativeSlope` (from previous attempt?), but our host_tiling_src does not have that. Actually the host_tiling_src defines only five fields: totalLength, inputH, inputW, outputH, outputW. The build system generates a header from that. In the leaked attempt, the kernel manually defined the same five fields. However, there could be a field added by the build? The warning says conflict with one in file ca6k00515_custom_tiling.h line 5. That suggests the auto-generated header is elsewhere and has a different definition. But in the latest build, the host_tiling_src is the one used; the auto-generated header should match. The warning might be benign. Yet the output mismatch persists.
+
+Let's also check the host_operator_src: It includes "ca6k_00515_custom_tiling.h". The build should generate that header from host_tiling_src. The kernel does not include it, but the GET_TILING_DATA macro uses the type defined in that header. The kernel is compiled with the generated header in the include path because the build system adds it. So the macro should find the type. The manual definition in the kernel is redundant and may override? Actually, if the kernel defines the struct with the same name, it will cause a conflict. That conflict could lead to using the wrong definition. So removing the manual definition is critical.
+
+Additionally, we should ensure that the kernel's Init receives the correct tiling fields. The host_tiling_src defines fields in order: totalLength, inputH, inputW, outputH, outputW. The kernel's Init takes parameters in the same order. That should be fine.
+
+Now, about the python binding: EXEC_NPU_CMD with aclnnCa6k00515Custom likely expects arguments: input, output_h, output_w, output. The operator attributes are output_h and output_w. In the host_operator_src, the op definition has attrs "output_h" and "output_w". So the aclnn API probably uses those names. The python binding passes ints. That should be fine.
+
+But note: In the reference model, the linear layer is inside ModelNew, which uses the custom op output. The custom op outputs a tensor of shape (N, C, oh, ow). Then the model flattens and applies linear. So the custom op's output shape must be (N, C, oh, ow). That is what InferShape sets. So it's correct.
+
+Now, the final fix: Modify kernel_src to remove manual struct definition, and optionally include the tiling header. Also, we could vectorize the averaging to avoid scalar loop for performance, but not necessary for correctness. However, the scalar loop might be slow, but that's okay. But there might be a bug in the scalar loop: using SetValue to accumulate sum might not work as expected? Let's examine: 
+```
+AscendC::LocalTensor<float> sumLocal = tmpScalar_.AllocTensor<float>();
+sumLocal.SetValue(0, 0.0f);
+...
+for (uint32_t ry = startH; ry < endH; ry++) {
+    ...
+    for (uint32_t i = 0; i < wRegion; i++) {
+        float val = rowLocal(i);
+        sumLocal.SetValue(0, sumLocal(0) + val);
+    }
+}
+```
+This should work. However, note that `sumLocal(0)` might be reading a stale value if SetValue uses a vector path that is not immediately visible. In AscendC, scalar operations on LocalTensor are typically done via scalar registers. But to be safe, we could use a local scalar float variable and then assign at the end. But the current code should work.
+
+Given the urgency, I'll produce a corrected version with the minimal changes: remove manual struct, include tiling header, and adjust kernel_src accordingly. Also, ensure that the kernel's Init does not need to include any extra header.
+
+Additionally, note that the host_operator_src has a small issue: it includes "ca6k_00515_custom_tiling.h" but in host_tiling_src the struct is defined in namespace optiling. That is fine.
+
+Let's also check the host_operator_src for any missing namespace closing. It seems okay.
+
+Now, produce the corrected six strings.
+
+Important: The kernel_src must not define the struct manually. It should include "kernel_operator.h" and possibly "ca6k00515_custom_tiling.h" (with proper path). But given the build environment, including the tiling header might be redundant. I'll include it for clarity.
+
+Also, to avoid the conflict warning, we should not define the struct. I'll remove it.
+
+Now, rewrite kernel_src:
+
+```
+#include "kernel_operator.h"
+#include "ca6k00515_custom_tiling.h"  // ensure struct is known
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCa6k00515Custom {
+public:
+    __aicore__ inline KernelCa6k00515Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength,
+                                uint32_t inputH, uint32_t inputW,
+                                uint32_t outputH, uint32_t outputW)
+    {
+        totalLen_ = totalLength;
+        inputH_ = inputH;
+        inputW_ = inputW;
+        outputH_ = outputH;
+        outputW_ = outputW;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalLen_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalLen_);
+
+        pipe_.InitBuffer(inRowQueue_, BUFFER_NUM, inputW_ * sizeof(float));
+        pipe_.InitBuffer(tmpScalar_, 1, sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalLen_ == 0) return;
+
+        uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+
+        uint32_t idx = blockIdx;
+        while (idx < totalLen_) {
+            ComputeOneOutput(idx);
+            idx += blockNum;
+        }
+    }
+
+private:
+    __aicore__ inline void ComputeOneOutput(uint32_t flatIdx)
+    {
+        uint32_t perChannel = outputH_ * outputW_;
+        uint32_t batchChannel = flatIdx / perChannel;
+        uint32_t spatialIdx = flatIdx % perChannel;
+        uint32_t oy = spatialIdx / outputW_;
+        uint32_t ox = spatialIdx % outputW_;
+
+        float scaleH = static_cast<float>(inputH_) / static_cast<float>(outputH_);
+        float scaleW = static_cast<float>(inputW_) / static_cast<float>(outputW_);
+        uint32_t startH = static_cast<uint32_t>(oy * scaleH);
+        uint32_t endH   = static_cast<uint32_t>((oy + 1) * scaleH);
+        uint32_t startW = static_cast<uint32_t>(ox * scaleW);
+        uint32_t endW   = static_cast<uint32_t>((ox + 1) * scaleW);
+        if (endH > inputH_) endH = inputH_;
+        if (endW > inputW_) endW = inputW_;
+        if (endH <= startH) startH = endH - 1;
+        if (endW <= startW) startW = endW - 1;
+        uint32_t hRegion = endH - startH;
+        uint32_t wRegion = endW - startW;
+
+        uint32_t inputBase = batchChannel * inputH_ * inputW_;
+
+        AscendC::LocalTensor<float> sumLocal = tmpScalar_.AllocTensor<float>();
+        sumLocal.SetValue(0, 0.0f);
+
+        for (uint32_t ry = startH; ry < endH; ry++) {
+            uint32_t rowOffset = inputBase + ry * inputW_ + startW;
+            AscendC::LocalTensor<float> rowLocal = inRowQueue_.AllocTensor<float>();
+            AscendC::DataCopy(rowLocal, xGm_[rowOffset], wRegion);
+            inRowQueue_.EnQue(rowLocal);
+            rowLocal = inRowQueue_.DeQue<float>();
+            for (uint32_t i = 0; i < wRegion; i++) {
+                float val = rowLocal(i);
+                sumLocal.SetValue(0, sumLocal(0) + val);
+            }
+            inRowQueue_.FreeTensor(rowLocal);
+        }
+
+        float count = static_cast<float>(hRegion * wRegion);
+        float avg = sumLocal(0) / count;
+
+        uint32_t outputBase = batchChannel * perChannel + oy * outputW_ + ox;
+        yGm_.SetValue(outputBase, avg);
+
+        tmpScalar_.FreeTensor(sumLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inRowQueue_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpScalar_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t totalLen_ {0};
+    uint32_t inputH_ {0};
+    uint32_t inputW_ {0};
+    uint32_t outputH_ {0};
+    uint32_t outputW_ {0};
+};
+
+extern "C" __global__ __aicore__ void ca6k_00515_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCa6k00515Custom op;
+    op.Init(x, y,
+            tiling_data.totalLength,
+            tiling_data.inputH, tiling_data.inputW,
+            tiling_data.outputH, tiling_data.outputW);
+    op.Process();
+}
+```
+
+Removed the manual struct definition. Added include of tiling header.
+
+Also, note that the host_tiling_src includes "register/tilingdata_base.h". That is fine.
+
+Now, the project_json_src: It should define the op with input "x", output "y", attrs "output_h" and "output_w". That is already there. Ensure the op name is "Ca6k00515Custom". The JSON is an array of objects, each with "op". That's correct.
+
+The host_tiling_src: define struct with fields. Should be fine.
+
+The host_operator_src: includes tiling header and defines TilingFunc, InferShape, InferDataType, and op registration. The op class name is "Ca6k00515Custom" and it adds config for "ascend910b". Good.
+
+The python_bind_src: uses aclnnCa6k00515Custom. The operator must be registered with that name. The host_operator_src defines the op with that name and registers it with OP_ADD(Ca6k00515Custom). So aclnn name should match. The python binding passes output_h and output_w as int64_t. Should be fine.
+
+The model_src: imports custom_ops_lib and defines ModelNew as shown.
+
+Now, output the six strings exactly.
+
+One more thing: The host_operator_src includes "ca6k_00515_custom_tiling.h". But in the leaked attempt, the filename has an underscore before 00515: "ca6k_00515_custom_tiling.h". The build expects the tiling header to be named after the operator: "ca6k00515_custom_tiling.h" (without underscore after ca6k)? The operator name is "Ca6k00515Custom". The build system may generate the header with lowercase: "ca6k00515_custom_tiling.h". But in the host_operator_src, they included "ca6k_00515_custom_tiling.h". This might be a mismatch. Let's check the leaked attempt's host_operator_src: it includes "ca6k_00515_custom_tiling.h". The build likely generated a header with the same name because the source file name? The build system uses the operator name to generate the header. Usually, the tiling header is named after the operator's source file? Actually, in the build, the tiling header is generated from the host_tiling_src file, which is written to a file named "ca6k_00515_custom_tiling.h" (since the host_tiling_src is the content of that file). The host_operator_src includes that file. So it's consistent. But the kernel_src we write should include the same file or not? The kernel is in a different directory; the build system includes the path to the generated tiling header. The kernel can include it. However, in the example leaky_relu, the kernel did not include any tiling header. It relied on the type being available via the GET_TILING_DATA macro expansion which uses the struct type defined in the host tiling header via the generated wrapper. So including it is optional. But to be safe, we include it. The include path should be okay.
+
+But note: The file name "ca6k00515_custom_tiling.h" (no underscore after ca6k) vs "ca6k_00515_custom_tiling.h" (with underscore). Which one is correct? The host_tiling_src is written to a file named "ca6k_00515_custom_tiling.h" (as per the include in host_operator_src). In the build log, we see files like "ca6k00515_custom.cpp" and "ca6k_00515_custom.cpp" both exist. The tiling header is likely generated from the host_tiling_src string and named according to the operator name. Since the operator name is "Ca6k00515Custom", the generated header might be "ca6k00515_custom_tiling.h" (no underscore). But the host_operator_src includes "ca6k_00515_custom_tiling.h". This could be a mismatch. The build succeeded, so the include path found the file. The file might be named with underscore because the source file for tiling is written to "ca6k_00515_custom_tiling.h". In the workspace, I see both "ca6k00515_custom.cpp" and "ca6k_00515_custom.cpp" - they are two separate source files. The tiling header is generated from the tiling source. The tiling source is likely written to a file named after the operator source file? Actually, the host_tiling_src is the content of the tiling header file. In the build process, it is written to a file named "Ca6k00515Custom_tiling.h"? Not sure.
+
+To avoid confusion, we should make sure the include in kernel_src matches the actual file name. The safest is to not include the tiling header in kernel_src and rely on the macro. But then we need to ensure the struct type is known. In the example, the struct was defined in host_tiling_src and the kernel used GET_TILING_DATA without explicit inclusion. That worked because the build system generates an additional file that includes the tiling header and then includes the kernel source. So the kernel source does not need to include the tiling header. Therefore, we can omit the include.
+
+Thus, in kernel_src, we can just have `#include "kernel_operator.h"` and no manual struct. That should avoid the conflict. I'll remove the include of tiling header as well.
+
+But we need to ensure that the GET_TILING_DATA macro can find the struct type. In the build, the generated kernel wrapper file includes the tiling header before including the kernel source. So the struct type is already declared. So it's safe to omit.
+
+So revised kernel_src: just remove manual struct and include only "kernel_operator.h". Also, change the `extern "C"` function to use `GET_TILING_DATA`. No other changes.
+
+Let's produce final strings.

@@ -1,0 +1,666 @@
+我们被要求生成一个自定义AscendC算子，替换PyTorch中的F.adaptive_max_pool1d_with_indices。参考程序是模型Model，接受输入x (batch, channels, length)，输出自适应最大池化1d的结果（以及indices，但模型只返回output）。我们只需要实现一个融合算子，输出与参考一致。
+
+任务ID: ca6k_02116，运营名字使用ca6k_02116_custom和PascalCase Ca6k02116Custom。JSON项目描述需要包含op为主要字段。
+
+约束：输出六个字符串变量：project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, model_src。不能有eval_src。注意之前的修复memory：不要有OP_ADD重复注册；直接使用public字段赋值而不是setter；保持OpDef类和REG_OP；GetInputShape返回StorageShape*。另外，GetInputShape的转换问题允许使用GetDim。
+
+我们考虑如何实现adaptive_max_pool1d_with_indices。给定输入(batch, channels, length)和输出大小output_size (一个标量)。自适应池化将输入长度分成output_size个区域，每个区域取最大值，并记录索引。需注意最后一个区域可能大小不同。通常实现：计算每个输出位置对应的输入窗口大小和偏移。对于任意长度的序列，池化窗口大小和步长可能不均匀。但AscendC实现要高效。
+
+参考原始算子：F.adaptive_max_pool1d_with_indices。参数x形状(N, C, L)，output_size整数。输出形状(N, C, output_size)和indices(N, C, output_size)。我们只使用output。
+
+融合算子输入：x (float)，以及标量attr: output_size (int32)，还有batch_size, channels, input_length (可能从形状推断)。tiling数据应包含这些信息以及池化参数。
+
+我们设计一个自定义算子Ca6k02116Custom，输入x，输出y (output)。我们需要在算子内部实现自适应最大池化。在tiling时，计算每个块的处理量。
+
+限制：需要保证数值精度匹配。
+
+实现关键：在AscendC kernel中，对于每个(N, C)平面，遍历output的每个位置，计算输入窗口范围，取最大值。由于输入长度可能很大（比如100000），而输出大小256，所以每个输出位置窗口大小约L/output_size。我们可以逐元素处理，但效率可能低。但算力足够。
+
+可考虑tile维度：将x按行分块，每个线程块处理一部分(N*C)平面和一部分output位置。
+
+但简化起见，我们按输出元素粒度处理：每个线程块处理一定数量的输出元素（每个元素对应一个(N,C,out_pos)）。注意N=16, C=64, output_size=256，总输出元素16*64*256=262144，不算大。tile可按通道或批处理。
+
+我们用一个简单的分块：输入x形状(N, C, L)，我们将其视为二维（batch * channels, L）。每个线程块处理一批连续的out_idx（比如64个），对于每个out_idx计算对应的窗口最大值。
+
+由于每个输出元素的窗口范围可能不同，需要提前计算。在tiling中我们可以传递output_size和input_length，在kernel中动态计算窗口参数。
+
+窗口计算：设输入长度L，输出长度O。对于输出索引i∈[0, O-1]，起始索引start = floor(i * L / O)，结束索引end = ceil((i+1) * L / O) - 1，窗口大小window = end - start + 1。然后在[start, end]范围内找最大值。索引从0开始。
+
+注意数据类型是float，索引用int32。
+
+我们需返回output，不需要indices。
+
+在AscendC kernel中，我们可以使用LocalTensor，需要管理UB大小。根据示例，UB预算192KB。每个线程处理多个输出元素。假设每个输出元素需要局部存储读取一块输入（窗口大小最多ceil(L/O)+1）。当L=100000, O=256时，窗口最大为ceil(100000/256)=391，加上边界最多392。每个float 4字节，392*4=1568字节，非常小。我们可以一次处理多个输出元素，复用输入块？为了简单，我们给每个输出元素单独从全局读取窗口。由于窗口小，可以分批处理。
+
+我们的tile设计：每个线程块处理一批输出元素（例如128个），每个元素计算窗口最大值需要读取输入的一个小窗口。我们可以使用DataCopy读取输入窗口到local tensor，然后计算最大值。由于窗口大小变化，我们可能需要对每个输出元素单独读取。为了简化，我们让每个线程处理一个输出元素，逐个处理。但这样并行度更高？由于输出元素总数约262k，我们可以用多个线程。
+
+在tiling中，我们可以设置blockDim = min(20, total_output_elems / some_factor)。但为了通用，我们直接使用全局线程grid stride方式：每个线程处理一个输出元素（总输出元素= batch*channels*output_size）。使用grid stride循环处理多个元素。这样简单。
+
+因此，在kernel中，每个线程处理一个输出元素（对应一个三维索引(n, c, out_idx)）。我们需要根据out_idx计算输入窗口范围。
+
+但是AscendC编程模型通常使用DataCopy以块为单位，每个线程块处理一个tile。如果每个线程处理一个元素，数据移动可能不是最优。但鉴于每个线程窗口小，可以每个线程直接使用DataCopy从全局读取窗口（窗口大小不超过400），然后计算最大值，这是一个合法用法。但要注意AscendC运行时通常一个block对应一个内核实例，可以启动多个block（blockDim）。我们可以在kernel中使用GetBlockIdx()作为线程ID，使用grid stride for循环处理多个输出元素。
+
+我们设tileLength为每个线程处理多少个输出元素？可以设为1，让每个线程处理一个，然后使用grid stride循环（步长=blockNum）。这样更加简化。
+
+但是tiling中需要传递的参数：batch, channels, input_length, output_size。我们可以从输入形状获取，但需要反射。可以在host通过context获取输入形状维度得到batch, channels, input_length，然后传递给tiling数据。
+
+在host_operator_src中，我们定义TilingFunc，获取输入形状，解析batch, channels, input_length，并设置tiling数据字段：batch, channels, input_length, output_size。同时计算blockDim。我们可以选择blockDim=24（最大）。每块处理输出元素数量：blockDim固定，每个线程处理多个输出元素，通过grid stride，所以可以设置tileLength = 1（每个线程处理的最小粒度），但实际上grid stride后每个线程处理多个。无需tileLength。更好是设置每个线程块处理固定的输出元素数，比如256。我们采用后者：每个block处理tileLength个输出元素，iterate over blocks. blockDim设为固定值，例如24。
+
+综合来看，我们设计tiling数据结构：
+- uint32_t batch (N)
+- uint32_t channels (C)
+- uint32_t inputLength (L)
+- uint32_t outputSize (O)
+- uint32_t totalOutputElems (N*C*O)
+- uint32_t tileLength (每个block处理的输出元素数)
+- uint32_t blockDim
+
+在Compute时，每个block处理自己范围内的输出元素，使用grid stride。（或者先计算自己的offset和count）。
+
+kernel中，对于每个输出元素，计算其全局索引，然后转换为(n, c, out_idx)。根据inputLength和outputSize计算窗口起点和长度，读取输入并找到最大值，写入y的对应位置。
+
+注意：需要从全局输入读取float，然后计算max。可以使用vec_max指令或循环。由于窗口大小较小（≤400），我们可以用标量循环计算最大值（或者用向量化，但需要对齐。简单起见，标量循环可行）。
+
+为了保持数值准确，使用float运算。
+
+考虑到性能，可能需要使用DataCopy一次拷贝窗口到local，然后用Scalar计算。但使用DataCopy要求地址对齐。窗口起始位置对应输入索引start，我们需要从全局地址读取多个连续元素。使用DataCopy时，全局地址必须32字节对齐（8个float）。由于窗口起始可能不对齐，我们可以先计算对齐起始和拷贝长度，手动处理不对齐部分？或者直接使用逐个元素的标量读取（从全局指针循环读取）。标量读取在现代硬件上可能慢，但窗口小，且总元素262k * 每个窗口平均400次读取 ≈ 1亿次读取，可能可接受。但最佳实践是用DataCopy。
+
+我们可以采用对齐拷贝策略：计算对齐起始 al_start = AlignDown(start, 8)，拷贝长度 = (end - al_start + 8) & ~7？然后用循环从拷贝的local tensor中提取实际窗口，使用向量max。为简化，我们使用标量循环直接读取全局（因为窗口小，且AscendC支持直接访问全局内存，但速度较慢）。考虑到代码简单和可靠性，使用标量循环。
+
+参考之前示例：kernel中使用DataCopy批量拷贝。我们也可以采用：每个线程处理多个输出元素，对于每个输出元素，读入窗口到local，然后计算最大值。但窗口大小变化，可能不适合批量拷贝。
+
+考虑到开发时间和正确性，采用最简单的方法：每个线程block处理tileLength个输出元素，对每个输出元素使用标量循环在全局内存中找最大值。在AscendC中，我们可以用GlobalTensor<float>和局部循环：for (int j = start; j <= end; ++j) { float val = xGm_[pos]; update max; }。这是允许的。
+
+因此kernel中不需要局部队列，直接处理。但注意：global memory访问有延迟，但可以接受。
+
+为了保持类似示例的结构（使用pipe和队列），可能不适合。我们的kernel可以更简单：不使用队列，直接使用全局Tensor访问。但为了符合AscendC风格，我们可以使用DataCopy拷贝窗口到local，但窗口大小变化且不对齐可能复杂。为了稳健，我们采用标量全局访问。
+
+注意：参考示例中使用了TQue等复杂结构。但我们的任务没有强制要求使用队列。我们可以设计一个简单的kernel：每个block处理tileLength个输出元素，直接计算。
+
+tiling数据：设置totalOutputElems, tileLength, blockDim, and池化参数。blockDim固定为24。tileLength = ceil(totalOutputElems / blockDim) 或适当值？我们采用前向循环：每个block的起始索引为blockIdx * tileLength，处理min(tileLength, remain)个。
+
+host_tiling_src: 定义TilingData结构包含所需字段。注意Memory1: 不要OP_ADD。host_operator_src内不要有OP_ADD，但可以有REG_OP? 实际上自动生成会注册，所以不要手动重复。我们将operator注册放在op_def类中，但使用REG_OP宏。根据Memory1，应该依靠自动生成的REG_OP，我们不要在host_operator_src中手动添加。所以我们在host_operator_src中只定义TilingFunc和InferShape等，不包含OP_ADD。可以包含OpDef类？实际上自动生成会包含#REG_OP，如果我们在host_operator_src里又手动注册，会导致重复。所以最好只写TilingFunc和InferShape等，不要写OpDef类和REG_OP。但自动生成框架会生成这个文件吗？在实测中，build过程会根据project_json生成op_proto.h和op_host下的文件。我们提供的host_operator_src将会被放置在op_host目录下，与自动生成的文件一起编译。如果自动生成已经包含OpDef，我们就不需要再添加。所以我们host_operator_src只包含tiling和infer函数，使用namespace optiling和ge。
+
+但Memory1提到不要有OP_ADD，否则重定义。我们遵照。
+
+Memory2: 不要setter，直接public字段赋值。
+
+Memory4: 使用GetInputShape(0)->GetOriginShape()可能返回StorageShape? 实际context->GetInputShape(0)返回的是const gert::StorageShape*，它有GetDimCount()和GetDim(i)。我们可以先获取。
+
+我们计划：
+
+project_json_src: 定义算子Ca6k02116Custom，输入x (float, ND)，输出y (float, ND)，attr: output_size (int, required? 默认值设为256因为get_init_inputs有pool_size=256)。根据需要，我们可以将output_size作为attr传递，并在tiling中获取。
+
+host_tiling_src: 头文件定义TilingData，包含字段：batch, channels, inputLength, outputSize, totalOutputElems, tileLength, blockDim。
+
+host_operator_src: 实现TilingFunc，从输入形状获取batch (dim0), channels (dim1), input_length (dim2)，从attr获取output_size。计算totalOutputElems。设置blockDim = 24，tileLength = min(256, totalOutputElems)? 或 ceil(totalOutputElems / blockDim)。我们采用tileLength = (totalOutputElems + blockDim - 1) / blockDim。然后赋值tiling字段。SetBlockDim。
+
+kernel_src: 实现算子ca6k_02116_custom，使用GridStride循环，每个block处理多个输出元素。Kernel类简单，不使用队列。只需要Init传入全局指针和tiling数据。Process中，计算当前block的起始输出索引base = blockIdx * tileLength，处理不超过totalOutputElems。对于每个输出索引，计算对应的n,c,out_idx，计算窗口范围，然后循环读取x并更新最大值，最后写入y。
+
+python_bind_src: 使用PYBIND11_MODULE绑定函数ca6k_02116_custom，调用EXEC_NPU_CMD(aclnnCa6k02116Custom, x, output_size, y)。注意需要实现aclnn接口，但这里不需要我们自己写aclnn，只需要调用一个现有函数？在python_bind_src中，我们通常使用EXEC_NPU_CMD调用自定义算子。但EXEC_NPU_CMD需要AclNN函数。通常工程会生成aclnn函数头文件。简化起见，我们模仿示例，使用EXEC_NPU_CMD(aclnnCa6k02116Custom, self, output_size, result)。但因为自定义算子，需要确保aclnn存在。在构建中，会自动生成aclnn。所以可以从python_bind调用。
+
+model_src: 导入自定义库，调用ca6k_02116_custom函数，传入x和output_size（作为位置参数或关键字？参考示例中leaky_relu_custom只传入x和negative_slope? 实际上在model_src中，调用fn(*inputs)，其中inputs=[x]，所以fn只接受x？但从get_inputs看只传x，而output_size是get_init_inputs返回，作为模型初始化参数。在ModelNew中，__init__接收init_inputs（input_channels, pool_size），然后forward只接收x，我们需要在模型内部使用init时获得的pool_size作为output_size。
+
+所以model_src: 类ModelNew在__init__中保存pool_size。forward中，调用custom_ops_lib.ca6k_02116_custom(x, self.pool_size)或其他。注意算子需要output_size作为attr。在python绑定中，函数接口应该是ca6k_02116_custom(x, output_size) -> y。所以调用时传递两个参数。
+
+理解：get_init_inputs返回[input_channels, pool_size]，在测试中会给ModelNew(*init_inputs)。所以__init__(self, input_channels, pool_size)。forward(self, x)中传入x（仅一个）。所以我们的ModelNew实现应调用ca6k_02116_custom(x, pool_size)。
+
+因此，python_bind_src中函数签名为：at::Tensor ca6k_02116_custom(const at::Tensor& x, int64_t output_size)。然后调用EXEC_NPU_CMD(aclnnCa6k02116Custom, x, output_size, result)。返回result。
+
+注意：attr的output_size在host_tiling_src中如何获取？我们从attr读取。确保传递正确。
+
+现在编写代码。
+
+首先定义project_json_src。格式参照示例，使用list包含一个op对象。注意属性output_size为int类型，required。默认值设为256，因为get_init_inputs传pool_size=256。
+
+host_tiling_src：using namespace optiling；定义TilingData，字段包括batch, channels, inputLength, outputSize, totalOutputElems, tileLength, blockDim。使用TILING_DATA_FIELD_DEF宏。
+
+host_operator_src：实现TilingFunc。从GetInputShape(0)->GetOriginShape()获取形状，但GetInputShape返回StorageShape*。我们用GetDim(0), GetDim(1), GetDim(2)。然后batch = shape->GetDim(0);等。注意存储顺序是0,1,2对应N,C,L。Attr从attrs->GetAttrPointer<int>(0)获取output_size。因为attr类型是int。在JSON中我们定义type为"int"。计算totalOutputElems = batch*channels*outputSize。然后blockDim = 24; tileLength = (totalOutputElems + blockDim - 1) / blockDim。赋值注意使用public字段，如tiling.batch = batch;。最后SetBlockDim。
+
+kernel_src：实现KernelCa6k02116Custom类。包含Init和Process。Process中：获取blockIdx, blockNum。计算baseIdx = blockIdx * tileLength_; 处理size = min(tileLength_, totalOutputElems_ - baseIdx); 对于每个i从0到size-1，计算globalIdx = baseIdx + i。然后推导n,c,out_idx。可分别计算：n = globalIdx / (channels_ * outputSize_); tmp = globalIdx % (channels_ * outputSize_); c = tmp / outputSize_; out_idx = tmp % outputSize_;。注意这里outputSize_是池化输出长度，不是总的output元素大小。总输出元素数是N*C*outputSize。所以推导正确。
+
+然后根据out_idx计算窗口：start = floor(out_idx * inputLength_ / outputSize_); end = ceil((out_idx+1) * inputLength_ / outputSize_) - 1; 使用整数计算避免浮点误差：start = out_idx * inputLength_ / outputSize_; (整数除法向下取整)。end = ((out_idx+1) * inputLength_ + outputSize_ - 1) / outputSize_ - 1; 即向上取整除以outputSize_后减1。确保护符。然后窗口长度winLen = end - start + 1。
+
+然后读取x数据：从xGm_获取起始地址偏移：input_base = (n * channels_ + c) * inputLength_ + start。然后循环for (int j=0; j<winLen; j++) { float val = xGm_[input_base + j]; if (val > maxVal) maxVal = val;}。然后写入y对应位置：yGm_[globalIdx] = maxVal。
+
+注意globalIdx是输出y的平铺索引，因为y形状(N, C, outputSize)。所以yGm_初始化时大小为totalOutputElems，和输出形状对应。
+
+在kernel函数入口，使用GET_TILING_DATA宏。注意tiling数据字段类型必须匹配。
+
+另外注意初始值：maxVal初始化为负无穷。使用-__FLT_MAX__或-1e38。
+
+我们还需要考虑性能：直接全局访问可能慢但正确。
+
+python_bind_src：使用torch扩展。
+
+model_src：定义ModelNew。
+
+现在我们写出完整代码。注意Memory5: 不要set_totalLength，直接赋值。
+
+让我们逐步构建。
+
+project_json_src:
+
+```json
+[
+  {
+    "op": "Ca6k02116Custom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "output_size",
+        "param_type": "required",
+        "type": "int",
+        "default_value": "256"
+      }
+    ]
+  }
+]
+```
+
+注意：op为主键。
+
+host_tiling_src:
+
+按照Memory2，字段不需要setter，直接定义struct? 实际上TILING_DATA结构体，我们定义字段后用赋值。
+
+```cpp
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Ca6k02116CustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, channels);
+  TILING_DATA_FIELD_DEF(uint32_t, inputLength);
+  TILING_DATA_FIELD_DEF(uint32_t, outputSize);
+  TILING_DATA_FIELD_DEF(uint32_t, totalOutputElems);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Ca6k02116Custom, Ca6k02116CustomTilingData)
+}  // namespace optiling
+```
+
+host_operator_src:
+
+注意：不要有OP_ADD。只包含TilingFunc, InferShape, InferDataType。但InferShape和InferDataType通常放在namespace ge中。另外可能还需要OpDef？但自动生成会包含。我们可以不写OpDef类。但Memory3说不要移除OpDef类？实际上Memory3是针对特定情况：如果生成文件缺少OpDef会导致输出零。但这里我们依赖自动生成，不手动写OpDef。是否安全？Memory3是“当生成operator txt文件时，不要移除OpDef类或REG_OP宏”。但这里我们没有移除，是自动生成包含。所以我们的host_operator_src中不应该包含OpDef，否则重复。所以只包含tiling和infer。
+
+因此：
+
+```cpp
+#include "ca6k_02116_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    Ca6k02116CustomTilingData tiling;
+
+    const gert::StorageShape* shape = context->GetInputShape(0);
+    uint32_t batch = static_cast<uint32_t>(shape->GetDim(0));
+    uint32_t channels = static_cast<uint32_t>(shape->GetDim(1));
+    uint32_t inputLength = static_cast<uint32_t>(shape->GetDim(2));
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int64_t *output_size_ptr = attrs->GetAttrPointer<int64_t>(0);
+    uint32_t outputSize = static_cast<uint32_t>(*output_size_ptr);
+
+    uint32_t totalOutputElems = batch * channels * outputSize;
+    uint32_t blockDim = 24;
+    uint32_t tileLength = (totalOutputElems + blockDim - 1) / blockDim;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.batch = batch;
+    tiling.channels = channels;
+    tiling.inputLength = inputLength;
+    tiling.outputSize = outputSize;
+    tiling.totalOutputElems = totalOutputElems;
+    tiling.tileLength = tileLength;
+    tiling.blockDim = blockDim;
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::StorageShape *x_shape = context->GetInputShape(0);
+    gert::StorageShape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape; // 需要修改shape dim2为outputSize? 因为输出最后一维变为outputSize。不能直接复制。
+    // 输出形状与输入形状除了最后一维不同：N, C, outputSize。所以我们需手动设置。
+    uint32_t batch = x_shape->GetDim(0);
+    uint32_t channels = x_shape->GetDim(1);
+    // 需要获取output_size。可以从attrs获取。context->GetAttrs?
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int64_t *output_size_ptr = attrs->GetAttrPointer<int64_t>(0);
+    uint32_t outputSize = static_cast<uint32_t>(*output_size_ptr);
+    y_shape->SetDim(0, batch);
+    y_shape->SetDim(1, channels);
+    y_shape->SetDim(2, outputSize);
+    y_shape->SetDimCount(3);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+```
+
+注意：InferShape中，x_shape->GetDimCount()可能返回3。我们设置y的形状相同，但最后一维替换为outputSize。所以不能直接赋值。
+
+还需要注意：context->GetAttrs()在InferShape中可能不可用？根据AscendC API，InferShapeContext有GetAttrs方法。可以使用。我们假设可用。
+
+kernel_src:
+
+```cpp
+#include "kernel_operator.h"
+
+class KernelCa6k02116Custom {
+public:
+    __aicore__ inline KernelCa6k02116Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t batch, uint32_t channels,
+                                uint32_t inputLength, uint32_t outputSize,
+                                uint32_t totalOutputElems, uint32_t tileLength)
+    {
+        batch_ = batch;
+        channels_ = channels;
+        inputLength_ = inputLength;
+        outputSize_ = outputSize;
+        totalOutputElems_ = totalOutputElems;
+        tileLength_ = tileLength;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, batch * channels * inputLength);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalOutputElems);
+    }
+
+    __aicore__ inline void Process()
+    {
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+
+        uint32_t baseIdx = blockIdx * tileLength_;
+        if (baseIdx >= totalOutputElems_) return;
+
+        uint32_t count = tileLength_;
+        if (baseIdx + count > totalOutputElems_) {
+            count = totalOutputElems_ - baseIdx;
+        }
+
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t globalIdx = baseIdx + i;
+            // derive (n, c, out_idx)
+            uint32_t tmp = globalIdx / outputSize_;
+            uint32_t out_idx = globalIdx - tmp * outputSize_; // = globalIdx % outputSize_
+            uint32_t n = tmp / channels_;
+            uint32_t c = tmp - n * channels_;
+
+            // compute window
+            uint32_t start = out_idx * inputLength_ / outputSize_;
+            uint32_t end = ((out_idx + 1) * inputLength_ + outputSize_ - 1) / outputSize_ - 1;
+            if (end >= inputLength_) end = inputLength_ - 1; // safety
+
+            uint32_t inputBase = (n * channels_ + c) * inputLength_ + start;
+            float maxVal = -__FLT_MAX__;
+            for (uint32_t j = start; j <= end; j++) {
+                float val = xGm_[inputBase + (j - start)];
+                if (val > maxVal) maxVal = val;
+            }
+            yGm_[globalIdx] = maxVal;
+        }
+    }
+
+private:
+    uint32_t batch_;
+    uint32_t channels_;
+    uint32_t inputLength_;
+    uint32_t outputSize_;
+    uint32_t totalOutputElems_;
+    uint32_t tileLength_;
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+};
+
+extern "C" __global__ __aicore__ void ca6k_02116_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCa6k02116Custom op;
+    op.Init(x, y,
+            tiling_data.batch, tiling_data.channels,
+            tiling_data.inputLength, tiling_data.outputSize,
+            tiling_data.totalOutputElems, tiling_data.tileLength);
+    op.Process();
+}
+```
+
+注意：GET_TILING_DATA宏会生成变量名tiling_data，我们需要确保字段名字匹配。我们使用的字段与头文件中定义一致。
+
+python_bind_src:
+
+```cpp
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor ca6k_02116_custom_impl_npu(const at::Tensor& x, int64_t output_size) {
+    at::Tensor result = at::empty({x.size(0), x.size(1), output_size}, x.options());
+    EXEC_NPU_CMD(aclnnCa6k02116Custom, x, output_size, result);
+    return result;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("ca6k_02116_custom", &ca6k_02116_custom_impl_npu, "AdaptiveMaxPool1d (Ca6k02116Custom on NPU)");
+}
+```
+
+注意：我们直接创建result。
+
+model_src:
+
+```python
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'ca6k_02116_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, input_channels, pool_size):
+        super(ModelNew, self).__init__()
+        self.pool_size = pool_size
+
+    def forward(self, x):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, self.pool_size)
+```
+
+注意：get_init_inputs返回[input_channels, pool_size]，所以__init__接收这两个参数，与ModelNew定义一致。
+
+现在组合输出。
+
+注意字符串格式：三引号，保持缩进。在Python代码块中，每个字符串变量以三个双引号（或单引号）开始和结束。我们统一使用"""..."""（双引号）。内部代码保持4空格缩进。另外注意host_tiling_src和host_operator_src中的代码中本身有缩进，需要保持。
+
+同时注意字符串中可能包含换行符，需在Python字符串中正确表示。
+
+最终输出必须严格是一个Python代码块，只包含六行赋值，没有其他内容。
+
+每个字符串变量赋值前不要有注释。
+
+最终代码：
+```python
+project_json_src = '''
+[
+  {
+    "op": "Ca6k02116Custom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      {
+        "name": "output_size",
+        "param_type": "required",
+        "type": "int",
+        "default_value": "256"
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src = '''
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Ca6k02116CustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, channels);
+  TILING_DATA_FIELD_DEF(uint32_t, inputLength);
+  TILING_DATA_FIELD_DEF(uint32_t, outputSize);
+  TILING_DATA_FIELD_DEF(uint32_t, totalOutputElems);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Ca6k02116Custom, Ca6k02116CustomTilingData)
+}  // namespace optiling
+'''
+
+host_operator_src = '''
+#include "ca6k_02116_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    Ca6k02116CustomTilingData tiling;
+
+    const gert::StorageShape* shape = context->GetInputShape(0);
+    uint32_t batch = static_cast<uint32_t>(shape->GetDim(0));
+    uint32_t channels = static_cast<uint32_t>(shape->GetDim(1));
+    uint32_t inputLength = static_cast<uint32_t>(shape->GetDim(2));
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int64_t *output_size_ptr = attrs->GetAttrPointer<int64_t>(0);
+    uint32_t outputSize = static_cast<uint32_t>(*output_size_ptr);
+
+    uint32_t totalOutputElems = batch * channels * outputSize;
+    uint32_t blockDim = 24;
+    uint32_t tileLength = (totalOutputElems + blockDim - 1) / blockDim;
+
+    context->SetBlockDim(blockDim);
+
+    tiling.batch = batch;
+    tiling.channels = channels;
+    tiling.inputLength = inputLength;
+    tiling.outputSize = outputSize;
+    tiling.totalOutputElems = totalOutputElems;
+    tiling.tileLength = tileLength;
+    tiling.blockDim = blockDim;
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::StorageShape *x_shape = context->GetInputShape(0);
+    gert::StorageShape *y_shape = context->GetOutputShape(0);
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const int64_t *output_size_ptr = attrs->GetAttrPointer<int64_t>(0);
+    uint32_t outputSize = static_cast<uint32_t>(*output_size_ptr);
+    y_shape->SetDimCount(3);
+    y_shape->SetDim(0, x_shape->GetDim(0));
+    y_shape->SetDim(1, x_shape->GetDim(1));
+    y_shape->SetDim(2, outputSize);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+'''
+
+kernel_src = '''
+#include "kernel_operator.h"
+
+class KernelCa6k02116Custom {
+public:
+    __aicore__ inline KernelCa6k02116Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t batch, uint32_t channels,
+                                uint32_t inputLength, uint32_t outputSize,
+                                uint32_t totalOutputElems, uint32_t tileLength)
+    {
+        batch_ = batch;
+        channels_ = channels;
+        inputLength_ = inputLength;
+        outputSize_ = outputSize;
+        totalOutputElems_ = totalOutputElems;
+        tileLength_ = tileLength;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, batch * channels * inputLength);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalOutputElems);
+    }
+
+    __aicore__ inline void Process()
+    {
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+
+        uint32_t baseIdx = blockIdx * tileLength_;
+        if (baseIdx >= totalOutputElems_) return;
+
+        uint32_t count = tileLength_;
+        if (baseIdx + count > totalOutputElems_) {
+            count = totalOutputElems_ - baseIdx;
+        }
+
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t globalIdx = baseIdx + i;
+            // derive (n, c, out_idx)
+            uint32_t tmp = globalIdx / outputSize_;
+            uint32_t out_idx = globalIdx - tmp * outputSize_;
+            uint32_t n = tmp / channels_;
+            uint32_t c = tmp - n * channels_;
+
+            // compute window
+            uint32_t start = out_idx * inputLength_ / outputSize_;
+            uint32_t end = ((out_idx + 1) * inputLength_ + outputSize_ - 1) / outputSize_ - 1;
+            if (end >= inputLength_) end = inputLength_ - 1;
+
+            uint32_t inputBase = (n * channels_ + c) * inputLength_ + start;
+            float maxVal = -__FLT_MAX__;
+            for (uint32_t j = 0; j <= end - start; j++) {
+                float val = xGm_[inputBase + j];
+                if (val > maxVal) maxVal = val;
+            }
+            yGm_[globalIdx] = maxVal;
+        }
+    }
+
+private:
+    uint32_t batch_;
+    uint32_t channels_;
+    uint32_t inputLength_;
+    uint32_t outputSize_;
+    uint32_t totalOutputElems_;
+    uint32_t tileLength_;
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+};
+
+extern "C" __global__ __aicore__ void ca6k_02116_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCa6k02116Custom op;
+    op.Init(x, y,
+            tiling_data.batch, tiling_data.channels,
+            tiling_data.inputLength, tiling_data.outputSize,
+            tiling_data.totalOutputElems, tiling_data.tileLength);
+    op.Process();
+}
+'''
+
+python_bind_src = '''
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor ca6k_02116_custom_impl_npu(const at::Tensor& x, int64_t output_size) {
+    at::Tensor result = at::empty({x.size(0), x.size(1), output_size}, x.options());
+    EXEC_NPU_CMD(aclnnCa6k02116Custom, x, output_size, result);
+    return result;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("ca6k_02116_custom", &ca6k_02116_custom_impl_npu, "AdaptiveMaxPool1d (Ca6k02116Custom on NPU)");
+}
+'''
+
+model_src = '''
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'ca6k_02116_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, input_channels, pool_size):
+        super(ModelNew, self).__init__()
+        self.pool_size = pool_size
+
+    def forward(self, x):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(x, self.pool_size)
+'''
+```
+
+检查内存：没有使用setter，直接赋值public字段。没有OP_ADD。GetInputShape使用StorageShape。InferShape中使用GetAttrs。kernel循环正确。
+
+注意：在kernel中，窗口start和end计算时，我们使用整数算术。inputBase = (n * channels_ + c) * inputLength_ + start，然后for循环j从0到(end-start)，索引xGm_[inputBase + j]。没问题。
+
+需要注意的是start可能很大，但totalInputElems = batch*channels*inputLength，乘法不会溢出uint32_t？输入长度100000，batch=16, channels=64，乘积约102400000，在uint32_t范围内（4e9）。所以安全。
+
+最终输出。

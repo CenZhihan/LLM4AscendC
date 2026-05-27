@@ -1,0 +1,262 @@
+我们被要求生成一个融合的自定义AscendC操作，替换参考模型中的nn.CELU和nn.Linear。参考模型是：输入x经过linear层，然后经过CELU激活。我们要设计一个融合操作，输入是x和linear权重（可能还有偏置），输出是线性变换后的CELU结果。但是注意原始模型是：
+
+class Model(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.celu = nn.CELU()
+        self.linear = nn.Linear(in_features, out_features)
+    def forward(self, x):
+        return self.celu(self.linear(x))
+
+这意味着：forward先做线性变换（权重矩阵乘法+偏置），然后应用CELU。CELU定义：CELU(x) = max(0, x) + min(0, alpha * (exp(x/alpha) - 1))，其中默认alpha=1.0。对于alpha=1.0，CELU(x) = max(0, x) + min(0, exp(x)-1) = relu(x) - min(0, 1-exp(x))? 但更准确：对于x>=0，CELU(x)=x；对于x<0，CELU(x)=exp(x)-1。所以CELU实际上就是ELU的一种形式（ELU: x if x>0 else alpha*(exp(x)-1)），CELU就是alpha=1的ELU（实际上CELU consistent version: CELU(x)=max(0,x)+min(0,alpha*(exp(x/alpha)-1))，当alpha=1时即为ELU）。所以CELU其实就是ELU。
+
+因此融合操作可以：输入x, weight, bias，输出 y = CELU(x * weight.T + bias)。注意：线性层通常采用weight形状(out_features, in_features)，但torch中的Linear(F, in, out)实际运算是 x @ weight.T + bias。所以如果我们想把线性层的权重和偏置作为输入，还需要注意转置。我们可以直接让融合操作接收三个输入：x (shape [B, in]), weight (shape [out, in]), bias (shape [out])? 但是torch的linear是将weight定义为(in, out)然后转置。或者我们可以将权重作为常量（使用attributes）？但通常权重是动态的，因为它来自模型参数。在自定义Ascend操作中，我们可以将weight和bias作为输入，这样更灵活。然后操作内部做矩阵乘，然后应用CELU。
+
+但是约束要求：实现一个单一的融合自定义op（或一小套）。我们可以实现一个操作，输入：x, weight, bias，输出：结果。这样可以替代整个连续过程。
+
+操作命名：使用ca6k_00536_custom和Ca6k00536Custom。
+
+需要考虑矩阵乘的实现：在AscendC中可以使用Matmul（注意AscendC提供有矩阵乘指令）。但是AscendC kernel编写复杂，我们需要在kernel中使用Matmul或者手动实现矩阵乘。通常为了性能，最好使用内置的Matmul。但是AscendC kernel的Matmul操作需要指定M, N, K等，并且需要使用相应的LocalTensor和GlobalTensor。我们可以使用AscendC的Matmul API，但需要注意参数。
+
+另外还有精度问题：CELU需要计算exp，在AscendC中可以使用Exp指令。
+
+我们的kernel需要实现：计算线性变换 y = x * W^T + b，然后对每个元素计算 CELU(y)。注意x是[B, in]，W是[out, in]（注意如果W存储为(in, out)形状，则需要转置）。我们可以约定输入W为(out, in)形状，或者让host端处理转置。为了简单，让输入x是[B, in]，weight是[out, in]，bias是[out]。然后内部计算：对于每个输出元素i，y = dot(x, weight[i,:]) + bias[i]。即输出形状[B, out]。
+
+然后在GP行stride方式处理。
+
+但是AscendC的Matmul通常要求输入shape: A(M, K), B(K, N), 输出C(M, N)。这里我们可以将x视为A，weight视为B（需转置？）。如果weight是(out, in)，则weight可以看作B的转置？标准Matmul: C = A @ B，其中A(M,K), B(K,N)。我们想要C = x @ W^T + b。设A=x (B,in), B=W^T (in, out) [因为W是(out,in), 所以W^T是(in,out)]。那么C = x @ B。所以我们可以要求输入权重为W^T（即形状(in, out)）。但原模型的weight是(in, out)吗？参考中nn.Linear(in_features, out_features)定义的weight形状是(out_features, in_features)。所以forward时x @ weight.T，即将weight转置后乘x。因此如果我们希望直接在kernel中做矩阵乘而不转置，可以要求输入weight为(in, out)即转置后的权重。这需要在host或ModelNew中预先转置。但我们可以让操作接受weight为(out, in)并做转置，但这样会增加内核复杂性。通常更简单：在ModelNew中，我们将权重转置后传给操作。这符合常见的算子库习惯（比如conv权重是C_out x C_in，但算子内部转置）。我们可以在ModelNew中调用自定义op时传入weight.T。但这样需要记录原始weight的转置。为了统一，可以在operator中直接处理转置吗？由于weight是动态的，每步都可能变化，我们可以在操作中约定weight的布局为(in, out)（即转置后的）。这样在ModelNew中构建线性时，需要提取weight.T。但注意torch的Linear模块weight是(out, in)，我们可以直接通过weight.T获取(in, out)。所以ModelNew可以传入weight.T。这样简化kernel。
+
+因此操作输入：
+- x: [B, in]
+- weight: [in, out] (transposed)
+- bias: [out]
+
+输出：
+- y: [B, out], 经过了CELU。
+
+注意bias形状[out]，广播加在每行。
+
+我们还需要考虑动态形状（batch大小可变）。我们的tiling需要处理这些。
+
+内存预算：我们需要存储x, weight, bias,中间结果（矩阵乘结果），以及exp等。矩阵乘结果将用于CELU。我们可以先计算矩阵乘，然后对每个元素计算CELU。在AscendC中，可以使用Matmul计算矩阵乘。然后对每个元素做CELU，可以用Exp和比较等。我们可以将矩阵乘结果写到yGm，然后分块读取并做CELU。但更好的做法是在一个kernel中完成：先计算矩阵乘的一块，然后对那块做CELU，然后写回。
+
+我们采用tile策略：按输出行分块（batch维度）。每次处理一个tile的行子集M_tile，计算这个子集乘以整个W（因为W较小，可以完全加载到UB？但in可能较大，需要tile K维度。然而W的大小是[in, out]，如果in和out都较大（in=2048, out=1024），则W元素数为2M，用float是8MB，远大于UB。所以我们也要对W进行tile：将in维度分块，每次加载一部分W行，计算部分和，累加。然后对结果行做CELU。这类似分块矩阵乘。
+
+但是实现起来比较复杂。考虑到in=2048, out=1024, B=8192。total operations较大。我们可以考虑使用AscendC的Matmul算子，它内部可能已经分块优化。AscendC提供MatmulCube指令，可以在kernel中调用。我们可以使用Matmul接口：例如：
+  Matmul<...> mm;
+  mm.SetTensorA(xLocal); // shape [M, K] tile
+  mm.SetTensorB(wLocal); // shape [K, N] tile
+  mm.SetTensorC(cLocal); // shape [M, N] result
+  mm.IterateAll();
+这样内部自动处理分块。但需要设置正确的参数。我们可以将整个x, weight, bias都搬到GlobalTensor，然后让Matmul处理。但需要注意矩阵乘的维度：x是[B, in], weight是[in, out]，结果c是[B, out]。然后对c加bias，再应用CELU。
+
+一个方案：在Init时，我们加载整个weight到UB？不行，太大。但我们可以将weight作为GlobalTensor，Matmul内部会分块读取数据。我们需要提供足够的UB空间用于分块。Matmul会管理自己的分块，我们只需要提供输入输出的GlobalTensor。但是Matmul通常要求数据在GM，它内部会分块搬到UB。这样我们可以直接使用。
+
+那么我们kernel可以：
+- Init: 保存x, weight, bias, y的GlobalTensor，以及总维度，tile参数等。
+- Process: 调用Matmul计算x * weight得到中间结果C（放在GM的一个临时缓冲区？或者直接覆盖？）但我们需要转置bias加，然后CELU。我们可以先分配一个GM中间结果缓冲区，或者直接在yGm中计算？yGm是最终输出，我们可以先计算矩阵乘写入yGm，然后在原位置进行加bias和CELU。但这样需要两次遍历：第一次写矩阵乘，第二次读回并处理。为了减少GM读写，更好的方法是在UB中完成一部分行的矩阵乘后立即加bias和CELU，然后写回。这需要分块处理行（M维度）。我们可以每次处理M_tile行，从xGm和wGm加载对应的tile，计算M_tile x out结果，然后加bias（bias可以从GM加载一小块到UB广播），然后对每个元素做CELU，最后写回yGm。这样可以减少中间结果GM访问。
+
+因此我们采用分块策略：按输出行数M分块（例如每块8行）。对于每块，我们需要加载x_tile（M_tile x K），以及整个W（K x out）？但W无法一次加载，所以我们还需要对K维度分块。所以两层分块。
+
+但是编写这样一个复杂的kernel需要很多行。考虑到这是一个算法任务，我们需要生成完整的代码。我们可以参考现有AscendC代码中的矩阵乘+激活融合模式。但作为AI生成，我们需要合理简化。
+
+另一种思路：因为in=2048, out=1024不算特别大，我们可以将整个计算在UB中完成吗？UB大小192KB，float占4B，所以最多约49152个float。而矩阵乘需要加载的x tile和w tile最少为M_tile*K + K*out，加上结果M_tile*out。例如M_tile=8, K=2048, out=1024时，x_tile=16384 float (64KB), w_tile=2048*1024=2M float (8MB) 太大。所以不可能一次性加载W。所以必须分K维。
+
+我们采用一种标准的分块矩阵乘：外循环分块输出行M_tile，内循环分块特征维度K_tile。对于每个M_tile，先初始化结果块为0。然后内循环K_tile，加载x块(M_tile x K_tile)和w块(K_tile x out)，计算部分积并累加到结果块（存在UB中）。内循环结束后，结果块已经包含完整的M_tile x out，然后加bias（bias可先加载一部分到UB，out维分块），再应用CELU，然后写回yGm。
+
+注意：bias是[out]，广播到每行。我们可以将bias加载到UB的一个数组（out维），然后对结果块的每行加该数组。但out=1024，一个bias数组是4KB，可以常驻UB。所以我们可以预先加载整个bias到UB（前提是out<= ~12000? 1024没问题）。同样，对于结果块，我们逐元素调整。
+
+由于UB有限，我们需要仔细规划。假设UB大小为192KB。我们分配：
+- bias: 1024 float = 4KB
+- x_tile: M_tile * K_tile float
+- w_tile: K_tile * out float
+- result_tile: M_tile * out float
+
+例如选择M_tile=8, K_tile=128，则：
+- x_tile: 8*128=1024 float = 4KB
+- w_tile: 128*1024=131072 float = 512KB！超过UB。所以K_tile必须更小。例如K_tile=16，则：w_tile=16*1024=16384 float =64KB; x_tile=8*16=128 float=0.5KB; total ~68.5KB，加上bias 4KB和result块8*1024=8192 float=32KB，总共约104.5KB，加上其他开销可能略超但可接受。我们还可以调整M_tile=4，result块更小。例如M_tile=4, K_tile=32: x_tile=4*32=128 float; w_tile=32*1024=32768 float=128KB; result_tile=4*1024=4096 float=16KB; bias=4KB; total ~148KB，接近192KB。可行。我们选择M_tile=4, K_tile=32。剩余空间用于临时变量。
+
+要实现这样的分块，我们需要在kernel中手动使用MMAD（矩阵乘）指令或使用循环累加。AscendC提供了矩阵乘指令，但手动循环累加使用VecMul等也可以。但为了正确性和性能，建议使用AscendC的Matmul接口。但Matmul接口可能不能灵活分块。实际上AscendC的Matmul接口底层使用cube加速器，可以实现高效矩阵乘。如果我们调用Matmul，通常它需要明确的碎片大小（tiling参数）。我们可以设置Matmul的A和B矩阵的tiling参数，比如A的M和K分块，B的K和N分块。但是AscendC的Matmul通常处理单次矩阵乘，且输入必须为GlobalTensor。它会自动分块。如果我们设置M_tile=4, K_tile=32, N_tile=1024（即out），然后调用一次Matmul计算这4行的结果。那我们需要将x的对应行子矩阵和W的完整列（但K分块）作为输入。Matmul可以指定offset。例如，我们可以设置dataOffsetA等参数。但实现起来仍然复杂。
+
+由于时间因素，我们选择一种更简单的方法：不自己实现矩阵乘，而是让操作接受线性变换的结果（即先计算线性层得到一个中间张量，再应用CELU）。这实际上不是融合，而是顺序操作。但题目要求融合替换，我们应该在一个kernel内完成。考虑到复杂度，或许我们可以实现一个操作，输入x, weight, bias，内部调用AscendC的Matmul计算线性层，然后对每个元素应用CELU。我们让Matmul一次性计算整个矩阵乘（可能需要多块），然后结果存到全局，然后通过另一个kernel或同一kernel的后半部分做CELU？如果是同一kernel，我们可以将Matmul的结果存在GM临时缓冲区，然后CELU再读回去。这需要两次GM读写。但比两次kernel调用好。我们可以实现一个kernel：先用Matmul计算，将结果写到yGm（但yGm最终也要写，我们可以直接覆盖）。但是CELU需要原始值，所以我们需要中间存储。可以使用一个额外的GM临时缓冲区（在host分配workspace）。或者，我们可以在同一个kernel内，先做Matmul得到结果，然后立即对结果做CELU。但Matmul结果在什么地方？如果Matmul的结果在GM中的目标缓冲区，我们可以对该缓冲区再次读取并修改。但这样读回需要开销。一种更高效的方式：Matmul可以使用LocalTensor作为输出（cLocal），我们可以直接将cLocal传入CELU计算，然后写回GM。但是Matmul的API通常要求输出是GlobalTensor或通过TQue? 我们可以使用MMAD直接计算到LocalTensor。AscendC有CubeMatmul这样可以输出到LocalTensor。使用示例：
+
+  CubeMatmulImp<...> mm;
+  mm.SetTensorA(aLocal, ...);
+  mm.SetTensorB(bLocal, ...);
+  mm.SetTensorC(cLocal, ...);
+  mm.IterateAll();
+
+这样cLocal就在UB中，我们可以继续计算。这要求我们将A和B的块加载到LocalTensor。所以我们仍然需要分块加载A和B。这又回到了手动分块。
+
+权衡后，我决定采用手动分块实现矩阵乘加法并融合CELU。我们将编写一个kernel，使用分块矩阵乘累加，然后加bias，然后CELU。这将确保融合。
+
+我们需要定义tiling参数：M_total=B, K=in, N=out。我们还需要tileM, tileK, tileN（我们固定tileN=out，即一次处理out列全部）。tileM和tileK需要根据UB计算。我们可以在tiling函数中计算合适的tileM和tileK。
+
+以下是大致设计：
+
+TilingData:
+  totalM: uint32_t (batch)
+  K: uint32_t (in)
+  N: uint32_t (out)
+  tileM: uint32_t
+  tileK: uint32_t
+  blockNum: uint32_t
+
+tiling函数计算：根据UB大小，计算最大tileM和tileK。
+
+UB预算：我们假设可用192KB，但需要留一些给其他临时变量。我们初步设定：
+- bias: N*4 bytes (N out)
+- x_tile: tileM * tileK * 4
+- w_tile: tileK * N * 4
+- result_tile: tileM * N * 4
+- 额外临时buf for exp计算? 可以用result_tile覆盖一部分。
+
+我们设定一个函数计算最大tileM和tileK使得总大小<=192KB。
+
+但N可能较大，我们也可以对N分块，但可以简化。对于N=1024，结果块大小为tileM*1024*4。tileM=4时分4行结果块16KB，加上w_tile (tileK*1024*4)，tileK=32时w_tile 128KB，x_tile 4*32*4=0.5KB，bias 4KB，总共148.5KB，加上临时变量可接受。我们选择tileM=4, tileK=32。
+
+但tileK=32意味着我们需要22个K分块（K=2048/32=64）。可以。
+
+由于我们需要跨block并行，每个block处理不同的M tiles（行块）。我们采用grid-stride循环：每个block的baseM = blockIdx * blockDimM? 但我们需要blockDim个块。我们可以设blockNum=8或根据M总块数调整。但tiling函数需要决定blockDim。
+
+简化：我们固定blockDim=8（或其他小值），每个block按grid-stride处理连续的M tiles。我们可以在kernel中实现：对于每个block，计算自己的row_start和row_end，然后循环处理其负责的行块。但更标准的是让所有block协作处理所有行（分块）。我们可以用global tile index，每个block处理连续的几块，步长为blockNum。
+
+需要设计循环加载W分块和x分块。注意W在所有块之间共享，所以每次加载w_tile时，所有块会独立加载相同的数据，这会导致重复加载，但更简单。可以通过同步等方式避免，但这里我们接受重复加载，因为blockNum较小（8），W本身较大，重复加载会增加带宽，但可以接受。
+
+另一种做法：每个block处理一组不同的M tiles，但是对于每个M tile，它需要加载W的所有列（沿K维度分块），这导致每个block重复加载W。为避免，可以用协作方式，但kernel复杂。我们保持简单。
+
+因此kernel伪代码：
+
+Init:
+  xGm, wGm, biasGm, yGm
+  M_total, K, N
+  tileM, tileK
+
+Process:
+  uint32_t rowsPerBlock = tileM; // 每个块每次处理的行数
+  uint32_t totalMBlocks = (M_total + tileM - 1) / tileM;
+  // 网格循环
+  for (uint32_t blockIdx = block_idx_begin; blockIdx < totalMBlocks; blockIdx += blockNum) {
+      uint32_t mStart = blockIdx * tileM;
+      uint32_t mEnd = min(mStart + tileM, M_total);
+      uint32_t curM = mEnd - mStart;
+
+      // 分配UB空间： bias (N), x_tile (curM*K_tile), w_tile (K_tile*N), result (curM*N)
+      // 将bias从GM读到biasLocal
+      // 初始化结果resultLocal为0
+
+      // 内循环K维块
+      for (uint32_t kIdx = 0; kIdx < (K + tileK -1) / tileK; ++kIdx) {
+          uint32_t kStart = kIdx * tileK;
+          uint32_t kEnd = min(kStart + tileK, K);
+          uint32_t curK = kEnd - kStart;
+
+          // 从xGm加载x块: [mStart:mEnd, kStart:kEnd] -> xLocal[curM, curK]
+          // 从wGm加载w块: [kStart:kEnd, 0:N] -> wLocal[curK, N]
+          // 计算 xLocal @ wLocal -> 部分积，累加到resultLocal
+          // 使用矩阵乘函数，如: Matmul<int32_t>（可能使用cube）
+          // 这里我们使用手动循环累加，但AscendC提供VecMatMul？ 实际上有CubeMatmul可以用于小矩阵。
+          // 为了简化，使用双层循环：对每个curM行，对每列N，累加dot。
+          // 但这样效率低。还是使用CubeMatmul。
+          // 我们使用AscendC的Matmul接口，指定数据块。
+          Matmul mm;
+          mm.SetTensorA(xLocal); // shape [curM, curK]
+          mm.SetTensorB(wLocal); // shape [curK, N]
+          // mm.SetBias? 不，我们后面加。
+          mm.SetTensorC(resultPartLocal); // shape [curM, N] 累加
+          mm.IterateAll();
+      }
+
+      // 加bias: 对resultLocal的每行加biasLocal
+      // 应用CELU: 对于每个元素，计算 y = (y > 0) ? y : exp(y) - 1   (alpha=1)
+      // 使用向量操作
+      // 写回yGm
+  }
+
+但Matmul的SetTensorC默认会覆盖，而不是累加。我们需要累加，所以需要将Matmul结果加到已有累加器上。Matmul可以配置MulMode等，但可能不支持累加。我们可以手动使用Add将结果加到resultLocal上：在每次Matmul后，将输出添加到resultLocal。但这需要额外的临时buffer。或者，我们可以将Matmul输出到tempLocal，然后Add到resultLocal，然后释放tempLocal。这是可行的。
+
+或者使用CUBE_OUT_ADD模式。在AscendC中，SetTensorC可以设置累加模式？文档有说明。我们假设可以设置累加模式，例如CUBE_OUT_ADD。或者我们使用MMAD的accumulate模式。
+
+为了保证代码正确，我们可以采用经典方法：在K循环外初始化resultLocal为0。在K循环内，计算部分积到一个临时矩阵tmpLocal，然后将tmpLocal加到resultLocal上。由于tmpLocal大小与resultLocal相同 (curM * N)，内存不够。我们可以考虑使用同一个resultLocal作为输入和输出？Matmul要求输出不能与输入重叠。所以需要临时空间。但我们可以利用UB中的另一块临时区，例如使用一部分用于临时，但可能不够。我们可以每次处理curM较小(如4行)，curM * N = 4096个float，约16KB。再加上xLocal和wLocal，总大小可能接近。假设curM=4, curK=32, N=1024，则tmpLocal=4096 float (16KB), xLocal=128 float (0.5KB), wLocal=32768 float (128KB), biasLocal=1024 float (4KB)，resultLocal=4096 float (16KB)，总计约164.5KB，加上其他开销略超。但我们可以在K循环中重复使用wLocal占用的buffer？因为每次K块后wLocal被释放？不，wLocal在每次K块需要重新加载。我们可以用同一块buffer。但是总的临时buffer还有tmpLocal，我们也可以复用部分buffer，但需要考虑生命周期。我们可以将resultLocal作为累加器，Matmul输出到tmpLocal，然后Add到resultLocal。tmpLocal可以与wLocal共享空间吗？wLocal在Matmul后不再需要，所以可以重用wLocal的buffer作为tmpLocal。但是wLocal在Matmul调用期间作为SetTensorB，Matmul可能正在使用该buffer，所以不能立即重用。必须等Matmul完成。我们可以在Matmul完成后，将wLocal的buffer通过FreeTensor或重新分配作为tmpLocal。但Aicore中Tensor分配是固定的，不能直接重映射。我们可以通过使用不同的Que，但这里使用TPipe分配不同的buffer。为简化，我们可以分配两个独立的buffer：tmpLocal和wLocal分别分配。那么总buffer为：xLocal (curM*curK), wLocal (curK*N), tmpLocal (curM*N), resultLocal (curM*N), biasLocal (N)。最大为wLocal (128KB) + resultLocal (16KB) + biasLocal (4KB) + xLocal (0.5KB) + tmpLocal (16KB)=164.5KB，可接受。所以我们可以这样分配。
+
+注意：Matmul需要适当的模板参数。AscendC中Matmul使用需要指定数据类型和碎片大小。碎片大小由tilling参数确定，但我们在kernel中可以先定义Matmul对象，并设置相关属性。但这需要很多额外代码。另一种选择：使用手动向量乘法：对于每个输出行，使用VecMul和ReduceAdd？但AscendC没有直接的向量矩阵乘。还是使用Matmul较好。
+
+鉴于代码长度限制，我决定采用更直接的方法：使用Matmul接口，并假设我们能够正确设置参数。在kernel_src中，我们将包括所需的头文件。
+
+现在，我们需要生成六个字符串。
+
+project_json_src：定义操作，输入为x (FLOAT, ND), weight (FLOAT, ND), bias (FLOAT, ND)，输出为y (FLOAT, ND)。注意weight的形状是[in, out] (转置后的)，bias是[out]。我们告诉框架输入个数和格式。
+
+host_tiling_src：定义TilingData，包含totalM, K, N, tileM, tileK, blockDim等。
+
+host_operator_src：实现TilingFunc和InferShape等。注意重定义问题：使用REG_OP宏仅一次。
+
+kernel_src：实现上述分块矩阵乘+CELU融合。
+
+python_bind_src：绑定自定义op到PyTorch。
+
+model_src：实现ModelNew，使用自定义op。注意需要在forward中传入weight.T和bias。
+
+我们还需要在host_operator_src中添加注册。注意需要包含头文件并正确设置。
+
+现在开始编写。注意使用Memory中的经验：不要使用set_*方法直接赋值tiling，而应该使用public字段赋值（根据Memory1）。我们的TilingData将直接定义public字段。在TilingFunc中，我们可以直接赋值tiling.totalM = ...等。注意Memory4：GetInputShape返回const gert::StorageShape*，所以使用StorageShape。
+
+还需要注意Memory5：避免重复REG_OP。所以我们在host_operator_src中只使用一次REG_OP。
+
+Memory3：避免浮点到无符号整数转换，使用static_cast。
+
+Memory2：避免重复定义类。
+
+现在开始编写代码。由于篇幅限制，我们尽量精简但完整。
+
+我们首先定义project_json_src。注意要求：解析后必须有顶层"op"键。我们可以写类似：
+
+[
+  {
+    "op": "Ca6k00536Custom",
+    "language": "cpp",
+    ... 
+  }
+]
+
+但示例中使用的是列表，每个元素一个op。我们照做。
+
+输入张量：x, weight, bias。输出：y。属性？不需要属性，因为alpha固定=1。可以加一个alpha属性但默认1。但参考模型nn.CELU()使用默认alpha=1.0，所以我们可以省略，或者添加一个alpha属性可选默认1.0。我们添加一个alpha属性，以便未来可调，但实际不用。在kernel中硬编码。但在host_operator_src中我们可以添加Attr alpha。
+
+host_tiling_src: 需要定义TilingData类，包括需要的字段。注意使用BEGIN_TILING_DATA_DEF(Ca6k00536CustomTilingData)等。我们将所有字段直接作为public member，不设setter。
+
+host_operator_src: 包含tiling函数，InferShape, InferDataType, OpDef注册。注意在TilingFunc中，我们需要根据输入形状计算totalM, K, N。注意输入形状：x = [B, in], weight = [in, out], bias = [out]。所以我们可以从GetInputShape(0)获取B和in，从GetInputShape(1)获取in和out（但第二个输入形状是[in, out]）。第三个输入形状是[out]。
+
+tiling计算：根据UB预算确定tileM和tileK。
+
+kernel_src: 实现KernelCa6k00536Custom。我们需要使用Matmul。为了简化，我们将使用MatmulCube指令。需要正确模板参数。由于AscendC版本差异，我们使用范型。
+
+我选择使用AscendC的Matmul类，例如：
+
+  using Matmul = Matmul<MatmulType<TPosition::VECCALC, CubeFormat::ND, float>, 
+                        MatmulType<TPosition::VECCALC, CubeFormat::ND, float>,
+                        MatmulType<TPosition::VECOUT, CubeFormat::ND, float>>;
+
+但需要包含"matmul_tiling.h"等。我们尝试使用更简单的接口：使用BatchMatmul? 但可能复杂。为了保险，我们使用手动向量乘加。由于K=2048, tileK=32, tileM=4，手动实现可以用向量运算：对于每个结果元素(i, j)，计算内积。可以使用VecMul + ReduceAdd。但是AscendC的向量指令支持一次性计算多对。我们可以在一个循环中计算一行的一部分K，然后累加。例如，对于一行i，对于所有输出列j，计算点积：加载x行i的tileK个连续元素到xLocal；加载w的tileK*N连续元素到wLocal（但wLocal是tileK行N列）。然后使用掩码？我们可以使用VecMul将xLocal广播到每个j？不行。更高效的方法是使用MMA指令。考虑到安全性，我们可以使用简单的两层循环：对于curM行，对于N列，内循环K。但这样效率极低，但符合功能正确。由于是测试代码，可能可以接受。但题目要求optimized，所以最好使用MMA。我尝试使用AscendC的Matmul。我们使用以下接口：
+
+  /*
+   * 使用MatmulCube
+   */
+  AscendC::LocalTensor<float> aLocal = ...; // shape [curM, curK]
+  AscendC::LocalTensor<float> bLocal = ...; // shape [curK, N] (col-major? 文档说明)
+  AscendC::LocalTensor<float> cLocal = ...; // shape [curM, N]
+  MatmulCube<AscendC::CubeFormat::ND, float, float, float> mm;
+  mm.SetTensorA(aLocal, AscendC::CubeFormat::ND, curM, curK);
+  mm.SetTensorB(bLocal, AscendC::CubeFormat::ND, curK, N);
+  mm.SetTensorC(cLocal, AscendC::CubeFormat::ND, curM, N);
+  mm.IterateAll();
+
+但这可能需要前置tiling参数。我们还可以使用AivMatMulImp类。但这里采用更稳定的方法：使用数据复制到LocalTensor，然后使用mma指令。AscendC的高级接口可能简化。
+
+由于时间，我决定采用手动向量方法，避免框架不兼容。我可以使用向量乘积加和指令：使用VecMulMuls和VecReduceAdd等。但AscendC中，对于矩阵乘，通常使用matmul库。我选择使用matmul库，并假设它可用。
+
+将kernel_src写为使用Matmul类，并包含必要的头文件。
+
+现在生成代码。注意变量名不能冲突。
+
+下面我将逐段生成。

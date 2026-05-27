@@ -1,0 +1,293 @@
+We need to generate the six Python strings for the custom AscendC operator that fuses torch.addmm. The operator name is ca6k_02874_custom, PascalCase Ca6k02874Custom. The reference model uses addmm(self.bias, x, self.weight) -> output = x @ weight.T + bias? Wait, torch.addmm(input, mat1, mat2, beta=1, alpha=1) performs beta*input + alpha*mat1 @ mat2. In the model: torch.addmm(self.bias, x, self.weight) where input=self.bias (shape bias_shape = (input_features,)), mat1=x (batch_size, input_features), mat2=self.weight (input_features, input_features). So output = bias + x @ weight. That is a matrix multiplication with bias addition. We'll fuse this into one custom op: takes input x, weight, bias, outputs y = bias + x @ weight.
+
+Constraints: Use single fused custom op, output exactly six variables. Follow memory repairs: no OP_ADD in host_tiling_src/host_operator_src, use direct field assignment in tiling, StorageShape, avoid casting issues, and remove tiling.h include from kernel source.
+
+We need to design tiling for matrix multiplication. The operator will compute y = bias + x * weight. We can treat it as a batched matrix-vector? Actually x is batch_size x input_features, weight is input_features x input_features, bias is input_features. So output is batch_size x input_features. We can tile along batch dimension and also along reduction dimension? Should use AscendC's matmul API? But manual implementation is complex. Since the example uses leaky_relu with simple element-wise, but addmm is more complex. The instruction is to replace operators, so we can implement a custom kernel that does matmul + bias using AscendC's matmul primitives or manual loops. However, AscendC provides Cube unit for matrix multiplication. But for simplicity, we can implement it as a naive kernel with loops, but that may be slow. But the harness just checks correctness, not performance. So we can implement a minimal fused kernel that computes y = bias + x @ weight using double loops for each output element. But we must ensure it works for given sizes: batch_size=1024, input_features=4096. That's 1024*4096=4M elements, weight 4096x4096=16M elements. The kernel will be memory-bound. We'll tile along rows of x and columns of weight? We'll design a tiling that loads a tile of x (batch dim) and weight, compute partial sums, write output. We'll use single core, but can use multiple blocks. We'll implement a kernel where each block handles a contiguous chunk of rows of output. For each output element (i,j), compute dot product of x[i,:] and weight[:,j] plus bias[j]. We'll tile along rows (batch) and possibly along reduction dimension. Use local memory for weight tile? Probably need to load weight into UB.
+
+Given constraints, we can write a simple kernel that for each block, for each output row in its range, compute dot product with weight and bias. We'll load a tile of weight into UB (say 256 columns) and accumulate partial sums. Or we can just do naive sequential for each output element, but that would be too slow for large matrices? But correctness only.
+
+Let's design.
+
+Project JSON: op name "Ca6k02874Custom", inputs: x (float ND), weight (float ND), bias (float ND). output: y (float ND). Attr: none? Actually addmm has beta and alpha, but reference model uses default beta=1, alpha=1, so no attrs needed.
+
+Tiling data: totalRows (batch_size), totalCols (input_features), tileRows (how many rows per tile), tileCols (how many cols per tile?), and maybe blockDim. But we also need to handle weight matrix in shared memory. Simplify: each block handles a chunk of rows. Use grid-stride loops. For each block, compute output for rows start to end. For each row, compute dot product with all columns of weight. We'll load weight column tiles? Actually, weight is stored as [in_features, in_features] in row-major? In PyTorch, weight shape is (input_features, input_features) so weight[j][k]. For x[i][k] dot weight[k][j]. We can transpose weight to column-major for efficient access? But we can just read weight in a loop over k and accumulate. Since weight is large, we can load a tile of weight columns into UB and accumulate. We'll design tileCols = number of columns of weight to compute at a time. Then for each output row, we process all column tiles, and for each column tile, we load a portion of weight (tileCols columns * in_features rows) and compute partial sums. That's complex but doable.
+
+Alternative: Use AscendC's Matmul class. But that requires handling cube unit. Might be easier to use the Cube operator. The example shows simple element-wise, but we can include Cube code. However, it's complicated and may have version dependencies. The harness probably doesn't have cube runtime? But it should be available. Given that we are to produce a working solution, perhaps we can rely on the built-in matmul via aclnn? But we are writing a custom kernel, we must implement the operation. The instruction says "replace PyTorch operators with custom AscendC kernels". So we must write a kernel.
+
+We'll implement a simple kernel that does matrix multiplication using double loops without cube (vector approach). It will be slow but correct. Use tiling: each block processes a chunk of rows. For each row, compute dot product with all columns of weight using a loop over reduction dimension. We'll unroll? We'll use vector instructions for dot product? But AscendC has vector multiplication and reduction. We can use vector multiply and reduce. However, to keep it simple and safe, we'll write loops.
+
+Given the complexity, we can define the kernel to take flattened x (batch*in), weight (in*in), bias (in), output (batch*in). Use float.
+
+Implementation: One block per row? But we can do grid-stride loops. We'll set blockDim = totalRows (batch_size=1024) maybe? But limited blocks. We can set blockDim = 1024? AscendC supports up to 40 blocks? Typically 24 on 910B. So we need to tile rows. We'll have each block handle a group of rows. Use tiling to set tile rows.
+
+We'll design tiling: totalRows, totalCols, tileRows, tileCols (unused maybe), blockDim. For each block, rows from blockIdx*tileRows to min(totalRows, (blockIdx+1)*tileRows). For each row i in that range, for j in 0..totalCols, compute sum over k of x[i*totalCols + k] * weight[k*totalCols + j] + bias[j]. That's O(totalRows * totalCols^2). For 4096 cols, that's 16M per row, too heavy. But we can use vector dot product: we can load a vector of x[i] and a column of weight? But weight is row-major, so column access is strided. We can transpose weight in host side? Not allowed. We'll need to load weight tiles and use vector multiply and reduce.
+
+Better: Use cube matmul. We'll use AscendC's Cube class: https://www.hiascend.com/document/detail/en/canncommercial/601/AscendC/AICPUOP/atlas_ascendc_10_0043.html. We can write a kernel that uses CubeMatMul for the multiplication and then add bias element-wise. That would be efficient and simpler to tile. The kernel will have two stages: matmul using cube, then add bias using vector add.
+
+Given tiling flexibility, we'll allocate buffer for cube input, weight, output. Use CubeMatMul with transpose? The weight matrix is (in, in), x is (batch, in), we need y = x * weight^T? Actually torch.addmm: y = bias + x @ weight. Weight is (in_features, in_features). So multiplication is x (batch, in) @ weight (in, in) = (batch, in). No transpose needed. CubeMatMul expects A (M, K), B (K, N), C (M, N). So we set A = x, B = weight, C = output, then add bias.
+
+Cube operations require specific alignment and cube unit restrictions. We'll need to tile because total size may be too large for one cube call. We can tile along M (batch) and N (cols). We'll use a double-tiling scheme.
+
+Given the complexity and time, but we must produce a working solution. The memory repairs indicate common pitfalls. We'll try to keep it as simple as possible: implement the kernel using element-wise operations? But we can't avoid matmul.
+
+Maybe we can rely on the fact that addmm is a single op and we can call aclnnAddmm from the kernel? No, custom kernel must implement the operation.
+
+Alternative: Write the kernel as a simple loop over rows and columns with vectorization using AscendC's vector instructions. Use Vmul and Vadd and reduce? We can use vector multiply to compute x[i] * weight, then reduce across k? That would be load x[i] (vector of in), load weight (matrix), for each j, compute dot product using Vmul and then reduce? But Vmul is element-wise, we need dot product. We can use Vmad (vector multiply and accumulate) but Vmad computes y = a*x + b, not dot.
+
+We can use the fact that for a fixed row i, y[i,j] = sum_k x[i,k] * weight[k,j] + bias[j]. If we load weight as a set of columns, we can compute y[i] = x[i] * weight (matrix-vector). We can do that with a loop over k: for each k, y[i] += x[i,k] * weight[k,:]. That is a classical matrix-vector multiply. For each row i, we can process all k: load current x scalar, load weight row k (vector of length in), and use Vmad to add scaled weight row to y. That requires vector of length in (4096 floats ~16KB, fits in UB). So we can do: for each row i, initialize y[i] = bias. Then for k in 0..in_features: load x[i,k], broadcast, load weight[k] (size in), compute y[i] = y[i] + x[i,k] * weight[k] using Vmad (or Vmul + Vadd). Vmad can do y = alpha * x + y, but we need alpha = x[i,k] and x = weight[k]. Vmad can do that if we use scalar-broadcast. We'll use Vmuls and Vadd. That is in-place. This is conceptually like doing a series of vector multiply-add. That is feasible.
+
+Thus our kernel: For each row i in block's chunk, load bias into local output buffer (size cols). Then for each k in 0..totalCols: load scalars x[i*totalCols + k], broadcast, load weight row k (global tensor offset k*totalCols, length totalCols), Vmuls with scalar, Vadd to output buffer. Then write output row back. This uses two UB buffers: output row (size cols), weight row (size cols). We'll tile over rows, and within rows over k? But columns are fixed 4096, so weight row is 4096 floats = 16KB. For each row, we loop over k 4096 times. That's 4096*4096 ops per row = 16M per row, total 1024*16M=16G operations, heavy but on AscendC vector unit may be okay? But we can also tile columns: process columns in tiles of size tileCols to reduce UB usage? But UB budget is 192KB, we have two buffers of tileCols each, plus overhead. We can set tileCols = 4096, then we load entire weight row. That's fine. We need to load bias only once per row.
+
+We'll also need to handle block distribution: each block processes a range of rows. We'll set tileRows for each block, and blockDim = totalRows / tileRows approx. We'll use grid-stride loops: each block iterates over rows with stride blockNum*tileRows.
+
+Tiling data: totalRows, totalCols, tileRows (how many rows per cube? For vector approach, tileRows=1? But we can process multiple rows? We'll process one row at a time. So tileRows = 1. But we can still set blockDim to something like 24 and each block processes rows from blockIdx to totalRows with step blockDim. That's fine.
+
+Thus tiling: totalRows, totalCols, blockDim. We don't need tileCols because we process full cols each time. But we may need to constrain blockDim based on UB usage: each block needs at least 2 * totalCols floats for output row and weight row. That's 2*4096=8192 floats = 32KB. UB budget 192KB, so fine. Also need scalar x[i,k] temporarily. So fine.
+
+We'll implement kernel with double buffering? Simple.
+
+Now write the six strings.
+
+Project JSON: 
+```json
+[
+  {
+    "op": "Ca6k02874Custom",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "x", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "weight", "param_type": "required", "format": ["ND"], "type": ["float"]},
+      {"name": "bias", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ],
+    "output_desc": [
+      {"name": "y", "param_type": "required", "format": ["ND"], "type": ["float"]}
+    ]
+  }
+]
+```
+
+Host tiling header:
+```cpp
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Ca6k02874CustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalRows);
+  TILING_DATA_FIELD_DEF(uint32_t, totalCols);
+  TILING_DATA_FIELD_DEF(uint32_t, tileRows);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Ca6k02874Custom, Ca6k02874CustomTilingData)
+} // namespace optiling
+```
+
+Host operator src (no OP_ADD, rely on autogen). Use StorageShape pointer. TilingFunc sets tiling fields directly. InferShape copies shapes. Set InferDataType.
+
+```cpp
+#include "ca6k_02874_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+static constexpr uint32_t UB_BUDGET_BYTES = 192 * 1024;
+static constexpr uint32_t ALIGN_ELEMS = 32; // for vector alignment
+static constexpr uint32_t MAX_BLOCKS = 24;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    Ca6k02874CustomTilingData tiling;
+    const gert::StorageShape *x_shape = context->GetInputShape(0);
+    const auto &shape = x_shape->GetOriginShape();
+    uint32_t batch_size = static_cast<uint32_t>(shape.GetDim(0));
+    uint32_t in_features = static_cast<uint32_t>(shape.GetDim(1));
+    uint32_t totalRows = batch_size;
+    uint32_t totalCols = in_features;
+
+    // Determine blockDim and tileRows
+    uint32_t blockDim = totalRows < MAX_BLOCKS ? totalRows : MAX_BLOCKS;
+    // Each block processes tileRows rows. We'll use grid-stride, so tileRows can be 1.
+    // But we need to ensure blockDim not too high; also ensure UB budget for two vectors of totalCols.
+    uint32_t bytes_for_two_vectors = 2 * totalCols * sizeof(float); // each vector totalCols
+    if (bytes_for_two_vectors > UB_BUDGET_BYTES) {
+        // need to tile columns? For simplicity, assume fits. totalCols=4096 => 32KB
+    }
+    uint32_t tileRows = 1; // process one row at a time
+    context->SetBlockDim(blockDim);
+
+    tiling.totalRows = totalRows;
+    tiling.totalCols = totalCols;
+    tiling.tileRows = tileRows;
+    tiling.blockDim = blockDim;
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::StorageShape *x_shape = context->GetInputShape(0);
+    gert::StorageShape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+// No OP_ADD to avoid double registration
+```
+
+Note: we used gert::StorageShape as per memory 3.
+
+Kernel source: implement vector-based matrix-vector multiply per row.
+
+```cpp
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCa6k02874Custom {
+public:
+    __aicore__ inline KernelCa6k02874Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR y,
+                                uint32_t totalRows, uint32_t totalCols, uint32_t tileRows, uint32_t blockDim)
+    {
+        totalRows_ = totalRows;
+        totalCols_ = totalCols;
+        blockDim_ = blockDim;
+        xGm_.SetGlobalBuffer((__gm__ float*)x, totalRows_ * totalCols_);
+        weightGm_.SetGlobalBuffer((__gm__ float*)weight, totalCols_ * totalCols_);
+        biasGm_.SetGlobalBuffer((__gm__ float*)bias, totalCols_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, totalRows_ * totalCols_);
+
+        pipe_.InitBuffer(inQueueX_, BUFFER_NUM, totalCols_ * sizeof(float)); // for weight row
+        pipe_.InitBuffer(tmpQueue_, 1, totalCols_ * sizeof(float)); // for output row
+        pipe_.InitBuffer(outQueueY_, BUFFER_NUM, totalCols_ * sizeof(float)); // for result
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (totalRows_ == 0 || totalCols_ == 0) return;
+
+        uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        // Each block processes rows with stride blockNum
+        for (uint32_t row = blockIdx; row < totalRows_; row += blockNum) {
+            ProcessOneRow(row);
+        }
+    }
+
+private:
+    __aicore__ inline void ProcessOneRow(uint32_t row)
+    {
+        // Load bias into tmp
+        AscendC::LocalTensor<float> outRow = tmpQueue_.AllocTensor<float>();
+        AscendC::DataCopy(outRow, biasGm_, totalCols_);
+        // For each k, accumulate weight[row k] * x[row][k]
+        for (uint32_t k = 0; k < totalCols_; ++k) {
+            float xVal = xGm_[row * totalCols_ + k];
+            // Load weight row k (vector of length totalCols) into weightRow
+            AscendC::LocalTensor<float> weightRow = inQueueX_.AllocTensor<float>();
+            AscendC::DataCopy(weightRow, weightGm_ + k * totalCols_, totalCols_);
+            // outRow += xVal * weightRow
+            AscendC::Muls(weightRow, weightRow, xVal, totalCols_);
+            AscendC::Add(outRow, outRow, weightRow, totalCols_);
+            inQueueX_.FreeTensor(weightRow);
+        }
+        // Write result to global memory
+        AscendC::DataCopy(yGm_ + row * totalCols_, outRow, totalCols_);
+        tmpQueue_.FreeTensor(outRow);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY_;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> weightGm_;
+    AscendC::GlobalTensor<float> biasGm_;
+    AscendC::GlobalTensor<float> yGm_;
+    uint32_t totalRows_ {0};
+    uint32_t totalCols_ {0};
+    uint32_t blockDim_ {1};
+};
+
+extern "C" __global__ __aicore__ void ca6k_02874_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCa6k02874Custom op;
+    op.Init(x, weight, bias, y, tiling_data.totalRows, tiling_data.totalCols, tiling_data.tileRows, tiling_data.blockDim);
+    op.Process();
+}
+```
+
+Python bind: call the custom op via aclnn. We'll use EXEC_NPU_CMD as in example. We'll define the function ca6k_02874_custom_npu.
+
+Model_src: use ModelNew class that imports custom_ops_lib and calls the function.
+
+We need to ensure the Python bind is correct. The custom op name in the JSON is Ca6k02874Custom, and the kernel extern is ca6k_02874_custom. The aclnn name should match the project JSON op name.
+
+We'll write python_bind_src as:
+
+```cpp
+#include <torch/library.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor ca6k_02874_custom_npu(const at::Tensor& x, const at::Tensor& weight, const at::Tensor& bias) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnCa6k02874Custom, x, weight, bias, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("ca6k_02874_custom", &ca6k_02874_custom_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("ca6k_02874_custom", &ca6k_02874_custom_npu, "Fused addmm (Ca6k02874Custom) on NPU");
+}
+```
+
+ModelNew:
+```python
+import torch
+import torch_npu
+import custom_ops_lib
+
+_FN = 'ca6k_02874_custom'
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, *init_inputs):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(init_inputs[0], init_inputs[0]))
+        self.bias = torch.nn.Parameter(torch.randn(init_inputs[1]))
+
+    def forward(self, *inputs):
+        fn = getattr(custom_ops_lib, _FN)
+        return fn(inputs[0], self.weight, self.bias)
+```
+
+Note: the original model takes weight and bias as parameters. In ModelNew we also create them as parameters. The init_inputs are [input_features, bias_shape] but bias_shape is tuple (input_features,). We'll use init_inputs[0] and init_inputs[1][0] perhaps. But bias_shape is given as (input_features,) so bias_shape[0] = input_features. So self.bias = torch.nn.Parameter(torch.randn(init_inputs[1][0])). However we can also accept bias_shape directly. Let's keep consistent: init_inputs[0] = input_features, init_inputs[1] = bias_shape (tuple). So we get input_features = init_inputs[0], bias_shape = init_inputs[1]. Then self.weight = nn.Parameter(torch.randn(input_features, input_features)). self.bias = nn.Parameter(torch.randn(bias_shape)). forward takes x.
+
+Now produce final answer.
+
+But we must ensure no raw-string prefixes. Use triple double quotes for Python strings. Use r'''? The example uses triple-quoted strings without r, but for raw we need r. Actually the example uses just """ for strings, but they don't contain backslashes. We'll use """ normally.
+
+Now write code block.

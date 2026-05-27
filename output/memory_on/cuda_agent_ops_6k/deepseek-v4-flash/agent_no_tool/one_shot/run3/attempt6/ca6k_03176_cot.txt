@@ -1,0 +1,168 @@
+We need to fix the kernel that caused vector core exception (aivec error) during execution. The kernel attempted to implement nanmedian using a per-element loop with scalar reads (GetValue) and complex control flow (quickselect) inside the kernel, which is not appropriate for AscendC vector processors. The vector core exception likely due to out-of-bounds memory access, misaligned data copies, or invalid tensor operations.
+
+The error log shows "When the D-cache reads and writes data to the UB, the response value returned by the bus is a non-zero value." This suggests memory access violation, possibly because we are using DataCopy with a length that is not aligned, or using GetValue on local tensors incorrectly.
+
+We need to rewrite the kernel to use vectorized operations, avoiding scalar loops and GetValue calls. Since nanmedian requires sorting or selection, we can implement a simple approach: for each column (along dim), we need to find the median ignoring NaN. A naive approach: sort each column and pick median. However, sorting on AscendC is not trivial. We can use a simpler but correct approach: use existing AscendC APIs where possible. But we need a fused kernel.
+
+Alternative: decompose the operation into manageable pieces. For each row (or column) we can compute the median by using bitonic sort or using quickselect with vector operations. However, quickselect with scalar loops is not vector-friendly.
+
+Given the complexity, perhaps a better approach is to use host-side pre-processing? But the task expects a custom operator that runs on NPU.
+
+Let's think: torch.nanmedian along dim returns values and indices. The shape is (input_size, 3) with dim=0 -> output shape (3,) for values and indices. Actually dim=0 means we take median over the first dimension (batch of 512000). That's a large reduction. The input is 512000x3. So we have 3 columns, each with 512000 elements. We need the median of each column ignoring NaN.
+
+Implementation idea: Since number of columns is small (3), we can process each column separately in the kernel, using block assignment per column. For each column, we need to find the median element. We can implement a simple selection algorithm using vectorized comparisons and reduction operations. But quickselect is inherently sequential.
+
+A practical approach: Use an efficient kernel that copies the column data into UB, then performs a bubble sort or insertion sort? But with 512000 elements, that's too large for UB.
+
+Alternative: Use a two-pass approach: first pass to count non-NaN per column and copy non-NaN values to a buffer (maybe using host-side? not allowed). Because kernel must be self-contained.
+
+Maybe we can lean on existing AscendC libraries? Not available.
+
+Given the constraints, perhaps we should implement median by sorting via a simple parallel bitonic sort on blocks? But that's complex.
+
+The previous kernel attempted to implement quickselect using scalar GetValue per element, which is extremely slow and likely caused memory issues because DataCopy of 1 element is not efficient and GetValue may not be safe on local tensors after dequeuing? Actually GetValue is allowed on local tensors, but the issue may be mismatched strides or alignment.
+
+We need a minimal fix that makes the kernel correct and avoids vector core exception. The key error: aivec error, mte error info indicates memory access violation. Possibly the DataCopy with length 1 (not aligned to 32-byte) is causing issues. In AscendC, DataCopy requires the length to be a multiple of 8 bytes for float32? Actually for vector memory copy, the length must be aligned to 32 bytes (8 floats). So copying 1 float is invalid. That's likely the root cause.
+
+So we need to avoid copying less than 32 bytes. We should always copy in blocks of at least 8 floats (32 bytes). For quickselect, we can read a tile and then work on that tile using vector operations. But quickselect is recursive.
+
+Better: implement median using a simple strategy: For each column, we can copy all elements into UB in tiles, but the total column size is 512000 floats, which is 2MB, far exceeding UB size (192KB). So we cannot hold entire column in UB.
+
+We need an algorithm that works in streaming fashion? For median we need all data. So we must do multiple passes over global memory. That's inefficient but possible. However, we can do a selection algorithm that uses bounded workspace: e.g., the "median of medians" but complex.
+
+Given time, perhaps we can implement a simpler but correct method: sort each column using bitonic sort on a tile-by-tile basis? Not feasible.
+
+Maybe we can do a host-side approach: use the operator's tiling to process each column independently, and for each column, perform a limited selection using histogram? Not accurate.
+
+Wait: The reference model uses torch.nanmedian(x, dim=0). This is a built-in PyTorch operation. We need to match it exactly. On NPU, there may be a built-in operator, but the task is to implement a custom one. However, we can delegate to existing ACL operators? But the binding is custom.
+
+Actually, we can implement the operator using existing AscendC APIs that already provide median-like functions? No.
+
+Let's reconsider the approach: The previous attempt compiled successfully but crashed at runtime due to memory access errors. The most likely fix is to ensure all DataCopy operations use lengths that are multiples of 8 (for float) and aligned to 32 bytes. Also, avoid GetValue on tensors that may not be properly initialized.
+
+But the algorithm itself (quickselect) requires random access to global memory and per-element reading, which is inefficient but should be possible if done correctly with proper alignment.
+
+I propose to fix the kernel by:
+- Reading an entire tile of data into a local tensor (aligned size, e.g., multiple of 8 floats).
+- Then processing that tile in a loop, using vectorized comparisons to count less/equal.
+- To avoid GetValue for each element, we can use AscendC::Compare and reduce operations.
+
+For example, we can use `AscendC::Compare` to produce a mask, then `AscendC::ReduceSum` or `AscendC::Count` to count number of elements less than pivot. This can be done tile by tile, summing counts. Similarly, we can find the exact median by repeated selection with a pivot that we compute from the first tile? But median selection requires global order.
+
+Given the complexity and time, perhaps the simplest fix is to change the algorithm to a straightforward but safe one: For each column, we can gather all non-NaN values into a local buffer by reading in tiles, but the buffer must be large enough to hold all non-NaN values. The maximum non-NaN is 512000. UB cannot hold that. So we would need to use global memory as temporary workspace? But we only have input and output global memories. We could use output values buffer as scratch? Not safe.
+
+Another idea: Use the fact that columns=3, each column 512000 floats. We can allocate a global memory temporary buffer (workspace) and use that. But we did not allocate workspace in tiling (currentWorkspace[0]=0). So we cannot use additional global memory.
+
+Given these constraints, I think the only viable path is to implement a correct kernel using vectorized operations that can compute median without sorting. For example, use a histogram-based method if the data range is limited, but floats are continuous.
+
+Maybe we can use AscendC's `Sort` API? There is `AscendC::Sort` intrinsic? Not sure.
+
+Let's look at the error more carefully: "The vector core execution is abnormal. error code = 0, dump info: pc start: 0x12c042600000, current: 0x12c042600b84, vec error info: 0x20000001c, mte error info: 0x106000021, ifu error info: 0x2fffd35307040, ccu error info: 0xe93063fb00000000, cube error info: 0, biu error info: 0, aic error mask: 0x6500020bd00028c". This indicates an MTEE (memory access error). The PC current is 0x12c042600b84. The binary is compiled, but we can't debug.
+
+Given that we have memory access errors, the fix is to ensure all memory accesses are aligned and lengths are multiples of the block size (8 floats for float32). In the previous kernel, we did `AscendC::DataCopy(tmp, xGm_[colStart + pivotPos], 1);` which copies 1 float. That is invalid; must be at least 8 floats. So we need to change those to copy a tile of say 8 floats and then extract the first value. That should fix the immediate crash.
+
+Similarly, the loops that iterate over individual indices with GetValue are problematic if the tensor was allocated with a tile length that is not a multiple of 8? Actually, GetValue should work, but if we copy only 1 float, the DataCopy may corrupt memory or cause alignment fault.
+
+Thus, for a minimal fix, replace single-element copies with copies of 8 floats (or ALIGN_ELEMS) and then use the first element. Also, we need to ensure that when we read pivot value, we treat the tensor properly.
+
+But the algorithm still uses scalar loops for counting less/equal, which may be slow but should not cause crash. The vector core exception likely comes from invalid copy sizes.
+
+Let's implement the fix: always copy a chunk of size that is a multiple of 8 (at least 8 floats). We'll define a constant MIN_COPY_SIZE = 8. For reading a single element, we read a chunk and take the first element.
+
+Also, in the tile-based copying, the tileLength should be aligned properly. In tiling, we set tileLen aligned to 1024, which is fine.
+
+But in the quickselect loops, we read individual elements with DataCopy of 1 - that's the problem.
+
+So I will revise the kernel to avoid any DataCopy with length not multiple of 8. Also, ensure that when we access xGm_ with an offset, the offset is byte-aligned. Since elements are floats (4 bytes), any offset is fine as long as the start address is 4-aligned. But DataCopy works on global memory with vector loads, so it requires alignment of 32 bytes? Actually, for Ascend910, vector load/store requires 32-byte alignment for the base address. However, if we use DataCopy with an offset from a tensor (which is just a pointer), the offset in elements should be such that the address is 32-byte aligned. For a global tensor of float, xGm_[offset] returns a pointer to offset*4 bytes from base. If base is aligned to 32 bytes, then offset must be multiple of 8 to maintain alignment. So we must ensure offsets used in DataCopy are multiples of 8. That's important.
+
+In our current implementation, colStart is blockIdx * rowSize (rowSize=3? Actually rowSize is the size of the dimension along which we reduce. For input (512000,3) and dim=0, rowSize=512000, columns=3. So column (blockIdx) selects a column. For a column, we access elements at offsets colStart + pos. pos can be any value from 0 to rowSize-1. If rowSize=512000, then colStart is 0, 512000, 1024000, etc. These are multiples of 512000, which is a multiple of 8? 512000/8=64000 integer, yes. So colStart is aligned. But pos may not be multiple of 8. So accessing xGm_[colStart + pivotPos] where pivotPos is arbitrary may cause unaligned access. That is likely the root cause.
+
+To fix, we need to align all accesses to multiples of 8. In the quickselect, we can adjust the algorithm to work on groups of 8 elements, but that complicates.
+
+Simpler: we can avoid complex selection by using a different algorithm that works on tiled and aligned data. Given that columns are small (3), we could precompute median by sorting on the host? No.
+
+Alternative: Use a different approach: compute median by using the fact that for each column, we can find the median by using the "median of medians" algorithm with block-level partitioning. But that's too much.
+
+Given the time, perhaps the most minimal fix that passes correctness is to implement a kernel that does not do any scalar access, but instead uses vectorized min/max and reduction to simulate median? That's not accurate.
+
+Wait, maybe we can use AscendC's built-in `AscendC::Median` or `AscendC::NanMedian`? I doubt.
+
+Let's think differently: The previous attempt had compiled successfully, meaning the project structure and binding are correct. The only issue is runtime crash due to memory access. If we fix all misaligned accesses and ensure DataCopy lengths are >=8, the algorithm may run and produce correct output? Possibly, but the quickselect algorithm may still be too slow but might pass.
+
+I'll implement the following fixes:
+
+1. In kernel, ensure all DataCopy calls use lengths that are multiples of 8. For single-element reads, copy 8 floats into a local tensor and read the first element.
+
+2. Ensure all offsets used in DataCopy are multiples of 8. In the quickselect loops, when we need to read an element at position pos, we read the aligned block containing that position. We can compute alignedStart = (pos / 8) * 8; offsetInBlock = pos - alignedStart; copy 8 floats from xGm_[colStart + alignedStart] and then read the value at index offsetInBlock.
+
+This will fix alignment and length issues.
+
+3. Also, in the counting loop, we read each element individually; we can instead process tiles of 8 elements at once, but for simplicity, we can keep the scalar loop but with aligned reads as above.
+
+However, the counting loop over 512000 elements per column with scalar reads will be extremely slow (512000 iterations * 3 columns * multiple passes), but it might not crash if memory accesses are correct. However, it may timeout. But we have no explicit timeout in kernel. It might work.
+
+Given the need for a minimal fix, I'll implement the aligned single-element read helper.
+
+Additionally, in the tile-based copy for initial counting, we already copy tiles of tileLen (aligned to 1024) which is fine.
+
+I'll also remove the usage of tmpQueue for single-element reads; instead use a dedicated small local tensor of 8 floats.
+
+Let's rewrite the kernel with these fixes.
+
+Also, note that in the previous code, we had `pipe_.InitBuffer(tmpQueue_, 1, tileLen_ * sizeof(float));` which allocates tileLen floats. That is fine.
+
+We'll add a small buffer for reading 8 floats: `pipe_.InitBuffer(readBuf_, 1, 8 * sizeof(float));` and use it.
+
+But careful: `tmpQueue_` is already used for temporary storage; we can reuse it for pivot reads, but it's allocated with tileLen_ size, not necessarily 8. But it's fine.
+
+We'll modify the code to use a helper function `ReadOneFloat` that copies a block of 8 floats and returns the value at the desired index.
+
+Also, ensure that when we call `AscendC::DataCopy` with length not multiple of 8, we pad or align. In the Process function, when counting non-NaN, we already use tiles of tileLen which is aligned. For quickselect, we need to read individual floats. We'll use ReadOneFloat.
+
+Now, the quickselect algorithm: It uses global memory reads repeatedly. This is inefficient but acceptable for small number of columns (3) and medium size (512k elements). The number of iterations in quickselect is O(log n) on average, but each iteration reads all elements once. So total reads ~ O(n log n) ~ 512k * 19 ~ 10M reads, each reading 1 float from global memory via aligned block copy of 8 floats. That's 80M bytes read per column, times 3 = 240MB, which is acceptable.
+
+We also need to handle NaN correctly: NaN compared to itself is false, so we skip it. In the pivot read, if pivot is NaN, we find next non-NaN.
+
+We'll implement ReadOneFloat as:
+
+```
+__aicore__ inline float ReadOneFloat(uint32_t gmOffset) {
+    uint32_t alignedOffset = (gmOffset / 8) * 8;
+    uint32_t offsetInBlock = gmOffset - alignedOffset;
+    AscendC::LocalTensor<float> tmp = readBuf_.AllocTensor<float>();
+    AscendC::DataCopy(tmp, xGm_[colStart + alignedOffset], 8);
+    float val = tmp.GetValue(offsetInBlock);
+    readBuf_.FreeTensor(tmp);
+    return val;
+}
+```
+
+But we need to ensure that colStart + alignedOffset is within bounds. The global tensor size is totalLength. We should guard.
+
+Also, we need to allocate readBuf_ in Init.
+
+Now, implement the whole kernel with these changes.
+
+Additionally, we must ensure that the output tensors values and indices have correct shapes. In InferShape we set output shape to be 1D (3,) for values and indices. The kernel will write to these tensors.
+
+In the kernel, we have valuesGm_ and indicesGm_ set with size columns (3). We'll write per block.
+
+The kernel will use blockDim = number of columns (3). So block 0 processes column 0, etc.
+
+Now, the algorithm: For each column, we need to find median of non-NaN values. We'll implement a quickselect that works on global memory with aligned reads.
+
+Let's write the kernel step by step.
+
+We'll keep the tiling as before: blockDim = columns (3) but may be capped at 24. That's fine.
+
+Now, the implementation:
+
+First pass: count non-NaN by iterating over tiles. Also we can store the non-NaN count.
+
+Second pass: quickselect to find median.
+
+We'll adjust the code accordingly.
+
+Now, produce the final answer with all six strings. We'll be careful to avoid syntax errors and keep indentation consistent.
+
+Let's write the full code.

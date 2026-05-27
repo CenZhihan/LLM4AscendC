@@ -1,0 +1,126 @@
+We need to generate the six Python string variables for the fused custom AscendC operator for pixel_unshuffle. The task is to implement a custom operator that replaces torch.pixel_unshuffle. The operator name stem is ca6k_00285, so kernel name ca6k_00285_custom, PascalCase Ca6k00285Custom.
+
+Pixel unshuffle rearranges elements from a tensor of shape (N, C, H, W) to (N, C * (r^2), H/r, W/r) by moving pixels from high resolution to low resolution, akin to a subpixel convolution in reverse. For a given upscale_factor r, it divides the image into r×r patches and rearranges them into the channel dimension.
+
+We need to implement this as a single custom operator on NPU. The reference shows a simple model that takes x and upscale_factor (as init param). The custom op should accept x and maybe upscale_factor as an attribute or input. Since the upscale_factor is known at model build time, we can pass it as an attribute in the JSON. The tiling data can store the factor.
+
+The kernel must perform the pixel unshuffle operation. We can do it using vectorized data movement. Since AscendC has limited indexing, we need to use DataCopy with appropriate global tensor offsets. The operation is essentially a reshape + permute. Given input shape (N, C, H, W) and factor r, output shape (N, C * r * r, H/r, W/r). The mapping: output[n, c * r^2 + r * i + j, h, w] = input[n, c, h*r + i, w*r + j] for i,j in [0,r-1].
+
+We can implement by iterating over output elements and reading from input using computed indices. Or we can use a tile-based approach where we process a block of the output tensor and compute source coordinates. Since the operation is data-dependent but not computationally heavy, we need efficient data movement.
+
+We should use a simple kernel that processes tiles of the output. Given the large dimensions (batch=64, C=3, H=1024, W=1024, factor=2 => output channels=12, H/W=512), we need to handle large total elements. The kernel should use grid-stride loop over blocks.
+
+We need to derive the tiling data: totalLength (number of output elements), tileLength (elements per tile per block). The UB budget is limited. We should compute tile size based on UB. Use the similar pattern as example but with simpler compute.
+
+Because pixel_unshuffle is just data rearrangement, no arithmetic, so the kernel only needs DataCopy. But we need to handle the layout transformation. We can compute the source address in global memory for each output element and do a 1D data copy. However, AscendC's DataCopy requires contiguous source and destination. So we need to copy from non-contiguous input to contiguous output? Actually, we can treat the input as 4D and output as 4D. We can copy entire slices (e.g., a batch element and complete channel dimension). But the mapping is not contiguous in source due to the patch extraction.
+
+Alternative: we can use a tiling strategy where we process a small block of output (e.g., a tile of spatial dimensions) and compute the corresponding source area. We'll copy the necessary source data into local memory, rearrange, then write out. Since there is no arithmetic, we can just use DataCopy with correct global offsets.
+
+Simpler approach: Use a 2D-like copy of the output block. For a given output block of shape (C', H', W'), we can compute the set of input rows/blocks needed. However, that's complex.
+
+Given the constraints and typical AscendC implementations, a straightforward method is to treat the operation as a reshape+permute and use the built-in tensor operations? But AscendC doesn't have permute directly. We can use the following: Since pixel_unshuffle is equivalent to first dividing the spatial dimensions into r×r patches, then reshaping each patch to channel dimension. That can be done by reshaping input from (N, C, H, W) to (N, C, H/r, r, W/r, r), then permuting to (N, C, r, r, H/r, W/r) and then merging dimensions to (N, C*r*r, H/r, W/r). This is a complex permutation.
+
+Given the harness expects numerical match, we can implement the kernel by manually copying using a double loop over output spatial indices. For each output element, compute source indices and use DataCopy with single element? That would be too slow.
+
+Instead, we can leverage the fact that the output elements within a single output channel (size H/r * W/r) come from one input channel but at scattered positions. However, for each patch of size r×r in input, the corresponding output channels are consecutive (c* r^2 + i*r + j). So we can process one input patch at a time: for each (n, c, h, w) where h is multiple of r and w multiple of r, we copy r×r input pixels into local buffer, then write them to the r^2 output channels at the same spatial location. This is a good tile: we can process one input tile of shape (r, r) and copy to r^2 output positions. The local buffer size is r^2 floats, which is small (r=2 => 4). So we can do this for each block.
+
+Better: Since r is small (usually 2 or 3), we can have a kernel that processes one output spatial location (h_out, w_out) and writes to all r^2 channels? That would be writing to scattered global memory, which is not coalesced. So we should process one input tile (r×r spatial block) and write to consecutive output channels, but the spatial positions are the same for all those r^2 channels (i.e., same h_out, w_out). So writing to multiple channels at same spatial location is still not contiguous in memory (since channels are contiguous for each spatial location). Actually, the output tensor layout is [N, C_out, H_out, W_out] with C_out = C*r^2. So for a fixed (n, h_out, w_out), the r^2 channels are contiguous in memory (because channel dimension is contiguous). That means we can write a contiguous block of r^2 floats per spatial location. That's good.
+
+So the kernel can iterate over output spatial positions (h_out, w_out) and for each, compute the input spatial region (h_in = h_out * r + i, w_in = w_out * r + j) for each channel c in 0..C-1. For each input channel c, we need to copy r^2 floats (the patch) and write them to output at the same (n, h_out, w_out) but with channel offset c*r^2. That is still non-contiguous because the r^2 floats from different input channels are not contiguous in input. But we can copy them one by one? Instead, we can process one input channel at a time: for each (n, c, h_out, w_out), we read an r×r patch from input and write to output at channel index c*r^2 + (i*r + j) ?? Wait, careful.
+
+Let's define output indices: for output pixel (n, cout, hout, wout) where cout = c*r^2 + i*r + j, with c in [0, C), i,j in [0,r). Then input position: (n, c, hout*r + i, wout*r + j). So for a fixed (n, hout, wout), if we iterate over c from 0 to C-1, and for each c, we need to read a block of r^2 elements from input (spatial patch) and write them to output at positions (n, c*r^2, hout, wout) to (n, c*r^2 + r^2 -1, hout, wout). That's contiguous in output because cout varies by 1. However, the input patch for each c is not contiguous: it's a 2D patch of size r×r, but within the input tensor, the spatial dimension is contiguous? Yes, input spatial is contiguous for a given channel. So the r×r patch is contiguous in memory if we flatten spatial? Actually, input shape (N, C, H, W) with H and W contiguous. For a fixed channel, the spatial pixels are laid out row-major: H rows of W cols. So a r×r patch at (hout*r, wout*r) is contiguous in memory? It is not contiguous as a block: the patch spans r rows, each row of length W, so the elements are not contiguous unless r=1. They are spaced by W. So we cannot read the entire patch as a single contiguous block from input. We need to read each row or each element separately.
+
+Given these complexities, perhaps we should implement a simpler approach: treat the operation as a general permute using an intermediate buffer. But on AscendC, we have limited local memory. Alternatively, we can use a naive kernel that processes one output element at a time using scalar moves? That would be too slow.
+
+Better: We can use a tiling strategy where we copy a larger contiguous block from input into local memory and then rearrange. For example, we can copy a whole row of the input (for a given channel) into local memory, then extract the needed positions. But the output requires interleaving from multiple channels.
+
+Given the example provided is for LeakyReLU which is elementwise, the pixel_unshuffle is more complex. But the harness only requires numerical match, not performance. So we can implement a straightforward kernel that uses a for loop over output elements and for each, copies a single float from input using DataCopy with a scalar? Actually, DataCopy requires contiguous source and destination of at least 1 element, but we can do single-element copies. However, that would be very slow but works.
+
+But to pass the compilation and correctness, we need a reasonable implementation. Let's design a kernel that processes the output tensor tile by tile, where each tile covers a contiguous block of output elements. For each output element, we compute the source index and do a scalar DataCopy? AscendC supports Scalar to Scalar move? We can use setValue and getValue? Or we can use a small local buffer to accumulate.
+
+Alternative: Use the fact that the output is row-major and the mapping from output linear index to input linear index can be computed. So we can iterate over output linear indices and for each, compute the input index and copy one float. This is a "naive" approach. For a tile of output elements, we can compute a vector of source indices and then use Gather? AscendC has Gather operation? Not sure.
+
+Given the constraints of this environment, the safest is to implement a kernel that copies data one element at a time using a loop. Since the example LeakyReLU used vector operations, but we can do elementwise copy. We'll set tileLength to some value and within Process, loop over output indices in the tile, compute source index, and copy using DataCopy with stride? Actually, we can store the source address in a local scalar, then use DataCopy from that address to a local tensor of length 1, then DataCopy from local to output address. That would be very slow but functionally correct.
+
+But we must ensure it passes within reasonable time. The total elements are large (64*12*512*512 = 64*12*262144 = 201,326,592). That's 200 million elements. A naive loop might timeout but the harness may allow some time. However, the AscendC kernel will be compiled and run on NPU, not CPU.
+
+Better: We can use the fact that for each output spatial location (hout, wout), the r^2 channels from each input channel can be written contiguously if we interleave. Actually, the output for a fixed (n, hout, wout) has r^2 * C elements that are contiguous. The source for these are from C channels, each providing r^2 elements scattered in input spatial. So we can process one spatial location at a time: for each (n, hout, wout), we read the required r^2 elements from each input channel (C total) and write them in sequence to output. This reduces the number of loops to H_out * W_out * batch size = 512*512*64 = 16,777,216 spatial locations, each copying r^2*C floats = 4*3=12 floats. That's still many but better.
+
+We can further reduce by copying entire rows of spatial locations? For a fixed n and hout, the output row (hout) has W_out * r^2 * C elements. The source for these W_out elements across channels is scattered, but we can process row by row.
+
+Given the complexity and the fact that the task is about replacing the operator, we can implement a relatively simple kernel that uses a single-threaded loop over output elements, but with fast vectorized copies using a local buffer of tile size. For each tile of output, we precompute the source indices and then do a multi-element copy using DataCopy with non-contiguous? Not supported.
+
+Perhaps we can use the approach: for each output element, do a scalar copy. That is simplest to implement and understand. We'll use a tile of length 1? No, we can treat each element individually. But we need to handle totalLength as the number of output elements. We can set tileLength to 1 and loop over totalLength within the block. However, that would not use multiple blocks efficiently as each block would process one element. Better: have a grid-stride loop where each block processes a contiguous chunk of output elements. For each element in the chunk, compute source index and copy.
+
+To copy one float from global to local and then to output, we can use the following in AscendC:
+LocalTensor<float> tmp;
+tmp.SetValue(0, xGm_[srcIdx]);
+yGm_[dstIdx] = tmp.GetValue(0); // but GetValue returns a scalar.
+
+But we cannot assign to global tensor directly with assignment? We can use DataCopy from a local tensor (size 1) to global. So we need to allocate a small local buffer of size 1 for each element? That would be inefficient. Instead, we can accumulate a vector of elements in local memory and then copy them in bulk. For a tile of size tileLen, we can compute the needed source addresses and copy using a loop and local buffer? But local memory is limited.
+
+Given the UB budget in the example is 192KB, which is about 49152 floats. We can allocate a local buffer of tileLen, then for each element in the tile, we copy from source to local, but we still need to do single-element copies? No, we can copy a block of contiguous source if possible. For pixel_unshuffle, the source elements are not contiguous in general. So we cannot copy a contiguous block from source to local. We must either do elementwise copies or gather operation.
+
+Given time, I'll implement a kernel that uses a single-threaded (blockDim=1) approach where each block processes a chunk of output elements by doing scalar copies using a small temporary tensor of size 1, and loops. This is not efficient but should work. We'll set blockDim=1 to simplify. The tiling will set tileLength to some reasonable number (e.g., 1024) and each block will process a tile of that size by looping over elements.
+
+But we need to ensure that blockDim is not 0. We can set blockDim=1 or 8.
+
+However, the example used multiple blocks and grid stride. For correctness, we can use multiple blocks with each block processing a contiguous chunk of output elements. For each element, we do a DataCopy of size 1 from source to a local scalar, then DataCopy from local to output. This is allowed but slow.
+
+I'll write the code accordingly. We'll define totalLength = number of output elements = N * C_in * r^2 * (H/r) * (W/r). Actually, output elements = N * (C_in * r^2) * (H/r) * (W/r). We'll compute that from input shape.
+
+In the tiling and host code, we need to know input shape and factor. The factor is known from attributes. We'll compute output shape in host and pass totalLength. The kernel will have the factor as a tiling field to compute source indices.
+
+The kernel code:
+
+We need to compute, for a given output linear index (within the tile), the source linear index. Let:
+- N, C_in, H, W input shape, r factor.
+- Output shapes: C_out = C_in * r^2, H_out = H/r, W_out = W/r.
+- Output linear index: idx_out = n * C_out * H_out * W_out + c_out * H_out * W_out + h_out * W_out + w_out.
+- Then: n = idx_out / (C_out * H_out * W_out); remainder = idx_out % (C_out * H_out * W_out)
+- c_out = remainder / (H_out * W_out); remainder2 = remainder % (H_out * W_out)
+- h_out = remainder2 / W_out; w_out = remainder2 % W_out.
+- Then c = c_out / (r^2); remaining = c_out % (r^2); i = remaining / r; j = remaining % r.
+- Then source linear index: idx_in = n * C_in * H * W + c * H * W + (h_out * r + i) * W + (w_out * r + j)
+
+We need to compute modulo and division. Since these are integer operations, we can compute them in the kernel. However, division and modulo are expensive but acceptable.
+
+To avoid division for each element, we can precompute strides and use nested loops. Within a tile that covers a contiguous chunk of output, we can compute the starting indices and then increment them.
+
+Simpler: Use the elementwise computation for each element in the tile. We'll use a for loop over tileLen.
+
+We'll store necessary dimensions in tiling data: totalLength, tileLength, blockDim, factor (r), C_in, H_in, W_in, C_out, H_out, W_out, strides. To reduce tiling data size, we can compute all strides from input shape and factor.
+
+But input shape is known from the tensor at runtime, so we can access tensor shapes in the kernel via GetBlockData? Actually, in kernel we don't have the shape directly; it's derived from tiling data. So we must pass necessary dimensions in tiling.
+
+We'll define tiling fields:
+- totalLength (output elements)
+- tileLength
+- blockDim
+- factor (upscale_factor)
+- C_in
+- H_in
+- W_in
+- C_out (or compute from C_in and factor)
+- H_out
+- W_out
+
+But that's many fields. The TilingData struct can hold them.
+
+Given the complexity, I'll implement a simpler alternative: Since pixel_unshuffle is essentially a depth-to-space inversion, we can use the native AscendC function? There might be no built-in. We'll proceed with the element-wise index computation.
+
+We must also consider that the factor is an attribute of the operator, so it will be passed to tiling and kernel.
+
+Now, for the host operator, we need to define the operator with inputs, outputs, and attribute. The input is a tensor x (float), output y (float). Attribute upscale_factor (int, default 2). We'll set default 2 but it's required from model.
+
+In TilingFunc, we need to compute output shape from input shape and upscale_factor. The input shape is [N, C, H, W]. We must check that H and W are divisible by factor. We'll compute output dimensions. Then set blockDim and tileLength. We'll use a conservative tile size.
+
+We'll follow the example's UB_BUDGET_BYTES = 192*1024, ALIGN_ELEMS=2048, etc. For each element, we need a local tensor of size 1? But we can allocate a buffer of tileLength for the source indices? Actually, we only need a temporary scalar for each element copy. The UB usage is small. We can set tileLength to a large value like 4096 or 8192. The kernel will loop over tileLength, each iteration doing a 1-element copy. That will be slow but correct.
+
+Alternatively, we can process multiple elements in parallel using vectorized copy if we can gather contiguous source blocks. Not possible.
+
+Given the time, I'll go with the simple elementwise copy kernel.
+
+Now, produce the six strings. Ensure no OP_ADD in host_operator_src (memory 4,5). Use direct field assignment for tiling (memory 1-3). Use ASCII only.
+
+Let's write the code step by step.

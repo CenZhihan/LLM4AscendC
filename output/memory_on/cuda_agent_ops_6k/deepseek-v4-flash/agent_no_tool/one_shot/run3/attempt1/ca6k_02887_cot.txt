@@ -1,0 +1,162 @@
+We need to generate the six Python string variables for a fused custom operator that replaces the Linear operation (matmul + bias addition) and then the addition of another bias. The reference model has:
+
+```python
+self.linear = nn.Linear(in_features, out_features)
+self.bias = nn.Parameter(torch.randn(out_features))
+forward: x = self.linear(x)  # returns x @ weight.T + bias_linear
+x = x + self.bias  # adds another bias
+```
+
+So effectively: y = x @ W.T + b_linear + b_extra. We can fuse these into a single custom operator that takes x, weight, linear_bias, extra_bias and outputs y. Inputs: x (batch, seq, in_features), weight (out_features, in_features), linear_bias (out_features), extra_bias (out_features). Output: y (batch, seq, out_features). The operation is a matrix multiply with broadcasted biases addition.
+
+We need to name stem: ca6k_02887. So operator name: ca6k_02887_custom, PascalCase: Ca6k02887Custom.
+
+We'll create a single fused operator. The kernel will do matmul (perhaps using AscendC's Matmul or manual tile-based multiplication) plus addition of two biases. Since it's a fused op, we can implement it as a tile-based matmul with bias addition.
+
+We need to provide the six strings. We'll follow the example structure but adapt for matmul+bias.
+
+Let's design:
+
+- project_json_src: JSON with top-level "op" containing operator metadata. Inputs: x (float, ND), weight (float, ND), bias1 (float, ND), bias2 (float, ND). Output: y (float, ND). Attr: none.
+
+- host_tiling_src: Tiling data structure with fields: totalElements (for output), tileM, tileN, tileK, blockDim, maybe strides? We'll use simple tiling: M = batch*seq, N = out_features, K = in_features. We'll tile along M and K. We'll include blockDim.
+
+- host_operator_src: Implements TilingFunc, InferShape, InferDataType, and OpDef registration. Use memory repair hints: use StorageShape* and direct member assignments.
+
+- kernel_src: Implement the kernel. Since matmul on AscendC is complex, we can use the built-in Matmul or use a manual loop with vectorization. For simplicity and given the example, we can implement a naive tile-based matrix multiplication using AscendC vector operations (Mmad or muls/adds). But AscendC has Matmul class. Let's use Matmul for efficiency. However, the example kernel used simple vector ops. To be safe and follow the pattern, we can implement matmul by loading tiles of A (x reshaped to M x K) and B (weight transposed? Actually we have weight as (out_features, in_features). We need y = A * W^T + bias1 + bias2, where A is M x K, W is (N x K) but we want A * W^T => M x N. So we need to transpose weight? Or we can compute as A * W^T where W is stored as (N,K). We'll load tiles of A and B and compute dot products.
+
+But AscendC's Matmul expects specific data layouts (e.g., row-major for A, column-major for B). We'll assume we can recast. Given the complexity, we might instead do a simpler approach: treat the operation as a fully connected layer and implement using a tile-based kernel that loads a tile of input, computes the linear transformation and bias additions. We can use a combination of data copy and vector operations, similar to the example but with inner product.
+
+Let's design a kernel that processes output tile M_tile x N (where N is out_features). For each output element (i, j), we need sum over k of a[i,k] * w[j,k] + bias1[j] + bias2[j]. We can loop over K tiles and accumulate outer products.
+
+Simpler: use a single vectorized approach: For each output row i (batch*seq index), load the entire row of input (K elements), load entire weight matrix? That would be huge. So we need tiling.
+
+Given the constraints, I'll implement a kernel that does:
+
+- For each output block of rows (blockIdx * tileM to next), for each out_feature j, accumulate over K tiles: load tile of input (tileM x Ktile) and tile of weight (j slice: Ktile elements) and compute partial sums. Use local memory.
+
+We'll use TQue and pipe.
+
+I'll follow the kernel pattern from example: CopyIn, Compute, CopyOut. But with matmul, Compute will do loop over K.
+
+We need to define tiling data: totalLength is output elements (M*N). tileM, tileK, tileN? Actually we'll tile along rows (M) and maybe along K? Fixed N (out_features) could be small (256) so we can keep all columns in registers? Not sure. We'll tile M and K. For each row tile of M_tile, for each column j, we accumulate over K tiles.
+
+We'll store output in a local buffer of size M_tile * N.
+
+Given the complexity, but we need to output a valid kernel. I'll produce a kernel that uses Matmul class of AscendC, which is the recommended way. The Matmul class requires input matrices with specific layout (e.g., row-major for A, column-major for B). We'll set up accordingly.
+
+I'll write kernel with template parameters for data type and use Matmul<...>. However, to keep it simple and consistent with example, I'll use vector operations: for each output row, compute dot product with weight column-wise using vector reduce? That might be inefficient but acceptable for demonstration.
+
+Better: use a manual tiled matrix multiplication with vectorized inner loops. Let's design:
+
+- For each output element (i, j), compute sum_{k} A[i][k] * B[j][k] (since B is weight stored as (N,K)). We can load a tile of A (tileM x tileK) and a tile of B (tileN x tileK) and compute partial results using outer product (Mmad). AscendC provides Mmad for matrix multiply. We can use Mmad: Z = A * B^T + C. That matches our need if we set B as weight (N x K) and then compute Z = A * B^T (result M x N) and then add biases.
+
+So we can use Mmad with appropriate data formats. Let's use the following: A is M x K, B is N x K (weight), we want C = A * B^T. Mmad can do that if we set isBTranspose? Actually Mmad expects A and B both row-major, and does A * B^T. So yes, if B is row-major (N x K), then B^T is K x N, and A * B^T is M x N. Good.
+
+So we can set up A and B as LocalTensor maybe fragment matrices. But Mmad works with fragment layout (FRACTAL_NZ). For simplicity, we could use the built-in Matmul class which handles layout conversion.
+
+Given the time, I'll produce a kernel that uses Matmul class. However, that requires more boilerplate. Alternatively, I'll implement a simple tile-based approach without Mmad, using loop over K and outer product update via vector operations (VecMul and VecAdd). But that is also heavy.
+
+Since the example kernel did not use matmul, the evaluator may accept a simpler implementation that still computes the correct output? The requirement is to match numerical output. So we must correctly compute the linear transformation plus biases.
+
+I'll attempt to implement a kernel that iterates over rows and columns, using inner product with reduction. For each output row i, we can compute the entire row of length N by multiplying the input row (K) by the weight matrix (N x K) using vector-matrix multiplication. We can load a row of input (K) and then for each j, compute dot product with weight row j (K). This is like a full-connect layer. To reduce memory, we can tile the weight matrix along rows (N), but N is only 256, so we can load entire weight? If K is large (256) and N small, weight is 256x256 = 65536 floats ≈ 256KB, which fits in UB? Possibly. But we have UB budget limited. Better to tile.
+
+Given the complexity, I'll adopt a pragmatic approach: implement the kernel as a series of vector operations: for each output element, compute sum using double loop with reduction. This is slow but correct. However, the evaluator might test performance? It says "optimized" but any correct fused op may pass.
+
+Given the repair memories, we need to avoid compilation errors.
+
+Let's write the kernel with manual tiling:
+
+- Input x: shape (batch, seq, in_features) = (M, K) flattened.
+- Weight: shape (out_features, in_features) = (N, K)
+- Bias1 and bias2: (N,)
+
+We'll process output tiles of rows (tileM) and all N columns. For each tile of rows, we compute:
+
+- Load tile of x (tileM x K) into local.
+- For each column j (0 to N-1):
+   - Load weight row j (K) into local.
+   - Compute dot product between each row of x tile and weight row j => tileM elements.
+   - Add bias1[j] and bias2[j] -> store in output tile column j.
+
+We can use vector Mul and Reduce operations? We can compute dot product as: sum over k of a[i,k] * b[k] using a combination of multiply and reduce. But AscendC has no reduce sum for vector elementwise? We can do:
+
+tmp = xLocal * wLocal (elementwise mul) -> then use a loop to sum? Or use reduce add? There is AscendC::ReduceSum? Actually, we can use vectorized reduction: use a loop to accumulate partial sums over chunks? Simpler: use AscendC::Matmul as intended.
+
+Given the time, I'll generate a kernel that uses the AscendC Matmul class. This is the standard way and will be efficient. However, it requires careful setup of data formats (NZ for A and B, or row-major with transpose flags). I'll follow typical examples from official documentation.
+
+I'll assume we can treat x as A (M x K row-major), weight as B (N x K row-major), and compute C = A * B^T (M x N). Then add biases.
+
+I'll write the kernel using Matmul class:
+
+```cpp
+#include "kernel_operator.h"
+using namespace AscendC;
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCa6k02887 {
+public:
+    __aicore__ inline KernelCa6k02887() {}
+    __aicore__ inline void Init(...) { ... }
+    __aicore__ inline void Process() {
+        Matmul<MatmulType<FP16, FP16, FP16>> mm; // or use float
+        // set up A, B, C
+        // mm.SetOrgShape(...);
+        // mm.SetTranspose(...);
+        // mm.IterateAll(...);
+    }
+};
+```
+
+But this is complex and might not compile without proper includes.
+
+Given the constraints, I'll revert to a simpler kernel that directly implements the operation as a series of vector adds and multiplies, but without matmul. I'll treat the operation as: for each output element, compute sum using a loop over K, but we can use vectorized multiplication and sum using a local accumulator. For a tile of rows M_tile, we can compute outer product with weight rows? Too heavy.
+
+Actually, we can use the AscendC vector API: `Mul` and `Add` and `ReduceSum`? There is no direct reduce sum, but we can use `VecReduceSum`? This is getting complicated.
+
+Given that the example kernel used only simple elementwise operations, maybe we should implement the fused operation as: given that linear layer with bias and additional bias can be replaced by a single operator that does matmul and double bias. But if we can't implement matmul efficiently, we might still implement it by simply calling the original PyTorch linear? That defeats the purpose.
+
+Wait: The instruction says "fused custom operator for a multi-op PyTorch reference program". The reference has two ops: linear (which includes bias add) and then another add. So we need to fuse them into one custom op that does both at once. So the custom op must compute matmul and add two biases.
+
+But we can rely on AscendC's built-in matmul? Possibly we can offload to AI Core using the Matmul instruction directly.
+
+Given the complexity, I'll produce a kernel that uses the `Matmul` class from AscendC, which is designed for this purpose. I'll follow a pattern from open source kernels. I'll set the transposeB flag to true since we have weight as (N, K) and want A * B^T.
+
+I'll also include the addition of biases using vector addition.
+
+To keep the code short, I'll assume that the tiling function sets appropriate dimensions.
+
+Let's design tiling data:
+
+- totalElements: M * N (output size)
+- blockDim: number of blocks
+- tileM: number of rows per tile
+- tileN: N (since we can process all columns at once? Actually for Matmul we need to tile along M and K. N is fixed. We'll use tiling for M and K.
+
+Tiling: tileM for rows, tileK for K dimension. The Matmul will iterate over tiles of K and accumulate.
+
+We'll define tiling data: totalM, totalN, totalK, tileM, tileK, blockDim.
+
+In kernel, each block will process a range of rows using blockId and tileM.
+
+Implementation plan:
+
+- Init: set up global tensors for x, weight, bias1, bias2, y.
+- Process: loop over row tiles assigned to this block. For each row tile, create a Matmul object, set input A tile (from x), input B (weight), output C (local). Matmul will handle tiling K. Then add bias1 and bias2 to C. Then copy out.
+
+I'll write the kernel code with comments.
+
+Now, generate the six strings.
+
+Note: The python_bind_src must bind the custom op to a function name, e.g., "ca6k_02887_custom". In model_src, we'll import custom_ops_lib and call that function.
+
+Also, we need to ensure that the op registered in operator_src has the correct inputs: x, weight, bias1, bias2, y.
+
+In project_json, we define input_desc and output_desc accordingly.
+
+Let's write the strings.
+
+I'll carefully follow the example format.
+
+Now, produce the Python code block.

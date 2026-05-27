@@ -1,0 +1,221 @@
+我们被要求生成一个Ascend C算子，用于融合F.adaptive_max_pool2d操作。参考模型（Model）只有一个Conv2d，但forward中实际上执行的是adaptive_max_pool2d，而conv没有在forward中使用？参考代码：
+
+```python
+class Model(nn.Module):
+    def __init__(self, ...):
+        self.conv = nn.Conv2d(...)
+    def forward(self, x):
+        x = F.adaptive_max_pool2d(x, output_size=(64, 128))
+        return x
+```
+
+所以实际上forward只用了adaptive_max_pool2d，conv定义但未使用。可是get_init_inputs传入了conv参数，但forward没用。可能是任务描述的问题：他们想替换adaptive_max_pool2d。注意任务说“fused custom AscendC operator for a multi-op PyTorch reference program”，但这里只有一个op？不过我们只需要实现adaptive_max_pool2d的自定义算子，用AscendC实现。不需要融合多个。
+
+算子名称：`ca6k_00358_custom`，PascalCase `Ca6k00358Custom`。
+
+需要输出六个字符串变量。
+
+需要考虑input_desc: adaptive_max_pool2d输入是tensor x和output_size（两个整数）。输出是tensor y。需要将output_size作为属性传入。
+
+数据类型参考示例使用float。
+
+我们需要设计tiling逻辑。adaptive_max_pool2d需要对输入进行滑动窗口最大池化，输出尺寸固定为(64,128)。输入是(N, C, H, W)，输出(N, C, 64, 128)。需要计算每个输出像素的池化区域：对于每个输出位置，映射回输入区域，取最大值。由于输出尺寸固定，可以预先计算池化窗口大小和步长。
+
+标准adaptive_max_pool2d行为：对于输出尺寸(H_out, W_out)，输入尺寸(H_in, W_in)，池化窗口大小stride = floor(H_in / H_out)？实际上是：对于每个输出位置，池化区域大小是ceil(H_in/H_out)和floor(H_in/H_out)？等等，PyTorch的adaptive_max_pool2d实现是：对于每个输出索引i，其对应的输入区域为 [i * (H_in / H_out) 到 (i+1) * (H_in / H_out)]，取最大值。具体实现是：对于3D输入（无batch），它计算每个输出位置对应的输入索引范围，可能有重叠或不规则。在自定义算子中，我们需要实现这个逻辑。
+
+由于AscendC的向量化能力，我们可能直接写一个kernel，每个线程处理一个输出元素，计算对应的输入区域（可能很长）并求最大值。但为了效率，我们应该使用grid-stride循环。
+
+我们需要设计tiling参数：blockDim、总输出元素数、每个tile处理多少输出元素。输出元素总数 = N * C * 64 * 128。通常很大。
+
+我们还需要考虑输入维度。input shape是(N, C, H, W)。我们需要从input shape得到H,W。
+
+在tiling中，需要计算池化参数。可以在host侧预计算并在kernel中直接使用。
+
+建议：在tiling中计算pooling的相关参数（input_H, input_W, output_H=64, output_W=128, stride_H, stride_W等等）。但是adaptive_max_pool2d的池化窗口大小是根据输入/输出比值动态决定的，kernel内部需要知道每个输出位置对应的输入区域。可以在host侧计算好映射表？但那样太复杂。通常的做法是在device侧计算每个输出位置对应的输入索引范围：start_h = floor(i * H_in / H_out), end_h = ceil((i+1) * H_in / H_out) 等等，然后遍历该区间取最大值。由于AscendC的循环效率较低，但我们可以用向量化方法？但最大池化在可变大小的窗口上难以向量化。可能最简单的实现是每个线程处理一个输出元素，使用for循环计算max。我们可以使用grid-stride。
+
+但AscendC的核函数是SIMD的，我们可以使用`AscendC::Max`等操作但需要局部内存。由于窗口大小可能很大，我们可能需要分块加载输入到local tensor然后计算。但考虑到adaptive_max_pool2d的输出尺寸较小（64*128=8192），而输入尺寸较大（原始参考中高宽2048，4096），每个输出对应输入区域大小约为2048/64=32, 4096/128=32，即32x32=1024个元素。如果每个输出元素用loop计算，性能可能还行。
+
+在host operator中，我们需要注册infer shape：输出shape为(N, C, 64, 128)。同时infer dtype。
+
+我们还需要注意tiling的budget。由于我们每个tile可能处理多个输出元素，需要规划。
+
+为了简化，我们设计kernel每个block处理一个输出元素（或一个batch中的一部分）。但blockDim数量较大，需要根据实际情况设置。
+
+另一个思路：利用AscendC库中的adaptive_max_pool2d？可能没有。所以必须自己实现。
+
+先设计tiling数据：
+- totalOutputElems: N*C*64*128
+- outputDimC, outputH, outputW: 可以存储
+- inputH, inputW: 从输入得到
+- poolSizeH, poolSizeW? 但adaptive不需要固定大小，而是在kernel内计算。
+- blockDim: 根据输出元素数量分配。
+
+为了支持grid-stride，我们在kernel中让每个block处理多个输出元素（stride=blockNum）。计算当前block的输出索引范围。
+
+在Init中传入这些参数。
+
+还需要考虑输入数据布局ND，float。
+
+在kernel中，我们需要从global memory读取输入数据。由于输入是NCHW，输出也是NCHW。对于每个输出索引(n, c, oh, ow)，我们需要计算输入区域范围。计算方式：
+- h_start = floor(oh * H_in / H_out)
+- h_end = ceil((oh+1) * H_in / H_out)  # 但注意不能超过H_in
+- w_start = floor(ow * W_in / W_out)
+- w_end = ceil((ow+1) * W_in / W_out)
+
+然后遍历输入区域的所有(h,w)取最大值。
+
+为了减少重复计算，我们可以将比例因子预先计算为浮点数。
+
+但浮点运算在kernel中可接受。
+
+注意：由于输出尺寸固定64x128，H_out=64，W_out=128。
+
+为了加速，我们可以将输入加载到local memory中？但输入尺寸很大，无法全部加载。对于每个输出元素，其区域可能是32x32=1024个元素，可以加载到local tensor中（约4KB），再计算max。但频繁的DataCopy可能开销大。
+
+我们可以使用`AscendC::Max`对两个标量？不行。最简单的是使用循环逐个比较，用标量寄存器。
+
+由于AscendC支持标量计算，我们可以用for循环和标量变量缓存最大值。
+
+但是AscendC的__aicore__函数中，我们可以使用标量float变量，并访问global memory。虽然效率不高，但对小规模输出（8192个输出元素）可能可行。
+
+另一个问题是线程映射：我们使用blockIdx和blockDim来分配输出元素。每个block处理多个输出（grid-stride）。在每个block内，我们用循环处理分配给它的输出元素。
+
+我们需要确定tile长度：每个tile处理多少个输出元素。由于输出总元素可能很大（假设N=16, C=3, 输出8192 => 393216，实际N*C=48, 输出元素=48*8192=393216）。这个数量适中，每个block处理几个到几十个元素。
+
+我们可以在tiling中设置tileLength为每个block一次迭代处理的输出元素数量，比如1或2等。为了简化，可以设置tileLength=1，每个block每次迭代处理一个输出元素。然后使用grid-stride循环，直到处理完所有输出元素。
+
+这样每个block的循环次数是 (totalOutputElems + blockNum -1)/blockNum。
+
+blockNum可以通过tiling设置，比如24个block。
+
+在kernel中，我们获取当前block的起始输出索引，然后循环tileLength次（一次处理tileLength个输出元素）。为了简化，我们可以设置tileLength=1，然后循环直到总元素处理完毕。
+
+但是CopyIn和CopyOut使用DataCopy一次复制tileLength个输出元素的输入和输出。由于每个输出元素依赖于多个输入元素（池化窗口），我们不能简单复制一块输入。所以CopyIn不能使用基于输出元素大小的简单DataCopy。我们需要针对每个输出元素分别读取输入数据。因此，使用DataCopy批量复制输入行是不合适的。我们必须逐个访问输入元素。
+
+所以，更合理的方案是：在kernel中，对于每个分配的输出元素，直接读取global memory中的输入数据（通过索引计算），计算最大值，然后写回输出。不使用local buffer做tile分批，因为输入窗口大小不定，难以组织成连续块。
+
+我们仍然可以使用AscendC的DataCopy吗？可以，但需要为每个输出元素复制其窗口。如果窗口较小（如32x32），复制到local tensor再计算max是可以的，但复制开销加上计算可能比直接读global更慢？不过AscendC的global memory访问延迟较高，使用local buffer可以减少global访问。我们可以为每个输出元素分配一个local tensor来存放窗口数据，然后使用AscendC的MaxReduce（求向量最大值）来加速。但AscendC的MaxReduce是对向量操作，需要连续内存。窗口数据在输入中是连续的？对于NCHW，一个通道内的数据是连续的，窗口在一个通道内是连续的矩形区域，但跨行不是连续的（有行间距W）。要复制矩形区域，需要多行DataCopy，但每行是连续的，可以多次DataCopy。但这样会比较复杂。
+
+鉴于输出元素数量不大（最大393216），如果每个元素直接for循环遍历窗口（最多1024个元素），总操作数约4亿次，在AscendC上可能可行，但要注意性能。为了更高效，我们可以让每个线程处理更多输出元素，减少线程数，利用向量化处理多个输出？困难。
+
+考虑到这是一个示例，可能对性能要求不是极端严格。我们可以实现一个简单的、正确的版本，每个线程遍历其池化窗口。为了使用DataCopy减少global访问，我们可以采用分块策略：先将输入的一部分行加载到local buffer中，然后对覆盖的输出元素计算。但实现复杂。
+
+我决定采用最简单的方案：在kernel中直接使用for循环访问global memory，不使用DataCopy。只使用标量计算。注意AscendC中，全局内存访问通过`xGm_[index]`即可。这应该是可以的，但要注意对齐和性能。由于这是一个自定义算子，可以接受。
+
+为了增加些效率，我们可以在Init中预计算输入布局参数：inputStrideN = C*H*W, inputStrideC = H*W, inputStrideH = W。
+
+在计算每个输出元素时：
+- get n,c,oh,ow from outputIndex
+- compute h_start, h_end, w_start, w_end
+- float maxVal = -inf
+- for h in [h_start, h_end):
+    - for w in [w_start, w_end):
+        - idx = n*inputStrideN + c*inputStrideC + h*inputStrideH + w
+        - val = xGm_[idx]
+        - if val > maxVal: maxVal = val
+- yGm_[outputIndex] = maxVal
+
+需要处理浮点负无穷：使用 -FLT_MAX。
+
+为了进一步优化，我们可以使用`AscendC::Max`在两层循环中，但这是标量，直接比较即可。
+
+注意：AscendC中的循环效率还行。
+
+在tiling中，我们需要计算totalOutputElems和blockDim等。我们还需要从input shape获取H,W。在host_operator_src中，TilingFunc需要获取输入shape并计算。
+
+由于input shape在TilingFunc中可通过context->GetInputShape(0)获得（StorageShape）。通过GetDim()获取各维度。
+
+我们需要设置blockDim，例如设置为24（固定），但根据元素数量自适应。
+
+我们还需要考虑workspace，不需要。
+
+InferShape: 输出shape (N, C, 64, 128)。
+
+InferDataType: 同输入，float。
+
+现在开始编写六个字符串。
+
+注意JSON格式：需要如下结构（参考示例）：
+```json
+[{
+  "op": "Ca6k00358Custom",
+  ...
+}]
+```
+必须包含"op"键。参考示例中是列表形式，包含一个字典。我们沿用。
+
+我们需要定义input_desc: x (type float, format ND)，output_desc: y。attr: output_size? 但是adaptive_max_pool2d的output_size是输入参数，应该作为属性传递，因为它是固定的（64,128）。在参考模型中，output_size是硬编码的，所以我们可以将其作为attr传入。attr可以是两个int：output_h, output_w。我们在python_bind中传入。注意，在torch的bind中，我们需要接收output_size作为参数。参考示例中leaky_relu_custom接受negative_slope作为参数。类似地，我们的bind函数也接受output_size作为参数。
+
+在host_operator_src中，Attribute需要注册两个整型属性：output_height, output_width。但为了简化，我们可以直接在tiling中计算输出尺寸，因为输出固定为(64,128)。但为了通用，还是作为属性传入。我们定义attr: output_height, output_width, type int, default 64,128。
+
+在TilingFunc中，读取这些属性并用于计算。
+
+在kernel中，我们使用tiling_data中的outputH和outputW。
+
+在python_bind_src中，我们定义函数`ca6k_00358_custom_impl_npu`接受tensor x和tuple output_size，然后调用aclnnCa6k00358Custom。我们需要提供ACLNN封装。但ascendc的算子注册后会自动生成ACLNN接口吗？通常是的，只要正确注册。我们只需调用`EXEC_NPU_CMD(aclnnCa6k00358Custom, x, output_height, output_width, result);`。注意ACLNN函数名根据算子名生成：`aclnn<OpName>`，这里为`aclnnCa6k00358Custom`。参数顺序：先输入tensor，然后属性，最后输出tensor。
+
+在model_src中，我们实现ModelNew，使用自定义算子。注意原来的forward中只有adaptive_max_pool2d，我们将其替换为自定义算子。
+
+由于自定义算子接受output_size作为参数（如64,128），ModelNew.forward需要调用自定义算子并传入output_size。
+
+但参考程序中的Model并没有使用conv的参数，所以ModelNew也不需要conv。但get_init_inputs会返回那些参数，ModelNew需要接受但不使用。
+
+在model_src中，我们定义ModelNew类，构造函数接受*init_inputs（忽略），forward接受*x（输入），返回自定义算子结果。
+
+注意：我们自定义算子需要输出output_size作为参数，所以forward中调用`custom_ops_lib.ca6k_00358_custom(x, (64,128))`。
+
+在python_bind中，我们导出函数`ca6k_00358_custom`，接受tensor x和tuple output_size，内部调用实现。
+
+现在编写具体代码。
+
+首先project_json_src: 注意JSON中op对应的名字是`Ca6k00358Custom`。属性定义两个整数。
+
+host_tiling_src: 定义TilingData结构，包含字段：totalOutputElems, outputH, outputW, inputH, inputW, blockDim。（实际上我们可以不需要inputH和inputW，因为在kernel中可以通过input shape的全局变量获得？但kernel需要知道输入H和W才能计算映射。所以需要在tiling中传递。或者我们可以在kernel中通过输入shape的额外参数传入？但AscendC kernel通常只能通过tiling data或global memory获取输入信息。我们可以在host侧将H,W存入tiling data。
+
+还可以存储stride等信息。
+
+注意：tiling data字段推荐使用uint32_t。输入H,W可能较大，可使用uint32_t。
+
+host_tiling_src中的字段定义使用TILING_DATA_FIELD_DEF。
+
+host_operator_src: 包含TilingFunc, InferShape, InferDataType, 以及OpDef注册。注意使用StorageShape。
+
+kernel_src: 实现KernelCa6k00358Custom。使用grid-stride循环，每个迭代处理一个输出元素。使用标量循环。
+
+python_bind_src: 包含torch extension绑定，调用EXEC_NPU_CMD。
+
+model_src: 定义ModelNew。
+
+注意：所有字符串必须是有效的Python字符串，且能被exec执行。用三引号。
+
+我们还需要注意语法错误，比如在host_operator_src中，TilingFunc需要正确使用StorageShape。
+
+根据记忆2和3，不能直接使用`const gert::Shape*`，而要用`const gert::StorageShape*`。
+
+所以TilingFunc中：
+```
+const gert::StorageShape* xShape = context->GetInputShape(0);
+const auto& originShape = xShape->GetOriginShape();
+int32_t inputN = originShape.GetDim(0);
+int32_t inputC = originShape.GetDim(1);
+int32_t inputH = originShape.GetDim(2);
+int32_t inputW = originShape.GetDim(3);
+```
+
+或者可以直接用`xShape->GetDim(0)`? 需要检查StorageShape API。在新版本中，可能`GetDim`直接在StorageShape上可用。我们使用`xShape->GetDim(0)`等。
+
+为了安全，使用`GetOriginShape()`获取Shape对象，然后调用`GetDim`。
+
+注意：`GetOriginShape()`返回`const gert::Shape&`。
+
+在InferShape中，也需要设置输出shape。`context->SetOutputShape(0, ...)`。我们需要构造一个gert::Shape对象，设置维度。我们可以使用`gert::Shape shape({N, C, 64, 128})`。
+
+在InferDataType中，同示例。
+
+在OpDef注册中，需要设置Input和Output的描述，以及Attribute。
+
+在Attribute定义中，使用`this->Attr("output_height").AttrType(OPTIONAL).Int(64);` 和 `this->Attr("output_width").AttrType(OPTIONAL).Int(128);`。
+
+注意：这里使用Int类型，但实际Python可能传入int，没问题。
+
+现在构建完整的代码。

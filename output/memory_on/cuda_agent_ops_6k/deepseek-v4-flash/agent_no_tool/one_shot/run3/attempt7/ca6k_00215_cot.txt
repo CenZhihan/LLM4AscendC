@@ -1,0 +1,98 @@
+We need to fix the previous attempt. The error logs show a vector core execution error (CCU instruction address check error). This suggests a problem in the kernel code, likely related to the tiling/UB buffer sizing or kernel logic. The kernel uses Tanh directly. But the error is "CCU instruction address check error" which may indicate an out-of-bounds access or misaligned data. 
+
+Key observations from previous code:
+- The kernel uses `AscendC::Tanh` which is a built-in vector function.
+- The tiling in host_operator_src uses UB_BUDGET_BYTES = 192 * 1024, maxTile = UB_BUDGET_BYTES / (2 * sizeof(float)) = 192*1024/8 = 24576, then AlignDown to ALIGN_ELEMS=2048 -> 24576 => 24576/2048=12 -> 12*2048=24576. That's fine. HARD_CAP_ELEMS=16384, so maxTile becomes 16384. tileLen=16384. That's okay.
+- The kernel uses double buffering with BUFFER_NUM=2, but the processing loop does not properly interleave prefetch/compute/copyout. In fact, it does a blocking sequence: AllocTensor, DataCopy, EnQue, then DeQue, Compute, EnQue, then DeQue, DataCopy, FreeTensor. That is not efficient but should be functionally correct. However, the error might be due to using `AscendC::Tanh` with an incorrect length or tensor alignment. Also, the kernel uses `AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();` but the queue was initialized with `tileLen_ * sizeof(float)` bytes. That's fine.
+
+However, the error "CCU instruction address check error" often indicates that the kernel tried to access an address that is not aligned or out of bounds. Possibly because the tileLength might be misaligned for certain vector instructions. On Ascend, vector operations often require alignment to 32 bytes (8 floats) or 64 bytes. Our ALIGN_ELEMS=2048 (8192 bytes) is more than enough.
+
+Another possibility: The kernel uses `AscendC::Tanh` which might need a larger temporary buffer internally? But the built-in Tanh should handle that.
+
+Wait, the error log shows many core errors with `fixp_error0` and `fixp_error1` info. This is typical of a vector core exception when an instruction encounters an invalid address. I suspect the issue is that the kernel is trying to perform Tanh on a `LocalTensor` that is not properly allocated or the length is zero? Let's check: In the kernel, `curLen = totalLen_ - base; if (curLen > tileLen_) curLen = tileLen_;` That's fine.
+
+But note: The kernel does not use `tmpQueue` for temporary storage, but the tiling in host_operator_src does not account for any temporary buffer. Actually, the tiling only accounts for input and output buffers (2 floats per element). However, `AscendC::Tanh` might require additional temporary storage internally. But that should be managed by the vector unit itself; not user-provided.
+
+Maybe the issue is that `AscendC::Tanh` is not available as a single instruction? Actually, it is available. But perhaps it requires the tensor to be properly aligned and the length to be a multiple of some vector length. The `length` parameter in AscendC API is usually the number of elements, not bytes. It should be fine.
+
+Another potential problem: The kernel uses `AscendC::DataCopy` with `curLen` as the number of elements. DataCopy expects number of elements as well. That's correct.
+
+I think the main issue is the kernel's loop structure: it uses a while loop with stride, but it does not handle the case where the input/output queues may not be empty when entering the next iteration. Actually, the code is: within the while loop, it does:
+- AllocTensor from inQueueX_, DataCopy, EnQue.
+- Then DeQue from inQueueX_ (the same tensor), compute, EnQue to outQueueY_.
+- Then DeQue from outQueueY_, DataCopy, FreeTensor.
+This sequence is correct for a blocking single-tile processing, but since we have double buffers, we could interleave. However, the current code processes one tile completely before moving to the next. That is fine functionally.
+
+But note: The kernel uses `AscendC::LocalTensor<float> xLocal = inQueueX_.AllocTensor<float>();` then later `xLocal = inQueueX_.DeQue<float>();` That overwrites the xLocal variable, but it's actually the same tensor (since we EnQue'd it). That's okay.
+
+However, a subtle bug: After `inQueueX_.EnQue(xLocal);`, the tensor is queued, and then we call `xLocal = inQueueX_.DeQue<float>();` That dequeues the same tensor. But we must ensure that we don't use the tensor after freeing it. But we only free after compute and after copyout. That's okay.
+
+But the error might be due to using `AscendC::Tanh` with a tensor that is not in the expected position? Actually, the tensor is in VECCALC? The queue positions: inQueueX_ is VECIN, outQueueY_ is VECOUT. But Tanh is a vector compute operation that works on VECIN or may need a VECCALC buffer? Typically, AscendC built-in activation functions (Tanh, Relu, etc.) take a LocalTensor as input and output to another LocalTensor, and they expect the input to be in VECIN? Actually, the typical pattern is to read from GM to VECIN, then compute into VECOUT (or VECCALC), then write back. But in our code, we allocate yLocal from outQueueY_ (VECOUT). That is correct: the output of Tanh goes to VECOUT. The input xLocal is from VECIN. So that should work.
+
+Maybe the problem is that we are using `AscendC::Tanh` which is a single-operation function, but it might have constraints on the input/output tensors being in the same position? No.
+
+I think the more likely issue is that the kernel does not have a `tmpQueue` for intermediate computation, and Tanh might require a temporary workspace. However, built-in functions like Tanh should handle internal temporary storage using the pipe's internal resources. But we must ensure that the pipe has enough memory for the vector unit's temporary buffers. The tile size we compute might be too large for the vector unit's private memory. The UB_BUDGET is 192KB, but the vector unit also has its own local memory (L1) which may be smaller. The built-in Tanh might use a lookup table or other methods that require scratch space. To be safe, we should reduce the tile size to something smaller, and also ensure we are using proper alignment.
+
+Looking at the error pattern: all cores failed with similar CCU error. That suggests a systematic issue in the kernel code or tiling data.
+
+Another possibility: The `GET_TILING_DATA` macro may not be correctly recovering tiling data because the tiling data structure does not match the kernel's expectation. In host_tiling_src, we have fields: totalLength, tileLength, blockDim. In kernel, we use `tiling_data.totalLength` and `tiling_data.tileLength`. That's fine.
+
+But in host_operator_src, the tiling function saves the tiling data with those fields. However, note the tiling data struct is `Ca6k00215CustomTilingData` and we call `set_totalLength`, etc. That's correct.
+
+The error could also be due to an incorrect blockDim setting. The tiling sets blockDim based on numTiles, but if blockDim is too high, some blocks may have no data? Actually, the kernel handles that: if base >= totalLen_ it returns. So that's fine.
+
+Let's look at the kernel's Process function again: It uses `strideElems = blockNum * tileLen_`. Then for each block, it starts at `base = blockIdx * tileLen_` and loops with `base += strideElems`. This is a typical grid-stride loop. However, note that each block's starting point is `blockIdx * tileLen_`. If there are more blocks than needed (because blockDim may be set to a large number), some blocks may have no work but they still run the loop and will see `base >= totalLen_` and return immediately. That's fine.
+
+But there is a potential issue: The kernel does not synchronize before using the DeQue after EnQue? In AscendC, after EnQue, the tensor is owned by the pipe; we must DeQue to get it back. That's done.
+
+Wait, I think I see a bug: In the kernel, after calling `inQueueX_.EnQue(xLocal);`, the xLocal tensor is moved into the queue. Then we call `xLocal = inQueueX_.DeQue<float>();` to get it back. But immediately after that, we call `AscendC::LocalTensor<float> yLocal = outQueueY_.AllocTensor<float>();` and then `AscendC::Tanh(yLocal, xLocal, curLen);`. At this point, xLocal is still in use. Then after Tanh, we call `outQueueY_.EnQue<float>(yLocal);` and `inQueueX_.FreeTensor(xLocal);`. That's correct.
+
+But note: The Tensor xLocal is a handle; after DeQue, it's valid. After FreeTensor, it's invalid. Good.
+
+However, the `AscendC::Tanh` function expects the input tensor to be from VECIN? Actually, looking at AscendC documentation, built-in activations like Tanh are typically called with input from VECIN and output to VECOUT. But the tensor xLocal is from VECIN queue, yLocal is from VECOUT queue. That matches.
+
+I suspect the issue might be that the tile size is too large for the vector unit's internal resources. The vector unit has a limited amount of local memory (e.g., 64KB). The tile size we use is 16384 floats = 65536 bytes (64KB). That's exactly the size of the local memory? That could cause issues because the vector unit needs space for the lookup tables or other data. We should reduce the tile size to be safe, e.g., 4096 floats (16KB). Also, we should ensure that the alignment is at least 32 bytes.
+
+Another improvement: Use a separate temporary queue for output? Actually, built-in Tanh might require a temporary buffer of the same size? Not sure.
+
+Let's modify the tiling to limit tile size to 4096 elements (16KB) to be safe. Also, the UB budget calculation should account for the fact that Tanh may need extra workspace. The example in the task for leaky_relu used a tmpQueue of 1 * tileLen floats. For Tanh, we may also need a tmpBuffer. To be robust, let's include a tmpQueue in the kernel and use it if needed. But actually, AscendC's Tanh may not require it; but adding a tmpQueue does not hurt and ensures we have spare memory. Also, we should adjust the UB budget to include that.
+
+Let's redesign the kernel to be more similar to the leaky_relu example: use double buffering with prefetch, and include a tmpQueue for safety. But the main fix is to reduce tile size and ensure alignment.
+
+Looking at the error, it says "CCU instruction address check error" which could be due to an instruction trying to access an address that is not in the allowed range. This could be caused by using `AscendC::Tanh` on a tensor that is not properly allocated in the expected memory region. Maybe the issue is that `AscendC::Tanh` expects the input tensor to be in VECCALC? Actually, the built-in activation functions are vector instructions that operate on data in VECIN and write to VECOUT. So the queue positions are correct.
+
+Another consideration: The kernel uses `AscendC::DataCopy` from global to local. That's fine.
+
+Given the error is consistent across all cores, it's likely a systematic tiling/data issue. Let's check the total data size for the input: batch_size=16, channels=32, height=1024, width=1024 => total elements = 16*32*1024*1024 = 16*32*1048576 = 536870912 floats. That's huge (~2GB). The totalLength will be 536870912. The tiling algorithm calculates tileLen=16384. numTiles = CeilDiv(536870912, 16384) = 32768. blockDim = min(24, max(8, numTiles)) = 24. That's fine.
+
+But with 24 blocks, each block processes roughly 536870912 / 24 ≈ 22369621 elements, which is a lot of iterations (each tile 16384 elements, so about 1365 tiles per block). That's fine.
+
+Maybe there is an issue with the size of the tiling data: the tiling data is saved to buffer, but the capacity might be insufficient? The tiling data size is sizeof(LeakyReluCustomTilingData) which is 4 uint32 + 1 float + padding? But our tiling data has three uint32, no float. That's 12 bytes, fine.
+
+I think the most likely fix is to adjust the kernel to use a proper double buffering pattern with prefetch and compute overlap, and ensure the output queue is allocated correctly. Also, we should use a smaller tile size to avoid exhausting local memory.
+
+Let's look at the leaky_relu example kernel: it uses a tmpQueue of 1 tile. For Tanh, we don't necessarily need tmpQueue, but we can keep it for safety. Also, it uses a grid-stride loop with prefetch of next tile. That works well.
+
+In the previous kernel, we did not prefetch; we processed one tile at a time inside the while loop. That is fine but less efficient. However, the error is not about performance.
+
+Maybe the issue is that we are using `AscendC::Tanh` incorrectly: it might require the length to be a multiple of some vectorization width (e.g., 64 elements). Our tileLen is 16384 which is a multiple of 64, but when we take the last tile, curLen may not be a multiple. For example, if totalLength is not a multiple of tileLen, the last tile will have curLen < tileLen, and that might cause issues if Tanh requires aligned length. To be safe, we should ensure that the length is aligned to the vector width (e.g., 64 or 128). The reference leaky_relu kernel used `Mins` and `Muls` which likely work on any length, but Tanh may have constraints. 
+
+We can pad the tiles to be multiples of 64 or use `AscendC::Tanh` with the actual length. According to AscendC documentation, most vector functions do not require length to be a multiple of anything specific; they handle arbitrary lengths. But the error suggests otherwise.
+
+Given the error is a CCU instruction address check, it could be that the vector instruction is trying to access beyond the allocated memory. This could happen if the tensor is not large enough or if the length is too large.
+
+I'll modify the kernel to:
+- Use a smaller tile size (e.g., 4096 elements).
+- Ensure that the tile length is aligned to 64 elements.
+- Include a tmpQueue for safety (though not used).
+- Use a double buffering pattern similar to the leaky_relu example to ensure proper synchronization.
+
+Also, in the host tiling, we should account for the tmpQueue in the UB budget: (2 input + 2 output + 1 tmp) * tileLen * 4 bytes = 5 * tileLen * 4 = 20 * tileLen bytes. We'll set UB budget accordingly.
+
+Also, in the host operator, we need to set the blockDim appropriately. We'll keep the same logic but cap blockDim to 24.
+
+Let's rewrite the kernel with a cleaner double-buffering pattern.
+
+Additionally, the kernel name in python_bind_src is `ca6k_00215_custom`, but in the model_src they use `_FN = 'ca6k_00215_custom'` and call `custom_ops_lib.ca6k_00215_custom`. That's consistent.
+
+Now, produce the corrected code.

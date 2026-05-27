@@ -1,0 +1,67 @@
+We need to generate the six Python string variables for the fused custom AscendC operator for LPPool1d with norm_type=2 (which is essentially L2 pooling, i.e., sqrt of sum of squares in each window). The reference uses nn.LPPool1d with norm_type=2, kernel_size=3, stride=2. We'll implement a fused kernel that does the pooling operation directly.
+
+The operator name should be ca6k_00305_custom, PascalCase Ca6k00305Custom.
+
+We need to consider that LPPool1d with p=2 is essentially: for each window of size kernel_size, compute (sum of |x|^p)^(1/p). Since p=2, it's sqrt of sum of squares. But note that LPPool1d uses average pooling? No, it's just the p-norm, not average. Reference: LPPool1d computes for each window: output = (1/kernel_size * sum(|x|^p))^(1/p)? Actually, from PyTorch docs: LPPool1d applies a 1D power-average pooling over an input signal composed of several input planes. The output is (1/kernel_size * sum(|x|^p))^(1/p). But the default is average? Let's check: https://pytorch.org/docs/stable/generated/torch.nn.LPPool1d.html
+"It applies a 1D power-average pooling over an input signal composed of several input planes. The output is (1/kernel_size * sum(|x|^p))^(1/p)." Yes, it includes division by kernel_size. So mathematically: output = ( (1/kernel_size) * sum(|x|^2) )^(1/2) = sqrt( mean(|x|^2) ).
+
+So we need to compute for each window: (1/K) * sum(x_i^2) then sqrt.
+
+But we can fuse: compute squares, sum over window, multiply by (1/K), then sqrt (or equivalently compute sum, then divide by K, then sqrt).
+
+We'll implement a custom kernel that does LPPool1d with p=2. Since norm_type is fixed to 2, we can hardcode p=2. The kernel will have inputs: x (float32, shape (N,C,L)), attributes: kernel_size, stride (both int), and output y (float32, shape (N,C,L_out) where L_out = floor((L - kernel_size)/stride) + 1). We'll compute the output directly.
+
+We need to handle tiling properly. Since the operation is reduction over windows, we can compute each output element independently. The kernel can be launched with blockDim = number of output elements? But we need to be careful about UB budget. We'll use a tiling strategy: each block processes a chunk of output elements (e.g., along L dimension). The input x is ND format, shape (N,C,L). We can treat it as 2D (N*C, L) for simplicity, computing pooling along L dimension. The output shape will be (N*C, L_out). Then we can reshape back.
+
+Tiling: total output elements = N*C*L_out. We'll split among blocks greedily.
+
+Host tiling struct: fields: totalLength (output elements), tileLength (elements per tile per block), blockDim, kernelSize, stride, inputWidth, outputWidth.
+
+But careful: The tiling data in AscendC is set via TilingData fields. We'll assign directly.
+
+We'll implement kernel: KernelCa6k00305Custom. Init with x, y, tiling data. Process: for blockIdx, compute its range of output elements. For each output index, compute the input window: for each position in window, compute x^2, accumulate, then multiply by invK (1.0/kernelSize), then sqrt.
+
+We'll use DataCopy for input tiles, but since we have a sliding window, we might need to load overlapping input regions. To simplify, we can load an input tile of size (tileLength * stride + kernelSize - 1) maybe. But we can instead load whole input? For large lengths, tiling is needed. We'll design: each block processes a contiguous chunk of output elements. For each output element, we need a contiguous window of kernel_size input elements. The input region for a block is from start_index * stride to (start_index + tileLength - 1) * stride + kernel_size - 1. We can load that entire input slice into local memory, then compute. That avoids repeated global reads. So we need a workspace for input tile.
+
+UB budget: we need to allocate local tensors for input slice and output chunk. Input slice size = (tileLength - 1)*stride + kernelSize. Output chunk size = tileLength. Also tmp for squares? We can compute on the fly. We'll use two buffers: inQueue for input slice, outQueue for output chunk. We'll need a temporary vector for the accumulation? We can do scalar loop inside threads? Since we are using vector operations, we can use a vector of length tileLength to hold sums, then compute sqrt. But note: AscendC vector operations are SIMD. We can use:
+
+- Load input slice (size inElems) into local tensor.
+- For each output position j (0..tileLength-1), compute sum of squares over window using a loop or using vector reduce? We can use a vectorized approach: for each offset in window, we compute square of the slice [j*stride + offset] and add to a sum vector. Since each output has different window positions, we need to gather values from the input slice. We can use a vector gather operation? That is complex. Simpler: we can process each output element sequentially in a loop, using scalar operations? But that would be inefficient. However, since kernel_size is 3, we can unroll and use vector operations by replicating the input slice appropriately. Another approach: treat the pooling as a convolution with a fixed kernel (all ones) followed by sqrt and scaling. But that might be overkill.
+
+Given kernel_size=3, we can do a direct implementation: for each output index, compute sum of squares of three input values. We can vectorize by having each thread compute one output element? That is simpler: we can launch blocks with blockDim = number of output elements, each block computes one output. For large L_out, blockDim may be large. But we can still use tiling to reduce per-block work.
+
+Alternative: use a simple scalar approach inside the kernel, where each block handles a range of output elements, and for each, it loads the three input values from global memory directly. Since kernel_size is small, the overhead of multiple global loads might be acceptable. But we need to be careful about performance. However, for a custom kernel example, correctness is paramount. We'll implement a straightforward approach: for each output index, load the three input values, compute square, sum, multiply by invK, sqrt, store. This is simple and will work.
+
+We'll tile output indices among blocks, and within a block, each iteration processes one output element (scalar). We'll use local variables to accumulate.
+
+But AscendC kernel is SIMD, but we can still do scalar loops inside a block. The block will have multiple threads? Actually, AscendC kernels are written for a single thread per block? The programming model is SIMD within a block, but we can use vector operations. However, if we do scalar loops, it will be inefficient but correct.
+
+Given the constraints and the example provided, we should aim for a vectorized approach using local tensors. But to keep it simple and correct, we can load the entire input slice for the block into a local tensor, then compute output using vector operations by constructing a matrix? Possibly we can use a sliding window approach: for each output position, we need a window of size kernel_size. If we load the whole input slice (size = (tileLength-1)*stride + kernelSize), we can then use AscendC's vector operations to compute the sum of squares over windows using a technique similar to 1D convolution with unrolled loops. For kernel_size=3, we can use vectorized operations: for each output offset j, we want to compute x[j*stride]^2 + x[j*stride+1]^2 + x[j*stride+2]^2. This can be done by starting with a vector of zeros, then for each offset in kernel, add the square of the shifted vector. For example, for offset 0, we take input slice[0: tileLength] (but stride is 2, so not contiguous). Actually, the indices are not contiguous because stride=2. So each output uses input positions spaced by 2. So we need to gather values at regular intervals. This is more complex. So perhaps scalar loop per output is the simplest to implement correctly.
+
+Given that the reference uses kernel_size=3 and stride=2, the output length L_out = (16384 - 3)//2 + 1 = 8191? Actually compute: (16384 - 3)/2 = 8190.5, floor = 8190, +1 = 8191. So each block would process many outputs. We'll use tiling: total output elements = N*C*L_out = 128*32*8191 = 33,554,432. That's large. We'll need many blocks.
+
+We'll design kernel to be vectorized but simple: each block processes a contiguous chunk of output elements along the L dimension for a single (N,C) pair? Or we can treat the whole 3D tensor as a 1D array of size (N*C*L) and compute pooling along the last dimension? But the pooling is only along the last dimension, so we need to handle the window boundaries correctly across different L positions. If we treat it as a 1D array of length N*C*L, then the pooling would be incorrect because windows would cross channel boundaries. So we need to ensure that each window only uses elements within the same (N,C) pair. The simplest is to process each (N,C) pair independently. So we can launch blocks with blockIdx over the total number of (N,C) pairs and then inside block, handle all L_out positions. That would be 128*32=4096 blocks, each handling 8191 output elements. That's manageable. We can tile further within each block by processing chunks of output elements.
+
+We'll set blockDim = total number of (N,C) pairs = N*C. Then each block processes all L_out positions. Within the block, we can loop over output positions in steps of tileLength (internally). We'll load an input tile of size (tileLength-1)*stride + kernelSize from global memory for that (N,C) pair. Then compute output.
+
+That seems like a good plan: blockDim = N*C, each block handles a single (N,C) pair, processing all L_out positions. We'll tile within the block using local buffers.
+
+We need to set blockDim in tiling. In host_operator_src, we'll set blockDim = totalChannels = N * C? But N and C are not known at compile time; they come from input shape. We can get input shape in TilingFunc and compute totalChannels = shape[0] * shape[1]. Then set blockDim = totalChannels. But note: blockDim is the number of blocks. We'll set it to totalChannels, and each block will process one (N,C) pair. Then we need to ensure that there are enough physical cores? The runtime will schedule blocks.
+
+In the kernel, we'll get blockIdx and map to (n,c) index. Then compute base pointer for that (n,c) pair: x_offset = (n * C + c) * L, y_offset = (n * C + c) * L_out.
+
+We'll use GET_TILING_DATA to get tiling parameters.
+
+Now, let's write the code.
+
+Important: Use direct assignment for tiling data fields, not setter methods (per memories). So in host_tiling_src, we need to define fields. Then in TilingFunc, assign directly: tiling.totalLength = totalLength; etc.
+
+Also avoid duplicate registration (memories 4,5): we will only use OpDef registration in host_operator_src, not REG_OP. The autogen will generate REG_OP? But we are providing custom host code. In the example, they used OpDef with OP_ADD. That should be fine. We must ensure no duplication.
+
+Now, write the six strings.
+
+We'll include necessary headers and use namespace optiling, etc.
+
+For the Python binding, we need to include pytorch_npu_helper.hpp and define a function that calls aclnnCa6k00305Custom. We'll need to create a custom op API. We'll assume that the op is built with aclnn registration. We'll use EXEC_NPU_CMD macro.
+
+Let's generate.

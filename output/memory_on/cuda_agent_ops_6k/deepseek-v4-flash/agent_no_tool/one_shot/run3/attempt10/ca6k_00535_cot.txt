@@ -1,0 +1,218 @@
+We need to fix the issue: the previous attempt's kernel output is all zeros. The kernel uses a for-loop over rows inside a per-column loop, but the local tensors are initialized with `TBuf` and `Get` without proper allocation/enqueue. Also the tiling struct conflict warning indicates the tiling data struct is defined in both host and kernel, but the kernel uses `GET_TILING_DATA` macro which expects the struct to be defined in the tiling header. However, the warning says "tiling struct [Ca6k00535CustomTilingData] is conflict with one in file ca6k00535_custom_tiling.h, line 5". This is because the kernel also defines the struct? In our kernel_src we include "ca6k_00535_custom_tiling.h" which likely contains the struct definition. The conflict warning might be benign but we need to ensure correct tiling data access.
+
+The main problem: the kernel's DataCopy uses rows as length, but DataCopy expects number of elements of type float; rows is correct. However, the local buffer allocation is not using proper queue/pipe mechanism. The previous attempt uses `TBuf` with `Get` directly, which may not work correctly because the buffer is not managed as a queue. For AscendC, we should use TQue for pipelining. But the kernel was written simply without double buffering. The all-zero output suggests the copy operations are not happening or the data is not being transferred correctly.
+
+The reference for cummax is a prefix scan. We need to compute cumulative maximum per column independently. Since the operation is simple (max scan), we can use a single buffer and sequential loop. However, the current approach might be failing because:
+
+- `DataCopy` with local tensor from GlobalTensor requires correct usage of `SetGlobalBuffer` and addressing. The `xGm_[col * rows_]` is a pointer to the beginning of column `col`. That's fine.
+- But the local tensor `xLocal` obtained from `inBufX_.Get()` returns a `LocalTensor`, and `DataCopy` requires source and destination as `LocalTensor`/`GlobalTensor` with appropriate overloads. The first argument is destination (local), second is source (global). That looks correct.
+- However, the buffer is allocated with `pipe_.InitBuffer(inBufX_, 1, rows_ * sizeof(float));` which allocates one buffer of size rows_*4 bytes. But `TBuf` does not have a `Get` method that returns a tensor; instead we need to use `AllocTensor` and `FreeTensor`. Actually `TBuf` is used with `TQue` or directly as a buffer. The typical pattern: `LocalTensor<float> xLocal = inBufX_.AllocTensor<float>();` and later `inBufX_.FreeTensor(xLocal);`. However, with `TBuf` (not TQue) we can directly get a tensor using `Buf.Get<float>()`. The documentation suggests `TBuf` has a `Get` method returning a tensor. So that should work.
+
+But the all-zero output indicates the data might not be read from global memory correctly. Perhaps the global tensor indexing is wrong: `xGm_[col * rows_]` is a subscript operator that returns a `LocalTensor`? Actually it returns a `GlobalTensor`? The operator[] on GlobalTensor returns a proxy? In AscendC, `GlobalTensor<float>` has an `operator[]` that returns a reference to the element, but to get a sub-tensor we need to use `xGm_.Slice(col * rows_, rows_)` or just treat it as pointer offset. Actually `xGm_[col * rows_]` is accessing the element at that index, but `DataCopy` expects a tensor or pointer. We need to use `xGm_.Slice(col * rows_, rows_)` to get a sub-tensor. That is likely the bug: `DataCopy(xLocal, xGm_[col * rows_], rows_)` is passing a float by reference, not a tensor. The correct way is to use `xGm_.Slice(col * rows_, rows_)`.
+
+Alternatively, we can use pointer arithmetic: `xGm_.SetGlobalBuffer((__gm__ float*)x, rows_ * cols_);` then we can do `DataCopy(xLocal, xGm_ + col * rows_, rows_);` because `GlobalTensor` supports addition and subtraction with integer to get new GlobalTensor. That should work.
+
+Also, the loop over columns should be done per block, but each block handles a subset of columns. That's fine.
+
+To fix, we need to change the DataCopy and the addressing to use proper tensor slice or pointer arithmetic.
+
+Also ensure that the tiling struct is defined only in the tiling header, and the kernel includes it. The host_tiling_src defines the struct. The host_operator_src includes the tiling header. The kernel also includes it. The conflict warning might be due to the kernel file also defining the struct? No, the kernel only includes the header. The warning appears during build but may be okay. However, we should ensure consistency: the tiling struct name matches, and the kernel uses GET_TILING_DATA which reads from the tiling buffer.
+
+Another possible issue: the tiling data fields are rows, cols, blockDim. But the kernel uses blockDim_ from tiling. That's fine.
+
+But the major fix is the DataCopy calls.
+
+Let's rewrite the kernel with proper addressing:
+
+```cpp
+    __aicore__ inline void Process()
+    {
+        if (rows_ == 0 || cols_ == 0) return;
+
+        uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        uint32_t colsPerBlock = (cols_ + blockDim_ - 1) / blockDim_;
+        uint32_t startCol = blockIdx * colsPerBlock;
+        uint32_t endCol = startCol + colsPerBlock;
+        if (endCol > cols_) endCol = cols_;
+
+        AscendC::LocalTensor<float> xLocal = inBufX_.AllocTensor<float>();
+        AscendC::LocalTensor<float> yLocal = outBufY_.AllocTensor<float>();
+
+        for (uint32_t col = startCol; col < endCol; col++) {
+            // Copy entire column to local
+            AscendC::DataCopy(xLocal, xGm_.Slice(col * rows_, rows_), rows_);
+            // Compute cumulative max sequentially
+            float curMax = -3.4028235e+38f;
+            for (uint32_t i = 0; i < rows_; i++) {
+                float val = xLocal(i);
+                if (val > curMax) curMax = val;
+                yLocal(i) = curMax;
+            }
+            // Copy result back to global
+            AscendC::DataCopy(yGm_.Slice(col * rows_, rows_), yLocal, rows_);
+        }
+
+        inBufX_.FreeTensor(xLocal);
+        outBufY_.FreeTensor(yLocal);
+    }
+```
+
+But note: we allocate local tensors once per block and reuse. That's fine.
+
+Also, we need to modify Init to use `AllocTensor` style? Actually `TBuf` does not require Alloc; the buffer is pre-allocated. We can get the tensor via `inBufX_.Get<float>()` or `AllocTensor`. To use `AllocTensor`, we need to not pre-allocate? Actually `TBuf` with `InitBuffer` allocates memory, and then `AllocTensor` returns a tensor pointing to that memory. So we can use `AllocTensor` and later FreeTensor.
+
+But simpler: keep `TBuf` and use `Get<float>()` to get a tensor. Then the DataCopy should work. Let's try with `Get<float>()` and correct Slice.
+
+However, the previous code used `xGm_[col * rows_]` which is wrong. So fix that.
+
+Additionally, the tiling struct conflict warning: we should ensure that the tiling header is only defined in host_tiling_src, and the kernel includes that header. The host_operator_src also includes the same header. There should be no conflict. The warning may be due to duplicate definitions if the kernel file also defines the struct? Our kernel_src does not define the struct; it includes the header. The warning appears during the build of the kernel binary. It may be a benign warning from the opc tool, but could cause issues. To avoid, we can define the tiling struct only in the host tiling header and not include it in the kernel? Actually the kernel uses `GET_TILING_DATA` macro which expects the struct to be defined. The macro typically expands to something that uses the struct definition. If the struct is not defined in the kernel translation unit, compilation will fail. So we must include the header. The conflict warning might be from the opc tool that generates some metadata. It may not affect correctness. But we saw the warning twice. We can try to change the struct name to something else? Or ensure the header guard? Typically the tiling header is generated by opbuild and has include guards. It's fine.
+
+But the output all zeros is the critical issue.
+
+Let's also ensure the kernel uses correct data types: `AscendC::DataCopy` with length in number of elements. The length `rows_` is correct.
+
+Also, ensure that the tensor sizes are correct: local buffer size = rows_ * sizeof(float). That's enough for one column.
+
+Now, also check the tiling data: rows, cols, blockDim. The blockDim is set to cols capped at 24. That's fine.
+
+Potential issue: the kernel uses `AscendC::GetBlockNum()` and `AscendC::GetBlockIdx()` but the tiling data blockDim is passed. The kernel uses blockDim_ from tiling, but the block assignment uses `AscendC::GetBlockIdx()` and `AscendC::GetBlockNum()` which is the actual number of blocks launched. The tiling blockDim may be different from actual block number. We should use `AscendC::GetBlockNum()` for the actual number, not the stored blockDim. In the tiling, blockDim is set to cols capped at 24, and context->SetBlockDim(blockDim) ensures that many blocks are launched. So actual block number = blockDim. We can use `AscendC::GetBlockNum()` which will equal blockDim. So it's okay.
+
+But the kernel uses blockDim_ from tiling but then computes colsPerBlock using blockDim_. That's fine.
+
+Now, to be safe, we can also add a check for blockIdx.
+
+Let's rewrite the kernel with fixes and also ensure proper usage of `Slice` for DataCopy.
+
+Also, ensure that the python binding and model are correct. The python bind uses `EXEC_NPU_CMD(aclnnCa6k00535Custom, self, result);`. The operator expects `x` and `y`. The generated aclnn function should have that signature. It's fine.
+
+Now, the model_src uses `import custom_ops_lib`. That's correct.
+
+Now, we need to output the six strings.
+
+Let's produce the corrected code.
+
+But before writing, note that the previous attempt also had a warning about tiling struct conflict. It might be due to the kernel including the tiling header but the opbuild also generates a file with the same struct? That is expected. The warning may not cause failure. But to ensure no issue, we can rename the tiling struct? Actually the naming mismatch? The host_tiling_src defines `Ca6k00535CustomTilingData` and host_operator_src includes the header. The kernel includes the same header. So it's consistent.
+
+The error log says "tiling struct [Ca6k00535CustomTilingData] is conflict with one in file ca6k00535_custom_tiling.h, line 5". This suggests that the struct is defined in two places: once in the host tiling header (generated from our host_tiling_src) and once in the kernel source? But kernel source does not define it. The warning may be from the opc tool that parses the kernel and finds the struct in the kernel's include? That's normal. Should not cause all-zero output.
+
+So we focus on the DataCopy fix.
+
+Also, the loop over columns: we allocate xLocal and yLocal once outside the loop, which is fine. But we need to ensure that after each iteration, the buffer is not freed. So we allocate once and reuse.
+
+We'll also use `ElemAddrs`? No.
+
+Let's rewrite kernel_src:
+
+```cpp
+#include "kernel_operator.h"
+#include "ca6k_00535_custom_tiling.h"
+
+class KernelCa6k00535Custom {
+public:
+    __aicore__ inline KernelCa6k00535Custom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t rows, uint32_t cols,
+                                uint32_t blockDim)
+    {
+        rows_ = rows;
+        cols_ = cols;
+        blockDim_ = blockDim;
+
+        xGm_.SetGlobalBuffer((__gm__ float*)x, rows_ * cols_);
+        yGm_.SetGlobalBuffer((__gm__ float*)y, rows_ * cols_);
+
+        pipe_.InitBuffer(inBufX_, 1, rows_ * sizeof(float));
+        pipe_.InitBuffer(outBufY_, 1, rows_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (rows_ == 0 || cols_ == 0) return;
+
+        uint32_t blockIdx = static_cast<uint32_t>(AscendC::GetBlockIdx());
+        uint32_t blockNum = static_cast<uint32_t>(AscendC::GetBlockNum());
+        uint32_t colsPerBlock = (cols_ + blockNum - 1) / blockNum;
+        uint32_t startCol = blockIdx * colsPerBlock;
+        uint32_t endCol = startCol + colsPerBlock;
+        if (endCol > cols_) endCol = cols_;
+
+        AscendC::LocalTensor<float> xLocal = inBufX_.Get<float>();
+        AscendC::LocalTensor<float> yLocal = outBufY_.Get<float>();
+
+        for (uint32_t col = startCol; col < endCol; col++) {
+            // Copy entire column to local
+            AscendC::DataCopy(xLocal, xGm_.Slice(col * rows_, rows_), rows_);
+            float curMax = -3.4028235e+38f;
+            for (uint32_t i = 0; i < rows_; i++) {
+                float val = xLocal(i);
+                if (val > curMax) curMax = val;
+                yLocal(i) = curMax;
+            }
+            // Copy result back to global
+            AscendC::DataCopy(yGm_.Slice(col * rows_, rows_), yLocal, rows_);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> inBufX_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> outBufY_;
+
+    AscendC::GlobalTensor<float> xGm_;
+    AscendC::GlobalTensor<float> yGm_;
+
+    uint32_t rows_ {0};
+    uint32_t cols_ {0};
+    uint32_t blockDim_ {0};
+};
+
+extern "C" __global__ __aicore__ void ca6k_00535_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCa6k00535Custom op;
+    op.Init(x, y, tiling_data.rows, tiling_data.cols, tiling_data.blockDim);
+    op.Process();
+}
+```
+
+We used `AscendC::GetBlockNum()` instead of `blockDim_` for the columns distribution to be consistent. The tiling blockDim is set to the actual block number, so it's same.
+
+Also ensure that the DataCopy uses the correct order: destination, source, length. Yes.
+
+Now, also check that the tiling header is included correctly. The host_operator_src includes "ca6k_00535_custom_tiling.h". The kernel also includes "ca6k_00535_custom_tiling.h". The filename must match. In the file system, the tiling header will be generated from host_tiling_src with name "ca6k00535_custom_tiling.h"? The host_tiling_src filename is specified in the project json? Actually the project JSON doesn't specify filenames; the build system expects certain naming conventions. In the example, they used `leaky_relu_custom_tiling.h`. The naming likely derives from the op name: for op "Ca6k00535Custom", the tiling header is probably `ca6k00535_custom_tiling.h`. But in the host_operator_src we included "ca6k_00535_custom_tiling.h" with an underscore after ca6k? In the previous attempt, the host_operator_src included "ca6k_00535_custom_tiling.h" (with underscore). And the kernel also included the same. However, the tiling header file name should match the op name converted to snake_case. The op name is "Ca6k00535Custom". The typical convention is to use lowercase with underscores: `ca6k00535_custom_tiling.h`. But in the example, they used `leaky_relu_custom_tiling.h` for op "LeakyReluCustom". So for "Ca6k00535Custom", the header should be `ca6k00535_custom_tiling.h` (no underscore between ca6k and 00535). But we have `ca6k_00535_custom_tiling.h` in the include. That might cause a file not found error. But the build succeeded (compiled: True), so the include path must be correct. The build system likely generates the header with the name based on the op name? Actually the host_tiling_src content is written to a file named according to the op name from project JSON. The project JSON has op name "Ca6k00535Custom". The build system will generate files like `ca6k00535_custom_tiling.h` (snake_case). In our host_operator_src we included "ca6k_00535_custom_tiling.h". That does not match. But compilation succeeded, so maybe the build system creates both names? Or maybe the two files exist? Actually we saw in the build log that both `ca6k_00535_custom.cpp` and `ca6k00535_custom.cpp` were compiled. So there are two source files? The project JSON likely generates two files: one with underscore and one without? That seems odd.
+
+Let's check the build log: 
+```
+[ 75%] Building CXX object op_host/CMakeFiles/cust_optiling.dir/ca6k_00535_custom.cpp.o
+[ 75%] Building CXX object op_host/CMakeFiles/cust_optiling.dir/ca6k00535_custom.cpp.o
+```
+So both files exist. This suggests that the build system may have generated two versions: one with the exact op name (ca6k00535_custom.cpp) and one with the task id (ca6k_00535_custom.cpp)? Actually the task id is `ca6k_00535`. The op name is `Ca6k00535Custom`. The task id has an underscore. The project JSON's op name is used for the filename. So the generated files should be based on op name. But we have both. This might be because we included both includes? Actually our host_operator_src includes "ca6k_00535_custom_tiling.h" but the tiling header is likely "ca6k00535_custom_tiling.h". The build system might generate both names due to some mapping. But the compilation succeeded, so the include path must be resolved.
+
+To avoid confusion, we should align the include filenames with the op name convention. The op name is "Ca6k00535Custom". The snake_case version is "ca6k00535_custom". So we should include "ca6k00535_custom_tiling.h" and "ca6k00535_custom_tiling.h" in both host and kernel. Let's change the includes to "ca6k00535_custom_tiling.h". But note that the project JSON's op name is used for the tiling struct prefix. The struct name is Ca6k00535CustomTilingData. So we need consistency.
+
+In the previous attempt, the host_tiling_src defined `BEGIN_TILING_DATA_DEF(Ca6k00535CustomTilingData)` and `REGISTER_TILING_DATA_CLASS(Ca6k00535Custom, Ca6k00535CustomTilingData)`. That's fine.
+
+Now, the host_operator_src includes "ca6k_00535_custom_tiling.h". That might be a mismatch, but it compiled. However, for correctness, we should use the correct name. Let's change to "ca6k00535_custom_tiling.h".
+
+Similarly, the kernel include should be "ca6k00535_custom_tiling.h".
+
+Also, the kernel file name in the project JSON? The kernel source file name is not specified in the project JSON. The build system expects kernel source file to be named according to op name? In the example, they had kernel source with no special naming. But the kernel function name is `leaky_relu_custom`. For our case, the kernel function name is `ca6k_00535_custom` (as in the extern "C"). That matches the python binding name. That's fine.
+
+Now, produce the corrected code.
+
+We also need to ensure that the host_operator_src has the correct include for the tiling header. Let's change to "ca6k00535_custom_tiling.h". Also ensure the host_operator_src includes necessary headers: it already includes "register/op_def_registry.h" etc.
+
+Now, let's write the six strings.
+
+We'll keep the project_json_src same (only change op name? Already correct).
+
+We'll keep host_tiling_src same.
+
+We'll modify host_operator_src to include "ca6k00535_custom_tiling.h" instead of "ca6k_00535_custom_tiling.h". Also we need to adjust the tiling function to use correct header. The tiling struct name is already Ca6k00535CustomTilingData, so that's fine.
+
+We'll modify kernel_src with the fixes and correct include.
+
+python_bind_src and model_src remain same.
+
+Let's output the code.

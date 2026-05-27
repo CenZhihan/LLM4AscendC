@@ -1,0 +1,203 @@
+We need to generate the AscendC artifacts for a fused operator that replaces nn.Unfold. The task is to implement a single fused custom op on NPU that matches the reference Model's output. The reference uses nn.Unfold with kernel_size=(3,5), dilation=(1,1). Input shape: (batch_size, in_channels, height, width) = (48, 3, 512, 256). Output shape: (batch_size, in_channels * kernel_height * kernel_width, L) where L = ((height + 2*padding - dilation*(kernel_height-1)-1)/stride + 1) * ((width + 2*padding - dilation*(kernel_width-1)-1)/stride + 1). With default stride=1, padding=0, dilation=1: L = (height - kernel_height + 1) * (width - kernel_width + 1) = (512-3+1)*(256-5+1) = 510*252 = 128520. So output shape: (48, 3*3*5=45, 128520). So total elements per batch: 45 * 128520 = 5,783,400. This is a large output.
+
+We need to implement Unfold as a custom kernel. The operation is to extract sliding local blocks from the input tensor. Typically, this involves data copying with indices.
+
+We can implement a single kernel that takes input tensor x (shape: N, C, H, W) and outputs y (shape: N, C*kH*kW, L). The kernel will be named Ca6k00347Custom (PascalCase). Kernel function name: ca6k_00347_custom.
+
+We need to handle tiling for large sizes. The UB budget is limited, so we need to tile along the output spatial dimension L. Each output column corresponds to a patch (kH*kW*C floats). So we can compute patches in a loop. We'll need to read input values from multiple positions (since dilation=1, it's contiguous within a patch). We can process multiple output columns per tile. Use double buffering for throughput.
+
+Constraints:
+- Use direct field assignments in tiling data (not setter methods) based on memory.
+- Use StorageShape in InferShape (not Shape* with GetOriginShape).
+- Do not add manual OP_ADD if autogen already registers; but we need to check. The host_operator_src will include op registration using the operator definition class. In previous successful examples, they use OP_ADD inside the operator class definition. However, memory 4 warns about redefinition if autogen also does REG_OP. But in the given example, they used `OP_ADD(LeakyReluCustom);` inside a namespace ops. The build system for custom ops typically expects the manual definition. Since we are not using autogen, we should include the full operator definition. I think it's safe to use manual definition; but to be safe, we can follow the pattern from the example where they define a class LeakyReluCustom and then OP_ADD. The memory says "do not add a second registration with OP_ADD; instead remove the manual OP_ADD and rely solely on the autogen REG_OP." This suggests that if the autogen already registers, we should not add another. But in our case, we are writing the host_operator_src manually; the build will compile our code and likely will have an autogen header that registers. To avoid duplication, we should not include OP_ADD. Instead, we can define the operator class but not call OP_ADD. However, the example in the prompt uses OP_ADD. I think the memory is specific to certain cases. Since we don't have the autogen setup, I'll follow the example pattern, but to be safe, I'll include the operator class and OP_ADD. If there is a conflict, the user can adjust later. The instruction says to use the given example style. So I'll include OP_ADD.
+
+Alternatively, we can omit OP_ADD and rely on autogen? But the example includes OP_ADD, so we should include it. The memory is a repair memory, not a hard rule. We'll follow the example.
+
+Now design the kernel.
+
+Operation: Unfold. For each output column l (spatial position), we need to extract a patch of size kH*kW*C. The output is stored in column-major order: for each batch, we have C*kH*kW rows and L columns. The ordering is that for each channel, the patch values are stored row-major within the patch, and over channels.
+
+We can implement a kernel that runs over blocks of output columns. Each block processes multiple columns. For each column, we compute the spatial coordinates (h_out, w_out) from l: h_out = l // W_out, w_out = l % W_out, where W_out = width - kW + 1 (since stride=1, dilation=1, padding=0). Then the patch indices: for dh in 0..kH-1, dw in 0..kW-1, the input element is at (b, c, h_out+dh, w_out+dw). So we need to read from multiple input positions.
+
+To optimize, we can process a batch of columns that share some spatial rows? Since we tile along output columns, it's fine.
+
+Using double buffer: we can have two tiles for input and output. We'll allocate local buffers for patch of size maxPatchSize * tileCols. Since tileCols can be small due to UB, we need to compute.
+
+We need tiling: total output elements per batch (rows * L) = C*kH*kW * L. But we process per column: each column requires reading kH*kW*C floats and writing same. So tiling data: totalRows = C*kH*kW, totalCols = L, tileCols = number of columns per iteration.
+
+We also need to handle large totalCols. Use grid stride with blockDim and blockIdx to distribute columns across cores.
+
+Kernel approach: Each block processes its assigned columns using a stride of blockNum * tileCols. For each tile, we compute the input positions and copy data.
+
+Simplification: Since the input is contiguous in memory for a given (b,c) and sliding window, we can load a row of input and then permute. But easier: For each column, manually compute indices. Use DataCopy to load 32-byte aligned blocks from GM to LB. However, the patch may not be contiguous in global memory because different spatial positions are separate. The input is a 4D tensor in NHWC? Actually, the data layout is NCHW. We need to read patches that are not contiguous in GM for a given batch. We could use vectorized reads via AscendC intrinsics? But we can do manual indexing with DataCopy of individual floats? That would be inefficient. Better to restructure: We can treat the input as a 3D tensor (N, C, H, W) and compute output as a 2D matrix per batch. Since the output is a column-major matrix (rows = C*kH*kW, cols = L), we can compute each column by reading scattered elements from the input. On Ascend, we can use DataCopy to copy vectors of floats from GM to LB, but we need to gather patches.
+
+One efficient approach: For each output column, the patch consists of kH*kW*C elements that come from a contiguous block in input for each channel? For a given channel, the patch elements are contiguous in height and width? In NCHW, the elements for a fixed channel and row are contiguous in width. So the patch for a channel is a rectangle (kH x kW). The elements within the rectangle are contiguous row-wise within that row and then row by row, but not contiguous overall because between rows there is a stride of width. So the patch is not a single contiguous block in memory; it is a set of kH contiguous segments of length kW, each spaced by width. So we can load each row of the patch separately. But that's many DMAs per column.
+
+To reduce overhead, we can process multiple columns in a tile and use vectorized gathering? Another approach: Precompute the input indices as a buffer? But that would be large.
+
+Given the constraints, a simpler approach: Use a single column per tile? But tileCols=1 leads to high overhead. However, the kernel must be correct. We can use a loop over output columns for each block, and for each column, use a manual gather with loops. Since UB is limited, we can process a few columns per tile.
+
+We need to compute the maximum tile size based on UB budget. For each column, we need to read kH*kW*C floats (max patch size = 3*5*3=45 floats). If we process N columns, we need to store input patch for N columns (N*45 floats) plus output (N*45 floats). Also temporary buffer for perhaps intermediate. So total floats per tile = 2 * N * 45 = 90N. UB budget = 192KB = 192*1024/4 = 49152 floats. So max N = 49152/90 ≈ 546. But we also need space for the input rows? Actually we can read directly from GM to local patch buffer using DataCopy? The input patch is scattered, so we need to read each row separately. That would require additional temporary buffers. So we should be conservative. Alternatively, we can read the entire input row segment and then extract patch. But that would require reading a larger contiguous block per channel.
+
+Better: For a given set of output columns, the input rows involved are from h_start to h_end (consecutive), and input cols from w_start to w_end. We can load a slab of the input tensor for each channel in that spatial region, then extract patches. That would be more efficient.
+
+Define: For a tile of output columns with indices 0..tileCols-1, the corresponding spatial positions: h_out_base = base // W_out, w_out_base = base % W_out. But columns within a tile may span multiple rows if tileCols > W_out. To simplify, we can restrict tileCols such that all columns in a tile belong to the same output row (i.e., base is at start of a row, and tileCols <= W_out). Then the input rows involved are the same kH rows. This greatly simplifies: we can load a chunk of input that covers those rows for all channels. For example, read a block of size (tileCols + kW - 1) * C * kH? Actually, for each output column in that tile, the patch rows are from h_out+0 to h_out+kH-1 (same h_out for all columns in tile because same output row). The patch columns are from w_out to w_out+kW-1. So we need to read a contiguous block of input of size (tileCols + kW -1) length per row per channel. We can read a 3D block: channels, rows, columns. Then we can assemble patches.
+
+This is the standard approach for im2col. We can implement a small im2col kernel.
+
+Given the complexity, we can write a kernel that does:
+
+For each block:
+- base_col = blockIdx * blockDim_cols (or use grid stride)
+- while base_col < totalCols:
+    - tileCols = min(blockDim_cols, totalCols - base_col)
+    - Determine the output row h_base and col w_base for base_col (since tileCols <= W_out, we can ensure all columns in tile are in same row by aligning base_col to W_out boundaries). Actually, blockDim_cols can be tileCols per iteration. To align, we can set blockDim_cols = tileCols and ensure tileCols divides W_out? That's not necessary; we can handle case where tile crosses rows by dividing further.
+
+Simpler: Use per-column iteration within a block: for each column assigned to block (stride by blockNum), process that column individually. That avoids complexity. We'll process one column per loop iteration, using a double buffer for the patch (input and output). Since UB can hold several columns' patches, we can prefetch next column while computing current. But to keep it simple and avoid index calculation errors, we can do single-buffered (BUFFER_NUM=1) but still use double buffering for overlap? The memory 5 says do not use BUFFER_NUM=2 when encountering vector core exception; use BUFFER_NUM=1. So we'll use BUFFER_NUM=1 to be safe.
+
+Thus, each block will loop over its assigned columns, for each column:
+- Read the patch from GM (scattered) into a local buffer.
+- Copy to local output (same size).
+- Write output to GM at appropriate location.
+
+Reading scattered data: We need to load kH*kW*C floats, but they are not contiguous. We can issue multiple DataCopy for each row of the patch. Or we can use a loop and load individual floats? DataCopy requires contiguous addresses. So we need to copy row by row. That means for each column, we need to do kH * C DataCopy operations (each of length kW floats). That could be many DMAs. But it's acceptable if UB is small.
+
+Alternatively, we can load the entire slab of input for a tile of columns if we restrict to same output row. For simplicity, we'll implement per-column processing with row-by-row DataCopy.
+
+We also need to compute the output index: output is stored in column-major order. The offset for a given batch b, column l, and row r (r = actual patch element index in range 0..C*kH*kW-1) is: (b * totalRows * totalCols) + r * totalCols + l. So we write to that location.
+
+We'll process per block using grid stride.
+
+Now, design tiling:
+
+We need parameters: totalLength (total elements in output for all batches? Actually we process per batch? Usually, we run the kernel for all batches? Since the input has batch dimension, we can either create a single kernel that loops over batch or have the host expand. Easier: The kernel will handle all batches? The Unfold operation can be done per batch independently. We can have the kernel take the full input tensor (N, C, H, W) and output (N, C*kH*kW, L) with appropriate strides. Then we can loop over batch inside kernel or have multiple kernel launches. To keep simple, we can have the kernel process one batch at a time, and the host calls it for each batch? That would be inefficient. Better to include batch dimension in tiling.
+
+We can treat the output as a 3D tensor: dimensions N, M, L where M = C*kH*kW. The total number of elements is N * M * L. We can flatten the output and index accordingly.
+
+We'll set tiling data: totalElements = N * M * L, but we need to process per batch? Actually, if we process all batches together, each block can handle a range of output elements (flattened). Then for each output element, we need to know which batch, which output row, which output column. We could compute batch = element // (M*L), etc. This may be heavy. Alternatively, we can keep kernel limited to single batch and loop over batch externally. But the reference forward is just a single call, so we can launch one kernel that processes all batches. We can use the same approach: each block processes a chunk of flattened output elements. For each element, we compute batch, row, col. But that requires divisions. Or we can process per batch with grid stride: for b in range(N), then process columns. We can use blockDim to distribute across batches? Possibly.
+
+Simpler: We can have the kernel take the input tensor shape and compute the output using loops. Since N=48, we can have each block handle a subset of batches and columns. We can partition the total output elements (N*M*L) across blocks. For each block, we compute its start and end element index, then loop over those elements, and for each element compute the corresponding batch, output row, output column, then read the patch and write.
+
+The compute for each element: batch = element // (M*L), remainder = element % (M*L), row = remainder // L, col = remainder % L. Then compute input coordinates: h_out = col // W_out, w_out = col % W_out. Then read patch.
+
+This involves many divisions, but it's okay.
+
+Given time, I'll design a kernel that processes a 1D range of output elements.
+
+Tiling data: totalOutputElems (uint64_t) and tileElems (uint32_t). Also store H, W, kH, kW, C, stride, padding, dilation (all int32). Since stride=1, padding=0, dilation=1. Also store M = C*kH*kW, W_out = W - kW + 1, H_out = H - kH + 1.
+
+We need to pass these as tiling data fields. Use uint32_t for sizes as they fit.
+
+Now, implement:
+
+host_tiling_src: define TILING_DATA with fields: totalOutputElems (uint64_t? Actually tiling data fields are limited to specific types? In example they used uint32_t. But total output elements could be 48 * 45 * 128520 = 48 * 5,783,400 = 277,603,200 which fits in uint32? 277 million > 2^32? 2^32 = 4.29e9, yes fits. So uint32 is fine. So tileElems uint32, batchSize, channels, C, kW, kH, H, W, stride, padding, dilation, M, H_out, W_out, etc.
+
+Simplify: just compute the output shape in tiling and pass necessary values: H, W, kH, kW, C, stride, padding, dilation, outputH, outputW, outputRows (=C*kH*kW), totalOutputElems.
+
+We'll compute in host tiling function.
+
+Now, write the code.
+
+We must follow the six-string format.
+
+We need to ensure kernel uses __aicore__ functions, GM_ADDR, etc.
+
+For the kernel, we'll use single buffering (BUFFER_NUM=1). We'll allocate a local buffer of size maxPatchSize (C*kH*kW) floats for input patch and one for output patch. Actually we can reuse one buffer: read patch into local, then compute (just copy), then write from same buffer.
+
+We'll use DataCopy for each row of a patch: for dh in range(kH): for c in range(C): source = x + (b*C*H*W + c*H*W + (h_out+dh)*W + w_out) ; dest = patch + (c*kH*kW + dh*kW); copy kW floats.
+
+But this uses many DMA operations per column. To reduce, we can combine all rows for one channel? Since rows are spaced by W, we can issue DMA for each row. That's fine.
+
+We'll allocate a single local tensor of size M (<=3*3*5=45). So it's small.
+
+In the kernel, we'll loop over totalOutputElems with a stride of blockDim (grid stride). For each element, compute batch, row, col as above. Then compute h_out = col // outputW, w_out = col % outputW. Then read patch.
+
+We'll need to ensure we use correct integer types.
+
+Also, output in row-major order? The output of Unfold is a 2D matrix per batch: rows = M, cols = L, stored in column-major (like Fortran order)? In PyTorch, nn.Unfold outputs a tensor of shape (batch, M, L) where M = C * kH * kW, L = number of patches. The memory layout is the default (contiguous) which is row-major for the last two dimensions? Actually in PyTorch, tensors are row-major. So the tensor of shape (N, M, L) is stored with stride: stride[0] = M*L, stride[1] = L, stride[2] = 1. So the element (b, r, l) is at index b*M*L + r*L + l. So that's what we will compute.
+
+For input, shape (N, C, H, W) with strides: N*C*H*W, C*H*W, H*W, W, 1. So input element (b, c, h, w) is at index b*C*H*W + c*H*W + h*W + w.
+
+Now, implement.
+
+We'll need to pass the input shape parameters via tiling. Since we have many params, we can pack into tiling struct.
+
+We'll define host_tiling with fields: totalOutputElems (uint32), tileOutputElems (uint32) - not using? We'll process per element, so tile not needed. But we need to limit per kernel loop to avoid long execution? We'll just iterate all elements assigned to block. That's fine.
+
+But we need to allocate local buffer. It's small.
+
+We'll use BUFFER_NUM=1 and process each element sequentially within the block.
+
+In Init, we'll set all params from tiling.
+
+In Process, loop over output elements with stride blockNum.
+
+Note: GetBlockNum returns number of blocks.
+
+We'll compute for each element and write output.
+
+For reading, we'll use DataCopy with vector operations. We'll need a local buffer of size M. Since M max 45, we can allocate fixed size (e.g., 256) to be safe.
+
+We'll use AscendC::DataCopy to copy from GM to LB. Since source is not contiguous, we need to call DataCopy for each row. DataCopy requires the source address and length in bytes. We'll compute addresses.
+
+Important: DataCopy can only copy contiguous data. So we must copy row by row.
+
+We'll define function ReadPatch that fills the local buffer.
+
+Because the kernel is small, we can inline.
+
+Now, write the artifacts.
+
+Let's start with project_json_src. op name: Ca6k00347Custom. Input: x (float, ND). Output: y (float, ND). Attributes: kernel_size (list of ints? Actually it's a tuple of two ints, but we can pass as two ints: kernel_h, kernel_w, dilation_h, dilation_w, stride, padding... However, the user may not set these; they are fixed from the model. But we can either hardcode them in tiling or pass as attributes. To match the golden, we need to support dynamic values? The reference model has fixed kernel_size and dilation, but the model class constructor receives them. In the get_inputs, they are not passed. The model uses the values from __init__. So we can hardcode in the model_src and pass to op via tiling. So we don't need attributes; we can compute tiling from input shape and fixed kernel params.
+
+But the op definition should include attributes for flexibility? The example had negative_slope attribute. We can include attributes for kernel_size and dilation as optional, but we can also just hardcode. Since the user instruction says to implement a custom op that matches the reference, we can embed the parameters in the host tiling which gets the values from the model. So we can have attributes for kernel_h, kernel_w, dilation_h, dilation_w, stride, padding (default 0). Then the host tiling uses those. But the reference uses stride=1, padding=0, dilation=1. We can set defaults.
+
+To be safe, include attributes: kernel_h, kernel_w, dilation_h, dilation_w, stride, padding. All optional with defaults as used.
+
+Now, compile all.
+
+Let's write the six strings.
+
+We'll use the naming: Ca6k00347Custom.
+
+Now, write host_tiling_src: define TILING_DATA with fields: batchSize, channels, height, width, kernelH, kernelW, dilationH, dilationW, stride, padding, outputH, outputW, outputRows, totalOutputElems, tileOutputElems, blockDim.
+
+We also need tileOutputElems for the kernel to iterate? Actually we can just loop over totalOutputElems with grid stride; no need for tile. But we need to limit per iteration? The kernel will loop over all assigned elements. That's fine.
+
+We'll include fields: totalOutputElems, blockDim (for reference).
+
+host_operator_src: Include tiling header, register op, define TilingFunc, InferShape, InferDataType, class op with attributes and OP_ADD. Must not use setter for tiling.
+
+InferShape: output shape = (batchSize, outputRows, outputL). Compute from input shape and attribute values.
+
+TilingFunc: compute output shape and set tiling data.
+
+kernel_src: as described.
+
+python_bind_src: include torch headers, define pybind and TORCH_LIBRARY_IMPL.
+
+model_src: class ModelNew that uses the custom op.
+
+We need to ensure the kernel function name matches: ca6k_00347_custom.
+
+Let's write.
+
+Note: The kernel process reads from global memory for each element, which may be slow but correct.
+
+We'll implement the kernel as:
+
+extern "C" __global__ __aicore__ void ca6k_00347_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(td, tiling);
+    KernelCa6k00347Custom op;
+    op.Init(x, y, td);
+    op.Process();
+}
+
+We'll need to store tiling data in a struct.
+
+Now, code.
+
+We'll produce the output as a single Python code block with six strings.
+
+Proceed.
