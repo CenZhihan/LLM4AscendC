@@ -1,0 +1,80 @@
+We need to fix the correctness issue. The previous attempt compiled but gave wrong outputs (all zeros likely). The error logs show "TBE Subprocess raise error" and "main process disappeared" after correctness check. The root cause is likely the kernel not correctly reading input and writing output. The tiling struct conflict warning also appears, but that's not the main issue. The kernel had a naive per-element loop that is extremely inefficient and might have missed proper tiling data handling. The init of pipe_ buffer with only 1 element was wrong. Also the kernel used Init with workspace (GM_ADDR workspace) but never used it. The Process computation attempted to compute output element by element using global memory reads, which is wrong because we need to read input data from global memory via DataCopy to local, then compute, then copy out.
+
+We need to redesign the kernel to properly use AscendC vector instructions. The kernel should read input tiles, process them with zero padding logic, and write output tiles. Since the padding operation adds zeros around the input, we can treat each output row: for rows within padding top/bottom (zero rows) just write zeros; for rows within input area, copy the input row with left/right padding zeros. This is a memory copy operation, not a compute operation. We can use DataCopy for the input rows, and set zeros for the padding regions.
+
+But a simpler approach: given the input is contiguous in NHWC? Actually input format is NCHW. The output is larger due to padding. The kernel can process each output row: for each row, if row is within padding top/bottom, fill with zeros; otherwise, copy the input row with zero padding left/right. This can be done by iterating over output rows and columns, but using vectorized operations might be tricky. However, since the data size is up to 16*3*2048*2048 ~ 201M floats, need good tiling.
+
+Given the previous kernel was extremely inefficient and likely caused timeout/error, we need to produce a correct kernel. Let's think of a decomposition: The output can be seen as a plane of shape (batch*channels, outputH, outputW). For each plane (batch*channels), the operation is: copy the input plane (inputH, inputW) into the middle of output plane of size (outputH, outputW) with zero padding around. This is like a "copy with offsets" operation. We can implement by iterating over output rows, and for each row, either fill with zeros (if row in top/bottom padding) or copy the corresponding input row with left/right zero padding.
+
+Given the constraints of AscendC, we can use DataCopy for contiguous segments. The padding can be done by setting zero regions before and after copying the input row segment. For each output row in the middle band, we can:
+- DataCopy zero from some local tensor for left pad region (padLeft elements)
+- DataCopy the input row (inputW elements) from global input
+- DataCopy zero for right pad region (padRight elements)
+
+This requires a pipeline with 3 copy operations per row. Alternatively, we can combine the three segments into one local buffer and then copy out.
+
+But we need to be careful with tiling: we can tile by rows of output. Since each row is outputW, we can process multiple rows per tile. The UB buffer can hold one row of output (or a few rows). Given outputW could be up to 2048+padLeft+padRight up to ~2052, that's small. We can easily fit multiple rows.
+
+Simplify: for each block, process a chunk of rows. Use a loop over rows. For each row, compute output row index, determine if it's top/bottom padding or middle. For middle rows, compute input row index. Then we need to copy the row data: the output row consists of (padLeft zeros + input row + padRight zeros). We can use DataCopy for zeros from a pre-initialized zero local tensor, and DataCopy for input row from global input.
+
+But DataCopy for zeros: we can have a local buffer initialized to zero, and copy from it repeatedly. Or we can use pipe_ and allocate local tensors for zeros.
+
+Better: we can allocate a local tensor for output row, set all values to zero via a vector operation (maybe easier), then copy input row into the appropriate offset within that local tensor, then copy the local tensor to global output. However, setting all to zero and then copying input over is fine.
+
+Given time, produce a simple but correct kernel: Process each output row individually. Use a single block (blockDim=1) or a few blocks. Since output rows are many (batch*channels*outputH up to 16*3*2050~98k), we can parallelize across rows using blocks. So blockDim = number of rows? That could be up to 98k, but we need to cap blockDim <= 24. So we need to tile rows across blocks and within each block process multiple rows.
+
+Let's design tiling: total rows = batch * channels * outputH. blockDim = min(total_rows, 24). Each block processes a contiguous segment of rows via grid-stride loop. For each row, copy padding zeros and input row.
+
+We need to ensure we have proper synchronization and pipeline. Use double buffer for in/out queues.
+
+But we must also respect UB size. Each row output length = outputW floats. We can allocate two local tensors of size outputW (for double buffer) and a zero constant tensor.
+
+Simpler: for each row, we can use Vector::SetZero to zero out a local tensor, then DataCopy the input row (if any) into the correct position. Then DataCopy the local tensor to output. This avoids separate zero buffers.
+
+Implementation steps per block:
+- Compute number of rows to process per block (grid-stride, each block processes rows from blockIdx*stride to blockIdx*stride+stride-1 where stride = blockNum * something). We'll iterate over rows assigned to this block.
+- For each row:
+  - Allocate local tensor yLocal of size outputW (float).
+  - Use `AscendC::LocalTensor<float> yLocal = ...`
+  - `AscendC::SetZero(yLocal, outputW)` or `AscendC::Duplicate(yLocal, 0.0f, outputW)`.
+  - If row is within middle band:
+    - Compute input row index: inRow = outRow - padTop.
+    - DataCopy from input global (with offset) into yLocal[padLeft] of length inputW.
+  - DataCopy yLocal to yGm_ at appropriate offset.
+  - Free tensor.
+
+This is simple but uses one DataCopy per row for zero-initialized local tensor (which is cheap if we do SetZero). The DataCopy for input row is from global to local, then local to global out. With double buffering, we can pipeline.
+
+But we need to be careful with alignment: DataCopy requires element count, not bytes. And offset must be in elements.
+
+Given time constraints, produce a corrected kernel using this approach. Also fix the tiling struct conflict: ensure that the tiling struct is defined only in the header (host_tiling_src) and included in kernel via that header. The previous attempt had a separate definition in kernel which caused warning. We'll include the header.
+
+Also fix python_bind_src: the binding function name should match the kernel name 'ca6k_00229_custom' but the previous binding used 'pad_zero_custom'. We need consistency: the binding should call the custom op using the operator name 'Ca6k00229Custom' via aclnn. The previous attempt used 'aclnnCa6k00229Custom' which is correct. But then in model_src, we need to call the custom op via the Python binding function. The binding function name should be something like 'ca6k_00229_custom'. Let's use the same name as kernel: 'ca6k_00229_custom'. Also in model_src, we call it.
+
+Also need to ensure the host_operator_src does not have OP_ADD because the autogen will register it. The previous had a comment about that. Keep.
+
+Now, incorporate memory repair #1: do not define tiling struct in kernel header; include the host tiling header. In kernel_src, include the tiling header from the host: `#include "ca6k_00229_custom_tiling.h"` (the header generated from host_tiling_src). That's already done.
+
+Memory repair #2: use `Int()` instead of `Int32()` for attrs. In host_operator_src, we are not using OpDef registration manually, so it's okay. But if the autogen uses Int32, it might cause error. The previous compilation succeeded, so likely fine.
+
+Now, produce the corrected six strings.
+
+Let's write them.
+
+First, project_json_src: should have op name "Ca6k00229Custom". Keep input desc for x (float, ND), output desc for y (float, ND). Attributes: pad_top, pad_bottom, pad_left, pad_right as int32 default 0. That's fine.
+
+host_tiling_src: define the tiling struct with fields: batch, channels, inputH, inputW, padTop, padBottom, padLeft, padRight, outputH, outputW, totalOutputRows, tileRows (number of rows per tile), blockDim. We'll use tileRows instead of tileLen (since we tile rows). But we could also keep tileLen as outputW * tileRows. Simpler: keep tileLen as total elements per tile, but that's harder for row-based processing. We'll tile by rows: each tile processes a number of consecutive rows. So fields: batch, channels, inputH, inputW, padTop, padBottom, padLeft, padRight, outputH, outputW, totalOutputRows, tileRows, blockDim.
+
+In host_operator_src TilingFunc: compute tileRows based on UB budget: each row requires 3 * outputW floats? Actually we need two double-buffered output rows and maybe an input row buffer. But to simplify, we can set tileRows = 1 and rely on double buffer across rows. UB budget: we need at least 2 * outputW floats for double buffer, plus some overhead. outputW up to ~2052, so 2*2052=4104 floats, well within 192KB (49152 floats). So we can set tileRows = UB_BUDGET_BYTES / (3 * outputW * 4) maybe 1. Actually we can compute tileRows = min(UB_BUDGET_BYTES / (sizeof(float) * outputW), 64) but ensure it's at least 1. We'll compute.
+
+But to keep tiling simple, just set tileRows = 1 per block? That would be inefficient. Instead, we can set tileRows to a number such that the total workspace for double buffering of output rows fits. With double buffering, we need 2 * tileRows * outputW floats. So max tileRows = UB_BUDGET_BYTES / (2 * outputW * sizeof(float)). We'll compute and clamp.
+
+Better: we don't need to store an entire row of zeros; we can use SetZero on local tensor each row. So only one output row local tensor per buffer. So two local tensors for double buffer. So 2 * outputW floats. For input row, we can copy directly into the output local tensor at offset padLeft, so no extra input row buffer needed. So UB budget: 2 * outputW floats. So max tileRows = UB_BUDGET_BYTES / (2 * outputW * sizeof(float)). But we also need temporary for pipe? Actually the pipe manages the queues. We'll use double buffer: inQueueX? No input queue needed because we read from global directly into local output tensor. Actually we need to copy input row from global into a local tensor (the output tensor) at offset. That's a DataCopy from global to local. So we need local tensor of size outputW for output row. That's it. So we can have two output local tensors for double buffering. So UB requirement: 2 * outputW floats. That's small, so we can set tileRows = min(UB_BUDGET_BYTES / (2 * outputW * sizeof(float)), some max like 128). We'll compute in TilingFunc.
+
+We'll set totalOutputRows = batch * channels * outputH. tileRows as computed. blockDim = min( numTiles (CeilDiv(totalOutputRows, tileRows)), 24 ) but clamp to at least 1.
+
+In kernel, each block processes rows in a grid-stride loop with step = blockDim * tileRows. For each iteration, process tileRows rows sequentially: for each row in the tile, do the zero+copy operation.
+
+Now write the code.
+
+Let's produce the final answer.

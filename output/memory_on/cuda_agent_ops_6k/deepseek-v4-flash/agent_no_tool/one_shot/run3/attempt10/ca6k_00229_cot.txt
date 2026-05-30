@@ -1,0 +1,118 @@
+We need to fix the kernel correctness. The error log shows compilation succeeded but correctness failed. The symptom shows "TBE Subprocess raise error, main process disappeared" which often indicates a crash during kernel execution. The kernel code looks suspicious: using DataCopy with non-contiguous addressing (xGm_[inputRowOffset] which is a GlobalTensor<float>, DataCopy expects contiguous src/dst). Also the kernel uses `AscendC::DataCopy(yLocal[padLeft], xGm_[inputRowOffset], inputW);` but yLocal is a LocalTensor and indexing it with a scalar offset is not correct. We need to use a different approach: perhaps use vectorized copy with offsets.
+
+But more importantly, the kernel seems to do row-by-row processing, which may be inefficient and cause issues. Also note that the tiling struct is defined in host_tiling_src and also included in kernel_src via `#include "ca6k_00229_custom_tiling.h"`. That should be fine as long as the tiling data is consistent.
+
+Let's analyze the correctness failure: the kernel is supposed to perform zero padding. The reference input shape: batch=16, channels=3, height=2048, width=2048, padding tuple (1,2,1,2). Output should be (16,3,2051,2051) because top=1, bottom=2 => height+3=2051; left=1, right=2 => width+3=2051.
+
+The kernel attempts to compute output row by row. It allocates a zero buffer and copies input rows into the appropriate positions. However, the DataCopy calls are likely incorrect. Also the kernel uses `AscendC::SetZero(zeroBuf, outputW);` and then `DataCopy(yLocal, zeroBuf, outputW);` to initialize yLocal to zeros. Then if the row is within input region, it copies from xGm_ starting at offset inputRowOffset to yLocal starting at padLeft. But DataCopy requires both source and destination to be continuous local tensors or global tensors. Here destination is `yLocal[padLeft]` which is a local float* offset? Actually LocalTensor has operator[] returning a LocalTensor with offset, which is allowed for DataCopy? Possibly not. In AscendC, DataCopy between LocalTensor and GlobalTensor requires the local tensor to be contiguous from its base. Using offset on local tensor might not work.
+
+Better approach: Since this is a simple zero padding, we can perform the operation using vectorized operations on the entire 4D tensor. But that would require complex indexing.
+
+Alternative: Use the ComputeForEach pattern with a single kernel that processes each output element by mapping back to input. However, we can also use the built-in AscendC pad operation? But the task requires custom op.
+
+Given the previous attempt used a row-by-row approach and it compiled but crashed, we need to fix the DataCopy usage. Instead, we can allocate a local tensor for the full row and then copy the input segment into the appropriate sub-region using vectorized assignment (SetValue or similar). But that's complicated.
+
+Perhaps a simpler approach: use a single loop over all output elements using grid-stride, and for each output element (n,c,h,w), compute if it falls within input region and copy from x if so, else set zero. This avoids row-by-row buffer management. But the kernel would be slower but correct.
+
+Given the time constraints, we need to produce a minimal fix that compiles and passes correctness. The previous attempt compiled, so no compilation errors. The crash is likely due to illegal memory access. Let's revise the kernel to use a straightforward element-wise approach (one thread per element) using Muls and other vectorized ops? Actually we cannot directly do element-wise because the mapping is strided.
+
+But we can still do it with a grid-stride loop over all output elements. For each output element, compute the corresponding input index if it is within padding region, else zero. Then we can use a single DataCopy for a block of elements? That would be complex.
+
+Maybe the crash is because of the `AscendC::DataCopy(yLocal[padLeft], xGm_[inputRowOffset], inputW);` line. Let's check the AscendC API: DataCopy can take a LocalTensor and a GlobalTensor with an offset? Actually signature: `DataCopy(LocalTensor<T> &dst, const GlobalTensor<T> &src, uint32_t count);` The src can be a GlobalTensor with offset (like `xGm_[offset]` returns a GlobalTensor with that offset). The dst is a LocalTensor. Using `yLocal[padLeft]` returns a LocalTensor with offset, which should be valid. But we must ensure that the local tensor has enough space from offset to end. We allocated yLocal of size outputW floats, and we copy inputW floats starting at padLeft. That should be fine if padLeft+inputW <= outputW. That is true.
+
+But wait: the kernel does `AscendC::DataCopy(yGm_[outputRowOffset], yLocal, outputW);` to write back. That is also valid.
+
+Another issue: The kernel initializes `zeroBuf` with size outputW and sets it to zero. Then it copies zeroBuf to yLocal using DataCopy. That should work.
+
+Potential cause: The kernel uses `AscendC::GetBlockIdx()` and grid-stride: `baseRow += blockDim * tileRows;` but blockDim is from tiling, not `AscendC::GetBlockNum()`. That's okay.
+
+But maybe the crash is due to the tiling struct being used incorrectly in kernel. The GET_TILING_DATA macro expands to something like `Ca6k00229CustomTilingData tiling_data; ...`. But we also defined the tiling struct in both host and kernel? Actually kernel_src includes the tiling header which defines the struct. That should be fine.
+
+Looking at the previous memories: Memory 1 says not to define tiling struct in both host and kernel files; instead define in a single shared header. But we have host_tiling_src which is the header, and kernel_src includes it via `#include "ca6k_00229_custom_tiling.h"`. That's consistent. However, the build log shows a warning: "tiling struct [Ca6k00229CustomTilingData] is conflict with one in file ca6k00229_custom_tiling.h, line 5". That suggests there might be a duplicate definition. Possibly the host_operator_src includes the same header? No, host_operator_src includes `#include "ca6k_00229_custom_tiling.h"` as well. That's fine.
+
+But the warning might be benign. The crash is a runtime issue.
+
+I think the main issue is the DataCopy with offset for destination may not be supported or causes memory alignment issues. A safer approach: instead of copying a row into a local tensor with offset, we can allocate two local tensors: one for the zero part and one for the input part. Or we can use a single local tensor and manually set the input segment using a loop with vectorized store. However, that would be slower but safer.
+
+Given the time, we can rewrite the kernel to use a more straightforward approach: treat the output as a 4D tensor and use grid-stride over all elements. For each output element (n, c, h, w), check if h is between padTop and padTop+inputH-1 and w between padLeft and padLeft+inputW-1, then copy from input, else output 0. Since we are doing element-wise, we can use a single DataCopy per element? That would be terrible. But we can process blocks of contiguous elements: for a given (n,c,h), the output rows are contiguous. So we can process entire rows at once, but we need to handle the zero padding at left and right. We can do three parts: left padding zeros, middle copy of input row, right padding zeros. That's what the original attempted but with offset copy.
+
+The offset copy might work if the hardware supports it. But maybe the issue is that yLocal is not initialized properly? Actually we initialized it by copying from zeroBuf, so it's all zeros. Then we copy input to `yLocal[padLeft]`. That should work if `yLocal[padLeft]` is a valid LocalTensor starting at offset padLeft. The DataCopy should then write inputW elements into that subregion.
+
+I suspect the problem is with the tiling data: the kernel uses `AscendC::GetBlockIdx()` and `AscendC::GetBlockNum()` but the tiling includes blockDim. However, the kernel does not use `AscendC::GetBlockNum()` for stride; it uses `blockDim` from tiling. That's okay.
+
+Another possibility: the kernel accesses `xGm_[inputRowOffset]` but inputRowOffset is computed as `planeIdx * inputH * inputW + inRow * inputW`. `planeIdx` is `rowIdx / outputH`. This should map correctly.
+
+But note: the input tensor is 4D ND format. The global memory layout is [N, C, H, W] contiguous. So for planeIdx = n*C + c, but we are using integer division: `planeIdx = rowIdx / outputH`. Since outputH is known, and total rows per plane = outputH. So planeIdx goes 0..batch*channels-1. That's correct.
+
+Then input offset for that plane: planeIdx * inputH * inputW, then add inRow*inputW. That's correct.
+
+The output offset: planeIdx * outputH * outputW + outRow * outputW. That's correct.
+
+So the indexing seems correct.
+
+I suspect the crash is due to the kernel using `AscendC::DataCopy` with a non-zero offset on the local tensor destination. Let's search memory: I recall that DataCopy requires both source and destination to be aligned to 32 bytes? Possibly the offset causes misalignment. To fix, we could use a temporary local tensor for the input row and then manually merge with zeros using vectorized operations. But that is complex.
+
+Given the build succeeded but eval had crash (returncode -11 indicates SIGSEGV), let's look at the eval log: "TBE Subprocess raise error, main process disappeared!" This suggests a segmentation fault in the kernel.
+
+I think the safest fix is to simplify the kernel to process only one row per block (tileRows=1) and use a simpler method: for each output row, we copy zeros for left pad, then copy input row, then zeros for right pad, using separate DataCopy calls for each contiguous segment. But that still uses offsets.
+
+Alternatively, we can use a workaround: instead of using DataCopy, we can loop over the row elements and assign values using vectorized store and load with index calculations. But that would be slower.
+
+Given time, I'll propose a fix that uses a single row buffer and writes each part separately using DataCopy with offsets, but we must ensure alignment. We can align the row length to 64 bytes? But the input width is 2048, which is already a multiple of 64 bytes (2048*4=8192 bytes). So alignment is fine.
+
+Maybe the issue is that the tiling data is not being passed correctly? The kernel uses `tilingBuf_` which is set from the GM_ADDR tiling parameter in Init. Then in Process, it calls `GET_TILING_DATA(tiling, tilingBuf_)`. That should work.
+
+I'll try a different approach: instead of row-by-row, process element-wise but vectorized across the row dimension? That is complex.
+
+Given the previous attempt compiled, we only need to fix the correctness. The crash suggests a bug in the kernel logic. Let's check if the kernel correctly handles the case where output row is entirely within padding (e.g., for top rows outRow < padTop). In that case, it does not enter the if condition, so yLocal remains zeros. That's correct.
+
+But if outRow >= padTop+inputH (bottom padding), also correct. So that's fine.
+
+Maybe the issue is that the kernel uses `AscendC::DataCopy(yGm_[outputRowOffset], yLocal, outputW);` and `yLocal` might be freed before the copy completes? The order: after copying to global, we free yLocal. But DataCopy is synchronous? Actually DataCopy is asynchronous on the pipeline; we need to enqueue and then wait. In the current code, after DataCopy we immediately free yLocal, which might cause a race. That's a major bug! In AscendC, DataCopy to global is done via the outQueue. But here we are using direct DataCopy without queues. That might be incorrect. The proper way is to use `AscendC::DataCopy` on a local tensor and then enqueue to outQueue, or use `AscendC::DataCopy` directly but ensure the tensor is not freed prematurely. However, DataCopy is a synchronous operation on the pipeline if the destination is global? Actually the pipeline handles global memory accesses via the out queue. The pattern from the leaky_relu example: they use `DataCopy` from global to local (input), then compute, then `DataCopy` from local to global (output) after enqueuing to outQueueY_. The output is first enqueued, then later dequeued and copied to global. In our kernel, we are not using queues for output; we directly copy from local to global without queuing. That might be the cause of the crash because the pipeline expects a certain order.
+
+In the leaky_relu kernel, the output is enqueued to outQueueY_, then later dequeued and copied to global. That ensures proper synchronization. Our kernel does not use that pattern; it directly copies after computation and then frees the tensor. That could lead to use-after-free or out-of-order execution.
+
+We need to adopt the queue-based pattern: allocate yLocal, compute, enqueue yLocal to outQueue, then dequeue and copy to global. We already have outQueueY_ initialized with BUFFER_NUM=2 and no fixed size. But we used `outQueueY_.AllocTensor<float>()` to allocate, but then we never enqueue it. We directly use it. That's wrong.
+
+Let's fix: Use the pipeline double-buffering pattern. For each row, allocate a local tensor, compute, enqueue, then later dequeue and copy to global, then free. But we need to handle the queue properly.
+
+Given the time, I'll rewrite the kernel to use the standard pipeline pattern with inQueue and outQueue. But we don't have input queue because we read directly from global. However, we can still use outQueue for output.
+
+I'll restructure the kernel:
+
+- In Init, set buffer sizes for inQueueX (if needed) and outQueueY.
+- In Process, loop over rows: allocate local tensor for output row, compute (set zeros, copy input portion), enqueue to outQueueY. Then after all rows for the tile, dequeue and copy to global.
+
+But the queue is double-buffered, so we can do overlap: allocate two tensors, enqueue one while processing next.
+
+Given the complexity, I'll simplify: process one row per block (tileRows=1) and use a single buffer without double buffering, but still use outQueue for proper synchronization. Actually we can still use outQueue with single buffer: AllocTensor, compute, EnQue, DeQue, DataCopy to global, FreeTensor. That ensures proper ordering.
+
+Let's implement that. Also need to set pipe_.InitBuffer for outQueueY_ with size of one row.
+
+Also need to remove the zeroBuf and use SetZero on the row buffer directly.
+
+I'll also correct the tiling struct to include all necessary fields, and ensure the kernel uses GET_TILING_DATA correctly.
+
+Also note: the initial tiling struct had fields like batch, channels, inputH, inputW, etc. But we also have totalOutputRows. The kernel used all these. That's okay.
+
+We need to ensure the kernel code is correct with the queue pattern.
+
+I'll produce fixed kernel_src. Also adjust host_operator_src if needed? Not necessary.
+
+Also check memory 2: build error about OpAttrDef no member Int32. In our host_operator_src, we didn't use OpAttrDef directly; we used the autogen and OP_ADD? In the provided host_operator_src, there is no OP_ADD because we said "Operator registration is handled by the framework autogen; no OP_ADD needed." But the build succeeded, so that's fine.
+
+But note: the project_json_src includes attributes as int32 type. The build may expect the host operator to register those attrs. Currently our host_operator_src does not call any OpAttrDef or similar; it only defines TilingFunc. The actual operator registration is done via OP_ADD in the autogen? I think the project_json_src is used to generate the operator registration code. So we don't need to manually register in host_operator_src. That's probably why it compiled.
+
+Now, generate the corrected code. I'll modify kernel_src heavily to use proper queue pattern and element-wise row processing with correct sync. Also I'll reduce tileRows to 1 to avoid complexity, but we can keep tileRows computation in tiling.
+
+Given the output is (16,3,2051,2051) total elements ~ 202 million floats. With blockDim up to 24, each block processes 1 row (2051 elements) per iteration, grid-stride. That's fine.
+
+I'll also remove the zeroBuf and just use SetZero on the row buffer.
+
+Let's write the new kernel.
+
+Also note: the kernel uses `AscendC::GetBlockNum()` but the tiling includes blockDim. I'll use blockDim from tiling for stride, consistent with previous.
+
+Finally, ensure all Python strings are properly quoted and no trailing spaces.
+
+I'll output the fixed code.
